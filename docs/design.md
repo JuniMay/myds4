@@ -18,7 +18,9 @@
 | `src/vision.metal` | The vision encoder's kernels. |
 | `src/chat.c` | Chat Completions requests as prompts (after the checkpoint's `encoding/encoding.py`), and the model's output as reasoning, content and tool calls. |
 | `src/serve.c` | The HTTP server: authentication, the request queue, the sessions' attention state, the log, the live view's snapshot of the server. |
+| `src/engine.c`, `src/engine.h` | The engine behind a C ABI for the Rust server: `serve.c`'s queue, sessions, batching, status and log without HTTP or JSON (see [The Rust server](server.md)). |
 | `src/tui.c` | The server's live view (`--tui`): the terminal, the statistics windows, the frame. |
+| `server/` | The Rust server on `deepseek-recipe`: HTTP, request conversion, prompts, output (see [The Rust server](server.md)). |
 | `tools/` | Table generation and checks (Python); `view_check.c`, a stand-in for the server's state that `check.py view` draws with `src/tui.c`. |
 
 Metal is used from C: every message goes through `objc_msgSend` cast to the
@@ -1273,6 +1275,11 @@ class. No read may run at the utility class or below, where macOS throttles
 disk reads.
 
 ## Server
+
+[The Rust server](server.md) (`build/myds4-server`) serves the same API
+with the same scheduler, in `src/engine.c` behind a C ABI, and converts
+requests and output with DeepSeek's `deepseek-recipe`; this section
+describes the C server.
 
 `--serve` runs an HTTP/1.1 server for the OpenAI Chat Completions API. A
 thread accepts connections (at most 64 at once) and a thread per connection

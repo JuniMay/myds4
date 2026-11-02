@@ -11,6 +11,9 @@ the GPU kernels are Metal Shading Language, compiled when the program starts.
   policy, decoding and prefill.
 - [Performance](docs/performance.md): the machine's limits, the model's byte
   and operation counts, and measured results.
+- [The Rust server](docs/server.md): a second server on DeepSeek's
+  `deepseek-recipe` crates over the same engine, its C ABI, and how it
+  differs from the C server (not yet the default).
 
 ## Requirements
 
@@ -276,6 +279,8 @@ The app stores the key in its own credential file (`~/.dsh/.credentials.yaml`).
 | --- | --- |
 | `.venv/bin/python tools/check.py tok CHECKPOINT` | The tokenizer against the `tokenizers` library on 17 texts. |
 | `.venv/bin/python tools/check.py encoding CHECKPOINT` | The prompts of the checkpoint's `encoding/tests` cases 1, 2, 3 and 5, and of 1,200 generated conversations (tools, tool calls and results, reasoning, system messages at the start and mid-conversation, content parts, escapes, both thinking modes, every effort form) and 600 with image parts in user turns and tool results (the placeholders' places and the images' order), against `encoding/encoding.py`, byte for byte (a few seconds). |
+| `MYDS4_RENDER=build/myds4-server .venv/bin/python tools/check.py encoding CHECKPOINT` | The same prompts rendered by the Rust server (`make build/myds4-server`) against `encoding.py`; where and why they differ is in [The Rust server](docs/server.md#differences-from-the-c-server). |
+| `MYDS4_CHECKPOINT=CHECKPOINT cargo test --release` in `server/` | The Rust server's compatibility steps and its output path through deepseek-recipe's stream processor, with the checkpoint's tokenizer; no model. |
 | `.venv/bin/python tools/check.py vision CHECKPOINT IMAGE` | The image's feature rows (`--vision-fd`) against `inference/image_processor.py` and `vision.py` (ViT and Aligner in BF16 on the CPU): their SNR, overall and per row. Needs `pillow`. |
 | `.venv/bin/python tools/check.py model CHECKPOINT [CACHE]` | Every layer's streams, the routing and the logits of 20 decoded positions against DeepSeek's `inference/model.py` on the CPU (about 12 minutes, up to 55 GB of memory; `CACHE` keeps the reference's results in a file for reruns). The reference reads the checkpoint through the page cache, which then holds tens of GB of it: until those pages are reclaimed, myds4 finds less free memory, and its expert reads may come from the page cache instead of the SSD. |
 | `build/myds4 -m CHECKPOINT -p TEXT --check-prefill` | The prompt as two batches (the first of odd length) against one: the final logits must be equal. The batched prefill's logits at every position against token-by-token decoding. |
