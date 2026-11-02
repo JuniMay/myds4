@@ -23,6 +23,19 @@ build/myds4: $(SRC) $(MODEL_HEADERS) src/kernels.metal src/gguf_grids.metal src/
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDLIBS)
 
+# The engine behind src/engine.h, for the Rust server (server/): the sources
+# of build/myds4 without main.c, serve.c and chat.c, and with engine.c.
+LIB_SRC = src/model.c src/io.c src/gpu.c src/tok.c src/util.c src/vision.c src/tui.c src/online_predictor.c src/sample.c src/engine.c
+LIB_OBJ = $(LIB_SRC:src/%.c=build/lib/%.o)
+
+build/lib/%.o: src/%.c $(MODEL_HEADERS) src/engine.h src/kernels.metal src/gguf_grids.metal src/gguf.metal src/vision.metal data/engram.bin data/unicode.bin
+	@mkdir -p build/lib
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+build/libmyds4.a: $(LIB_OBJ)
+	rm -f $@
+	ar rcs $@ $(LIB_OBJ)
+
 build/online-predictor-unit: tools/online_predictor_unit.c src/online_predictor.c src/online_predictor_math.h src/myds4.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/online_predictor_unit.c -framework Accelerate

@@ -295,6 +295,12 @@ const char *tok_piece(int id, int *len) {
   return *len ? pieces[id] : "";
 }
 
+int tok_added(int id) {
+  for (int k = 0; k < nadded; k++)
+    if (added[k].id == id) return 1;
+  return 0;
+}
+
 int tok_find(const char *special) {
   for (int k = 0; k < nadded; k++)
     if (!strcmp(added[k].s, special)) return added[k].id;

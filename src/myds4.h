@@ -272,6 +272,7 @@ int tok_encode(const char *text, int *out, int max);
 int tok_encode_chat(const char *text, int *out, int max);
 #define IMAGE_MARK "\xff"  // no valid UTF-8 text holds this byte
 const char *tok_piece(int id, int *len);
+int tok_added(int id);  // one of tokenizer.json's added tokens (the special tokens among them)
 int tok_find(const char *special);
 // Engram hashing (data/engram.bin): multipliers [2][4], primes [2][3][8],
 // offsets [2][24], the compressed pad id and token map.
