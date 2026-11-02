@@ -1,0 +1,7 @@
+__pycache__
+build/
+.venv/
+.claude/
+.vscode/
+.DS_Store
+*.state
