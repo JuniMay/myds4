@@ -4,10 +4,12 @@
   python tools/check.py encoding CHECKPOINT
                                            prompts of the encoding's test cases and of 1,200
                                            generated conversations against encoding/encoding.py
-  python tools/check.py vision CHECKPOINT IMAGE
+  python tools/check.py vision CHECKPOINT IMAGE [BINARY...]
                                            an image's feature rows (myds4 --vision-fd) against
                                            inference/vision.py's ViT and Aligner on the CPU
-                                           (needs Pillow: pip install pillow)
+                                           (needs Pillow: pip install pillow); BINARY: builds
+                                           to check against the one reference instead of
+                                           build/myds4
   python tools/check.py model CHECKPOINT [CACHE]
                                            every layer's streams, the routing and the logits
                                            against DeepSeek's inference/model.py on the CPU;
@@ -448,10 +450,10 @@ def snr(want, got):
     return float("inf") if err == 0 else 10 * math.log10(float((want ** 2).sum() / err))
 
 
-def vision(checkpoint, image):
+def vision(checkpoint, image, *binaries):
     """The image's feature rows: inference/image_processor.py's patches through
     vision.py's ViT and Aligner (BF16 on the CPU, as the reference runs them)
-    against myds4's (--vision-fd)."""
+    against each build's (--vision-fd; build/myds4 without binaries)."""
     import numpy as np
     import torch
     from safetensors import safe_open
@@ -476,22 +478,25 @@ def vision(checkpoint, image):
     patches, vh, vw, th, tw = mods["image_processor"].load_image({"url": str(image)}, args)
     with torch.inference_mode():
         want = aligner(vit(patches, vh, vw), vh, vw).float().numpy()
-    r, w = os.pipe()
-    proc = subprocess.Popen(["build/myds4", "-m", checkpoint, "--image", str(image), "--vision-fd", str(w)],
-                            pass_fds=(w,), stderr=subprocess.DEVNULL)
-    os.close(w)
-    with os.fdopen(r, "rb") as f:
-        raw = f.read()
-    if proc.wait():
-        sys.exit("myds4 failed")
-    got = (np.frombuffer(raw, np.uint16).astype(np.uint32) << 16).view(np.float32).reshape(-1, cfg["dim"])
-    if got.shape != want.shape:
-        sys.exit(f"myds4 wrote {got.shape[0]} rows, the reference {want.shape[0]} ({th} x {tw} tokens)")
-    rows = [snr(want[i], got[i]) for i in range(want.shape[0])]
-    print(f"vision: {vh} x {vw} patches, {th} x {tw} tokens; feature SNR {snr(want, got):.1f} dB "
-          f"(rows min {min(rows):.1f}, median {np.median(rows):.1f}); {int((want == got).all(1).sum())} of "
-          f"{want.shape[0]} rows equal")
-    return snr(want, got) >= 30
+    ok = True
+    for binary in binaries or ("build/myds4",):
+        r, w = os.pipe()
+        proc = subprocess.Popen([binary, "-m", checkpoint, "--image", str(image), "--vision-fd", str(w)],
+                                pass_fds=(w,), stderr=subprocess.DEVNULL)
+        os.close(w)
+        with os.fdopen(r, "rb") as f:
+            raw = f.read()
+        if proc.wait():
+            sys.exit(f"{binary} failed")
+        got = (np.frombuffer(raw, np.uint16).astype(np.uint32) << 16).view(np.float32).reshape(-1, cfg["dim"])
+        if got.shape != want.shape:
+            sys.exit(f"{binary} wrote {got.shape[0]} rows, the reference {want.shape[0]} ({th} x {tw} tokens)")
+        rows = [snr(want[i], got[i]) for i in range(want.shape[0])]
+        print(f"vision ({binary}): {vh} x {vw} patches, {th} x {tw} tokens; feature SNR {snr(want, got):.1f} dB "
+              f"(rows min {min(rows):.1f}, median {np.median(rows):.1f}); {int((want == got).all(1).sum())} of "
+              f"{want.shape[0]} rows equal")
+        ok &= snr(want, got) >= 30
+    return ok
 
 
 def model_check(checkpoint, cache=None):
@@ -744,7 +749,7 @@ if __name__ == "__main__":
         sys.exit(0 if model_check(*sys.argv[2:]) else 1)
     if len(sys.argv) == 2 and sys.argv[1] == "view":
         sys.exit(0 if view() else 1)
-    if len(sys.argv) == 4 and sys.argv[1] in ("idle", "demand", "vision", "placeholder"):
+    if len(sys.argv) == 4 and sys.argv[1] in ("idle", "demand", "placeholder") or len(sys.argv) >= 4 and sys.argv[1] == "vision":
         sys.exit(0 if globals()[sys.argv[1]](*sys.argv[2:]) else 1)
     if len(sys.argv) != 3 or sys.argv[1] not in ("tok", "encoding"):
         sys.exit(__doc__)

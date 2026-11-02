@@ -803,7 +803,7 @@ later. Late reads can reduce remaining demand waits, but are not ready hits.
 The timing model has one aggregate 12 GB/s transfer budget, 2 MiB pieces,
 LRU replacement and at most six pending reads per verification row. Per-layer
 compute is assumed to be 0.68 ms multiplied by `1 + 0.35 * (rows - 1)`.
-It excludes predictor cost, actual worker latency, GPU/ANE contention and
+It excludes predictor cost, actual worker latency, GPU contention and
 native score-based replacement. Generic deadline/pressure cancellation may
 drop a started read after its current piece; this approximates native rules.
 
@@ -832,7 +832,7 @@ Distances four and eight provide no material further gain in this model.
 This is a constrained scheduling comparison, not a universal speed ceiling
 or proof that the oracle schedule is optimal.
 
-#### DSpark signals and ANE execution
+#### DSpark signals
 
 Four separate uninstrumented 64-token Rust merge runs, before the cache
 readiness fix, illustrate the memory trade-off at a 30 GiB cache ceiling:
@@ -882,24 +882,6 @@ Captured final streams reconstruct the actual head input with relative L2
 errors of 0.00000472 and 0.0000294, confirming the row alignment used by this
 experiment. Capture timing includes synchronous diagnostics and must not be
 treated as a live prefetch lead-time measurement.
-
-The ANE agreement experiment tested an actual learned 768→16→384
-ReLU correction through the original private ANE execution probe. The model
-compiled once per process; features and learned weights arrived as runtime
-inputs. Training used the coding capture prefix, excluding its final group
-update; the final six passes were held out with no further updates.
-For backbone layer 8 predicting layer 10, all top-three/top-six sets and
-top-one choices matched the FP32 CPU correction on 17 MXFP4 and 16 Q2 rows.
-Correction SNR was 66.84 and 66.68 dB. This checks hardware agreement on one
-layer pair, not predictor quality across the model.
-
-Median correction-frame round trips were 0.229 and 0.200 ms through the
-diagnostic ANE bridge, including pipes, packing, execution and readback.
-CPU correction medians were 0.0159 and 0.0123 ms. Startup was separate;
-router forecasting, feature construction, ranking and training are excluded
-from both correction timings. This small predictor runs on ANE, but no
-latency or energy advantage has been demonstrated. Public Core AI predictor
-exports have not yet established actual ANE placement.
 
 The cache readiness check now queries dispatch-group completion without
 releasing the group. A retained non-null handle alone previously classified
@@ -1032,15 +1014,6 @@ inference overhead depends on where copying, prediction and updates run in
 the GPU pipeline. Synchronously adding every cost to decoding could consume
 the modeled gain.
 
-The original private ANE probe also ran eight independent 768→16→384 heads in
-one call: warm median execution was 0.165 ms, with about 0.159 ms of full input
-packing. Two independent 5,888-value heads, padded to 6,144 and rank 64, took
-0.178 ms median execution; subsequent full packs took 0.115–0.130 ms. Changing
-one head's weights left other heads bit-identical, and synthetic ranking checks
-passed. These measurements prove batch execution and head isolation, not a
-live speedup. Only heads whose inputs are already available together can be
-batched without sacrificing their lookahead time. Energy was not measured.
-
 #### DSpark lookahead and resident protection
 
 Full 384-value target-router projections of DSpark's final state were tested
@@ -1084,7 +1057,7 @@ verification passes, including rejected verification rows and tokenwise
 diagnostic input. Large batched prefill does not train it. The model thread
 owns copied source features and native routing labels. Updates run after
 expert command buffers have been submitted, permitting overlap with GPU work.
-The learner runs on the CPU, not ANE.
+The learner runs on the CPU.
 
 The learner works with substitution, GPU routing, DSpark, serving, images,
 traces, profiling and model-check options. State belongs to the engine and
@@ -1542,119 +1515,35 @@ conversation's second turn, which resent the image, reused 338 of its 349
 tokens and prefilled 11 in 0.91 s. `tools/check.py vision` with the small
 photo took 48 s, most of it the reference on the CPU.
 
-### Core AI vision checks
+Attention moved from the ALUs (FP32) to the matrix units on 2026-11-01.
+Each process encoded three letter-size pages (1275 x 1650 pixels, 104 x 81
+patches, 982 tokens), then the 4096 x 2160 photo, in runs that alternated
+with the ALU build, 3 s apart:
 
-Checked on 2026-10-31 on the development M5 Max, macOS 27.0.1, using the
-public Core AI runtime, coreai-core 1.0.0b3, coreai-torch 0.4.3 and PyTorch
-2.15.0. These are backbone checks on a 16 x 16 patch grid with deterministic
-eight-bit random RGB and gradient RGB values, normalized to [-1, 1] and
-rounded to BF16. They exclude image decoding, the Aligner and the language
-model. This small grid is below normal image preprocessing's minimum size;
-these results do not establish real-image task accuracy or an end-to-end
-speedup. The CPU reference used two threads.
+| Attention | First page | Later pages | Photo | GPU per page (profile) |
+| --- | ---: | ---: | ---: | ---: |
+| ALUs, four rounds | 2.47–2.50 s | 2.34–2.41 s | 2.25–2.31 s | 2,358 ms, attention 2,084 ms |
+| ALUs, two later rounds | 2.52–3.60 s | 2.83–3.30 s | 3.07–3.44 s | |
+| Matrix units, alternating with the later rounds | 0.74 s | 0.62–0.63 s | 0.62–0.64 s | 592 ms, attention 305 ms |
 
-| Export | Blocks | Feature SNR, random / gradient | Observed warm call time |
-| --- | ---: | ---: | ---: |
-| FP16 | 1 | 40.6 / 32.7 dB | 1.55–1.75 ms |
-| FP16 | 32 | 7.6 / 9.8 dB | 18.4 ms |
-| Reference rounding | 1 | 47.4 / 42.8 dB | 5–7 ms |
-| Reference rounding | 32 | 23.9 / 11.7 dB | 55–94 ms |
+Other applications used 24 to 33% of the GPU in all rounds; why the later
+rounds' ALU times were slower is not known. The attention's 9.35 TFLOP per
+page run at about 31 TFLOPS, as the ViT's matrix products do (`mm_bf16`,
+217 ms). Feature SNR against the
+checkpoint's CPU BF16 reference (`tools/check.py vision`, after the
+Aligner), overall / worst row / median row:
 
-Times include layout conversion and copying through the C/Swift adapter.
-Bulk tensor input/output access reduced the one-block FP16 call from about
-15 ms to about 1.7 ms. A normal Instruments recording of eight FP16 calls
-showed eight matching ANE prediction intervals and no GPU execution
-attributed to the test process; the ANE intervals were 0.53–0.66 ms. The
-reference-rounding one-block recording showed ANE activity for all eight
-calls and 83 GPU execution intervals. Those traces were removed after
-inspection. The Python debug compute plan instead reported GPU operations
-for the FP16 graph, so its report does not establish normal-run placement
-on this toolchain.
-
-Both full-depth exports failed a provisional 30 dB aggregate backbone-SNR
-check and were moved outside runtime selection. That threshold is not the
-original vision regression check, which measures after the Aligner. On the same 16 x 16
-gradient, the checkpoint's FP32 reference differed from its BF16 reference
-by 12.43 dB. The eager CPU FP16 export differed from BF16 by 12.50 dB,
-and the Core AI FP16 output differed from that eager export by 11.63 dB.
-Precision changes therefore matter independently of backend differences;
-these checks do not isolate one operator as the cause. No energy saving or
-production-ready full-encoder offload has been established.
-
-Further numerical diagnosis used the same 800 x 551 system photograph as
-the Metal vision check above, at its normal 40 x 58 patch grid. A second
-system aerial photograph was fitted to 800 x 551 in memory to reuse that
-grid. Both used the checkpoint's preprocessing. The following SNR values
-compare the actual 280 post-Aligner rows with the CPU BF16 reference:
-
-| Computation | First photo | Second photo |
+| Image | ALUs | Matrix units |
 | --- | ---: | ---: |
-| FP16 export, ANE preferred | 18.29 dB | 21.23 dB |
-| Reference-rounding export, ANE preferred | 26.80 dB | Not measured |
-| Full FP32 checkpoint reference | 28.60 dB | 29.25 dB |
-| Existing Metal implementation | 33.2 dB, earlier measurement | Not measured |
+| Page 7 (104 x 81 patches) | 37.5 / 19.7 / 40.7 dB | 35.3 / 5.8 / 40.7 dB |
+| 4096 x 2160 photo (66 x 125) | 32.6 / 7.0 / 39.1 dB | 34.3 / 6.0 / 39.1 dB |
+| 107 x 65 thumbnail (31 x 50) | 36.4 / 18.4 / 40.4 dB | 35.9 / 16.3 / 40.4 dB |
 
-The plain ANE-preferred export's RMS error is approximately 3.3 and 2.5
-times the respective FP32/BF16 reference differences. On the first photo,
-44 of 280 output rows have cosine similarity below 0.99, versus five for
-the FP32 reference. Worst-row cosine similarity is 0.723 versus 0.950.
-Reference rounding reduces this to three rows below 0.99, but its worst row
-is still 0.868. Repeated calls on the second FP16 photo and the first
-reference-rounding photo were identical. These measurements establish
-additional numerical loss, not its effect on image-question answering.
-
-The same saved FP16 graph, run with GPU preference on the first photo,
-agrees with the FP32 reference at 36.64 dB before the Aligner and 40.93 dB
-after the same BF16 Aligner. ANE preference gives 14.30 and 18.36 dB against
-that reference. Backend numerical behavior therefore contributes beyond
-the change from checkpoint BF16 arithmetic to the exported FP16 graph.
-No accumulation width or specific compiler defect has been established.
-
-Algebra and local-error checks on the small gradient support that
-distinction. The FP32 exporter and FP32 checkpoint agree at 89.23 dB after
-all 32 blocks. Feeding each tested block the same reference input gives
-about 55–78 dB agreement, while allowing earlier rounding differences to
-propagate gives much larger drift. Intermediate scalar magnitudes grow
-from roughly two to over 500 and later 896. This is evidence of sensitivity
-to small numerical changes, not proof of a particular outlier-token mechanism.
-
-Projection rounding is one definite arithmetic difference: an FP16 result
-rounded afterward to BF16 can differ from direct BF16 rounding. In a CPU
-ablation, removing that intermediate FP16 rounding improved final small-grid
-gradient SNR from 13.30 to 18.81 dB. Using the reference's BF16 linear
-operations gave 21.63 dB, and using its BF16 attention operation as well
-gave 24.76 dB. These are diagnostic substitutions, not ANE implementations.
-
-Small public-runtime probes did not reproduce a catastrophic operator
-failure. Across 42 RMSNorm calls, all outputs were finite; ANE-preferred
-agreement was at least 65.86 dB, including inputs with 552/896 outliers and
-uniform values up to 1,000. Convolution and attention probes also stayed
-finite. Against FP32 computation rounded to FP16:
-
-| Probe | CPU only | GPU preferred | ANE preferred |
-| --- | ---: | ---: | ---: |
-| Convolution, ordinary input | 46.55 dB | 104.13 dB | 71.53 dB |
-| Convolution, cancellation/outliers | 44.78 dB | 94.52 dB | 87.77 dB |
-| Attention, ordinary input | 48.56 dB | 65.15 dB | 59.31 dB |
-| Attention, queries and keys scaled by eight | 32.43 dB | 47.81 dB | 47.80 dB |
-
-PyTorch FP16 attention also gives 47.81 dB in the last case. CPU-only Core AI
-is therefore not a suitable numerical gold reference for these FP16 graphs.
-The probes used normal execution without debug capture; hardware placement
-was not separately traced for them. The current evidence supports precision
-differences amplified through the model, while leaving backend-specific
-issues and downstream task tolerance open. No vision weights were trained,
-calibrated, clipped or otherwise changed to compensate for the differences.
-
-An additional conversion check found that a requested FP16-to-BF16-to-FP16
-round-trip is reduced to an identity graph. PyTorch rounds the FP16 input
-1.0009765625 to 1.0 through BF16; the converted Core AI CPU-only function
-returns 1.0009765625 unchanged. `tools/vision_ai_cast_probe.py` reproduces
-this behavior. Thus the reference-rounding variant does not preserve all
-requested BF16 boundaries. This is an export-stage semantic difference,
-not evidence that ANE violates floating-point standards. Tensor declarations
-also do not establish the precision of hardware accumulators or approximated
-nonlinear functions. SNR measures relative tensor distance, not answer quality.
+The worst rows are rows of small norm (about half the median's), whose
+features the 32 blocks make sensitive to small rounding differences; such
+rows also set most of the overall figures' differences. The photo's
+`--vision-fd` hash changed from 9292f85c4db456a7 to 60bff1d9cb4bef8d; the
+text hashes and `--check-batch --draft 2` did not change.
 
 ## Speculative decoding
 
@@ -1689,8 +1578,7 @@ prefix reuse, numeric request overrides, thinking overrides, invalid-input
 rejection, image requests and clean-stop saving. A fixed-seed streamed request
 matched its non-streamed counterpart. Effective sampler settings and draft
 counts were read from server logs. Image output was checked for successful
-execution, not visual accuracy. These runs used the Metal vision encoder and
-CPU learner, and do not establish ANE placement or an ANE speedup.
+execution, not visual accuracy.
 
 ### Sampled draft-length sweep
 
@@ -2029,7 +1917,7 @@ stayed normal.
   6.2 s of its profile's 13.2 s are in the tile kernels of the GGUF codes,
   whose products and decoding take turns on the GPU's cores (see
   [Prefill kernels](#prefill-kernels)).
-- Images: the vision encoder's attention runs on the ALUs in FP32, not on
-  the matrix units, and its work grows with the square of the image's
-  patches (up to about 9,200 for an image of up to 1,024 tokens): 2.39 s for
-  8,250 patches (see [Images](#images)).
+- Images: the vision encoder's attention runs on the matrix units, and its
+  work grows with the square of the image's patches (up to about 9,200 for an
+  image of up to 1,024 tokens): 0.62 to 0.63 s for a letter-size page's 8,424
+  patches, about half of it attention (see [Images](#images)).

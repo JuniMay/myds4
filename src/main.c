@@ -23,7 +23,6 @@ static void usage(void) {
         "  --image FILE  an image (any format macOS reads) before the prompt's text, up to 16; with --raw\n"
         "                each takes a <｜deepseek_image｜> of the prompt instead\n"
         "  --vision-fd FD  write the --image images' feature rows (BF16, 5120 per token) to FD and exit\n"
-        "  --vision-ai DIR  prefer Core AI vision assets in DIR (myds4-ai build; missing grids use Metal)\n"
         "  --ctx N       context capacity in tokens, at most 1048576 (default 16384; with --serve 1048576)\n"
         "  --cache GB    expert cache budget (default: from available memory)\n"
         "  --cache-half-life N  score half-life in forward passes, 1-1000000 (default 50)\n"
@@ -187,8 +186,7 @@ int main(int argc, char **argv) {
     } else if (!strcmp(a, "--predictor-state")) {
       if (!*v) die("--predictor-state needs a nonempty path");
       o.predictor_state = v, o.online_predictor = 64;
-    } else if (!strcmp(a, "--vision-ai")) o.vision_ai = v;
-    else if (!strcmp(a, "--substitute")) o.substitute = atof(v);
+    } else if (!strcmp(a, "--substitute")) o.substitute = atof(v);
     else if (!strcmp(a, "--experts")) o.experts = v;
     else if (!strcmp(a, "--prefill")) prefill = atoi(v);
     else if (!strcmp(a, "--logits-fd")) logits_fd = atoi(v);
@@ -208,9 +206,6 @@ int main(int argc, char **argv) {
     chat_render_file(render);
     return 0;
   }
-#ifndef MYDS4_VISION_AI
-  if (o.vision_ai) die("--vision-ai requires the myds4-ai build (make vision-ai)");
-#endif
   if (vision_fd >= 0 && !prompt) prompt = "";
   if (!model || (!prompt && !ids && !bench && !so.port)) usage();
   if (nimg && (ids || bench || so.port || check || check_batch || perplexity || o.dump_fd >= 0))

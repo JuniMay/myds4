@@ -137,33 +137,7 @@ build/memory-available-check: tools/memory_available_check.c src/io.c src/gpu.c 
 memory-available-check: build/memory-available-check
 	./build/memory-available-check
 
-# The optional public Core AI adapter is Swift because Core AI exposes a
-# Swift API. Model execution and the inference engine remain in C.
-build/libmyds4_vision_ai.dylib: src/vision_ai.swift src/vision_ai.h
-	@mkdir -p build
-	swiftc -O -swift-version 6 -emit-library -module-cache-path build/vision-ai-cache \
-		-Xlinker -install_name -Xlinker @rpath/libmyds4_vision_ai.dylib -o $@ src/vision_ai.swift
-
-build/myds4-ai: $(SRC) $(MODEL_HEADERS) src/vision_ai.h build/libmyds4_vision_ai.dylib src/kernels.metal src/gguf_grids.metal src/gguf.metal src/vision.metal data/engram.bin data/unicode.bin
-	$(CC) $(CFLAGS) -DMYDS4_VISION_AI -o $@ $(SRC) $(LDLIBS) \
-		-Lbuild -lmyds4_vision_ai -Wl,-rpath,@executable_path
-
-vision-ai: build/myds4-ai
-
-# Same C ABI and graph, with fixed public device preferences for diagnostics.
-build/libmyds4_vision_ai_cpu.dylib: src/vision_ai.swift src/vision_ai.h
-	@mkdir -p build
-	swiftc -O -swift-version 6 -D VISION_AI_VALIDATE_CPU -emit-library \
-		-module-cache-path build/vision-ai-cache -o $@ src/vision_ai.swift
-
-build/libmyds4_vision_ai_gpu.dylib: src/vision_ai.swift src/vision_ai.h
-	@mkdir -p build
-	swiftc -O -swift-version 6 -D VISION_AI_VALIDATE_GPU -emit-library \
-		-module-cache-path build/vision-ai-cache -o $@ src/vision_ai.swift
-
-vision-ai-diagnostics: build/libmyds4_vision_ai_cpu.dylib build/libmyds4_vision_ai_gpu.dylib
-
 clean:
 	rm -rf build
 
-.PHONY: clean server predict-probe gguf-decode-check cache-ready-check draft-cache-check prefetch-metrics-check prefetch-queue-check cache-policy-check memory-available-check shutdown-check sampling-check gpu-clock-check vision-ai vision-ai-diagnostics
+.PHONY: clean server predict-probe gguf-decode-check cache-ready-check draft-cache-check prefetch-metrics-check prefetch-queue-check cache-policy-check memory-available-check shutdown-check sampling-check gpu-clock-check
