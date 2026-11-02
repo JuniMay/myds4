@@ -1542,6 +1542,36 @@ conversation's second turn, which resent the image, reused 338 of its 349
 tokens and prefilled 11 in 0.91 s. `tools/check.py vision` with the small
 photo took 48 s, most of it the reference on the CPU.
 
+Attention moved from the ALUs (FP32) to the matrix units on 2026-11-01.
+Each process encoded three letter-size pages (1275 x 1650 pixels, 104 x 81
+patches, 982 tokens), then the 4096 x 2160 photo, in runs that alternated
+with the ALU build, 3 s apart:
+
+| Attention | First page | Later pages | Photo | GPU per page (profile) |
+| --- | ---: | ---: | ---: | ---: |
+| ALUs, four rounds | 2.47–2.50 s | 2.34–2.41 s | 2.25–2.31 s | 2,358 ms, attention 2,084 ms |
+| ALUs, two later rounds | 2.52–3.60 s | 2.83–3.30 s | 3.07–3.44 s | |
+| Matrix units, alternating with the later rounds | 0.74 s | 0.62–0.63 s | 0.62–0.64 s | 592 ms, attention 305 ms |
+
+Other applications used 24 to 33% of the GPU in all rounds; why the later
+rounds' ALU times were slower is not known. The attention's 9.35 TFLOP per
+page run at about 31 TFLOPS, as the ViT's matrix products do (`mm_bf16`,
+217 ms). Feature SNR against the
+checkpoint's CPU BF16 reference (`tools/check.py vision`, after the
+Aligner), overall / worst row / median row:
+
+| Image | ALUs | Matrix units |
+| --- | ---: | ---: |
+| Page 7 (104 x 81 patches) | 37.5 / 19.7 / 40.7 dB | 35.3 / 5.8 / 40.7 dB |
+| 4096 x 2160 photo (66 x 125) | 32.6 / 7.0 / 39.1 dB | 34.3 / 6.0 / 39.1 dB |
+| 107 x 65 thumbnail (31 x 50) | 36.4 / 18.4 / 40.4 dB | 35.9 / 16.3 / 40.4 dB |
+
+The worst rows are rows of small norm (about half the median's), whose
+features the 32 blocks make sensitive to small rounding differences; such
+rows also set most of the overall figures' differences. The photo's
+`--vision-fd` hash changed from 9292f85c4db456a7 to 60bff1d9cb4bef8d; the
+text hashes and `--check-batch --draft 2` did not change.
+
 ### Core AI vision checks
 
 Checked on 2026-10-31 on the development M5 Max, macOS 27.0.1, using the
@@ -2029,7 +2059,7 @@ stayed normal.
   6.2 s of its profile's 13.2 s are in the tile kernels of the GGUF codes,
   whose products and decoding take turns on the GPU's cores (see
   [Prefill kernels](#prefill-kernels)).
-- Images: the vision encoder's attention runs on the ALUs in FP32, not on
-  the matrix units, and its work grows with the square of the image's
-  patches (up to about 9,200 for an image of up to 1,024 tokens): 2.39 s for
-  8,250 patches (see [Images](#images)).
+- Images: the vision encoder's attention runs on the matrix units, and its
+  work grows with the square of the image's patches (up to about 9,200 for an
+  image of up to 1,024 tokens): 0.62 to 0.63 s for a letter-size page's 8,424
+  patches, about half of it attention (see [Images](#images)).

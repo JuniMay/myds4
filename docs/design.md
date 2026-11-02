@@ -900,8 +900,21 @@ norms (eps 1e-6), the 2D RoPE and the attention output are rounded to BF16.
 The RoPE turns head values i and i + 32 by the patch's row for i < 16 and by
 its column otherwise (theta 10,000). The products run on the matrix units
 (`mm_bf16`, as the prompt's dense products). Attention covers all of the
-image's patches: an online softmax in FP32 over blocks of 32 keys, a
-threadgroup per 64 queries of one head. Each block is a command buffer of
+image's patches, also on the matrix units: `vit_heads` copies each head's
+queries, keys and values as BF16 (exact, as they are rounded to BF16
+already), with zero rows up to a multiple of 64, and each simdgroup takes 16
+queries of one head on its own (four to a threadgroup of 64 queries) over
+blocks of 64 keys. The scores accumulate in FP32 and pass through an online
+softmax in FP32, whose row maxima and sums come from the matrix units' row
+reductions (`reduce_rows`); the probabilities are rounded to BF16 for their
+product with the values, as PyTorch's CPU attention rounds them for the
+reference's BF16 inputs (over blocks of 512 keys, as an emulation that
+matched 97.5% of its outputs showed), and the outputs
+accumulate in FP32. The probabilities pass from the scores' layout to the
+second product's through `get_left_input_cooperative_tensor`, which needs a
+source of its own element type (a float source passed this way gave wrong
+rows), so a change of the products' shapes or types needs
+`tools/check.py vision` again. Each block is a command buffer of
 its own, so that no long buffer holds up the display. The Aligner merges 3 x
 3 patches (zero-padded at the edges) into rows of 9,216, then applies w1,
 GELU and w2 to 5,120; the GELU (erf) runs on the CPU in double precision,

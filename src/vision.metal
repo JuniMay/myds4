@@ -34,56 +34,83 @@ kernel void vit_rope(device float *qkv [[buffer(0)]], device const float *cs [[b
   v[i + 32] = bf(x2 * c + x1 * s);
 }
 
+// The queries, keys and values as BF16 for the matrix units, which vit_bias
+// and vit_rope already rounded them to: of head h, rows of 64 in hv at
+// (s 16 + h) np 64 for s = 0, 1, 2 (queries, keys, values), the np - n rows
+// after the patches' zero. Thread x: four of a patch's 3072 values.
+kernel void vit_heads(device const float4 *qkv [[buffer(0)]], device bfloat4 *hv [[buffer(1)]],
+                      constant uint2 &dims [[buffer(2)]], uint2 i [[thread_position_in_grid]]) {
+  uint n = dims.x, np = dims.y, c = i.x * 4, s = c / 1024, h = c % 1024 / 64;
+  hv[(((s * 16 + h) * np + i.y) * 64 + c % 64) / 4] = i.y < n ? bfloat4(qkv[i.y * 768 + i.x]) : bfloat4(0);
+}
+
 // Attention over all n patches of an image (scaled_dot_product_attention
-// without a mask): 16 heads of 64, scale 1/8, an online softmax in FP32, the
-// output rounded to BF16. A threadgroup of 256 threads takes 64 queries of
-// one head, four threads a query, over blocks of 32 keys: thread part p of a
-// query scores keys p, p + 4, ... of the block and sums the query's outputs
-// p, p + 4, ... (strides that keep the threads on distinct memory banks).
-kernel void vit_attn(device const float *qkv [[buffer(0)]], device float *o [[buffer(1)]],
-                     constant uint &n [[buffer(2)]], uint2 tg [[threadgroup_position_in_grid]],
-                     uint t [[thread_index_in_threadgroup]]) {
-  threadgroup float ks[32 * 65], vs[32 * 64], ps[64 * 33];
-  uint h = tg.y, qi = t / 4, p = t % 4, q = tg.x * 64 + qi;
-  float qv[64], acc[16], m = -INFINITY, l = 0;
-  for (uint d = 0; d < 64; d++) qv[d] = q < n ? qkv[q * 3072 + h * 64 + d] * 0.125f : 0;
-  for (uint d = 0; d < 16; d++) acc[d] = 0;
-  for (uint k0 = 0; k0 < n; k0 += 32) {
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = t; i < 32 * 64; i += 256) {
-      uint r = k0 + i / 64, d = i % 64;
-      ks[(i / 64) * 65 + d] = r < n ? qkv[r * 3072 + 1024 + h * 64 + d] : 0;
-      vs[i] = r < n ? qkv[r * 3072 + 2048 + h * 64 + d] : 0;
+// without a mask): 16 heads of 64, scale 1/8, on the matrix units. A
+// threadgroup takes 64 queries of one head, each of its 4 simdgroups 16 of
+// them on its own, over blocks of 64 keys: the scores accumulate in FP32, an
+// online softmax in FP32 over the simdgroup's rows of scores, the
+// probabilities rounded to BF16 for their product with the values (PyTorch's
+// CPU attention rounds them too for the reference's BF16 inputs, over blocks
+// of 512 keys, as an emulation of it showed), and the outputs accumulate in
+// FP32, rounded to BF16. The
+// probabilities pass from the scores' layout to the second product's through
+// get_left_input_cooperative_tensor, which needs a source of its element type
+// (a float source passed this way gave wrong rows): a change of the products'
+// shapes or types needs tools/check.py vision again.
+kernel void vit_attn(device const bfloat *hv [[buffer(0)]], device float *o [[buffer(1)]],
+                     constant uint2 &dims [[buffer(2)]], uint2 tg [[threadgroup_position_in_grid]],
+                     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float state[4][4][16];  // a simdgroup's rows: running maximum, sum, rescale, reduction
+  threadgroup float *mx = state[sg][0], *sum = state[sg][1], *rescale = state[sg][2], *red_rows = state[sg][3];
+  uint n = dims.x, np = dims.y, h = tg.y, q0 = tg.x * 64 + sg * 16;
+  constexpr auto sdesc = matmul2d_descriptor(16, 64, 64, false, true, false, matmul2d_descriptor::mode::multiply);
+  constexpr auto odesc = matmul2d_descriptor(16, 64, 64, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<sdesc, execution_simdgroup> sop;
+  matmul2d<odesc, execution_simdgroup> oop;
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tq((device bfloat *)hv + h * np * 64, dextents<int32_t, 2>(64, np));
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tk((device bfloat *)hv + (16 + h) * np * 64, dextents<int32_t, 2>(64, np));
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tv((device bfloat *)hv + (32 + h) * np * 64, dextents<int32_t, 2>(64, np));
+  auto qt = tq.slice(0, q0), kt = tk.slice(0, 0), vt = tv.slice(0, 0);
+  auto acc = oop.get_destination_cooperative_tensor<decltype(oop.get_left_input_cooperative_tensor<bfloat, bfloat, float>()), decltype(vt), float>();
+  for (uint16_t i = 0; i < acc.get_capacity(); i++)
+    if (acc.is_valid_element(i)) acc[i] = 0;
+  if (lane < 16) mx[lane] = -INFINITY, sum[lane] = 0;
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint k0 = 0; k0 < n; k0 += 64) {
+    kt = tk.slice(0, k0), vt = tv.slice(0, k0);
+    auto sc = sop.get_destination_cooperative_tensor<decltype(qt), decltype(kt), float>();
+    sop.run(qt, kt, sc);
+    for (uint16_t i = 0; i < sc.get_capacity(); i++)
+      if (sc.is_valid_element(i)) sc[i] = k0 + sc.get_multidimensional_index(i)[0] < n ? sc[i] * 0.125f : -INFINITY;
+    auto red = sop.get_row_reduction_destination_cooperative_tensor<decltype(qt), decltype(kt), float>();
+    reduce_rows(sc, red, reduction_operation::max, -INFINITY);
+    for (uint16_t i = 0; i < red.get_capacity(); i++)  // lanes may hold a row's result alike
+      if (red.is_valid_element(i)) red_rows[red.get_multidimensional_index(i)[0]] = red[i];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < 16) {
+      float m = max(mx[lane], red_rows[lane]);
+      rescale[lane] = exp(mx[lane] - m), mx[lane] = m;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float s[8], mx = -INFINITY;
-    for (uint j = 0; j < 8; j++) {
-      uint kj = 4 * j + p;
-      float a = 0;
-      for (uint d = 0; d < 64; d++) a += qv[d] * ks[kj * 65 + d];
-      s[j] = k0 + kj < n ? a : -INFINITY;
-      mx = max(mx, s[j]);
-    }
-    mx = max(mx, simd_shuffle_xor(mx, 1));
-    mx = max(mx, simd_shuffle_xor(mx, 2));
-    float mn = max(m, mx), c = exp(m - mn), sum = 0;
-    for (uint j = 0; j < 8; j++) {
-      float e = exp(s[j] - mn);
-      sum += e;
-      ps[qi * 33 + 4 * j + p] = e;
-    }
-    sum += simd_shuffle_xor(sum, 1);
-    sum += simd_shuffle_xor(sum, 2);
-    l = l * c + sum, m = mn;
-    for (uint d = 0; d < 16; d++) acc[d] *= c;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint j = 0; j < 32; j++) {
-      float e = ps[qi * 33 + j];
-      for (uint d = 0; d < 16; d++) acc[d] += e * vs[j * 64 + 4 * d + p];
-    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    auto pb = sop.get_destination_cooperative_tensor<decltype(qt), decltype(kt), bfloat>();
+    for (uint16_t i = 0; i < sc.get_capacity(); i++)
+      if (sc.is_valid_element(i)) sc[i] = exp(sc[i] - mx[sc.get_multidimensional_index(i)[1]]), pb[i] = bfloat(sc[i]);
+    reduce_rows(sc, red, reduction_operation::sum, 0.0f);
+    for (uint16_t i = 0; i < red.get_capacity(); i++)
+      if (red.is_valid_element(i)) red_rows[red.get_multidimensional_index(i)[0]] = red[i];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < 16) sum[lane] = sum[lane] * rescale[lane] + red_rows[lane];
+    for (uint16_t i = 0; i < acc.get_capacity(); i++)
+      if (acc.is_valid_element(i)) acc[i] *= rescale[acc.get_multidimensional_index(i)[1]];
+    auto p = oop.get_left_input_cooperative_tensor<bfloat, bfloat, float>(pb);
+    oop.run(p, vt, acc);
+    simdgroup_barrier(mem_flags::mem_threadgroup);  // the next block rewrites the rows' values
   }
-  if (q < n)
-    for (uint d = 0; d < 16; d++) o[q * 1024 + h * 64 + 4 * d + p] = bf(acc[d] / l);
+  for (uint16_t i = 0; i < acc.get_capacity(); i++)
+    if (acc.is_valid_element(i)) {
+      auto a = acc.get_multidimensional_index(i);
+      if (q0 + a[1] < n) o[(q0 + a[1]) * 1024 + h * 64 + a[0]] = bf(acc[i] / sum[a[1]]);
+    }
 }
 
 // The MLP's activation: a = bf(bf(silu(gate)) up), gate and up the two

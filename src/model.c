@@ -111,8 +111,8 @@ static int K_mm_fp8, K_mm_bf16, K_mv_fp8, K_mv_bf16, K_mvm_fp8, K_mvm_bf16, K_mv
     K_kv_window, K_compress, K_index_key, K_index_score, K_index_topk, K_attend_scores, K_attend_values,
     K_attend_combine, K_attn_out, K_route,
     K_engram_rows, K_engram_gate, K_copy_rows, K_copy_keys, K_attend_m, K_hc_mean, K_markov, K_argmax, K_cand_topk,
-    K_resolve, K_x_bf16, K_q_rope, K_vit_bias, K_vit_norm, K_vit_rope, K_vit_attn, K_vit_swiglu, K_vit_add,
-    K_vit_unfold;
+    K_resolve, K_x_bf16, K_q_rope, K_vit_bias, K_vit_norm, K_vit_rope, K_vit_heads, K_vit_attn, K_vit_swiglu,
+    K_vit_add, K_vit_unfold;
 
 static uint64_t dense_bytes;
 static size_t rows_bytes(int l, int cap, int keys);
@@ -368,7 +368,7 @@ void model_load(const char *dir, const Options *options) {
   K(attend_scores), K(attend_values), K(attend_combine);
   K(route), K(engram_rows), K(engram_gate), K(copy_rows), K(copy_keys), K(attend_m), K(hc_mean), K(markov), K(argmax);
   K(cand_topk), K(resolve), K(x_bf16), K(q_rope);
-  K(vit_bias), K(vit_norm), K(vit_rope), K(vit_attn), K(vit_swiglu), K(vit_add), K(vit_unfold);
+  K(vit_bias), K(vit_norm), K(vit_rope), K(vit_heads), K(vit_attn), K(vit_swiglu), K(vit_add), K(vit_unfold);
   st_open(dir);
   double t0 = now();
   static const uint8_t ratios[LAYERS] = {0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
@@ -1962,15 +1962,17 @@ static int vit_ai(const Image *im, const Buf *patch, const Buf *cs, Buf *feature
 
 void model_image(Image *im) {
   uint32_t n = (uint32_t)(im->vh * im->vw), L = (uint32_t)(im->th * im->tw);
+  uint32_t np = (n + 63) / 64 * 64, dims[2] = {n, np};  // vit_attn's rows: the patches, padded to its tiles
   Buf px = gpu_alloc((size_t)n * VIT_K * 4), cs = gpu_alloc((size_t)n * 64 * 4);
   for (size_t i = 0; i < (size_t)n * VIT_K; i++) ((uint32_t *)px.ptr)[i] = (uint32_t)im->patch[i] << 16;
   image_rope(im, (float *)cs.ptr);
-  Buf y = gpu_alloc((size_t)n * 1024 * 4), x = {0}, t = {0}, qkv = {0}, h = {0}, a = {0};
+  Buf y = gpu_alloc((size_t)n * 1024 * 4), x = {0}, t = {0}, qkv = {0}, hv = {0}, h = {0}, a = {0};
   int ai = vit_ai(im, &px, &cs, &y);
   vit_load(!ai);
   if (!ai) {
     x = gpu_alloc((size_t)n * 1024 * 4), t = gpu_alloc((size_t)n * 1024 * 4);
-    qkv = gpu_alloc((size_t)n * 3072 * 4), h = gpu_alloc((size_t)n * 5632 * 4), a = gpu_alloc((size_t)n * 2816 * 4);
+    qkv = gpu_alloc((size_t)n * 3072 * 4), hv = gpu_alloc((size_t)np * 3072 * 2);
+    h = gpu_alloc((size_t)n * 5632 * 4), a = gpu_alloc((size_t)n * 2816 * 4);
     gpu_begin();
     vit_linear(&vit.patch, n, &px, VIT_K, &x, &vit.patch_b);
     gpu_commit();
@@ -1982,9 +1984,12 @@ void model_image(Image *im) {
       gpu_kern(K_vit_rope);
       gpu_buf(0, &qkv, 0), gpu_buf(1, &cs, 0);
       gpu_go(1024 / 256, n, 1, 256, 1, 1);
+      gpu_kern(K_vit_heads);
+      gpu_buf(0, &qkv, 0), gpu_buf(1, &hv, 0), gpu_bytes(2, dims, sizeof dims);
+      gpu_go(768 / 256, np, 1, 256, 1, 1);
       gpu_kern(K_vit_attn);
-      gpu_buf(0, &qkv, 0), gpu_buf(1, &y, 0), gpu_bytes(2, &n, 4);
-      gpu_go((n + 63) / 64, 16, 1, 256, 1, 1);
+      gpu_buf(0, &hv, 0), gpu_buf(1, &y, 0), gpu_bytes(2, dims, sizeof dims);
+      gpu_go(np / 64, 16, 1, 128, 1, 1);
       vit_linear(&b->o, n, &y, 1024, &t, &b->b_o);
       vit_add(&x, &t, n);
       vit_norm(&x, &b->norm2, &y, n);
@@ -2015,7 +2020,7 @@ void model_image(Image *im) {
   free(im->rows);
   im->rows = xmalloc((size_t)L * DIM * 2);
   for (size_t i = 0; i < (size_t)L * DIM; i++) im->rows[i] = (uint16_t)(((uint32_t *)f.ptr)[i] >> 16);
-  Buf *all[] = {&px, &cs, &x, &y, &t, &qkv, &h, &a, &u, &g, &f};
+  Buf *all[] = {&px, &cs, &x, &y, &t, &qkv, &hv, &h, &a, &u, &g, &f};
   for (size_t i = 0; i < sizeof all / sizeof *all; i++) gpu_free(all[i]);
 }
 
