@@ -1,0 +1,4 @@
+# Build outputs stay under the repository's build/ directory, beside the
+# engine's library.
+[build]
+target-dir = "../build/cargo"

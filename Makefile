@@ -36,6 +36,15 @@ build/libmyds4.a: $(LIB_OBJ)
 	rm -f $@
 	ar rcs $@ $(LIB_OBJ)
 
+# The Rust server. Its target directory is build/cargo, as server/.cargo/config.toml
+# sets it for cargo run inside server/.
+CARGO ?= cargo
+build/myds4-server: build/libmyds4.a server/Cargo.toml server/Cargo.lock server/build.rs $(wildcard server/src/*.rs)
+	$(CARGO) build --release --locked --manifest-path server/Cargo.toml --target-dir build/cargo
+	cp build/cargo/release/myds4-server $@
+
+server: build/myds4-server
+
 build/online-predictor-unit: tools/online_predictor_unit.c src/online_predictor.c src/online_predictor_math.h src/myds4.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/online_predictor_unit.c -framework Accelerate
@@ -157,4 +166,4 @@ vision-ai-diagnostics: build/libmyds4_vision_ai_cpu.dylib build/libmyds4_vision_
 clean:
 	rm -rf build
 
-.PHONY: clean predict-probe gguf-decode-check cache-ready-check draft-cache-check prefetch-metrics-check prefetch-queue-check cache-policy-check memory-available-check shutdown-check sampling-check gpu-clock-check vision-ai vision-ai-diagnostics
+.PHONY: clean server predict-probe gguf-decode-check cache-ready-check draft-cache-check prefetch-metrics-check prefetch-queue-check cache-policy-check memory-available-check shutdown-check sampling-check gpu-clock-check vision-ai vision-ai-diagnostics

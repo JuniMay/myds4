@@ -157,12 +157,14 @@ def torch_kernels(torch):
 
 def render(case, images=False):
     """myds4's prompt for a test case (the encoding/tests format), or None if it
-    refused; with images, also the image URLs in placeholder order."""
+    refused; with images, also the image URLs in placeholder order. The
+    renderer is build/myds4, or the executable that MYDS4_RENDER names (the
+    Rust server's build/myds4-server)."""
     import tempfile
     with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8") as f:
         json.dump(case, f, ensure_ascii=False)
         f.flush()
-        out = subprocess.run(["build/myds4", "--render", f.name], capture_output=True)
+        out = subprocess.run([os.environ.get("MYDS4_RENDER", "build/myds4"), "--render", f.name], capture_output=True)
     prompt = out.stdout.decode("utf-8") if out.returncode == 0 else None
     if not images:
         return prompt
