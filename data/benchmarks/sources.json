@@ -1,0 +1,36 @@
+{
+  "retrieved_utc": "2026-11-01T06:56:59.569266+00:00",
+  "sources": [
+    {
+      "file": "gsm8k_test.jsonl",
+      "dataset": "GSM8K",
+      "source_url": "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl",
+      "license": "MIT",
+      "bytes": 749738,
+      "rows": 1319
+    },
+    {
+      "file": "gsm8k_LICENSE.txt",
+      "dataset": "GSM8K license",
+      "source_url": "https://raw.githubusercontent.com/openai/grade-school-math/master/LICENSE",
+      "license": "MIT",
+      "bytes": 1062
+    },
+    {
+      "file": "HumanEval.jsonl.gz",
+      "dataset": "HumanEval",
+      "source_url": "https://raw.githubusercontent.com/openai/human-eval/master/data/HumanEval.jsonl.gz",
+      "license": "MIT",
+      "bytes": 44877,
+      "rows": 164
+    },
+    {
+      "file": "humaneval_LICENSE.txt",
+      "dataset": "HumanEval license",
+      "source_url": "https://raw.githubusercontent.com/openai/human-eval/master/LICENSE",
+      "license": "MIT",
+      "bytes": 1083
+    }
+  ],
+  "total_download_bytes": 796760
+}

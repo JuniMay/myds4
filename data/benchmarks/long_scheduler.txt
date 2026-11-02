@@ -1,0 +1,73 @@
+
+Use the following project specification. The scheduler is embedded in an application that owns the event
+loop. It must not spawn threads, sleep, read wall-clock time, perform file I/O, or execute task bodies.
+Its job is to accept events and return decisions. Time is an unsigned integer supplied by the caller.
+Every method must be deterministic for an identical sequence of calls.
+
+Public types should include TaskId = u64, Tick = u64, a TaskSpec, a TaskState, and an Error enum.
+TaskSpec contains id, priority: i32, release_at: Tick, deadline: Option<Tick>, and a small owned String
+payload. The payload is opaque to the scheduler. TaskState has Waiting, Ready, Running, Completed,
+Cancelled, and Expired variants. Define these methods with explicit Result return types:
+
+pub fn new(capacity: usize) -> Scheduler;
+pub fn submit(&mut self, spec: TaskSpec) -> Result<(), Error>;
+pub fn advance_to(&mut self, tick: Tick) -> Result<Vec<TaskId>, Error>;
+pub fn start_next(&mut self) -> Result<Option<TaskSpec>, Error>;
+pub fn complete(&mut self, id: TaskId) -> Result<(), Error>;
+pub fn cancel(&mut self, id: TaskId) -> Result<bool, Error>;
+pub fn state(&self, id: TaskId) -> Option<TaskState>;
+pub fn forget(&mut self, id: TaskId) -> Result<(), Error>;
+
+Submission order is a monotonically increasing sequence number assigned only after successful admission.
+Equal-priority ready tasks prefer the smallest finite deadline; no deadline sorts after every finite
+deadline. Equal priority and deadline prefer the earlier submission. Task IDs do not determine queue
+order. Reject a deadline earlier than release_at. A task submitted with release_at at or before the
+current clock becomes immediately ready unless it is already expired. At exactly its deadline it may
+still start. A waiting or ready task expires only when now is strictly greater than its deadline.
+Once running, it remains running even if its deadline passes; completion is a caller decision.
+
+The configured capacity limits all retained task records, including terminal states. submit must reject
+an ID already present, even if that record is completed, cancelled or expired. forget removes only a
+terminal record and permits that ID to be reused. Never forget waiting, ready or running work. For a
+forgotten and resubmitted ID, stale queue entries must not identify the new task by mistake. Explain a
+generation or equivalent identity check that prevents this error. Avoid unchecked overflow in clock,
+generation and submission counters; choose and document a deterministic error for exhaustion.
+
+Cancellation of waiting or ready work transitions it to Cancelled and returns true. Repeating the
+cancellation on an already cancelled record returns false. Missing IDs and other terminal states also
+return false. Cancelling running work returns a specific error and leaves its state unchanged. complete
+accepts only Running records; every other state or missing ID is an error. start_next returns None if
+there is no eligible work. Multiple tasks may be Running simultaneously: the caller owns any worker limit.
+
+advance_to must reject a backwards time without making partial changes. On success it first updates the
+clock, then releases and expires all affected tasks. Return the IDs that became Expired during that call
+in ascending ID order. Calling advance_to again at the same time is valid and should produce no duplicate
+expiration notifications. If release and expiration are both due, expiration wins whenever the deadline
+has already passed. Querying state never changes the clock or performs maintenance.
+
+Use a clear ownership strategy so start_next can return the payload without cloning it unnecessarily.
+State inspection must still identify the running task after its payload is returned. If queues retain
+stale entries, include a bounded compaction policy: repeated submit, cancel, forget and ID reuse must not
+cause unbounded heap growth while the retained-record count remains below capacity. Document the time
+and memory complexity of normal calls and compaction. Explain whether a failed call may consume a
+sequence number; the required behavior is that unsuccessful submission does not consume one.
+
+For an example trace, submit task 90 with priority 5, release 10, deadline 30; task 12 with priority 5,
+release 0, deadline 20; and task 3 with priority 5, release 0, no deadline. At clock 0, task 12 should start
+before task 3. Advancing to 10 makes task 90 eligible. A lower-priority task with an earlier deadline must
+still follow a higher-priority ready task. Test deadline equality separately from deadline expiration.
+
+Include tests that exercise simultaneous releases, negative priorities, equal deadlines, FIFO ties,
+backwards time rejection, cancellation of running work, forgotten-ID reuse with stale entries, capacity
+accounting of terminal records, and many cancellation cycles that trigger compaction. Also include a
+small straightforward reference scheduler in the test module and compare decisions for a deterministic
+pseudorandom event sequence. Do not use external test dependencies. Keep the production implementation
+readable, with comments explaining invariants rather than restating each line.
+
+Design and implement a deterministic task scheduler as a Rust library using only the standard library.
+Tasks have unique u64 IDs, integer priorities, release times and optional deadlines. Support submission,
+cancellation, advancing a monotonic logical clock, starting ready work, and completion. Choose eligible
+tasks by descending priority, then earliest deadline, then submission order. Running work cannot be
+cancelled. Reject duplicate IDs and time moving backwards. Explain the data structures and invariants,
+then provide complete compiling Rust code and focused unit tests for ordering, cancellation and time
+boundaries. Make the implementation suitable for bounded-memory use without background threads.
