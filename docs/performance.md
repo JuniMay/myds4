@@ -1894,7 +1894,8 @@ stayed normal.
   Of the GPU's work, the one-row dense products take 15.5 ms per token, at
   370 to 570 GB/s of their weights (`--bench`); the routed experts take 6.4
   ms and the head 1 ms.
-- Memory: the cache keeps 10 GiB available, counting the file cache only
+- Memory: the cache keeps 10 GiB available (the default `--reserve`),
+  counting the file cache only
   beyond the kernel's 23.9 GiB share, and backs off as soon as the kernel
   compresses anything while the free memory is below the reserve (see
   [Memory and the file cache](#memory-and-the-file-cache)). With about 45

@@ -15,7 +15,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYDS4_ABI 1
+#define MYDS4_ABI 2
 
 // The engine's settings: the C server's model and server options.
 typedef struct {
@@ -24,6 +24,7 @@ typedef struct {
   const char *experts;         // --experts: a GGUF file or any shard of a set; null: the checkpoint's
   int ctx;                     // --ctx: context capacity in tokens, 1 to 1,048,576
   double cache_gb;             // --cache: expert cache budget in GB; 0: from available memory
+  double reserve_gb;           // --reserve: memory the cache leaves to other programs in GiB; 0: 10
   int cache_half_life;         // --cache-half-life in forward passes; 0: the default, 50
   int cache_read_cost;         // --cache-read-cost
   float substitute;            // --substitute D; 0: exact

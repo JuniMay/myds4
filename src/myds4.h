@@ -192,6 +192,12 @@ enum { CACHE_HALF_LIFE_DEFAULT = 50, CACHE_HALF_LIFE_MAX = 1000000 };
 // decode/verify pass and after prefill, not once per emitted token. Read-cost
 // weighting changes backbone decode eviction priority only; raw history stays.
 void cache_retention(int half_life, int read_cost);
+enum { CACHE_RESERVE_DEFAULT = 10, CACHE_RESERVE_MIN = 2, CACHE_RESERVE_MAX = 1024 };
+// Before cache_init: the memory in GiB that the cache leaves available to
+// other programs, 0 for the default. The cache starts within the free memory
+// less the reserve, gives slots back when the available memory falls below
+// it and grows only while 4 GiB more than it is available.
+void cache_reserve(double gib);
 void cache_init(uint64_t budget, int layers);
 // Bounded draft pools are demand-only. Finish prior GPU use of a stage's
 // buffers before cache_load/cache_request may replace their experts.
@@ -313,6 +319,7 @@ void image_free(Image *im);
 typedef struct {
   int ctx;            // capacity in tokens
   double budget_gb;   // expert cache budget, 0 = automatic
+  double reserve_gb;  // memory the expert cache leaves to other programs (GiB), 0 = CACHE_RESERVE_DEFAULT
   int cache_half_life;  // score half-life in forward passes; 0 = default 50
   int cache_read_cost;  // weight decode eviction priorities by aligned read bytes / slot size
   int dump_fd;        // -1, or a pipe receiving per-layer streams

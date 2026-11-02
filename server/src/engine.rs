@@ -7,7 +7,7 @@ use std::ptr;
 use deepseek_recipe::stream::StreamTokenizer;
 use tokio::sync::mpsc;
 
-const ABI: c_int = 1;
+const ABI: c_int = 2;
 const STARTED: c_int = 0;
 const TOKENS: c_int = 1;
 const DONE: c_int = 2;
@@ -21,6 +21,7 @@ struct RawConfig {
     experts: *const c_char,
     ctx: c_int,
     cache_gb: f64,
+    reserve_gb: f64,
     cache_half_life: c_int,
     cache_read_cost: c_int,
     substitute: f32,
@@ -97,6 +98,7 @@ pub struct Config {
     pub experts: Option<String>,
     pub ctx: i32,
     pub cache_gb: f64,
+    pub reserve_gb: f64,
     pub cache_half_life: i32,
     pub cache_read_cost: bool,
     pub substitute: f32,
@@ -129,6 +131,7 @@ pub fn start(c: &Config) -> bool {
         experts: experts.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
         ctx: c.ctx,
         cache_gb: c.cache_gb,
+        reserve_gb: c.reserve_gb,
         cache_half_life: c.cache_half_life,
         cache_read_cost: c.cache_read_cost.into(),
         substitute: c.substitute,

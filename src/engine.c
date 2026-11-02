@@ -851,6 +851,8 @@ int myds4_start(const myds4_config *c) {
                   : c->draft_trim && !c->draft      ? "--draft-trim needs --draft"
                   : c->cache_half_life < 0 || c->cache_half_life > CACHE_HALF_LIFE_MAX
                       ? "--cache-half-life takes 1 to 1000000 forward passes"
+                  : c->reserve_gb && !(c->reserve_gb >= CACHE_RESERVE_MIN && c->reserve_gb <= CACHE_RESERVE_MAX)
+                      ? "--reserve takes 2 to 1024 GiB"
                   : running                         ? "the engine runs already"
                                                     : 0;
   if (bad) {
@@ -860,7 +862,7 @@ int myds4_start(const myds4_config *c) {
   cfg = *c;
   cfg.model = copy(c->model), cfg.experts = copy(c->experts), cfg.predictor_state = copy(c->predictor_state);
   cfg.address = copy(c->address);
-  opt = (Options){.ctx = c->ctx, .budget_gb = c->cache_gb, .cache_half_life = c->cache_half_life,
+  opt = (Options){.ctx = c->ctx, .budget_gb = c->cache_gb, .reserve_gb = c->reserve_gb, .cache_half_life = c->cache_half_life,
                   .cache_read_cost = c->cache_read_cost, .dump_fd = -1, .routes_fd = -1, .draft = c->draft,
                   .draft_cache = c->draft_cache, .draft_trim = c->draft_trim, .predictor_state = cfg.predictor_state,
                   .substitute = c->substitute, .gpu_route = c->gpu_route, .experts = cfg.experts, .quiet = 1,

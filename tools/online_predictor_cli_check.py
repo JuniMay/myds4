@@ -100,6 +100,12 @@ def main():
             "--draft-cache needs --draft",
         ),
         ("draft trim constraint", ["--draft-trim"], None, "--draft-trim needs --draft"),
+        ("memory reserve", ["--reserve", "4"], None, missing_tokenizer),
+        ("fractional memory reserve", ["--reserve", "2.5"], None, missing_tokenizer),
+        ("zero memory reserve", ["--reserve", "0"], None, "--reserve takes 2 to 1024 GiB"),
+        ("small memory reserve", ["--reserve", "1"], None, "--reserve takes 2 to 1024 GiB"),
+        ("large memory reserve", ["--reserve", "2000"], None, "--reserve takes 2 to 1024 GiB"),
+        ("nonnumeric memory reserve", ["--reserve", "lots"], None, "--reserve takes 2 to 1024 GiB"),
     ):
         add(name, args, profile, expected)
     failures = []

@@ -486,6 +486,7 @@ void model_load(const char *dir, const Options *options) {
     }
   }
   cache_retention(opt.cache_half_life, opt.cache_read_cost);
+  cache_reserve(opt.reserve_gb);
   cache_draft_limit(opt.draft_cache);
   cache_init(opt.budget_gb > 0 ? (uint64_t)(opt.budget_gb * GiB) : 0, opt.draft ? CACHE_LAYERS : LAYERS);
 #ifdef MYDS4_PREDICT_PROBE

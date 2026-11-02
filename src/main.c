@@ -25,6 +25,7 @@ static void usage(void) {
         "  --vision-fd FD  write the --image images' feature rows (BF16, 5120 per token) to FD and exit\n"
         "  --ctx N       context capacity in tokens, at most 1048576 (default 16384; with --serve 1048576)\n"
         "  --cache GB    expert cache budget (default: from available memory)\n"
+        "  --reserve GB  memory the expert cache leaves to other programs, 2-1024 (default 10)\n"
         "  --cache-half-life N  score half-life in forward passes, 1-1000000 (default 50)\n"
         "  --cache-read-cost   weight decode eviction priority by expert read bytes (default off)\n"
         "  --tokens IDS  comma-separated token ids, run without generation\n"
@@ -167,6 +168,13 @@ int main(int argc, char **argv) {
       think_set = 1;
     } else if (!strcmp(a, "--ctx")) o.ctx = atoi(v), ctx_set = 1;
     else if (!strcmp(a, "--cache")) o.budget_gb = atof(v);
+    else if (!strcmp(a, "--reserve")) {
+      char *end;
+      double gib = strtod(v, &end);
+      if (end == v || *end || !(gib >= CACHE_RESERVE_MIN && gib <= CACHE_RESERVE_MAX))
+        die("--reserve takes %d to %d GiB", CACHE_RESERVE_MIN, CACHE_RESERVE_MAX);
+      o.reserve_gb = gib;
+    }
     else if (!strcmp(a, "--cache-half-life")) {
       char *end;
       long half_life = strtol(v, &end, 10);

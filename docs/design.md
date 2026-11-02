@@ -451,7 +451,7 @@ CPU validation is available independently of model execution:
 | Check | Scope |
 | --- | --- |
 | `make build/online-predictor-unit`, then `build/online-predictor-unit` | 43 module checks: math, record ownership, native labels, available horizons, causal updates, changed row counts, reset, freeze boundaries and windows. |
-| `.venv/bin/python -B tools/online_predictor_cli_check.py` | 33 CLI checks of boolean enable, state paths, removed options, compatible modes and existing constraints, before model loading. Includes empty and nonempty profiler values. |
+| `.venv/bin/python -B tools/online_predictor_cli_check.py` | 39 CLI checks of boolean enable, state paths, removed options, compatible modes and existing constraints, before model loading. Includes empty and nonempty profiler values and the `--reserve` range. |
 | `make build/online-predictor-state-check`, then `build/online-predictor-state-check` | 42 CPU checks of round-trip and continued-learning identity, file validation, binding mismatch, unsafe paths and atomic-save failures. Temporary files are removed. |
 | `make shutdown-check` | 8 CPU checks of signal handling and safe-boundary shutdown notification. |
 | `make build/online-predictor-check`, then `build/online-predictor-check --rank 64 --pairs 77 --milliseconds 20` | 20 shared-math checks with 20,000 dead/repeated-feature update rows, followed by a bounded CPU microbenchmark. |
@@ -963,7 +963,8 @@ without encoding it again.
 ## The expert cache and memory
 
 A slot is a Metal buffer holding one expert (18.9 MB with alignment slack).
-The cache's budget is the available memory less a 10 GiB reserve. The
+The cache's budget is the available memory less a reserve for other
+programs: 10 GiB, or 2 to 1,024 GiB with `--reserve`. The
 available memory is the free memory (the kernel's free pages, which include
 the file pages read ahead) and the file cache beyond the share that the
 kernel keeps (`vm.vm_page_filecache_min`, 23.9 GiB with 128 GiB). While the
@@ -1046,7 +1047,8 @@ when 64 MiB more of the process's own memory is compressed than at the
 check before. Memory given back shows as free only after a while, so it
 waits a second before shrinking again, unless the pressure is critical or
 the system swaps. It grows again, by a quarter of the headroom, only after
-32 checks in which the kernel compressed nothing, up to `--cache` when one
+32 checks in which the kernel compressed nothing and while the available
+memory exceeds the reserve by 4 GiB, up to `--cache` when one
 is given. For five minutes after a compression or swap that the cache could
 have caused, the headroom is the free memory alone, without the file
 cache.

@@ -291,6 +291,8 @@ static int16_t where[CACHE_LAYERS][EXPERTS];
 static int nslots, cap, max_slots, *free_list, nfree, npinned;
 static int nmapped, mcap;  // slots mapped for the GPU, and how many may be
 static uint64_t reserve, pinned_bytes;
+
+void cache_reserve(double gib) { reserve = (uint64_t)((gib > 0 ? gib : CACHE_RESERVE_DEFAULT) * GiB); }
 static int draft_capacity = DRAFT_EXPERTS;
 static uint64_t draft_clock, draft_touch_clock;
 static uint64_t draft_age[DRAFTS * DRAFT_EXPERTS];  // recency within the separate pools
@@ -607,7 +609,7 @@ void cache_init(uint64_t budget, int layers) {
   draft_clock = draft_touch_clock = 0;
   memset(draft_age, 0, sizeof draft_age);
   uint64_t free = mem_free(), avail = mem_available(), limit = gpu_working_set();
-  reserve = 10 * (uint64_t)GiB;
+  if (!reserve) cache_reserve(0);
   int fixed = budget > 0;
   if (!budget) budget = avail > reserve ? avail - reserve : 0;
   if (budget > limit) budget = limit;
@@ -653,8 +655,9 @@ void cache_init(uint64_t budget, int layers) {
   for (int i = max_slots; i < max_slots + npinned; i++) finish(i);
   int64_t gpu_room = mem_gpu_room();
   fprintf(stderr, "expert cache: %d slots (%.1f GiB) to start, up to %d mapped for the GPU, %.1f GiB free and %.1f GiB "
-          "of file cache beyond the kernel's share, GPU resident memory %.1f GiB",
-          cap, cap * (double)SLOT_SIZE / GiB, mcap, free / GiB, (avail > free ? avail - free : 0) / GiB, mem_gpu() / GiB);
+          "of file cache beyond the kernel's share, %.1f GiB kept for other programs, GPU resident memory %.1f GiB",
+          cap, cap * (double)SLOT_SIZE / GiB, mcap, free / GiB, (avail > free ? avail - free : 0) / GiB, reserve / GiB,
+          mem_gpu() / GiB);
   if (gpu_room < INT64_MAX) fprintf(stderr, " (%.1f GiB below the GPU's limit)", gpu_room / GiB);
   fprintf(stderr, ", GPU working set %.1f GiB\n", limit / GiB);
   fprintf(stderr, "cache policy: half-life %d forward passes, read-cost weighting %s\n",
@@ -878,6 +881,9 @@ static int take(int layer, int e, int optional) {
       if (optional) return -1;
       die("the expert cache (%d slots) cannot hold the experts of two layers", nslots);
     }
+    // Routing can demote a prefetch while its read is still running. Do not
+    // stall the model for optional work or evict a higher-scoring resident.
+    if (optional && slot_reading(i)) return -1;
     cancel(i);
     metrics_retire(i, optional);
     unlink_slot(i);

@@ -38,6 +38,7 @@ const USAGE: &str = "usage: myds4-server -m MODEL --serve PORT [options]
   --think N       thinking effort 1-100 of requests that set none; 0 turns thinking off (default 75)
   --ctx N         context capacity in tokens, at most 1048576 (default 1048576)
   --cache GB      expert cache budget (default: from available memory)
+  --reserve GB    memory the expert cache leaves to other programs, 2-1024 (default 10)
   --cache-half-life N  score half-life in forward passes, 1-1000000 (default 50)
   --cache-read-cost   weight decode eviction priority by expert read bytes
   --experts GGUF  read the routed experts from a GGUF file or set of shards
@@ -102,6 +103,7 @@ fn parse() -> Args {
                     "--experts" => e.experts = Some(v.clone()),
                     "--ctx" => e.ctx = value(flag, v),
                     "--cache" => e.cache_gb = value(flag, v),
+                    "--reserve" => e.reserve_gb = value(flag, v),
                     "--cache-half-life" => e.cache_half_life = value(flag, v),
                     "--substitute" => e.substitute = value(flag, v),
                     "--draft" => e.draft = value(flag, v),

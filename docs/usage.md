@@ -43,7 +43,8 @@ it, saying so on stderr. `lockf(1)` takes the same lock.
 | `--top-p P` | Nucleus probability from 0 to 1; default 1 samples the full distribution. Also sets the server default. Zero retains only the highest-probability token. |
 | `--seed N` | Nonnegative integer seed for repeatable sampling. Also sets the server default; individual requests may override it. Omit it to initialize each CLI run or server request from system randomness. |
 | `--ctx N` | Context capacity in tokens, up to 1,048,576, the model's own (default 16,384; 1,048,576 with `--serve`). The attention state of a conversation takes about 3.1 KB per token and grows with it. |
-| `--cache GB` | Upper bound on expert memory, including reserved draft pools. After reserving those pools, the budget must hold two backbone layers' experts. The cache adapts to available memory and keeps a reserve for other programs; the requested budget is not a guaranteed allocation. Slots outside the GPU's mapping limit remain in memory and are mapped when needed. See [Design](design.md#the-expert-cache-and-memory). |
+| `--cache GB` | Upper bound on expert memory, including reserved draft pools. After reserving those pools, the budget must hold two backbone layers' experts. The cache adapts to available memory and keeps a reserve for other programs (`--reserve`); the requested budget is not a guaranteed allocation. Slots outside the GPU's mapping limit remain in memory and are mapped when needed. See [Design](design.md#the-expert-cache-and-memory). |
+| `--reserve GB` | The memory the expert cache leaves to other programs, 2 to 1,024 GiB (default 10). The cache starts within the free memory less the reserve, gives slots back when the available memory falls below it, and grows only while the available memory exceeds it by 4 GiB. A smaller reserve keeps more experts in memory and leaves less to other applications; the cache still gives slots back when the kernel reports pressure, swaps or compresses memory while the free memory is below the reserve. |
 | `--cache-half-life N` | Retention-score half-life, 1 to 1,000,000 forward-pass advances; default 50. A decode or verification pass advances once, and prefill advances once at its end. A DSpark pass can emit several tokens, so these are not emitted-token units. |
 | `--cache-read-cost` | Off by default. Multiply backbone decode eviction priority by the expert's aligned read bytes divided by the fixed slot size. Raw score history, prefill eviction, memory-pressure release and GPU unmapping retain their existing rules. |
 | `--online-predictor` | Learn a CPU correction to available one- and two-layer prefetch forecasts during inference. Included in the normal engine, off by default. Works with substitution, DSpark, GPU routing and serving. See [online CPU predictor](#online-cpu-prefetch-predictor) for learning and measurement scope. |
@@ -162,7 +163,8 @@ While no request runs, the server keeps its experts in memory, so the next
 request finds them as the last one left them. Every second it checks memory
 as it does between tokens: when other programs take memory (the kernel
 reports pressure, the system swaps, the kernel compresses memory while the
-free memory is below the 10 GiB reserve, or the available memory falls
+free memory is below the reserve, 10 GiB unless `--reserve` sets it, or
+the available memory falls
 below the reserve), it gives expert slots back, as it does when the memory
 that all processes keep resident for the GPU passes the GPU's limit. The
 whole cache counts as the server's memory, for example in Activity Monitor.
@@ -269,7 +271,7 @@ The app stores the key in its own credential file (`~/.dsh/.credentials.yaml`).
 | `python3 -B tools/predictor_lab.py --checkpoint CHECKPOINT --q2 GGUF_SHARD --phase live --policy native --native-router-only --variants embedding --metrics --repeat-control` | Tests learned fetch/abstain and eviction actions using existing router candidates, with a control before and after. No extra DSpark prediction network, traces or saved learner state. |
 | `make build/online-predictor-unit`, then `build/online-predictor-unit` | Runs 43 CPU checks of learner math, owned records, pass boundaries, available forecast horizons, native labels, row-count changes, reset, freeze controls and reporting windows. No model or GPU execution. |
 | `make sampling-check` | Runs 19 CPU checks of softmax/nucleus sampling, ties, seed consumption, EOS and sampled draft verification. No model or GPU. |
-| `.venv/bin/python -B tools/online_predictor_cli_check.py` | Runs 33 CLI compatibility and input-validation checks before model loading, including sampled drafts and temperature/top-p settings. Build `build/myds4` first. |
+| `.venv/bin/python -B tools/online_predictor_cli_check.py` | Runs 39 CLI compatibility and input-validation checks before model loading, including sampled drafts, temperature/top-p settings and the `--reserve` range. Build `build/myds4` first; another build can be passed as the argument. |
 | `make build/online-predictor-check`, then `build/online-predictor-check --rank 64 --pairs 77 --milliseconds 20` | Runs 20 math checks, including 20,000 update rows with dead or repeated features, followed by a bounded CPU microbenchmark. Uses the live module's shared math; its times exclude inference, I/O and GPU scheduling. |
 | `make build/online-predictor-state-check`, then `build/online-predictor-state-check` | Runs 42 CPU checks of state round trips, identical continued learning, compatibility binding, invalid-file rejection and atomic-save failure handling. Creates bounded temporary state files and removes them. |
 | `make shutdown-check` | Runs 8 CPU checks of shutdown signal handling and safe-boundary notification. No model or GPU execution. |
