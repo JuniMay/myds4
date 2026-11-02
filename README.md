@@ -62,7 +62,6 @@ it, saying so on stderr. `lockf(1)` takes the same lock.
 | `--think N` | Thinking effort 1 to 100; 0 disables thinking. CLI defaults to off; the server defaults to effort 75. |
 | `--image FILE` | An image (any format macOS reads; JPEG through libjpeg-turbo) before the prompt's text, up to 16. With `--raw`, each image takes a `<｜deepseek_image｜>` of the prompt instead. The vision encoder's weights (0.97 GB) load at the first image (see [Design](docs/design.md#images)). |
 | `--vision-fd FD` | With `--image`: write the images' feature rows (BF16, 5,120 per token) to the file descriptor FD and exit, for `tools/check.py vision`. |
-| `--vision-ai DIR` | With the optional `build/myds4-ai`, use fixed-grid Core AI vision assets from DIR. Missing or failed assets use Metal. ANE is preferred; Core AI may use the CPU or GPU. See [Core AI vision](#core-ai-vision). |
 | `-n N` | Tokens to generate (default 128). |
 | `-t T`, `--temperature T` | Finite nonnegative sampling temperature; 0, the default, is greedy. With `--serve` it sets the requests' default, which is then 1. |
 | `--top-p P` | Nucleus probability from 0 to 1; default 1 samples the full distribution. Also sets the server default. Zero retains only the highest-probability token. |
@@ -323,103 +322,6 @@ report unsupported timing coverage. The eviction and rerequest counters record
 observations; they do not establish causal cache pollution or saved time.
 The server's status endpoint and terminal view retain their existing counters.
 
-## Core AI vision
-
-`make vision-ai` builds `build/myds4-ai` and its small Swift adapter for
-Apple's public Core AI API. The C inference engine, image preprocessing,
-patch merge and Aligner remain in use. This optional backend is experimental:
-its FP16 arithmetic differs from the default Metal backbone's BF16 rounding.
-ANE placement, image quality, speed and energy need validation for each
-exported shape before deployment. A successful Core AI call alone does not
-establish ANE execution. Real-image checks show additional numerical drift
-in the ANE-preferred FP16 path; keep Metal as the production backend. See the
-[recorded checks](docs/performance.md#core-ai-vision-checks).
-
-Exporting needs Python 3.14 with `torch`, `safetensors`, `coreai-core==1.0.0b3`
-and `coreai-torch==0.4.3`, including their dependencies. Use a separate export
-environment: these Core AI packages require NumPy below 2.5. The runtime
-does not require Python. An isolated installation under `build/vision-python`
-can be selected with `PYTHONPATH=build/vision-python` when running the tools.
-This directory is removed by `make clean`. To install the export packages
-while reusing the current environment's PyTorch and its dependencies:
-
-```sh
-.venv/bin/python -m pip install --target build/vision-python --no-cache-dir \
-  'coreai-core==1.0.0b3' 'numpy>=2.3,<2.5' scipy 'rich>=13,<16' strenum
-.venv/bin/python -m pip install --target build/vision-python --no-cache-dir --no-deps \
-  'coreai-torch==0.4.3'
-```
-
-The converter warns that PyTorch versions above 2.13 are not validated by
-its maintainers. Conversion was exercised here with PyTorch 2.15; that does
-not establish compatibility for other graphs.
-
-Set `CHECKPOINT` to the checkpoint directory. Begin with a one-block export
-for a small fixed patch grid:
-
-```sh
-make vision-ai
-.venv/bin/python tools/vision_ai_check.py
-PYTHONPATH="$PWD/build/vision-python" .venv/bin/python tools/vision_ai.py "$CHECKPOINT" build/vision-models --height 16 --width 16 --layers 1
-PYTHONPATH="$PWD/build/vision-python" .venv/bin/python tools/vision_ai_validate.py "$CHECKPOINT" build/vision-models/vit-1-16x16.aimodel --height 16 --width 16 --layers 1
-```
-
-The validator runs through the same C ABI as the application, compares
-prepared-patch features with the checkpoint's CPU BF16 reference, and reports
-load time and repeated call times. It does not load the language model. Its
-default 30 dB aggregate backbone-SNR threshold is provisional. The original
-`tools/check.py vision` threshold measures the output after the Aligner,
-which is a different interface. Neither threshold establishes task accuracy
-or a speedup. The math check uses small CPU tensors
-and needs no checkpoint or Core AI package.
-
-Use `tools/vision_ai_diagnose.py CHECKPOINT IMAGE --asset ASSET` for a normal
-image. It uses checkpoint preprocessing, compares backbone and post-Aligner
-outputs with BF16 and FP32 references, reports per-row agreement, and checks
-repeatability. `--image-size WIDTH HEIGHT` fits a second image in memory to
-reuse an existing grid. `make vision-ai-diagnostics` builds CPU-only and
-GPU-preferred adapters; select one with the diagnostic tools' `--library`.
-These compare the same saved graph without enabling debug specialization.
-The CPU-only FP16 backend is not a numerical gold reference.
-
-Small normalization, convolution and attention comparisons across public
-device preferences did not reproduce catastrophic overflow, even though
-full-model differences grew. The retained image diagnostic checks the whole
-exported graph and its Aligner output.
-
-Omitting `--layers 1` exports all 32 blocks for further numerical checks;
-one-block success is insufficient for deployment. The 16 x 16 grid is a
-small numerical probe. Normal image preprocessing enforces at least 295,936
-pixels, so a small square image produces a 39 x 39 patch grid.
-`--height` and `--width` name the exact patch grid reported by image
-preprocessing, not pixel dimensions. Each asset uses global attention over
-all real patches; query tiling does not crop the keys. The application loads
-only `vit-32-HEIGHTxWIDTH.aimodel` from the directory supplied to
-`--vision-ai`. It caches one grid at a time and falls back to Metal for a
-missing asset or runtime failure. A failed grid is retried after switching
-grids or restarting the process. Use the Core AI Instruments template to
-inspect ANE, GPU and CPU execution before interpreting timing results.
-`tools/vision_ai_placement.py --trace RECORDING.trace` checks that the target's
-model calls overlap ANE prediction and have no recorded GPU execution.
-Passing an asset instead prints a debug compute plan. On this toolchain the
-debug plan reported GPU placement while the normal Swift run used ANE, so
-that plan must not be used as a normal-execution acceptance test.
-
-`--reference-rounding` is an experimental export variant that requests BF16
-rounding boundaries and uses FP32 normalization, rotary, attention and elementwise math.
-It keeps FP16 matrix products and takes FP32 rotary tables. Its assets are
-named `vit-bf16-LAYERS-HEIGHTxWIDTH.aimodel` and are not selected by the
-application. The current converter removes some requested BF16 round-trips;
-`tools/vision_ai_cast_probe.py` reproduces this on CPU-only execution. The
-variant therefore does not establish faithful BF16 rounding. Both variants currently need more numerical work at full depth;
-failed exports belong in a diagnostic directory, outside runtime selection.
-
-The full backbone contains roughly 0.82 GB of FP16 weights; compiled assets,
-compiler caches and export intermediates need additional space. A one-block
-export contains roughly 26 MiB of weights. Large-grid exports can require
-substantial compiler memory even though attention is tiled. Export one shape
-at a time and keep sufficient memory available for inference and the system.
-
 ## Online CPU prefetch predictor
 
 Build the engine and set `CHECKPOINT` to the model directory.
@@ -463,7 +365,7 @@ prediction records about 0.8 MiB; working buffers and library memory are additio
 The learner changes prefetches, not checkpoint weights or the native routing
 rule. Exact routing keeps the same output. With `--substitute`, changed cache
 residency can change substituted experts and output, as with other cache
-settings. This live learner uses the CPU, not ANE.
+settings. This live learner runs on the CPU.
 
 ### Persistent predictor state
 

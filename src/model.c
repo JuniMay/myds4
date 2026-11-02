@@ -25,9 +25,6 @@
 #ifdef MYDS4_PREDICT_LAB
 #include "predictor_lab.h"
 #endif
-#ifdef MYDS4_VISION_AI
-#include "vision_ai.h"
-#endif
 
 typedef struct { Buf w, s; int n, k, group; } Lin;  // s.obj is null for BF16 weights; group: rows
                                                   // per input slice (wo_a)
@@ -1838,7 +1835,7 @@ const float *model_forward(const int *tokens, int n, int pos) {
 
 typedef struct { Buf norm1, norm2, b_qkv, b_o; Lin qkv, o, w1, w2; } VitBlock;
 static struct {
-  int loaded, backbone_loaded;
+  int loaded;
   Lin patch, a1, a2;  // patch: proj with its 588 inputs zero-padded to VIT_K
   Buf patch_b, norm, a1_b, a2_b;
   VitBlock b[32];
@@ -1847,31 +1844,27 @@ static struct {
 static const Image *imgs;  // the prompt's images (model_images)
 static int nimgs;
 
-// The Aligner loads at the first image. Metal backbone weights load only
-// when an image needs that backend (0.97 GB for both parts).
-static void vit_load(int backbone) {
-  char s[96];
-  if (backbone && !vit.backbone_loaded) {
-    Tensor t = st_get("vision.patch_embed.proj.weight");
-    Buf raw = load(t);
-    vit.patch = (Lin){.w = zeros((size_t)1024 * VIT_K * 2), .n = 1024, .k = VIT_K};
-    for (int r = 0; r < 1024; r++)
-      memcpy((uint16_t *)vit.patch.w.ptr + (size_t)r * VIT_K, (uint16_t *)(raw.ptr + raw.off) + (size_t)r * 588, 588 * 2);
-    gpu_free(&raw);
-    vit.patch_b = vec(st_get("vision.patch_embed.proj.bias"));
-    for (int l = 0; l < 32; l++) {
-      VitBlock *b = &vit.b[l];
-      snprintf(s, sizeof s, "vision.blocks.%d.attn.wqkv", l), b->qkv = lin(s);
-      snprintf(s, sizeof s, "vision.blocks.%d.attn.wo", l), b->o = lin(s);
-      snprintf(s, sizeof s, "vision.blocks.%d.mlp.w1", l), b->w1 = lin(s);
-      snprintf(s, sizeof s, "vision.blocks.%d.mlp.w2", l), b->w2 = lin(s);
-      b->b_qkv = vec(st_get("vision.blocks.%d.attn.wqkv.bias", l)), b->b_o = vec(st_get("vision.blocks.%d.attn.wo.bias", l));
-      b->norm1 = vec(st_get("vision.blocks.%d.norm1.weight", l)), b->norm2 = vec(st_get("vision.blocks.%d.norm2.weight", l));
-    }
-    vit.norm = vec(st_get("vision.norm.weight"));
-    vit.backbone_loaded = 1;
-  }
+// The vision encoder's weights (0.97 GB) load at the first image.
+static void vit_load(void) {
   if (vit.loaded) return;
+  char s[96];
+  Tensor t = st_get("vision.patch_embed.proj.weight");
+  Buf raw = load(t);
+  vit.patch = (Lin){.w = zeros((size_t)1024 * VIT_K * 2), .n = 1024, .k = VIT_K};
+  for (int r = 0; r < 1024; r++)
+    memcpy((uint16_t *)vit.patch.w.ptr + (size_t)r * VIT_K, (uint16_t *)(raw.ptr + raw.off) + (size_t)r * 588, 588 * 2);
+  gpu_free(&raw);
+  vit.patch_b = vec(st_get("vision.patch_embed.proj.bias"));
+  for (int l = 0; l < 32; l++) {
+    VitBlock *b = &vit.b[l];
+    snprintf(s, sizeof s, "vision.blocks.%d.attn.wqkv", l), b->qkv = lin(s);
+    snprintf(s, sizeof s, "vision.blocks.%d.attn.wo", l), b->o = lin(s);
+    snprintf(s, sizeof s, "vision.blocks.%d.mlp.w1", l), b->w1 = lin(s);
+    snprintf(s, sizeof s, "vision.blocks.%d.mlp.w2", l), b->w2 = lin(s);
+    b->b_qkv = vec(st_get("vision.blocks.%d.attn.wqkv.bias", l)), b->b_o = vec(st_get("vision.blocks.%d.attn.wo.bias", l));
+    b->norm1 = vec(st_get("vision.blocks.%d.norm1.weight", l)), b->norm2 = vec(st_get("vision.blocks.%d.norm2.weight", l));
+  }
+  vit.norm = vec(st_get("vision.norm.weight"));
   vit.a1 = lin("aligner.w1"), vit.a1_b = vec(st_get("aligner.w1.bias"));
   vit.a2 = lin("aligner.w2"), vit.a2_b = vec(st_get("aligner.w2.bias"));
   const char *name[3] = {"image_start", "image_end", "image_newline"};
@@ -1921,91 +1914,48 @@ static void vit_gelu_row(void *ctx, size_t r) {
   for (int i = 0; i < DIM; i++) g[i] = bf_cpu((float)(0.5 * g[i] * (1 + erf(g[i] / sqrt(2.0)))));
 }
 
-// One cached grid keeps compiled backbones from accumulating in memory.
-// Core AI's preference does not guarantee ANE placement; profile each asset.
-static int vit_ai(const Image *im, const Buf *patch, const Buf *cs, Buf *features) {
-  if (!opt.vision_ai) return 0;
-#ifdef MYDS4_VISION_AI
-  static VisionAI *handle;
-  static int height, width;
-  char error[1024];
-  if (height != im->vh || width != im->vw) {
-    vision_ai_destroy(handle);
-    handle = 0;
-    height = im->vh, width = im->vw;
-    size_t cap = strlen(opt.vision_ai) + 80;
-    char *path = xmalloc(cap);
-    snprintf(path, cap, "%s/vit-32-%dx%d.aimodel", opt.vision_ai, height, width);
-    if (access(path, R_OK) == 0)
-      handle = vision_ai_create(path, "vision", height * width, error, sizeof error);
-    else snprintf(error, sizeof error, "no asset for the %d x %d patch grid", height, width);
-    free(path);
-    if (!handle) fprintf(stderr, "vision: %s; using Metal\n", error);
-    else fprintf(stderr, "vision: Core AI backbone %d x %d; ANE preferred, placement not verified\n", height, width);
-  }
-  if (!handle) return 0;
-  if (!vision_ai_run(handle, (const float *)patch->ptr, (const float *)cs->ptr,
-                     (float *)features->ptr, error, sizeof error)) {
-    fprintf(stderr, "vision: Core AI failed: %s; using Metal\n", error);
-    vision_ai_destroy(handle);
-    handle = 0;
-    return 0;
-  }
-  float *values = (float *)features->ptr;
-  for (size_t i = 0; i < (size_t)height * width * 1024; i++) values[i] = bf_cpu(values[i]);
-  return 1;
-#else
-  die("--vision-ai requires the myds4-ai build (make vision-ai)");
-  return 0;
-#endif
-}
-
 void model_image(Image *im) {
   uint32_t n = (uint32_t)(im->vh * im->vw), L = (uint32_t)(im->th * im->tw);
   uint32_t np = (n + 63) / 64 * 64, dims[2] = {n, np};  // vit_attn's rows: the patches, padded to its tiles
   Buf px = gpu_alloc((size_t)n * VIT_K * 4), cs = gpu_alloc((size_t)n * 64 * 4);
   for (size_t i = 0; i < (size_t)n * VIT_K; i++) ((uint32_t *)px.ptr)[i] = (uint32_t)im->patch[i] << 16;
   image_rope(im, (float *)cs.ptr);
-  Buf y = gpu_alloc((size_t)n * 1024 * 4), x = {0}, t = {0}, qkv = {0}, hv = {0}, h = {0}, a = {0};
-  int ai = vit_ai(im, &px, &cs, &y);
-  vit_load(!ai);
-  if (!ai) {
-    x = gpu_alloc((size_t)n * 1024 * 4), t = gpu_alloc((size_t)n * 1024 * 4);
-    qkv = gpu_alloc((size_t)n * 3072 * 4), hv = gpu_alloc((size_t)np * 3072 * 2);
-    h = gpu_alloc((size_t)n * 5632 * 4), a = gpu_alloc((size_t)n * 2816 * 4);
+  Buf y = gpu_alloc((size_t)n * 1024 * 4), x = gpu_alloc((size_t)n * 1024 * 4), t = gpu_alloc((size_t)n * 1024 * 4);
+  Buf qkv = gpu_alloc((size_t)n * 3072 * 4), hv = gpu_alloc((size_t)np * 3072 * 2);
+  Buf h = gpu_alloc((size_t)n * 5632 * 4), a = gpu_alloc((size_t)n * 2816 * 4);
+  vit_load();
+  gpu_begin();
+  vit_linear(&vit.patch, n, &px, VIT_K, &x, &vit.patch_b);
+  gpu_commit();
+  for (int l = 0; l < 32; l++) {  // a command buffer per block: one long buffer would hold up the display
+    VitBlock *b = &vit.b[l];
     gpu_begin();
-    vit_linear(&vit.patch, n, &px, VIT_K, &x, &vit.patch_b);
+    vit_norm(&x, &b->norm1, &y, n);
+    vit_linear(&b->qkv, n, &y, 1024, &qkv, &b->b_qkv);
+    gpu_kern(K_vit_rope);
+    gpu_buf(0, &qkv, 0), gpu_buf(1, &cs, 0);
+    gpu_go(1024 / 256, n, 1, 256, 1, 1);
+    gpu_kern(K_vit_heads);
+    gpu_buf(0, &qkv, 0), gpu_buf(1, &hv, 0), gpu_bytes(2, dims, sizeof dims);
+    gpu_go(768 / 256, np, 1, 256, 1, 1);
+    gpu_kern(K_vit_attn);
+    gpu_buf(0, &hv, 0), gpu_buf(1, &y, 0), gpu_bytes(2, dims, sizeof dims);
+    gpu_go(np / 64, 16, 1, 128, 1, 1);
+    vit_linear(&b->o, n, &y, 1024, &t, &b->b_o);
+    vit_add(&x, &t, n);
+    vit_norm(&x, &b->norm2, &y, n);
+    vit_linear(&b->w1, n, &y, 1024, &h, 0);
+    gpu_kern(K_vit_swiglu);
+    gpu_buf(0, &h, 0), gpu_buf(1, &a, 0);
+    gpu_go(2816 / 256, n, 1, 256, 1, 1);
+    vit_linear(&b->w2, n, &a, 2816, &t, 0);
+    vit_add(&x, &t, n);
     gpu_commit();
-    for (int l = 0; l < 32; l++) {  // a command buffer per block: one long buffer would hold up the display
-      VitBlock *b = &vit.b[l];
-      gpu_begin();
-      vit_norm(&x, &b->norm1, &y, n);
-      vit_linear(&b->qkv, n, &y, 1024, &qkv, &b->b_qkv);
-      gpu_kern(K_vit_rope);
-      gpu_buf(0, &qkv, 0), gpu_buf(1, &cs, 0);
-      gpu_go(1024 / 256, n, 1, 256, 1, 1);
-      gpu_kern(K_vit_heads);
-      gpu_buf(0, &qkv, 0), gpu_buf(1, &hv, 0), gpu_bytes(2, dims, sizeof dims);
-      gpu_go(768 / 256, np, 1, 256, 1, 1);
-      gpu_kern(K_vit_attn);
-      gpu_buf(0, &hv, 0), gpu_buf(1, &y, 0), gpu_bytes(2, dims, sizeof dims);
-      gpu_go(np / 64, 16, 1, 128, 1, 1);
-      vit_linear(&b->o, n, &y, 1024, &t, &b->b_o);
-      vit_add(&x, &t, n);
-      vit_norm(&x, &b->norm2, &y, n);
-      vit_linear(&b->w1, n, &y, 1024, &h, 0);
-      gpu_kern(K_vit_swiglu);
-      gpu_buf(0, &h, 0), gpu_buf(1, &a, 0);
-      gpu_go(2816 / 256, n, 1, 256, 1, 1);
-      vit_linear(&b->w2, n, &a, 2816, &t, 0);
-      vit_add(&x, &t, n);
-      gpu_commit();
-    }
   }
   Buf u = gpu_alloc((size_t)L * 9216 * 4), g = gpu_alloc((size_t)L * DIM * 4), f = gpu_alloc((size_t)L * DIM * 4);
   uint32_t gr[3] = {(uint32_t)im->vh, (uint32_t)im->vw, (uint32_t)im->tw};
   gpu_begin();
-  if (!ai) vit_norm(&x, &vit.norm, &y, n);
+  vit_norm(&x, &vit.norm, &y, n);
   gpu_kern(K_vit_unfold);
   gpu_buf(0, &y, 0), gpu_buf(1, &u, 0), gpu_bytes(2, gr, sizeof gr);
   gpu_go(9216 / 256, L, 1, 256, 1, 1);
@@ -2030,7 +1980,7 @@ void model_images(const Image *im, int n) { imgs = im, nimgs = n; }
 // (merge_image_embeddings): the delimiters' learned rows, or the image's
 // feature rows in reading order.
 static const uint16_t *image_row(int pos) {
-  if (!vit.loaded) vit_load(0);
+  if (!vit.loaded) vit_load();
   for (int i = 0; i < nimgs; i++) {
     const Image *im = &imgs[i];
     int j = pos - im->start, n = image_span(im);

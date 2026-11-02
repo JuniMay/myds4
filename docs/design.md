@@ -348,8 +348,7 @@ current-layer residual forecast (`PC`). It uses backbone routing features;
 support for DSpark verification does not mean it reads DSpark's internal
 hidden states. Exact routing preserves the model output. With substitution,
 prefetches can change cache residency, which can change substitutions and
-output. All live learner math runs on the CPU. ANE predictor probes remain
-separate experiments.
+output. All live learner math runs on the CPU.
 
 #### Persistent state
 
@@ -918,47 +917,9 @@ rows), so a change of the products' shapes or types needs
 its own, so that no long buffer holds up the display. The Aligner merges 3 x
 3 patches (zero-padded at the edges) into rows of 9,216, then applies w1,
 GELU and w2 to 5,120; the GELU (erf) runs on the CPU in double precision,
-rounded to float, then to BF16. With the default Metal backend, the weights
-(0.97 GB, BF16) load at the first image and stay. Their resident memory counts toward the GPU's limit
+rounded to float, then to BF16. The weights (0.97 GB, BF16) load at the
+first image and stay. Their resident memory counts toward the GPU's limit
 like the others', and the cache maps fewer slots at its next check.
-
-The optional `myds4-ai` build accepts `--vision-ai DIR` for the backbone
-through Apple's public Core AI API. A C ABI in `vision_ai.h` contains the
-Swift interface to Core AI. The exporter uses one fixed function for each
-patch grid: prepared patches `[1,640,1,n]` and the two rotary tables
-`[1,32,1,n]` produce normalized patch features `[1,1024,1,n]`, in FP16.
-The adapter accepts FP16 or FP32 rotary tables according to the asset's
-signature. It uses bulk input copies and output strides to convert layouts.
-It tiles only attention queries; every query sees every real key. No extra
-padding patches participate in attention. The adapter returns row-major
-FP32 features, which the C host rounds to BF16 before the existing patch
-merge and Aligner. Intermediate FP16 arithmetic differs from the reference's
-BF16 arithmetic, so the backend remains opt-in and needs numerical and
-task-level validation. Full-depth exports remain diagnostic assets; the
-default backend is Metal. The standalone backbone's 30 dB threshold is
-provisional and is distinct from the existing post-Aligner vision check.
-Real-image tests measure both interfaces and reference precision variation.
-
-The export tool's reference-rounding variant keeps the matrix products in
-FP16 but requests the checkpoint's BF16 rounding boundaries, with FP32 norm
-weights, rotary tables and intermediate arithmetic. It uses a separate
-`vit-bf16` asset prefix and is not selected by the application. Its one-block
-graph uses both ANE and GPU; its full-depth graph also needs numerical work.
-The current converter removes some FP16-to-BF16-to-FP16 cast sequences, so
-the source-level rounding requests do not establish the compiled graph's
-rounding behavior. A small CPU-only cast probe reproduces this independently
-of ANE hardware.
-
-The host loads only a 32-block asset whose grid matches the image. It caches
-one Core AI model at a time. Missing or failed assets use the Metal backbone;
-a failed grid is retried after another grid or a restart. Metal backbone
-weights load only when needed, while Aligner and image-delimiter weights
-load on first use. Core AI prefers ANE but permits CPU/GPU fallback. Its
-memory belongs to the process and affects system memory availability, but
-is not part of the C Metal residency set. Placement and memory must be
-profiled on the exported asset; a successful load does not prove ANE use.
-The Python debug compute plan is diagnostic only: its placement differed
-from the normal Swift hardware trace in the recorded checks.
 
 A rendered chat prompt marks each image part's place with the byte 0xFF
 (`IMAGE_MARK`), which no valid UTF-8 text holds; the server's JSON parser

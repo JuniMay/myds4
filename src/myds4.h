@@ -320,7 +320,6 @@ typedef struct {
   int draft_cache;    // draft expert slots per stage; 0 = all 128 preloaded
   int draft_trim;     // final draft stage: only requested query/FFN rows; keep all five keys
   const char *predictor_state; // load or create online state; save on clean completion
-  const char *vision_ai;       // directory of fixed-grid public Core AI vision assets, or null for Metal
   float substitute;            // > 0: replace a missing expert by a resident one up to this far below in key
   int gpu_route;               // decoding: the GPU looks up each layer's experts (see step_spec)
   const char *experts;         // a GGUF file (set) whose routed experts replace the checkpoint's, or null
@@ -375,9 +374,7 @@ const float *model_forward_rows(State **st, const int *tokens, const int *pos, i
 // BLOCK positions before the last one that ran, or after a reset at 0.
 void model_seek(const int *tokens, int pos);
 // The vision encoder (inference/vision.py ViT and Aligner): the image's
-// feature rows into im->rows. Options.vision_ai selects a public Core AI
-// backbone when a matching asset is available; Metal is the default and
-// fallback. The Aligner remains on Metal/CPU. Weights load on first use.
+// feature rows into im->rows. Weights load on first use.
 void model_image(Image *im);
 // The images whose spans (their starts set) the prompts that model_forward
 // runs next hold as negative tokens (image_keys); a span's positions may be
