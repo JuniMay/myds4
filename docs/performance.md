@@ -1922,3 +1922,29 @@ stayed normal.
   work grows with the square of the image's patches (up to about 9,200 for an
   image of up to 1,024 tokens): 0.62 to 0.63 s for a letter-size page's 8,424
   patches, about half of it attention (see [Images](#images)).
+
+## Joint prefill
+
+On 2026-11-03, a 13,772-token reconstructed Harness request was
+measured with a fixed 20 GiB expert cache and 4 GiB reserve. Its system/tool
+prefix ends at token 12,453. The split control prefills that prefix, saves
+it and runs the remaining 1,319 tokens separately. Joint prefill saves the
+prefix during a single forward call over the whole prompt. Each measurement
+starts a fresh model process. No generation, substitution, learned predictor
+or DSpark runs in this series. Native prefetch remains enabled.
+
+| Expert format | Split control, mean (range) | Joint prefill | Ratio to control mean |
+| --- | ---: | ---: | ---: |
+| MXFP4 | 44.93 s (41.82–48.05) | 25.10 s | 1.79x |
+| IQ2_XXS mixed | 34.36 s (32.38–36.35) | 27.09 s | 1.27x |
+
+Both split controls and the joint run produced identical final
+logits within each expert format. MXFP4 requested expert reads fell from
+about 530.87 GB to 289.28 GB; IQ2 from 283.14 GB to 157.64 GB. The reduction
+comes from one traversal of the layers for the whole prompt. Cache size
+stayed fixed. These are application read counts, not physical SSD traffic.
+The controls show substantial timing variation under desktop activity, and
+each joint setting has one measurement. This is a cold-prefill comparison,
+not a decoding or task-completion benchmark.
+
+The aggregate record is `data/benchmarks/joint_prefill_results.json`.

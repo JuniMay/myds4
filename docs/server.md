@@ -123,16 +123,29 @@ which saves the predictor state (`--predictor-state`) and returns.
   serve the prompt checks and the output decoding below. The tokenizer keeps
   its work buffers in static memory, so the engine serializes its calls.
 
-A request's prompt arrives whole and waits in the queue whole; nothing in
-the interface splits a prompt or makes one request wait for another's
-prefill. The engine prefills a request's new tokens in one pass, as the C
-server does; for a new conversation it stops once at the first user turn,
-whose state it keeps for forks (see [Sessions](design.md#sessions)), and
-runs the rest in a second pass. Because the queue holds whole prompts, a
-later engine can prefill several queued prompts in shared passes, reading
-each expert once for all of them, without a change to the interface.
+A request's system, user, tool and context messages arrive as one prompt.
+The engine passes all its new tokens to the model together. It saves the
+state before the first user turn during the same pass, for later forks
+(see [Sessions](design.md#sessions)). The model divides more than 16,384
+new tokens into chunks to bound working memory. The scheduler prefills
+separate requests in queue order while other requests wait to decode.
+Rendering and tokenization precede enqueueing, so HTTP arrival order and
+queue order can differ. The two identifiers in the log expose that timing.
+
+Arrival logs carry an HTTP identifier, body size, and message/tool counts.
+Queue logs show waiting requests and how many the scheduler admits for
+prefill. Each completed prefill reports its chunks, token count and saved prefix. These are counts, without conversation
+text or API keys. `GET /v1/status` includes the `last_prefill` plan. A separate title request therefore has its own arrival
+and prefill records rather than appearing as a chunk of the main request.
 
 ## Requests
+
+Joint prefill was checked against full prefill at 640 and 16,521 tokens
+with MXFP4 and mixed IQ2 experts and two-token DSpark. Final logits,
+saved prefix state and resumed execution matched bit-for-bit. Four
+synthetic chat-completion requests through the C server checked concurrent
+arrivals, prefix reuse, and identical seeded replies without recomputation
+on retry. These checks do not score task quality.
 
 The server's defaults for requests that do not set a value:
 
@@ -345,9 +358,7 @@ renders it; the server refuses such a request.
 - The Responses and Messages endpoints, which recipe converts too.
 - Log probabilities, and the constraints of structured output (recipe
   converts them; the engine does not enforce them).
-- Prefilling several queued prompts in shared passes, and a new
-  conversation's prefill in one pass with its first user turn's state saved
-  inside the pass.
+- Prefilling several queued prompts in shared passes.
 - Image preprocessing through recipe's image crate.
 - Retiring `src/chat.c` and the C server's copy of the scheduler in
   `src/serve.c`.

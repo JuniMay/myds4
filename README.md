@@ -65,8 +65,11 @@ EXPERTS="$GGUF/UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00001-of-00005.gguf"
 build/myds4 -m "$CHECKPOINT" --experts "$EXPERTS" -p "What is the capital of France?"
 ```
 
-Without `--experts`, myds4 decodes with the checkpoint's own experts: the
-model's exact output, at about half the speed. The server needs an API key:
+Without `--experts`, myds4 uses the checkpoint's native MXFP4 experts and
+original output head. With substitution off, it runs the full model
+using the router's selected experts. Numerical differences from the reference
+runtime remain; see [Numerics](docs/design.md#numerics).
+The server needs an API key:
 
 ```sh
 mkdir -p ~/.config/myds4 && openssl rand -hex 32 > ~/.config/myds4/api-key && chmod 600 ~/.config/myds4/api-key
@@ -74,12 +77,16 @@ build/myds4 -m "$CHECKPOINT" --experts "$EXPERTS" --cache 56 \
   --serve 8008 --api-key-file ~/.config/myds4/api-key --tui
 ```
 
-It serves `http://127.0.0.1:8008/v1`, decodes exactly, samples at temperature
+It serves `http://127.0.0.1:8008/v1`, uses the router's selected experts, samples at temperature
 1 and top-p 1, and shows a live view that the `q` key stops. In DeepSeek
 Harness, add a provider with **Custom model API**, that base URL, the OpenAI
 Chat Completions protocol and the key file's contents (see
 [Usage](docs/usage.md#deepseek-harness)). Each run takes most of the memory,
 so one runs at a time: a second waits for the first's lock.
+
+Each new conversation's system prefix is saved within the same prefill as
+its remaining messages. Arrival and prefill logs show request counts,
+queue depth and actual chunks without logging conversation text.
 
 ## Performance
 

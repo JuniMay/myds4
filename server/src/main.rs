@@ -10,6 +10,7 @@ mod engine;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::process::exit;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
@@ -155,6 +156,7 @@ struct Shared {
     defaults: Defaults,
     ctx: i64,
     started: u64,
+    arrivals: AtomicU64,
 }
 
 type App = State<Arc<Shared>>;
@@ -213,13 +215,15 @@ async fn status() -> Response {
 
 async fn completions(State(s): App, ConnectInfo(peer): ConnectInfo<SocketAddr>, body: Bytes) -> Response {
     let peer = peer.ip().to_string();
+    let arrival = s.arrivals.fetch_add(1, Ordering::Relaxed) + 1;
+    engine::log(&format!("http {arrival}: arrived from {peer}, {} body bytes", body.len()));
     let defaults = s.defaults.clone();
     // Rendering and the engine's tokenization take a while for long prompts.
     let from = peer.clone();
     let queued = tokio::task::spawn_blocking(move || {
         let p = chat::prepare(&body, &defaults)?;
         let note = format!(
-            "from {from}: {} messages, {} tools, {}; {}",
+            "http {arrival} from {from}: {} messages, {} tools, {}; {}",
             p.messages,
             p.tools,
             if p.stream { "streamed" } else { "one response" },
@@ -312,6 +316,7 @@ fn main() {
         defaults: a.defaults.clone(),
         ctx: config.ctx as i64,
         started: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |t| t.as_secs()),
+        arrivals: AtomicU64::new(0),
     });
     let app = Router::new()
         .route("/health", get(health))

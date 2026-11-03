@@ -350,6 +350,12 @@ void model_save_predictor(void);
 void model_load(const char *dir, const Options *o);
 // Runs the tokens at positions pos.. and returns the logits of the last one.
 const float *model_forward(const int *tokens, int n, int pos);
+// Run one prompt traversal while saving the state at prefix_pos in slot 1.
+const float *model_forward_prefix(const int *tokens, int n, int pos, int prefix_pos);
+typedef struct {
+  int tokens, chunks, prefix_tokens;
+} ModelForwardInfo;
+ModelForwardInfo model_forward_info(void);
 // The DSpark draft for `token` at position pos, every position before it
 // having run (with Options.draft): the tokens it drafts for pos + 1 .. pos + BLOCK.
 void model_draft(int token, int pos, int *drafts, int n); // the first n of BLOCK drafts

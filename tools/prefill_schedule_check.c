@@ -1,4 +1,4 @@
-// Saved-prompt retries and prefix-only requests must preserve cache correctness.
+// One submitted prompt should use one forward call while retaining its prefix.
 // The engine runs against CPU-only model spies; no weights or GPU are used.
 #include "myds4.h"
 #include <stdlib.h>
@@ -7,9 +7,11 @@
 static int forwards, saved_mask, started_events;
 static struct { int n, pos; } forward_calls[8];
 static float fixture_logits[VOCAB];
+static ModelForwardInfo spy_info;
 static const float *spy_forward(const int *tokens, int n, int pos) {
   if (forwards < 8) forward_calls[forwards] = (typeof(*forward_calls)){n, pos};
   forwards++;
+  spy_info = (ModelForwardInfo){.tokens = n, .chunks = 1};
   return fixture_logits;
 }
 static State *spy_new(void) { return (State *)(uintptr_t)1; }
@@ -22,7 +24,17 @@ static void spy_save(int slot) { saved_mask |= 1 << slot; }
 static void spy_restore(int slot) {}
 static void spy_seek(const int *tokens, int pos) {}
 static void spy_images(const Image *images, int count) {}
+static const float *spy_prefix(const int *tokens, int n, int pos, int prefix) {
+  spy_save(1);
+  const float *lg = spy_forward(tokens, n, pos);
+  spy_info.prefix_tokens = prefix;
+  return lg;
+}
+static ModelForwardInfo spy_forward_info(void) { return spy_info; }
+
 #define model_forward spy_forward
+#define model_forward_prefix spy_prefix
+#define model_forward_info spy_forward_info
 #define model_state_new spy_new
 #define model_state_use spy_use
 #define model_state_free spy_free
@@ -47,7 +59,12 @@ int main(void) {
   memcpy(r.p, prompt, sizeof prompt);
   Gen g;
   int accepted = begin(&r, &g);
+  int one_prompt = forwards == 1 && forward_calls[0].n == r.n && forward_calls[0].pos == 0;
   int retained = g.s->base == 4 && (saved_mask & 2) && (saved_mask & 1);
+  printf("prefill scheduling: accepted=%d, forward_calls=%d (expected 1), prefix_retained=%d, started=%d\n",
+         accepted, forwards, retained, started_events);
+  for (int i = 0; i < forwards && i < 8; i++)
+    printf("  forward %d: position=%d tokens=%d\n", i + 1, forward_calls[i].pos, forward_calls[i].n);
   // A short reply can still fit the rewind margin. A retry must restore
   // saved logits, while a changed last prompt token must run again.
   g.s->busy = 0;
@@ -78,5 +95,5 @@ int main(void) {
   printf("prefix-only request: reused=%d (must leave a token for logits)\n", from);
   free(g.p);
   for (int i = 0; i < SESSIONS; i++) free(sessions[i].ids), free(sessions[i].logits);
-  return !(accepted && retained && short_prompt && retry_ok && changed_ok && started_events == 3);
+  return !(accepted && one_prompt && retained && short_prompt && retry_ok && changed_ok && started_events == 3);
 }

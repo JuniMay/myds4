@@ -93,6 +93,7 @@ static struct {
   int kinds[4];          // requests by session: new, kept, saved, forked
   int nlive;             // the requests decoding (for the live view)
   ViewReq live[FEW];
+  ModelForwardInfo prefill;
 } status = {.phase = "idle"};
 
 static void hit(Session *s, int at) {  // a request reused s's rows up to position at
@@ -303,6 +304,8 @@ static void drop_req(Req *r) {  // after its last event
 }
 
 static void end_waiting(Req *r, int finish) {  // a request that never started
+  say("req %llu: ended before prefill (%s), waited %.3f s", (unsigned long long)r->id,
+      finish == MYDS4_CANCELLED ? "cancelled" : "shutdown", now() - r->queued);
   event(r, (myds4_event){.kind = MYDS4_DONE, .prompt = r->n, .finish = finish});
   drop_req(r);
 }
@@ -354,6 +357,8 @@ int myds4_submit(const myds4_request *q, uint64_t *id, char *message, size_t cap
     last = r;
     r->next_live = alive, alive = r;
     waiting++;
+    say("req %llu: queued, waiting=%d, prompt_tokens=%d, max_new=%ld",
+        (unsigned long long)r->id, waiting, r->n, r->max_new);
     pthread_cond_signal(&q_job);
   }
   pthread_mutex_unlock(&q_lock);
@@ -366,10 +371,12 @@ int myds4_submit(const myds4_request *q, uint64_t *id, char *message, size_t cap
 }
 
 void myds4_cancel(uint64_t id) {
+  int changed = 0;
   pthread_mutex_lock(&q_lock);
   for (Req *r = alive; r; r = r->next_live)
-    if (r->id == id) atomic_store(&r->cancelled, 1);
+    if (r->id == id) changed = !atomic_exchange(&r->cancelled, 1);
   pthread_mutex_unlock(&q_lock);
+  if (changed) say("req %llu: cancellation requested", (unsigned long long)id);
 }
 
 // ---- the requests being served ----
@@ -479,23 +486,31 @@ static int begin(Req *r, Gen *g) {
       (unsigned long long)r->id, n, s->number, how, g->from, thinking ? "on" : "off", g->max_new,
       g->sp.temp > 0 ? "sampled" : "greedy", wait);
   set_status("prefill", g);
+  pthread_mutex_lock(&q_lock);
+  int queued = waiting;
+  pthread_mutex_unlock(&q_lock);
+  say("req %llu: prefill start, waiting=%d, new_tokens=%d",
+      (unsigned long long)r->id, queued, n - g->from);
   int encoded = 0;  // the ViT runs for the images the prefill reaches; the others are in the session's rows
   for (int i = 0; i < g->nims; i++)
     if (g->ims[i].start + image_span(&g->ims[i]) > g->from) model_image(&g->ims[i]), encoded++;
   model_images(g->ims, g->nims);
   if (encoded) say("req %llu: %d of %d images encoded in %.2f s", (unsigned long long)r->id, encoded, g->nims, now() - t0);
   CacheStats c0 = cache_stats;
+  ModelForwardInfo plan = {0};
   const float *lg;
   if (same_prompt) {
     model_state_restore(0);  // a short reply may have selected the current rewindable state
     lg = s->logits;
     model_seek(g->p, n);
   } else {
-    int z = 0, start = g->from;
+    int z = 0;
     while (!g->from && z < n && g->p[z] != user) z++;
-    if (z > 1 && z < n - 1)  // a new conversation: its rows at its first user turn are saved too
-      model_forward(g->p, z, 0), model_state_save(1), s->base = start = z;
-    lg = model_forward(g->p + start, n - start, start);
+    if (z > 1 && z < n - 1) {
+      lg = model_forward_prefix(g->p, n, 0, z);
+      s->base = z;
+    } else lg = model_forward(g->p + g->from, n - g->from, g->from);
+    plan = model_forward_info();
     model_state_save(0);
     if (!s->logits) s->logits = xmalloc(VOCAB * 4);
     memcpy(s->logits, lg, VOCAB * 4);
@@ -504,10 +519,13 @@ static int begin(Req *r, Gen *g) {
   pthread_mutex_lock(&st_lock);
   memcpy(s->ids, g->p, (size_t)n * sizeof *g->p);
   s->n = n, s->saved = n, s->used = now();
+  status.prefill = plan;
   pthread_mutex_unlock(&st_lock);
   g->t1 = g->tick = now();
   say("req %llu: prefill of %d tokens in %.2f s (%.0f tokens/s), %.2f GB of experts read", (unsigned long long)r->id,
       n - g->from, g->t1 - t0, (n - g->from) / fmax(g->t1 - t0, 1e-9), (cache_stats.bytes - c0.bytes) / 1e9);
+  say("req %llu: prefill plan: %d chunks, %d tokens, prefix=%d",
+      (unsigned long long)r->id, plan.chunks, plan.tokens, plan.prefix_tokens);
   event(r, (myds4_event){.kind = MYDS4_STARTED, .prompt = n, .reused = g->from});
   g->thinking = thinking;
   g->pos = n, g->t = sample_token(lg, VOCAB, &g->sp), g->c1 = cache_stats;
@@ -618,6 +636,7 @@ static void worker(void) {
       if (!(first = r->next)) last = 0;
       waiting--;
     }
+    if (na) say("queue: admitted=%d for prefill, waiting=%d, decoding=%d", na, waiting, ngens);
     pthread_mutex_unlock(&q_lock);
     for (int i = 0; i < na; i++) {
       Req *r = admit[i];
@@ -800,6 +819,8 @@ char *myds4_status(void) {
              "\"totals\": {\"requests\": %llu, \"prompt_tokens\": %llu, \"generated_tokens\": %llu}, ",
              kv_bytes() / GiB, cfg.kv_gb, (unsigned long long)status.requests,
              (unsigned long long)status.prompt_tokens, (unsigned long long)status.generated_tokens);
+  str_printf(&b, "\"last_prefill\": {\"chunks\": %d, \"tokens\": %d, \"prefix_tokens\": %d}, ",
+             status.prefill.chunks, status.prefill.tokens, status.prefill.prefix_tokens);
   pthread_mutex_unlock(&st_lock);
   CacheStats c = cache_stats;
   str_printf(&b, "\"expert_cache\": {\"slots\": %d, \"gib\": %.1f, \"hits\": %llu, \"misses\": %llu, \"read_gb\": %.1f}, "
@@ -830,6 +851,7 @@ static void *engine(void *arg) {
   shutdown_watch();
   say("kv cache: up to %.1f GiB (--kv-cache); a session takes %.0f MiB at first, %.2f GiB at %d tokens", cfg.kv_gb,
       model_state_bytes(0, 0) / 1048576.0, model_state_bytes(0, opt.ctx) / GiB, opt.ctx);
+  say("prefill: system prefix saved within the prompt pass");
   pthread_mutex_lock(&ready_lock);
   ready = 1;
   pthread_cond_broadcast(&ready_cond);

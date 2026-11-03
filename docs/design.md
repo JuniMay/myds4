@@ -110,7 +110,16 @@ rows of an 8,916-token source file).
 
 ## Numerics
 
-The kernels compute what `inference/model.py` computes, including the
+With substitution off and no GGUF override, the engine uses the
+checkpoint's original stored weights, full layer stack and router-selected
+experts. Prefetching changes when weights are read, not which experts run.
+“Exact routing” describes that selection policy. A bitwise optimization check
+compares two paths in this engine under the tested settings. Neither claim
+establishes bit-for-bit equivalence to DeepSeek's official CUDA runtime.
+The reference comparisons and precision limits below describe the known
+numerical differences.
+
+The kernels implement the operations in `inference/model.py`, including the
 quantization the model was trained with: activations are quantized to E4M3
 with power-of-two scales per 32 before every FP8 and FP4 product, window keys
 to E4M3, compressed keys to E2M1 with E4M3 scales per 16, and indexer
@@ -1332,15 +1341,19 @@ character's remaining UTF-8 bytes, waits for the next token.
 Each conversation keeps its attention state in a session: the layers'
 window rings, compressed rows, index keys and compressor rows, the draft's
 windows and the Engram history. The compressed rows and index keys take
-3.1 KB per position in BF16; a state starts with room for 16,384 positions
+3,200 bytes per position (3.125 KiB) in BF16; a state starts with room for 16,384 positions
 (66 MiB with its saved rows) and doubles its room when a forward pass
 needs more, up to `--ctx` (3.14 GiB at 1,048,576), keeping the rows it
 holds; a reset gives the room back. The layers use one session's state at a time. A ring holds its
 layer's last 133 positions for a window of 128, and the compressor rows the
 last 8, so a state can continue at any of its last 5 positions (BLOCK).
 After each prompt's prefill the session saves those rows (slot 0, about 6
-MB); a new conversation's first prefill stops at its first user turn and
-saves them there too (slot 1). The compressed rows and index keys of earlier
+MB). A new conversation also saves the state before its first user turn
+(slot 1), during the same prefill. Each layer copies the prefix's last ring
+rows from its completed attention batch and preserves its compressor rows.
+DSpark captures the prefix's final input rows separately, so saving the
+prefix does not overwrite the current request's draft state. The compressed
+rows and index keys of earlier
 positions are never rewritten, so a saved slot and the state's later rows
 together give the state at the saved position.
 

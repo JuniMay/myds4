@@ -15,6 +15,7 @@ time, file sizes and row counts.
 | Local conversation diagnostics | Built by `context_cases()` | 2 templates | Original project fixtures; no downloaded content | Exact JSON answer after a history of job-state changes or a code review with revised requirements. |
 | Long scheduler specification | [long_scheduler.txt](long_scheduler.txt) | 1 prompt | Original project fixture; no downloaded content | Unscored generation for long-response timing, predictor learning and paired output comparisons. |
 | Live predictor study | [predictor_lab_results.json](predictor_lab_results.json) | Aggregate trial records | Original project measurements | Settings, throughput, read attribution, cache bounds and exact-output checks. Contains no generated answers, raw routing traces or learned weights. |
+| Joint prefill | [joint_prefill_results.json](joint_prefill_results.json) | Aggregate timing records | Original project measurements | Split versus joint system-prefix prefill with unchanged final logits in MXFP4 and IQ2. |
 
 The GSM8K file includes reference reasoning and answers. HumanEval includes
 reference implementations and tests. Prompt selection passes only questions

@@ -149,7 +149,9 @@ earlier turns, whose rows the session holds, are not encoded again. For the
 DeepSeek Harness, the model's entry needs `image` among its inputs
 (`input: [text, image]`).
 
-Requests run in arrival order. A new request is prefilled while the ones
+Requests run in queue order. The Rust server converts and tokenizes a request
+before enqueueing it, so a short request can enter first even if another HTTP
+body arrived earlier. A new request is prefilled while the ones
 decoding wait, and then up to `--batch` requests decode together, a token
 each per step; each is computed exactly as it would be alone, so a greedy
 request's text does not depend on what else runs. With the GGUF experts and
@@ -158,6 +160,12 @@ one in all (each row reads its own experts, and the SSD binds; see
 [Performance](performance.md#concurrent-requests)). A request that
 repeats a conversation's last prompt (a retry) continues from that prompt's
 saved state and logits, so a greedy retry gives the same text.
+
+Each request's system, user, tool and context messages form one prompt. The
+server saves the system prefix during that prompt's prefill, without a
+second pass at the first user turn. Prompts longer than 16,384 new tokens
+still use bounded chunks. Separate requests keep separate attention states.
+
 
 While no request runs, the server keeps its experts in memory, so the next
 request finds them as the last one left them. Every second it checks memory
@@ -173,8 +181,13 @@ the others like any program's memory, which is why the server gives slots
 back as soon as the kernel compresses anything while the free memory is
 below the reserve.
 
-The log on stderr has a line per event: each request's arrival, its prompt
-tokens and how many it reused, the prefill's speed and expert reads, the
+The log on stderr has a line per event: each HTTP request's arrival, its body
+size, message and tool counts, queue admission, and waiting-request count.
+Prefill logs show new and reused tokens, actual chunk count, saved prefix, speed and expert reads.
+Queue admission also reports requests taken together for subsequent prefills.
+`GET /v1/status` includes `last_prefill` with the
+last completed plan. These fields distinguish separate HTTP requests from
+chunks inside one prompt. The log also shows the
 decoding's progress every 10 s, and its end (tokens, speed, expert hits,
 SSD reads, KV sessions, memory), expert slots given back while idle, and
 refused or unauthorized requests. It never shows keys or conversation text.

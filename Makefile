@@ -14,6 +14,10 @@ build/prefill-state-check: tools/prefill_state_check.c $(SRC) $(MODEL_HEADERS) s
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Isrc -o $@ tools/prefill_state_check.c $(filter-out src/main.c src/model.c,$(SRC)) $(LDLIBS)
 
+build/prefill-prefix-check: tools/prefill_prefix_check.c $(SRC) $(MODEL_HEADERS) src/kernels.metal src/gguf_grids.metal src/gguf.metal src/vision.metal data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc -o $@ tools/prefill_prefix_check.c $(filter-out src/main.c src/model.c,$(SRC)) $(LDLIBS)
+
 build/attention-candidate-check: tools/attention_candidate_check.c $(SRC) $(MODEL_HEADERS) src/kernels.metal src/gguf_grids.metal src/gguf.metal src/vision.metal data/engram.bin data/unicode.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Isrc -o $@ tools/attention_candidate_check.c $(filter-out src/main.c src/model.c,$(SRC)) $(LDLIBS)

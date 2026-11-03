@@ -50,6 +50,8 @@ static Buf final_norm, cs_base, cs_comp;
 static Tensor embed_t;
 static Options opt;
 
+static ModelForwardInfo forward_info;
+
 #define MB 2048     // rows of a prompt batch
 #define TARGET 37   // the first of the layers whose attention input the draft reads
 // Rows a pass writes for rejected drafts (at most BLOCK, after the accepted
@@ -113,6 +115,7 @@ static int K_mm_fp8, K_mm_bf16, K_mv_fp8, K_mv_bf16, K_mvm_fp8, K_mvm_bf16, K_mv
 
 static uint64_t dense_bytes;
 static size_t rows_bytes(int l, int cap, int keys);
+static size_t saved_bytes(void);
 static int start_cap(void);
 static void base_state(void), reserve(int need, int keep), shrink(void);
 // One sequence's attention state (see the state section at the end). A
@@ -126,6 +129,14 @@ struct State {
   char *saved[2];  // the rows model_state_save copied
 };
 static State *active;  // the state the layers work on
+
+typedef struct {
+  int at, tap_first;
+  uint8_t captured[LAYERS];
+  char *ring[LAYERS], *cstate[LAYERS], *dring[DRAFTS], *history;
+} PrefixCapture;
+static PrefixCapture prefix_capture = {.at = -1};
+static Buf prefix_taps, prefix_drings[DRAFTS];
 
 // --experts: the 40 layers' routed experts from GGUF files in llama.cpp's
 // layout, all of a layer's experts' rows of w1, w3 and w2 in one tensor each
@@ -1360,8 +1371,9 @@ static void routed_batch(const Batch *b, int l, int ahead, int inflight, int app
 // ---- the draft's inputs ----
 
 // The attention input of layers TARGET to TARGET + 2 (the mean of the
-// streams) for the batch's rows among the request rows [end - keep, end),
-// into MAINH from its row 0.
+// streams), from max(batch start, end - keep) through the whole batch.
+// Prefill retains its request tail. Decoding passes end=keep=1 to anchor
+// storage at row zero while capturing every verification row.
 static void capture(const Batch *b, int l, int end, int keep) {
   int first = end - keep, r0 = b->row > first ? b->row : first, r1 = b->row + b->m;
   if (!opt.draft || l < TARGET || r1 <= r0) return;
@@ -1740,8 +1752,100 @@ static void step(const int *tokens, int m, int pos) {
 
 uint64_t model_dense_bytes(void) { return dense_bytes; }
 
+static int prefix_batch(const Batch *b, int l) {
+  return prefix_capture.at > b->pos && prefix_capture.at <= b->pos + b->m;
+}
+
+static void prefix_prepare(int at, int pos) {
+  prefix_capture = (PrefixCapture){.at = at};
+  if (at < 0) return;
+  prefix_capture.tap_first = at > WINDOW ? at - WINDOW : 0;
+  if (prefix_capture.tap_first < pos) prefix_capture.tap_first = pos;
+  if (!active->saved[1]) active->saved[1] = xmalloc(saved_bytes());
+  char *p = active->saved[1];
+  memset(p, 0, saved_bytes());
+  for (int l = 0; l < LAYERS; l++) {
+    prefix_capture.ring[l] = p, p += L[l].ring.size;
+    if (L[l].kv_source) prefix_capture.cstate[l] = p, p += L[l].cstate.size;
+  }
+  for (int d = 0; opt.draft && d < DRAFTS; d++) {
+    prefix_capture.dring[d] = p, p += D[d].ring.size;
+    if (!prefix_drings[d].obj) prefix_drings[d] = zeros(D[d].ring.size);
+    memcpy(prefix_drings[d].ptr, D[d].ring.ptr, D[d].ring.size);
+  }
+  prefix_capture.history = p;
+  if (opt.draft && !prefix_taps.obj)
+    prefix_taps = zeros((size_t)WINDOW * 3 * DIM * 4);
+}
+
+// The previous chunk's attention is already synchronized. Its expert work
+// may still run, but that work does not write these attention buffers.
+static void prefix_before(const Batch *b, int l) {
+  if (!prefix_batch(b, l)) return;
+  memcpy(prefix_capture.ring[l], L[l].ring.ptr, L[l].ring.size);
+  if (L[l].kv_source) memcpy(prefix_capture.cstate[l], L[l].cstate.ptr, L[l].cstate.size);
+}
+
+static void prefix_inputs(const Batch *b, int l) {
+  if (prefix_capture.at < 0 || !opt.draft || l < TARGET) return;
+  int first = b->pos > prefix_capture.tap_first ? b->pos : prefix_capture.tap_first;
+  int end = b->pos + b->m < prefix_capture.at ? b->pos + b->m : prefix_capture.at;
+  if (first >= end) return;
+  uint32_t part = l - TARGET;
+  gpu_kern(K_hc_mean);
+  gpu_buf(0, &HS, (size_t)(b->row + first - b->pos) * HC * DIM * 4);
+  gpu_buf(1, &prefix_taps, (size_t)(first - prefix_capture.tap_first) * 3 * DIM * 4);
+  gpu_bytes(2, &part, sizeof part);
+  gpu_go(DIM / 256, end - first, 1, 256, 1, 1);
+}
+
+static void prefix_after(const Batch *b, int l) {
+  if (!prefix_batch(b, l)) return;
+  int first = prefix_capture.at - RING;
+  if (first < b->pos) first = b->pos;
+  int base = b->pos >= WINDOW - 1 ? b->pos - (WINDOW - 1) : 0;
+  for (int p = first; p < prefix_capture.at; p++) {
+    const char *src = b->m == 1 ? (const char *)L[l].ring.ptr + (size_t)(p % RING) * HEAD_DIM * 2 :
+                                 (const char *)WIN.ptr + (size_t)(p - base) * HEAD_DIM * 2;
+    memcpy(prefix_capture.ring[l] + (size_t)(p % RING) * HEAD_DIM * 2, src, HEAD_DIM * 2);
+  }
+  if (L[l].kv_source && L[l].ratio == 2) {
+    first = prefix_capture.at - PENDING;
+    if (first < b->pos) first = b->pos;
+    size_t half = (size_t)PENDING * HEAD_DIM * 4;
+    for (int p = first; p < prefix_capture.at; p++) {
+      size_t dst = (size_t)(p % PENDING) * HEAD_DIM * 4;
+      size_t src = (size_t)(2 + p - b->pos) * HEAD_DIM * 4;
+      memcpy(prefix_capture.cstate[l] + dst, CK.ptr + src, HEAD_DIM * 4);
+      memcpy(prefix_capture.cstate[l] + half + dst, CS.ptr + src, HEAD_DIM * 4);
+    }
+  }
+  prefix_capture.captured[l] = 1;
+}
+
+static void prefix_complete(void) {
+  if (prefix_capture.at < 0) return;
+  for (int l = 0; l < LAYERS; l++)
+    if (!prefix_capture.captured[l])
+      die("prefix snapshot missed layer %d", l);
+  if (opt.draft) {
+    Buf original_taps = MAINH, original_rings[DRAFTS];
+    MAINH = prefix_taps;
+    for (int d = 0; d < DRAFTS; d++) original_rings[d] = D[d].ring, D[d].ring = prefix_drings[d];
+    draft_keys(prefix_capture.at - prefix_capture.tap_first, prefix_capture.tap_first);
+    for (int d = 0; d < DRAFTS; d++) {
+      memcpy(prefix_capture.dring[d], D[d].ring.ptr, D[d].ring.size);
+      D[d].ring = original_rings[d];
+    }
+    MAINH = original_taps;
+  }
+  forward_info.prefix_tokens = prefix_capture.at;
+  prefix_capture.at = -1;
+}
+
 static void prefill(const int *tokens, int n, int pos0) {
   if (pos0 + n > opt.ctx) die("context full (%d tokens)", opt.ctx);
+  forward_info.chunks++;
   cache_metrics_begin(PF_PREFILL, n);
   CacheStats c0 = cache_stats;
   prefill_n = n, prefill_layer = 0;
@@ -1749,7 +1853,10 @@ static void prefill(const int *tokens, int n, int pos0) {
   request_capacity(n);
   for (int i = 0; i < n; i++) ((uint8_t *)IMG.ptr)[i] = tokens[i] < 0;
   int64_t (*rows)[2][ENGRAM_ROWS] = xmalloc((size_t)n * sizeof *rows);
-  for (int i = 0; i < n; i++) engram_hash(tokens[i], pos0 + i, rows[i]);
+  for (int i = 0; i < n; i++) {
+    engram_hash(tokens[i], pos0 + i, rows[i]);
+    if (prefix_capture.at == pos0 + i + 1) memcpy(prefix_capture.history, history, sizeof history);
+  }
   Rows rr = {rows, n, {dispatch_group_create(), dispatch_group_create()}};
   for (int e = 0; e < 2; e++) dispatch_group_enter(rr.read[e]);
   dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &rr, read_rows);
@@ -1764,15 +1871,18 @@ static void prefill(const int *tokens, int n, int pos0) {
     if (l == 1 || l == 14) dispatch_group_wait(rr.read[l == 14], DISPATCH_TIME_FOREVER);
     for (int s = 0; s < n; s += MB) {
       Batch b = {n - s < MB ? n - s : MB, pos0 + s, s};
+      prefix_before(&b, l);
       gpu_begin();
       if (l == 1 || l == 14) engram(&b, l);
       capture(&b, l, n, n < WINDOW ? n : WINDOW);
+      prefix_inputs(&b, l);
       attention(&b, l);
       ffn_front(&b, l);
       shared_expert(b.m, &L[l]);
       gpu_commit();
       if (s == 0) cache_adapt_pass(l);  // layer l - 1's experts may still be in use
       gpu_sync();
+      prefix_after(&b, l);
 #ifdef MYDS4_PREDICT_PROBE
       probe_target(2, b.pos, l, b.m, tokens + s, b.row);
 #endif
@@ -1817,7 +1927,11 @@ static void prefill(const int *tokens, int n, int pos0) {
 // rows): a longer prompt runs as several passes, each reading the experts.
 #define CHUNK 16384
 
-const float *model_forward(const int *tokens, int n, int pos) {
+static const float *forward(const int *tokens, int n, int pos, int prefix_pos) {
+  if (n < 1 || pos < 0 || n > opt.ctx - pos) die("invalid forward range");
+  if (prefix_pos >= 0 && (prefix_pos <= pos || prefix_pos >= pos + n)) die("invalid prefix snapshot position");
+  forward_info = (ModelForwardInfo){.tokens = n};
+  prefix_prepare(prefix_pos, pos);
   for (int done = 0, k; done < n; done += k) {
     k = n - done < CHUNK ? n - done : CHUNK;
     if (k > 1 && opt.dump_fd < 0) {
@@ -1829,12 +1943,23 @@ const float *model_forward(const int *tokens, int n, int pos) {
       for (int i = done; i < done + k; i++) {
         step(tokens + i, 1, pos + i);
         if (opt.draft) draft_keys(1, pos + i);
+        forward_info.chunks++;
       }
     }
   }
+  prefix_complete();
   if (opt.dump_fd >= 0 && write(opt.dump_fd, logits.ptr, VOCAB * 4) < 0) die("dump failed");
   return (const float *)logits.ptr;
 }
+
+const float *model_forward(const int *tokens, int n, int pos) { return forward(tokens, n, pos, -1); }
+
+const float *model_forward_prefix(const int *tokens, int n, int pos, int prefix_pos) {
+  const float *lg = forward(tokens, n, pos, prefix_pos);
+  return lg;
+}
+
+ModelForwardInfo model_forward_info(void) { return forward_info; }
 
 // ---- the vision encoder (inference/vision.py ViT and Aligner) ----
 
