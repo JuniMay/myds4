@@ -6,6 +6,18 @@ LDLIBS = -framework Metal -framework Foundation -framework IOKit -framework Imag
 SRC = src/main.c src/model.c src/io.c src/gpu.c src/tok.c src/util.c src/chat.c src/serve.c src/vision.c src/tui.c src/online_predictor.c src/sample.c
 MODEL_HEADERS = src/myds4.h src/online_predictor_math.h
 
+build/prefill-schedule-check: tools/prefill_schedule_check.c src/engine.c src/engine.h $(SRC) $(MODEL_HEADERS) src/kernels.metal src/gguf_grids.metal src/gguf.metal src/vision.metal data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc -o $@ tools/prefill_schedule_check.c $(filter-out src/main.c src/serve.c,$(SRC)) $(LDLIBS)
+
+build/prefill-state-check: tools/prefill_state_check.c $(SRC) $(MODEL_HEADERS) src/kernels.metal src/gguf_grids.metal src/gguf.metal src/vision.metal data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc -o $@ tools/prefill_state_check.c $(filter-out src/main.c src/model.c,$(SRC)) $(LDLIBS)
+
+build/attention-candidate-check: tools/attention_candidate_check.c $(SRC) $(MODEL_HEADERS) src/kernels.metal src/gguf_grids.metal src/gguf.metal src/vision.metal data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc -o $@ tools/attention_candidate_check.c $(filter-out src/main.c src/model.c,$(SRC)) $(LDLIBS)
+
 # Retained research build: explicit feature ablations and real prefetch trials.
 build/myds4-predict-lab: $(SRC) src/predictor_lab.c src/predictor_lab.h $(MODEL_HEADERS) src/kernels.metal src/gguf_grids.metal src/gguf.metal src/vision.metal data/engram.bin data/unicode.bin
 	@mkdir -p build

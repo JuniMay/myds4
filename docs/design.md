@@ -1364,8 +1364,10 @@ another request may fork from it. The prompt's last token always runs, for its l
 is the session's saved prompt again: then the saved rows and the logits kept
 with them (0.5 MB) continue the request, so that a retry decodes exactly as
 the first try did; the prompt's last token in a decoding step would round
-differently from the prefill's. `--kv-cache` bounds the
-sessions' memory, which is apart from the expert cache's budget: before a
+differently from the prefill's. Reuse checks every token, including the last,
+and restores the saved window even if a short reply leaves the current
+window within rewind range. `--kv-cache` bounds the sessions' memory,
+which is apart from the expert cache's budget: before a
 request runs, the least recently used other sessions are freed until the
 chosen one fits with room for its prompt, and a request whose session alone
 does not fit is refused; a session that grew while decoding pushes others

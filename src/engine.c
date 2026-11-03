@@ -185,7 +185,7 @@ static Session *pick(const int *p, int n, int *from, const char **how) {
     Session *c = &sessions[i];
     if (!c->st) continue;
     int w, r = c->busy ? 0 : reusable(c, p, n, &w), k = common(p, n, c->ids, c->n);  // a busy one only forks
-    int f = c->base > 1 && k >= c->base ? c->base : 0;
+    int f = c->base > 1 && c->base < n && k >= c->base ? c->base : 0;
     if (r > *from) *from = r, saved = w, s = c, src = 0;
     if (f > *from) *from = f, src = c, s = 0;
   }
@@ -472,6 +472,8 @@ static int begin(Req *r, Gen *g) {
     return 0;
   }
   s->busy = 1;
+  int same_prompt = g->from == n - 1 && s->saved == n && s->n >= n && g->p[n - 1] == s->ids[n - 1];
+  if (same_prompt) g->from = n;
   int thinking = g->p[n - 1] == think_start;
   say("req %llu: %d prompt tokens, session %d (%s), %d reused; thinking %s; at most %ld new tokens, %s; waited %.1f s",
       (unsigned long long)r->id, n, s->number, how, g->from, thinking ? "on" : "off", g->max_new,
@@ -484,8 +486,9 @@ static int begin(Req *r, Gen *g) {
   if (encoded) say("req %llu: %d of %d images encoded in %.2f s", (unsigned long long)r->id, encoded, g->nims, now() - t0);
   CacheStats c0 = cache_stats;
   const float *lg;
-  if (g->from == n - 1 && s->saved == n && (!strcmp(how, "saved") || s->n == n)) {
-    lg = s->logits, g->from = n;  // the same prompt again: its state and logits as they were
+  if (same_prompt) {
+    model_state_restore(0);  // a short reply may have selected the current rewindable state
+    lg = s->logits;
     model_seek(g->p, n);
   } else {
     int z = 0, start = g->from;

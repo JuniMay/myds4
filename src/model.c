@@ -80,7 +80,7 @@ static Buf XB;
 // Per row of a batch.
 static Buf H1, MA, PART, X, XQ, QA, QR, QRQ, Q, O, OA, AO, KV, CK, CS, LAT, IK, QI, IW, SC, GL, RT, PR;
 // The index scores of up to sc_rows rows at once (SC), and each row's
-// candidate blocks (CAND, cand_words bits per row).
+// candidate blocks (CAND, cand_words 32-bit words per prompt row).
 static Buf CAND;
 static int sc_rows, cand_words;
 static Buf SHG, SHU, SHH, SHO, EROW, EC[2], ES[2], EX, EKV, MH, YK, TILES, PTOK, PW, TP, WIN, ETAB, logits;
@@ -264,6 +264,7 @@ static void request_capacity(int rows) {
   gpu_free(&HS), gpu_free(&MF), gpu_free(&SEL);
   HS = zeros((size_t)rows * HC * DIM * 4), MF = zeros((size_t)rows * MIX * 4);
   SEL = zeros((size_t)rows * (IDX_TOPK + 1) * 4);
+  gpu_free(&CAND), CAND = zeros((size_t)(rows > MB ? rows : MB) * cand_words * 4);
   gpu_free(&IMG), IMG = zeros((size_t)rows);
   for (int e = 0; e < 2; e++) {
     gpu_free(&EC[e]), gpu_free(&ES[e]);
@@ -425,6 +426,7 @@ void model_load(const char *dir, const Options *options) {
   fprintf(stderr, "\rloaded %.1f GiB of dense weights in %.1f s\n", dense_bytes / GiB, now() - t0);
 
   size_t m = MB, p = MB * TOPK;
+  cand_words = (ctx / 8 + 31) / 32 + 1;
   request_capacity(1);
   H1 = zeros(m * HC * DIM * 4), MA = zeros(m * MIX * 4), PART = zeros(m * 400 * 4);
   X = zeros(m * DIM * 4), XQ = zeros(m * DIM * 4), QA = zeros(m * QRANK * 4), QR = zeros(m * QRANK * 4);
@@ -434,8 +436,7 @@ void model_load(const char *dir, const Options *options) {
   IK = zeros(m * IDX_DIM * 4), QI = zeros(m * IDX_HEADS * IDX_DIM * 4), IW = zeros(m * IDX_HEADS * 4);
   sc_rows = (int)((256u << 20) / ((size_t)ctx * 4));  // 256 MB of scores
   sc_rows = sc_rows > (int)m ? (int)m : sc_rows < FEW ? FEW : sc_rows;
-  cand_words = (ctx / 8 + 31) / 32 + 1;
-  SC = zeros((size_t)sc_rows * ctx * 4), CAND = zeros(m * cand_words * 4);
+  SC = zeros((size_t)sc_rows * ctx * 4);
   GL = zeros(m * EXPERTS * 4), GP = zeros(m * EXPERTS * 4), RT = zeros(m * 16 * 4);
   PR = zeros(m * PREDICT * 4);
   SHG = zeros(m * INTER * 4), SHU = zeros(m * INTER * 4), SHH = zeros(m * INTER * 4), SHO = zeros(m * DIM * 4);
@@ -869,7 +870,9 @@ static void attend_rows(int l, int m, int pos, int r0, int srow) {
     for (int t0 = 0; t0 < m; t0 += sc_rows) {  // rows in tiles, as many as SC holds
       uint32_t rows = m - t0 < sc_rows ? m - t0 : sc_rows, seen = (pos + t0 + rows) / y->ratio;
       Index ix = {p32 + t0, (uint32_t)y->ratio, (uint32_t)opt.ctx, cand && l > CAND_LAYER ? cand_words : 0};
-      size_t cand_off = (size_t)(r0 + t0) * cand_words * 4;
+      // Layer 20 writes once; later indexers reuse the same prompt row,
+      // even when decoder compaction starts partway through a batch.
+      size_t cand_off = (size_t)(srow + t0) * cand_words * 4;
       gpu_kern(K_index_score);
       gpu_buf(0, &QI, (size_t)(r0 + t0) * IDX_HEADS * IDX_DIM * 4), gpu_buf(1, &IW, (size_t)(r0 + t0) * IDX_HEADS * 4);
       gpu_buf(2, &src->keys, 0), gpu_buf(3, cs, 0), gpu_buf(4, &SC, 0), gpu_bytes(5, &ix, sizeof ix);
@@ -909,7 +912,8 @@ static void attend_rows(int l, int m, int pos, int r0, int srow) {
     }
   }
   if (m > 1) {  // the batch's last positions become the ring
-    uint32_t keep = m < WINDOW ? m : WINDOW;
+    // Saved server states can rewind BLOCK positions before continuing.
+    uint32_t keep = m < RING ? m : RING;
     copy_rows(&WIN, 0, &y->ring, 0, (Copy){pos + m - keep, keep, base, mod, 0, RING}, K_copy_keys);
   }
   gpu_kern(K_attn_out);
