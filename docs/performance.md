@@ -2022,4 +2022,36 @@ The MXFP4 controls spent about 71 ms per emitted token waiting for expert
 reads, 0.4 ms encoding GPU work and 0.2 ms adapting the cache. Main-queue GPU
 execution averaged 33.5 ms per token and can overlap host waits; these
 numbers must not be summed as independent costs. Host encoding and cache
-maintenance are therefore small targets in this workload.
+maintenance are therefore small targets in this workload. The code audit
+also found that small DSpark verification batches share dense matrix weight
+loads across rows but execute routed experts separately for each row.
+The experimental shared-expert build now groups repeated row/expert pairs
+while preserving each row's accumulation order. Its checks and measurement
+method are described in [Design](design.md#experimental-sharing-across-expert-rows).
+[Experiment records](../data/benchmarks/expert_batch_results.json) distinguish
+synthetic kernel timings, real-model logit checks and long inference runs.
+Kernel timing improvements alone do not establish a model-throughput gain.
+
+The Rust engine already uses a user-interactive inference thread. Its token
+callback sends to a channel without waiting for network output. Those code
+paths do not support a hypothesis that lower worker priority or synchronous
+socket writes explain the CLI's read-bound result. Server throughput was
+not measured in this check.
+
+## Experimental expert-row sharing
+
+The retained build is `build/myds4-expert-batch`; the normal executable does
+not enable this path. On the 8,171-token repository-review request, with
+1,024 emitted tokens, two DSpark drafts, a fixed 20 GiB cache, a 4 GiB
+reserve, temperature/top-p 1 and seed 12345, MXFP4 controls took 187.36 and
+188.68 seconds. The shared-expert run took 186.25 seconds, about 0.9% less
+than the mean control. Main-queue GPU work fell from 35.98 to 31.37 seconds,
+12.8%, while expert-read waiting stayed near 154 seconds. Generated output
+matched exactly. This is one candidate run under recorded desktop load;
+it establishes a GPU-work reduction but not a general throughput guarantee.
+
+The kernel fixtures and all-row model checks are recorded in
+[expert_batch_results.json](../data/benchmarks/expert_batch_results.json).
+They distinguish synthetic kernel timings, real-model logit checks and
+emitted-token timing. See [Design](design.md#experimental-sharing-across-expert-rows)
+for supported formats, fallback behavior and resource limits.

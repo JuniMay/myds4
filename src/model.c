@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include "myds4.h"
+#include "expert_batch.h"
 #ifdef MYDS4_PREDICT_LAB
 #include "predictor_lab.h"
 #endif
@@ -114,6 +115,17 @@ static Buf ASC, AMAX, APART;
 // experts, then how many of them were missing), and the table of ready
 // experts they come from.
 static Buf RU, PARTS;  // PARTS: decoded rows' experts' down products, row r's at 8 DIM r, of expert e at 8 i + e
+#ifdef MYDS4_EXPERT_BATCH
+static Buf EROWS;
+static int K_moe_up_rows, K_moe_down_rows;
+static uint64_t expert_batch_calls, expert_batch_pairs, expert_batch_groups;
+static void report_expert_batch(void) {
+  fprintf(stderr, "{\"expert_batch\":{\"scope\":\"all small backbone batches\",\"calls\":%llu,"
+                  "\"row_expert_pairs\":%llu,\"weight_groups\":%llu}}\n",
+          (unsigned long long)expert_batch_calls, (unsigned long long)expert_batch_pairs,
+          (unsigned long long)expert_batch_groups);
+}
+#endif
 static const Buf *ready_tab;
 uint64_t spec_fixups;  // layers whose experts the CPU computed again
 
@@ -156,16 +168,21 @@ static Buf prefix_taps, prefix_drings[DRAFTS];
 // (ffn_gate_exps, ffn_up_exps, ffn_down_exps), in one of the codes of
 // gguf.metal; the DSpark stages keep the checkpoint's. gk: a layer's kernels
 // for its codes (gk[l].up 0: the checkpoint's MXFP4).
-static const struct { int type; uint32_t bytes; const char *k[4]; } gg_codes[] = {
-    {GG_Q2_K, 84, {"gg_up_q2_k", "gg_down_q2_k", "gg_up_m_q2_k", "gg_down_m_q2_k"}},
-    {GG_IQ2_XXS, 66, {"gg_up_iq2_xxs", "gg_down_iq2_xxs", "gg_up_m_iq2_xxs", "gg_down_m_iq2_xxs"}},
-    {GG_IQ2_XS, 74, {"gg_up_iq2_xs", "gg_down_iq2_xs", "gg_up_m_iq2_xs", "gg_down_m_iq2_xs"}},
-    {GG_IQ2_S, 82, {"gg_up_iq2_s", "gg_down_iq2_s", "gg_up_m_iq2_s", "gg_down_m_iq2_s"}},
-    {GG_IQ3_XXS, 98, {"gg_up_iq3_xxs", "gg_down_iq3_xxs", "gg_up_m_iq3_xxs", "gg_down_m_iq3_xxs"}},
-    {GG_IQ1_S, 50, {"gg_up_iq1_s", "gg_down_iq1_s", "gg_up_m_iq1_s", "gg_down_m_iq1_s"}},
+static const struct { int type; uint32_t bytes; const char *k[6]; } gg_codes[] = {
+    {GG_Q2_K, 84, {"gg_up_q2_k", "gg_down_q2_k", "gg_up_m_q2_k", "gg_down_m_q2_k", "gg_up_rows_q2_k", "gg_down_rows_q2_k"}},
+    {GG_IQ2_XXS, 66, {"gg_up_iq2_xxs", "gg_down_iq2_xxs", "gg_up_m_iq2_xxs", "gg_down_m_iq2_xxs", "gg_up_rows_iq2_xxs", "gg_down_rows_iq2_xxs"}},
+    {GG_IQ2_XS, 74, {"gg_up_iq2_xs", "gg_down_iq2_xs", "gg_up_m_iq2_xs", "gg_down_m_iq2_xs", "gg_up_rows_iq2_xs", "gg_down_rows_iq2_xs"}},
+    {GG_IQ2_S, 82, {"gg_up_iq2_s", "gg_down_iq2_s", "gg_up_m_iq2_s", "gg_down_m_iq2_s", "gg_up_rows_iq2_s", "gg_down_rows_iq2_s"}},
+    {GG_IQ3_XXS, 98, {"gg_up_iq3_xxs", "gg_down_iq3_xxs", "gg_up_m_iq3_xxs", "gg_down_m_iq3_xxs", "gg_up_rows_iq3_xxs", "gg_down_rows_iq3_xxs"}},
+    {GG_IQ1_S, 50, {"gg_up_iq1_s", "gg_down_iq1_s", "gg_up_m_iq1_s", "gg_down_m_iq1_s", "gg_up_rows_iq1_s", "gg_down_rows_iq1_s"}},
     {GG_IQ1_M, 56, {"gg_up_iq1_m", "gg_down_iq1_m", "gg_up_m_iq1_m", "gg_down_m_iq1_m"}}};
 enum { GG_CODES = sizeof gg_codes / sizeof gg_codes[0] };
-static struct { int up, down, up_m, down_m; } gk[LAYERS];
+static struct {
+  int up, down, up_m, down_m;
+#ifdef MYDS4_EXPERT_BATCH
+  int up_rows, down_rows;
+#endif
+} gk[LAYERS];
 static uint32_t expert_quant[LAYERS][3]; // 0 is native MXFP4; otherwise the GGUF type
 static Buf head_q6;  // the GGUF file's output head in Q6_K, if it has one: used instead of the checkpoint's
 static int K_gg_head1, K_gg_head6;
@@ -198,6 +215,10 @@ static void gguf_experts(const char *path) {
     expert_spans[l] = 3;
     gk[l].up = gpu_kernel(gg_codes[code[0]].k[0]), gk[l].down = gpu_kernel(gg_codes[code[2]].k[1]);
     gk[l].up_m = gpu_kernel(gg_codes[code[0]].k[2]), gk[l].down_m = gpu_kernel(gg_codes[code[2]].k[3]);
+#ifdef MYDS4_EXPERT_BATCH
+    if (gg_codes[code[0]].k[4] && gg_codes[code[2]].k[5])
+      gk[l].up_rows = gpu_kernel(gg_codes[code[0]].k[4]), gk[l].down_rows = gpu_kernel(gg_codes[code[2]].k[5]);
+#endif
   }
   Gguf h;
   if (gguf_get("output.weight", &h) && h.type == 14 && h.ne[0] == DIM && h.ne[1] == VOCAB) {  // Q6_K
@@ -388,6 +409,10 @@ void model_load(const char *dir, const Options *options) {
   K(mm_fp8), K(mm_bf16), K(mv_fp8), K(mv_bf16), K(mvm_fp8), K(mvm_bf16), K(mv_fp8_3), K(mv_bf16_3), K(mvm_fp8_3);
   K(mvm_bf16_3), K(moe_up), K(moe_down), K(moe_up_m), K(moe_down_m), K(gg_gather), K(act_quant_h);
   K(moe_combine), K(moe_parts), K(act_quant), K(embed), K(rmsnorm), K(hc_mix), K(hc_pre_norm), K(hc_post);
+#ifdef MYDS4_EXPERT_BATCH
+  K(moe_up_rows), K(moe_down_rows);
+  atexit(report_expert_batch);
+#endif
   K(swiglu), K(kv_window), K(compress), K(index_key), K(index_score), K(index_topk), K(attn_out);
   K(attend_scores), K(attend_values), K(attend_combine);
   K(route), K(engram_rows), K(engram_gate), K(copy_rows), K(copy_keys), K(attend_m), K(hc_mean), K(markov), K(argmax);
@@ -473,6 +498,9 @@ void model_load(const char *dir, const Options *options) {
   PTOK = zeros(p * 4), PW = zeros(p * 4), TP = zeros(p * 4), WIN = zeros((m + WINDOW) * HEAD_DIM * 2);
   ETAB = zeros((3 * LAYERS * FEW + DRAFTS * BLOCK) * 256), logits = zeros((size_t)(BLOCK + 1) * VOCAB * 4);
   RU = zeros(LAYERS * FEW * 8 * 4), PARTS = zeros(FEW * DIM * 8 * 4);
+#ifdef MYDS4_EXPERT_BATCH
+  EROWS = zeros(2 * LAYERS * FEW * TOPK * sizeof(ExpertRows));
+#endif
   XP = zeros(FEW * DIM * 4), PT = zeros(PREDICT * 4), PC = zeros(FEW * PREDICT * 4);
   ASC = zeros(HEADS * ATT_ROWS * 4), AMAX = zeros(ATT_CHUNKS * HEADS * 4), APART = zeros(ATT_CHUNKS * HEADS * 514 * 4);
   if (opt.draft) {
@@ -1041,7 +1069,6 @@ static void shared_expert(int m, const Layer *y) {
   linear(&y->sh2, m, &SHH, 0, INTER, &SHO, 0, DIM, 1);
 }
 
-typedef struct { uint64_t p[3]; float weight, pad; } ExpertRef;  // Expert and MoeTile in the kernels
 typedef struct { uint64_t p[3]; uint32_t start, count; } MoeTile;
 
 // --substitute D (off by default; it changes the output): a decoded or
@@ -1177,6 +1204,28 @@ static void experts_sum(int r, size_t mf, size_t hs) {
   gpu_go(DIM / 256, 1, 1, 256, 1, 1);
 }
 
+#ifdef MYDS4_EXPERT_BATCH
+// Each layer keeps distinct early/late descriptors until the GPU finishes.
+// A group shares weight loads, while PARTS retains each row's summation order.
+// Without repeated experts, the caller keeps the ordinary fused down kernel.
+static int experts_rows(int l, int m, size_t entries, int late) {
+  if (m < 2 || (gk[l].up && !gk[l].up_rows)) return 0;
+  size_t offset = (size_t)(2 * l + late) * FEW * TOPK * sizeof(ExpertRows);
+  ExpertRows *groups = (ExpertRows *)(EROWS.ptr + offset);
+  int ng = expert_batch_plan(groups, ETAB.ptr + entries, m, TOPK, 256), pairs = 0;
+  for (int g = 0; g < ng; g++) pairs += groups[g].count;
+  if (ng == pairs) return 0;
+  expert_batch_calls++, expert_batch_pairs += pairs, expert_batch_groups += ng;
+  gpu_kern(gk[l].up ? gk[l].up_rows : K_moe_up_rows);
+  gpu_buf(0, &EROWS, offset), gpu_buf(1, &XQ, 0), gpu_buf(2, &MH, 0);
+  gpu_go(INTER / 32, ng, 1, 256, 1, 1);
+  gpu_kern(gk[l].up ? gk[l].down_rows : K_moe_down_rows);
+  gpu_buf(0, &EROWS, offset), gpu_buf(1, &MH, 0), gpu_buf(2, &PARTS, 0);
+  gpu_go(DIM / 32, ng, 1, 256, 1, 1);
+  return 1;
+}
+#endif
+
 // --gpu-route: where in ETAB the resolve kernel writes row r's entries of
 // layer l, apart from the CPU's, so that a fix-up (fix_layer) writes its own
 // while the pass that reads these may still run.
@@ -1288,6 +1337,15 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
 #endif
   for (int i = 0; i < nn; i++) nready += ready[need[i]] = cache_ready(l, need[i]);
   int split = rest && nready > 0 && nready < nn;
+#ifdef MYDS4_EXPERT_BATCH
+  if (split && m > 1 && (!gk[l].up || gk[l].up_rows)) {
+    size_t eo = (size_t)l * FEW * 256;
+    for (int r = 0; r < m; r++) fill_entries(l, eo + r * 256, rt + r * 16, rw + r * 16 + 8, ready, 1);
+    if (!experts_rows(l, m, eo, 0))
+      for (int r = 0; r < m; r++)
+        experts_go(l, r, eo + r * 256, mf_off(b) + (size_t)r * MIX * 4, hs_off(b) + (size_t)r * HC * DIM * 4, 1);
+  } else
+#endif
   for (int r = 0; split && r < m; r++) {
     size_t eo = (size_t)(l * FEW + r) * 256;
     fill_entries(l, eo, rt + r * 16, rw + r * 16 + 8, ready, 1);
@@ -1297,6 +1355,19 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
   double t1 = now();
   cache_wait(l, need, nn);
   phase_s[3] += t1 - t0, phase_s[2] += now() - t1, phase_s[4] -= now() - t0;
+#ifdef MYDS4_EXPERT_BATCH
+  if (m > 1 && (!gk[l].up || gk[l].up_rows)) {
+    size_t eo = split ? late_entries(l, 0) : (size_t)l * FEW * 256;
+    for (int r = 0; r < m; r++) fill_entries(l, eo + r * 256, rt + r * 16, rw + r * 16 + 8, split ? ready : NULL, 0);
+    int grouped = experts_rows(l, m, eo, split);
+    for (int r = 0; r < m; r++) {
+      size_t mf = mf_off(b) + (size_t)r * MIX * 4, hs = hs_off(b) + (size_t)r * HC * DIM * 4;
+      if (!grouped) experts_go(l, r, eo + r * 256, mf, hs, split);
+      if (split || grouped) experts_sum(r, mf, hs);
+    }
+    return split;
+  }
+#endif
   for (int r = 0; r < m; r++) {
     size_t mf = mf_off(b) + (size_t)r * MIX * 4, hs = hs_off(b) + (size_t)r * HC * DIM * 4;
     if (!split) {

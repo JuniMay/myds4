@@ -7,6 +7,7 @@
 | `src/main.c` | Command line, chat template, sampling, statistics, `--check-prefill`, `--perplexity`. |
 | `src/sample.c` | Shared temperature/top-p sampling and DSpark prefix verification. |
 | `src/model.c` | Weights, request state, the forward pass for decoding and prefill, `--bench`. |
+| `src/expert_batch.h` | Row grouping and GPU descriptors for the experimental shared-expert kernels. |
 | `src/online_predictor.c`, `src/online_predictor_math.h` | Online CPU prefetch correction, owned forecast/label records, recursive least-squares updates and learner metrics. |
 | `src/kernels.metal` | The GPU kernels. |
 | `src/gguf.metal`, `src/gguf_grids.metal` | The kernels for routed experts in GGUF codes (`--experts`), and their codebook grids, generated from llama.cpp's `ggml-common.h` (MIT License). |
@@ -276,6 +277,76 @@ split of the work must keep the order of every sum, or the outputs change
 (see Numerics): each score's lanes and `simd_sum`, a chunk's probability
 sum as two halves of 32 rows, the values row by row, the chunks from the
 first.
+
+### Experimental sharing across expert rows
+
+`build/myds4-expert-batch` enables `MYDS4_EXPERT_BATCH` in the common model
+code. In batches of two to six rows, it groups up to three uses of the same
+resident expert. Each group shares weight loads and decoding while keeping
+an accumulator, routing weight and output position for each row. Fixed loop
+sizes let the compiler keep those accumulators in registers. The available
+paths cover MXFP4 and the Q2_K, IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S and IQ3_XXS
+codes used by the IQ2 expert build.
+
+Rows retain their scalar lane assignment, order of additions, BF16 rounding
+and FP8 activation quantization. Down products go into `PARTS`; the existing
+`moe_parts` kernel sums each row's experts in expert order and performs its
+hyper-connection expansion. A phase with no repeated expert uses the existing
+per-row kernels. The single-row path and unsupported expert formats also use
+those kernels.
+
+The CPU groups entries after routing and substitution have selected the
+experts. Ready experts run before the SSD wait; late experts run afterward.
+Each layer has separate descriptors for those phases, held until the GPU
+finishes the pass. The descriptor allocation is 180 KiB. This preserves the
+existing overlap of expert computation and reads. The SSD request path
+already requests the union of selected experts across rows; grouping targets
+GPU weight traffic and decoding work.
+
+The experimental executable prints aggregate `expert_batch` counters on
+exit: grouped calls, row/expert pairs and weight groups. These describe
+issued kernel work. They do not measure physical GPU memory traffic, SSD
+traffic, cache hits or emitted-token speed.
+
+The retained checks are:
+
+| Target or tool | Scope |
+| --- | --- |
+| `build/expert-batch-check` | Synthetic GPU comparison against the scalar kernels, including all one-to-six-row sizes, three sharing patterns and whole/split/empty-first read phases. `--check-only` omits timing; `--format` selects a supported code. |
+| `build/expert-batch-model-check` | Experimental engine: compare all six verification rows' logits with sequential decoding from the same saved state. Arguments are the checkpoint directory and, optionally, the expert GGUF file. |
+| `build/expert-batch-model-control` | The same all-row check with the ordinary engine. |
+| `tools/expert_batch_bench.py` | Serial ordinary/grouped comparisons with identical prompts, sampling, draft settings and cache budgets. It checks output identity, actual cache bounds and that the candidate issued grouped work. |
+
+The GPU checks take the same model lock as inference. The benchmark runner
+also checks device activity, other compute processes, AC power and memory;
+it interrupts only its own child when interference appears. Source excerpts
+form long repository-review traces. The runner counts the complete chat
+template and stops excerpts before image-marker literals. It keeps prompts
+and generated answers in memory, and can save bounded aggregate results.
+Generated code is not executed. These workloads measure inference on
+agentic-style histories; they do not measure autonomous task completion.
+Before loading, the runner requires the requested expert-cache budget,
+14 GiB for weights and working buffers, and the explicit engine reserve to
+be free. The reserve defaults to 10 GiB; `--reserve` sets it for every
+comparison arm and for the guard. The native memory-pressure policy remains
+active, and a run with cache shrinkage or new compression/swap is rejected.
+The all-row model check requests a 20 GiB cache and a 4 GiB reserve; it
+compares logits and makes no throughput claim.
+The default timing admission limit is 20% device activity. Explicit
+`--desktop` comparisons record ordinary desktop GPU activity without treating
+its aggregate utilization as another model job. Process exclusion and the model
+lock still apply. The runner records device/renderer activity during the
+run. This does not establish exclusive GPU use; desktop-load
+timings must be reported with that limitation and the repeat-control range.
+In this desktop mode, Python jobs and known compiler/build tools are
+logged as background CPU work when the driver exposes GPU-client
+ownership and neither they nor their descendants own a GPU client. During
+inference the model's own GPU client must also be visible for that exception
+to apply. GPU clients, named model/probe jobs and the model lock
+still block a run; memory bounds, cache shrinkage and new compression/swap
+remain grounds to reject a comparison. CPU work does not need a separate
+reservation. The default quiet mode retains the broader Python-job
+exclusion. Background-helper observations are retained with the result.
 
 ### Reading experts ahead
 

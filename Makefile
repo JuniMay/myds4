@@ -4,7 +4,7 @@ CFLAGS = -std=c23 -O2 -Wall -Wextra -Wno-unused-parameter $(shell pkg-config --c
 LDLIBS = -framework Metal -framework Foundation -framework IOKit -framework ImageIO -framework CoreGraphics -framework Accelerate -lobjc \
          $(shell pkg-config --libs yyjson libjpeg)
 SRC = src/main.c src/model.c src/io.c src/gpu.c src/tok.c src/util.c src/chat.c src/serve.c src/vision.c src/tui.c src/online_predictor.c src/sample.c
-MODEL_HEADERS = src/myds4.h src/online_predictor_math.h
+MODEL_HEADERS = src/myds4.h src/online_predictor_math.h src/expert_batch.h
 
 build/prefill-schedule-check: tools/prefill_schedule_check.c src/engine.c src/engine.h $(SRC) $(MODEL_HEADERS) src/kernels.metal src/gguf_grids.metal src/gguf.metal src/vision.metal data/engram.bin data/unicode.bin
 	@mkdir -p build
@@ -21,6 +21,22 @@ build/prefill-prefix-check: tools/prefill_prefix_check.c $(SRC) $(MODEL_HEADERS)
 build/attention-candidate-check: tools/attention_candidate_check.c $(SRC) $(MODEL_HEADERS) src/kernels.metal src/gguf_grids.metal src/gguf.metal src/vision.metal data/engram.bin data/unicode.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Isrc -o $@ tools/attention_candidate_check.c $(filter-out src/main.c src/model.c,$(SRC)) $(LDLIBS)
+
+build/expert-batch-check: tools/expert_batch_check.c src/gpu.c src/util.c src/myds4.h src/expert_batch.h src/kernels.metal src/gguf_grids.metal src/gguf.metal
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc -o $@ tools/expert_batch_check.c src/gpu.c src/util.c $(LDLIBS)
+
+build/myds4-expert-batch: $(SRC) $(MODEL_HEADERS) src/kernels.metal src/gguf_grids.metal src/gguf.metal src/vision.metal data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_EXPERT_BATCH -o $@ $(SRC) $(LDLIBS)
+
+build/expert-batch-model-check: tools/expert_batch_model_check.c $(SRC) $(MODEL_HEADERS) src/kernels.metal src/gguf_grids.metal src/gguf.metal src/vision.metal data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc -DMYDS4_EXPERT_BATCH -o $@ tools/expert_batch_model_check.c $(filter-out src/main.c,$(SRC)) $(LDLIBS)
+
+build/expert-batch-model-control: tools/expert_batch_model_check.c $(SRC) $(MODEL_HEADERS) src/kernels.metal src/gguf_grids.metal src/gguf.metal src/vision.metal data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc -o $@ tools/expert_batch_model_check.c $(filter-out src/main.c,$(SRC)) $(LDLIBS)
 
 # Retained research build: explicit feature ablations and real prefetch trials.
 build/myds4-predict-lab: $(SRC) src/predictor_lab.c src/predictor_lab.h $(MODEL_HEADERS) src/kernels.metal src/gguf_grids.metal src/gguf.metal src/vision.metal data/engram.bin data/unicode.bin
