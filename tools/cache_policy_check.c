@@ -63,7 +63,44 @@ static void rejected(const char *name, void (*operation)(void)) {
   expect(name, WIFEXITED(status) && WEXITSTATUS(status) != 0);
 }
 
+// A reader has started the cheapest victim's last piece, but routing has
+// demoted its prefetch. Optional work must leave it alone rather than wait
+// for that read or evict a more valuable resident. Demand can wait and reuse it.
+static void *complete_read(void *group) {
+  usleep(100000);
+  dispatch_group_leave(group);
+  return NULL;
+}
+
+static void busy_victim(int optional, int prefill) {
+  setup(10, 0);
+  pass_layer = prefill ? 1 : -1;
+  slots[0].loading = dispatch_group_create();
+  slots[0].npiece = 1;
+  atomic_store(&slots[0].taken[0], 1);
+  dispatch_group_enter(slots[0].loading);
+  pthread_t reader;
+  if (pthread_create(&reader, NULL, complete_read, slots[0].loading)) die("cannot start fixture reader");
+  double began = now();
+  int got = take(2, 0, optional);
+  double elapsed = now() - began;
+  pthread_join(reader, NULL);
+  fprintf(stderr, "cache policy: %s %s with busy victim: slot %d, %.3f ms\n",
+          prefill ? "prefill" : "decode", optional ? "prefetch" : "demand", got, elapsed * 1000);
+  if (optional) {
+    expect("prefetch declines a victim still being read", got == -1);
+    expect("declined prefetch preserves all residents", where[0][0] == 0 && where[0][1] == 1 &&
+           where[0][2] == 2 && where[2][0] == -1 && cache_stats.evictions == 0);
+    finish(0);
+    expect("prefetch can use the same victim once its read ends", take(2, 0, 1) == 0);
+  } else {
+    expect("demand still waits for and reuses the cheapest victim", got == 0 && !slots[0].loading &&
+           where[0][0] == -1 && where[2][0] == 0 && cache_stats.evictions == 1);
+  }
+}
+
 int main(void) {
+  alarm(20);
   setup(0, 0);
   expect("zero selects default half-life", retention_half_life == 50);
   expect("default ratio retains original constant", retention_growth == exp2(1.0 / 50));
@@ -148,6 +185,9 @@ int main(void) {
   expect("overflow guard rescales resident history", near(escore[0], old / scale));
   expect("overflow guard rescales ghost history", near(escore[3], 7 / scale));
   expect("resident and historical scores stay consistent", score[where[0][0]] == escore[0]);
+  busy_victim(1, 0);
+  busy_victim(1, 1);
+  busy_victim(0, 0);
   for (int i = 0; i < max_slots; i++) finish(i);
   fprintf(stderr, "cache policy: %d/%d checks passed\n", checks - failures, checks);
   return failures != 0;

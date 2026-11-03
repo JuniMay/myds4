@@ -11,6 +11,7 @@ static dispatch_queue_t deferred;
 
 static int checks, failures;
 static Slot fixture;
+static double fixture_score;
 
 static void expect(const char *name, int ok) {
   checks++;
@@ -25,7 +26,12 @@ static void setup(int fd) {
   fixture.expert = 0;
   fixture.b.ptr = calloc(1, 65536);
   fixture.b.size = 65536;
-  slots = &fixture;
+  fixture.mapped = 1;
+  fixture.prev = fixture.next = -1;
+  slots = &fixture, score = &fixture_score;
+  head = tail = 0, weight = 1;
+  memset(where, 0xff, sizeof where);
+  where[0][0] = 0;
   expert_spans[0] = 1;
   expert_span[0][0][0] = (FileSpan){fd, 0, 16384};
   qhead = qtail = 0;
@@ -71,6 +77,20 @@ int main(void) {
   setup(fd);
   start(0, 1);
   expect("demand reads do not consume prefetch admissions", atomic_load(&prefetching) == 0);
+  teardown();
+
+  setup(fd);
+  start(0, 0);
+  fixture.prefetched = 1;
+  cache_demote(0); // Not selected in its predicted pass; it is still queued.
+  int wanted = 0;
+  expect("demotion leaves the prefetch pending", !fixture.prefetched && slot_reading(0));
+  int reading = cache_request(0, &wanted, 1);
+  expect("demand sees a demoted read still pending", reading == 1);
+  expect("demand promotes every queued piece of a demoted prefetch",
+         atomic_load(&demand) == 1 && atomic_load(&fixture.taken[0]) == 1);
+  // Reap even on the unfixed implementation, whose request left it queued.
+  if (!atomic_load(&demand)) claim(0);
   teardown();
 
   dispatch_release(deferred);

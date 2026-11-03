@@ -312,6 +312,14 @@ with at most 4 pieces (8 MiB). A demand request for an expert still being
 prefetched reads its pieces that no reader has started at once, and an
 evicted slot's queued pieces are dropped.
 
+Routing removes prefetch protection from unused experts of that layer even
+when their reads are still pending. A later demand promotes their remaining
+queued pieces to demand priority. If an optional prefetch's chosen victim is
+still being read, the cache declines that admission. It leaves the victim
+and the higher-scoring residents in place. A demand may wait for its victim's
+read to finish before reusing the buffer.
+
+
 ### Online CPU predictor
 
 The normal engine links the online predictor and Accelerate for single-thread

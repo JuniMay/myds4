@@ -1016,9 +1016,12 @@ int cache_request(int layer, const int *experts, int n) {
     if (i >= 0) {
       if (!slots[i].pinned) unlink_slot(i), push_front(i), map_slot(i);
       pending = slot_reading(i);
+      // A forecast can outlive its predicted pass and lose its protection.
+      // Any later demand must promote its queued pieces, protected or not.
+      if (pending) claim(i);
       if (slots[i].prefetched) {
         cache_stats.prefetch_hits++;
-        if (pending) claim(i), cache_stats.late++;
+        if (pending) cache_stats.late++;
       } else {
         cache_stats.hits++;
       }

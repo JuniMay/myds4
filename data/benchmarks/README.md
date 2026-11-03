@@ -16,6 +16,7 @@ time, file sizes and row counts.
 | Long scheduler specification | [long_scheduler.txt](long_scheduler.txt) | 1 prompt | Original project fixture; no downloaded content | Unscored generation for long-response timing, predictor learning and paired output comparisons. |
 | Live predictor study | [predictor_lab_results.json](predictor_lab_results.json) | Aggregate trial records | Original project measurements | Settings, throughput, read attribution, cache bounds and exact-output checks. Contains no generated answers, raw routing traces or learned weights. |
 | Joint prefill and server CED | [joint_prefill_results.json](joint_prefill_results.json) | Aggregate timing records | Original project measurements | Split versus joint system-prefix prefill and production CED depths, including the five-row rewind margin. Final logits match for split/joint CED-off runs. A documented metadata correction preserves the originally emitted diagnostic-only flags. |
+| Pending-read scheduling | [runtime_overhead_results.json](runtime_overhead_results.json) | Aggregate trial records | Original project measurements | Regression behavior and bounded timing records; no general speedup established. |
 
 The GSM8K file includes reference reasoning and answers. HumanEval includes
 reference implementations and tests. Prompt selection passes only questions

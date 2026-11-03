@@ -1966,3 +1966,60 @@ candidate masks are retained per prompt row across attention batches.
 The prefill state check also covers all 133 retained local rows, including
 the server's five-row rewind margin. These are implementation checks, not
 task-quality scores.
+
+## Pending expert reads
+
+Two CPU regressions exercise reads that remain pending after routing removes
+their prefetch protection. They use memory-backed fixtures, without a model
+or SSD traffic:
+
+| Check | Reproduced behavior | Checked behavior |
+| --- | --- | --- |
+| Optional admission into a full cache | A new prefetch waited about 105 ms for the chosen victim's simulated 100 ms read; 39/44 cache-policy checks passed. | The admission declines immediately and preserves every resident. Demand can still wait and reuse the same victim. All 44 checks pass. |
+| Demand for a demoted prefetch | The requested expert's queued pieces kept background priority; 13/14 admission checks passed. | Demand claims those pieces even after prefetch protection has ended. All 14 checks pass. |
+
+Neither change alters expert selection, weights or arithmetic. Readiness can
+still change which experts approximate substitution serves; the exact-path
+comparisons below leave substitution disabled. These regressions establish
+scheduling behavior, not a throughput improvement.
+
+The live checks on 2026-11-01/02 used DeepSeek-V4.1-Flash-1017, a fixed 36 GiB expert cache,
+the 1,229-token scheduler fixture, 256 emitted tokens, temperature 1, top-p 1,
+seed 12,345, thinking effort 75 and an 8,192-token context capacity. It used
+native prefetching, with the online learner, DSpark, GPU routing and
+substitution disabled. The runner required three quiet GPU samples and
+checked for other compute processes, compression and swap throughout each
+run. All completed runs held their requested cache; none compressed or
+swapped pages. This guard is not an exclusive reservation of the GPU.
+
+| Experts | Baseline decode seconds | With both scheduling changes | Generated output |
+| --- | --- | --- | --- |
+| MXFP4 | 26.68 and 26.69 (9.59 tokens/s) | 26.86 and 26.80 (9.53 and 9.55 tokens/s) | Identical within format |
+| UD-IQ2_XXS | 13.12 (19.51 tokens/s) | 13.00 (19.69 tokens/s) | Identical within format |
+
+These results establish no scheduling speedup. MXFP4 was slightly slower;
+IQ2's single comparison was 0.9% faster. Main-queue GPU time and renderer
+activity varied between runs. The two MXFP4 controls preceded the
+candidates; there was no interleaved unfixed control afterward. The IQ2
+candidate completed in a quiet window after three earlier attempts did not
+launch because GPU activity remained above the 20% admission threshold. The
+[structured records](../data/benchmarks/runtime_overhead_results.json) retain
+the settings, completed measurements, output comparisons and refused attempts.
+
+A capacity check then changed only the fixed engine's MXFP4 cache budget
+from 36 to 40 GiB. It held 2,275 backbone slots (39.99 GiB), versus 2,048,
+with the default 10 GiB reserve and no compression or swap. Decode took
+25.05 seconds (10.22 tokens/s), about 7% faster than the preceding fixed
+36 GiB run. Logical expert reads fell from 309.85 to 286.07 GB, and read wait
+fell from 18.46 to 16.78 seconds. Generated text was identical. This is one
+capacity comparison, not evidence of a scheduling-fix gain. The larger
+cache also remapped 32 experts per emitted token for the GPU, while the
+36 GiB runs remapped none; host cache adaptation still averaged only
+0.2 ms/token. A larger CPU cache does not imply that every slot stays mapped
+for the GPU.
+
+The MXFP4 controls spent about 71 ms per emitted token waiting for expert
+reads, 0.4 ms encoding GPU work and 0.2 ms adapting the cache. Main-queue GPU
+execution averaged 33.5 ms per token and can overlap host waits; these
+numbers must not be summed as independent costs. Host encoding and cache
+maintenance are therefore small targets in this workload.
