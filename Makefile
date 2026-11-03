@@ -6,6 +6,15 @@ LDLIBS = -framework Metal -framework Foundation -framework IOKit -framework Imag
 SRC = src/main.c src/model.c src/io.c src/gpu.c src/tok.c src/util.c src/chat.c src/serve.c src/vision.c src/tui.c src/online_predictor.c src/sample.c
 MODEL_HEADERS = src/myds4.h src/online_predictor_math.h src/expert_batch.h
 
+# CED numerical and prefill/DSpark timing checks.
+build/ced-check: tools/ced_check.c $(SRC) $(MODEL_HEADERS) src/kernels.metal src/gguf_grids.metal src/gguf.metal src/vision.metal data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc -o $@ tools/ced_check.c $(filter-out src/main.c src/model.c,$(SRC)) $(LDLIBS)
+
+build/dspark-state-check: tools/dspark_state_check.c $(SRC) $(MODEL_HEADERS) src/kernels.metal src/gguf_grids.metal src/gguf.metal src/vision.metal data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc -o $@ tools/dspark_state_check.c $(filter-out src/main.c src/model.c,$(SRC)) $(LDLIBS)
+
 build/prefill-schedule-check: tools/prefill_schedule_check.c src/engine.c src/engine.h $(SRC) $(MODEL_HEADERS) src/kernels.metal src/gguf_grids.metal src/gguf.metal src/vision.metal data/engram.bin data/unicode.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Isrc -o $@ tools/prefill_schedule_check.c $(filter-out src/main.c src/serve.c,$(SRC)) $(LDLIBS)
@@ -26,6 +35,7 @@ build/expert-batch-check: tools/expert_batch_check.c src/gpu.c src/util.c src/my
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Isrc -o $@ tools/expert_batch_check.c src/gpu.c src/util.c $(LDLIBS)
 
+# Experimental exact sharing of resident expert weights across verification rows.
 build/myds4-expert-batch: $(SRC) $(MODEL_HEADERS) src/kernels.metal src/gguf_grids.metal src/gguf.metal src/vision.metal data/engram.bin data/unicode.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -DMYDS4_EXPERT_BATCH -o $@ $(SRC) $(LDLIBS)

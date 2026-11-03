@@ -15,9 +15,22 @@ time, file sizes and row counts.
 | Local conversation diagnostics | Built by `context_cases()` | 2 templates | Original project fixtures; no downloaded content | Exact JSON answer after a history of job-state changes or a code review with revised requirements. |
 | Long scheduler specification | [long_scheduler.txt](long_scheduler.txt) | 1 prompt | Original project fixture; no downloaded content | Unscored generation for long-response timing, predictor learning and paired output comparisons. |
 | Live predictor study | [predictor_lab_results.json](predictor_lab_results.json) | Aggregate trial records | Original project measurements | Settings, throughput, read attribution, cache bounds and exact-output checks. Contains no generated answers, raw routing traces or learned weights. |
-| Joint prefill and server CED | [joint_prefill_results.json](joint_prefill_results.json) | Aggregate timing records | Original project measurements | Split versus joint system-prefix prefill and production CED depths, including the five-row rewind margin. Final logits match for split/joint CED-off runs. A documented metadata correction preserves the originally emitted diagnostic-only flags. |
 | Pending-read scheduling | [runtime_overhead_results.json](runtime_overhead_results.json) | Aggregate trial records | Original project measurements | Regression behavior and bounded timing records; no general speedup established. |
 | Expert-row sharing study | [expert_batch_results.json](expert_batch_results.json) | Aggregate trial records | Original project measurements | Numerical checks, synthetic kernel timings and matched long repository-review runs. Generated code is not executed. |
+| Decoder replay study | [ced_results.json](ced_results.json) | Aggregate numerical record | Original project measurements | Full prefill versus decoder SWA masks on a reconstructed Harness request. Contains cache/logit statistics, not private prompts, generated text or task-accuracy scores. |
+| CED and proposal measurement archive | [ced_speed_results.json](ced_speed_results.json) | Aggregate checks and timing records | Original project measurements | Compact-versus-mask validation, verification recovery without DSpark, and matched model timings on reconstructed Harness requests. |
+| Larger-cache measurement archive | [ced_cache56_results.json](ced_cache56_results.json) | Aggregate checks and timing records | Original project measurements | Fixed 56 GiB comparisons with literal copying and repeated-pattern rules. |
+| Online RNN measurement archive | [online_draft_results.json](online_draft_results.json) | Aggregate checks and timing records | Original project measurements | A small CPU RNN trained on the current prompt and verified tokens, with exact target-model verification. |
+| Larger RNN and DSpark measurement archive | [online_draft_large_results.json](online_draft_large_results.json) | Aggregate checks and timing records | Original project measurements | A 128-unit online RNN and two-token DSpark compared with matched plain decoding at 56 GiB. |
+| IQ2 decoder replay numerics | [ced_iq2_results.json](ced_iq2_results.json) | Aggregate numerical record | Original project measurements | Local KV and fixed-prefix probability changes from decoder replay in the mixed IQ2_XXS model. |
+| Second-request CED comparison | [ced_extended_results.json](ced_extended_results.json) | Aggregate checks and timing records | Original project measurements | Cold prefill and generation with CED off, 128-token replay and 512-token replay on another real Harness request. |
+| Joint prefill and server CED | [joint_prefill_results.json](joint_prefill_results.json) | Aggregate timing records | Original project measurements | Split versus joint system-prefix prefill and production CED depths, including the five-row rewind margin. Final logits match for split/joint CED-off runs. A documented metadata correction preserves the originally emitted diagnostic-only flags. |
+| DSpark window-state consistency | [dspark_state_results.json](dspark_state_results.json) | Aggregate model checks | Original project measurements | One through six accepted rows compared with sequential DSpark windows, in MXFP4 and IQ2. |
+
+These JSON records preserve measured results and their limitations. Archived
+records can name experimental proposal modes that are absent from the current
+CLI. The retained tools and their available modes are described in
+[Design](../../docs/design.md#ced-and-dspark-study-tools).
 
 The GSM8K file includes reference reasoning and answers. HumanEval includes
 reference implementations and tests. Prompt selection passes only questions

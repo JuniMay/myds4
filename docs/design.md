@@ -348,6 +348,44 @@ remain grounds to reject a comparison. CPU work does not need a separate
 reservation. The default quiet mode retains the broader Python-job
 exclusion. Background-helper observations are retained with the result.
 
+### CED and DSpark study tools
+
+Build with `make build/ced-check build/dspark-state-check`. The CED tool
+accepts `CHECKPOINT PROMPT_FILE|-`, using stdin for `-`. `--request` reads a
+text-only Chat Completions request; `--chat` takes rendered prompt text.
+Inputs are bounded below 16,384 tokens and remain in memory.
+
+The default numerical mode compares full prefill with decoder local-window
+masks over the same continuation tokens, with temperature/top-p 1 and seed
+12345. It reports local KV error, global KV/index equality, router overlap,
+logit and probability differences, and sample agreement. `--steps N` sets
+1–64 continuation positions. `--compare-compact N` checks compact execution
+against the corresponding full-shape mask; it does not assert equality to
+full prefill.
+
+`--bench N` measures prefill and up to N generated tokens; zero times only
+prefill. `--prefill-plan split|joint` compares system-prefix scheduling.
+`--ced off|N` uses production replay, including its five-row rewind margin.
+The diagnostic `--compact --keep N` instead retains exactly N decoder rows.
+`--dspark N` enables 1–5 native drafts, 32 expert slots per stage and trimming.
+`--cache GIB`, `--reserve GIB` and `--experts GGUF` choose cache bounds and
+expert format. Sampling verification uses the main model's requested draws.
+
+`tools/ced_bench.py` reconstructs an append-only, text-only Harness request
+from a supplied session path and event cutoff, using Python 3.14 or later.
+Recorded tool calls are data and are never executed. It checks the recorded
+input-token count, GPU ownership, memory and actual cache bounds, then runs
+serial controls and candidates. Phases are `validate`, `prefill`,
+`joint-prefill`, `ced-generation` and `dspark`; `all` runs numerical checks
+and cold-prefill comparisons. Candidate timings require matching validation
+where applicable. Output and diagnostics stay in RAM; aggregate reports are
+bounded to 512 KiB and contain no private prompts or generated text.
+
+`build/dspark-state-check CHECKPOINT [EXPERT_GGUF]` compares all three draft
+windows after one through six accepted verification rows with sequential
+execution of those same tokens. Its retained MXFP4 and IQ2 results matched
+bit-for-bit. This checks state handling, not acceptance rate or task quality.
+
 ### Reading experts ahead
 
 Three predictions name a layer's experts before its routing does, each
@@ -875,6 +913,32 @@ for each of five rows. Every currently requested expert is protected before
 choosing a victim, and the previous GPU use of that stage's buffers finishes
 before a slot is reused. Bounded pools fetch the native draft selections
 even when backbone substitution is enabled.
+
+Rejected rows need no undo: the rows they write in the window rings and the
+compressor rows are never read by later positions (hence the ring of 133
+and the 8 compressor rows), compressed and index rows are rewritten before
+use, the Engram history is rebuilt from the kept tokens, and the draft's
+windows receive the kept positions only.
+
+With exact expert routing, verification uses the main model's requested
+sampling distribution. Cache settings change which experts must be read; trimming changes
+which unused final-stage outputs are computed. Neither changes the routing
+rule. With backbone substitution, output depends on cache state and timing.
+Validation and measured performance are recorded in
+[Performance](performance.md#speculative-decoding). Prompts of up to six
+tokens use the same row kernels in prefill.
+
+The checkpoint's additional DSpark weights contain about 14.23 billion
+parameters: 13.59 billion routed-expert parameters and 0.636 billion other
+parameters. Their stored size is 7.39 GiB, including 6.72 GiB of routed
+experts and 0.66 GiB of other tensors. These counts exclude the backbone's
+shared embedding and output head and count both FP4 values in each packed
+byte. A 32-slot pool per stage reserves about 1.68 GiB of expert payload;
+alignment and buffers add overhead. Without `--draft`, the loader skips
+DSpark-specific weights and buffers, and the expert-cache budget serves the
+backbone. Draft length controls proposal count; every enabled length loads
+all three DSpark stages. The draft experts remain native MXFP4 even when
+the backbone uses GGUF experts.
 
 Rejected rows need no undo: the rows they write in the window rings and the
 compressor rows are never read by later positions (hence the ring of 133
@@ -1459,6 +1523,32 @@ prefix does not overwrite the current request's draft state. The compressed
 rows and index keys of earlier
 positions are never rewritten, so a saved slot and the state's later rows
 together give the state at the saved position.
+
+The storage rate follows the three ratio-2 KV sources and one ratio-1
+source: `(3/2 + 1) * (512 + 128) * 2 = 3200` bytes per input token,
+apart from rounding and guard rows. The values already obey the model's
+FP4 quantization for global KV/index keys and FP8 for local windows;
+BF16 holds those quantized values exactly. This format is the same for
+MXFP4 and GGUF expert weights and for full or compact CED prefill.
+
+DeepSeek's packed global layout instead needs 288 bytes per 512-value
+main-KV group (256 code bytes and 32 E4M3 scales) and 68 bytes per
+128-value index-key group (64 code bytes and four UE8M0 scales). The
+amortized logical payload is therefore 890 bytes per input token. The
+official DeepInfer index layout separates block-wide data and scale arrays;
+padding depends on block alignment, rather than a universal 72-byte index
+record. At 1,048,576 positions, packed logical global payload is about
+0.869 GiB; this engine's BF16 global payload is 3.125 GiB, before rings and
+saved-state allowances. These are layout calculations, not measured process
+RSS. Model weights, expert buffers, positional tables and attention scratch
+space are additional memory.
+
+Packed KV storage is not implemented in this engine. Storing the existing
+codes and scales could preserve its quantized values while reducing global
+state memory by about 3.6x; load/dequantization kernels and state handling
+would need numerical and performance validation. See
+[FlashMLA's format](https://github.com/deepseek-ai/FlashMLA/blob/main/csrc/cuda_kernels/kv_cache_format.h)
+and [DeepInfer's cache layouts](https://github.com/deepseek-ai/DeepInfer/blob/main/deepinfer/model_executor/layers/tilelang_ops/cache_common.py).
 
 A request runs only the tokens a session does not hold:
 

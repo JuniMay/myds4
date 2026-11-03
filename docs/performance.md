@@ -2055,3 +2055,168 @@ The kernel fixtures and all-row model checks are recorded in
 They distinguish synthetic kernel timings, real-model logit checks and
 emitted-token timing. See [Design](design.md#experimental-sharing-across-expert-rows)
 for supported formats, fallback behavior and resource limits.
+
+## Decoder replay numerical comparison
+
+The `build/ced-check` diagnostic compared full prefill with decoder SWA
+bounded attention on one reconstructed DeepSeek Harness request. The
+request contained 13,772 tokens, seven messages, a tool schema and a real
+tool-result round. Its token count matched the recorded full input count.
+The stored session retained message content and settings, rather than an
+original wire payload or token array, so this is a reconstructed request.
+Private prompt text and generated tokens were not saved in the repository.
+
+The model was DeepSeek-V4.1-Flash-1017
+(`deepseek-ai/DeepSeek-V4.1-Flash-1017`), using native MXFP4 experts and a
+20 GiB expert cache. DSpark, substitution and the learned predictor were
+off. The native expert prefetcher remained active. The original thinking
+effort was max (100). Evaluation sampling used temperature 1, top-p 1 and
+seed 12345. The reference supplied 16 continuation tokens; every comparison
+consumed those same tokens. Thus probability differences were measured on
+identical prefixes, without divergent sampled text changing the input.
+
+The diagnostic retained full tensor shapes and computation and applied a
+local-attention lower bound to decoder layers 20 through 39. It did not
+implement row removal or measure optimized CED prefill speed. A full-window
+repeat was bit-identical in the compared caches, routes and all 2,068,480
+continuation logits. Encoder local KV, global KV and index keys remained
+bit-identical for every shorter replay.
+
+| Retained decoder tokens | Decoder-local KV SNR | Relative KV RMS error | Mean probability TV | Maximum probability TV | Same-draw sampled tokens matching |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 8.61 dB | 37.12% | 1.055% | 5.962% | 16/16 |
+| 256 | 15.80 dB | 16.21% | 1.083% | 6.208% | 16/16 |
+| 512 | 20.54 dB | 9.40% | 0.482% | 2.193% | 16/16 |
+| 1,024 | 23.94 dB | 6.35% | 0.538% | 1.745% | 16/16 |
+
+KV statistics compare the last 128 live positions across the 20 decoder
+layers. SNR is `10 log10(sum(reference^2) / sum(error^2))`; relative RMS
+error is `sqrt(sum(error^2) / sum(reference^2))`. Total variation (TV) is
+half the sum of absolute differences between next-token probabilities at
+temperature 1. It measures probability redistribution, not answer accuracy.
+The mean and maximum cover the 16 fixed-prefix continuation positions.
+At replay length 256, the most likely token differed at one position,
+although sampling with the reference random draws still selected the same
+tokens at all positions. The other replay lengths matched all 16 argmaxes.
+
+The fraction of changed expert selections over the final 128 prompt rows
+in decoder layers was 22.01%, 9.40%, 5.33% and 3.50% respectively. These are
+the exact routers applied to the changed hidden states, without expert
+substitution. Smaller cache error did not imply monotonically smaller
+next-token probability differences in this sample.
+
+The combined study completed in 174.7 seconds with no detected competing
+model job, compression or swap. Its elapsed time includes all full-shape
+comparison passes and is not a CED throughput result. The result covers one
+text-only request, one seed and 16 continuation positions; it establishes
+neither general task-quality equivalence nor long-session behavior. Aggregate
+MXFP4 measurements are in [ced_results.json](../data/benchmarks/ced_results.json).
+
+The corresponding mixed-IQ2_XXS numerical study used the same reconstructed
+request and 16 fixed-prefix continuation positions, with a 56 GiB expert
+cache. Full-window repetition, encoder local KV, global KV and index keys
+were bit-identical in the comparisons. Its shorter replay results were:
+
+| Retained decoder tokens | Decoder-local KV SNR | Mean probability TV | Maximum probability TV | Same-draw samples matching |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 8.68 dB | 2.587% | 9.235% | 15/16 |
+| 256 | 14.14 dB | 1.697% | 4.720% | 15/16 |
+| 512 | 20.26 dB | 1.213% | 4.163% | 15/16 |
+| 1,024 | 24.28 dB | 1.232% | 3.118% | 15/16 |
+
+All 16 most-likely tokens matched in these IQ2 comparisons, but each shorter
+replay changed one same-draw sampled token. This is measured numerical
+sensitivity relative to the IQ2 baseline, not a task-accuracy difference or
+a comparison of IQ2 quality with MXFP4. Records are in
+[ced_iq2_results.json](../data/benchmarks/ced_iq2_results.json).
+
+## Additional CED measurements
+
+The retained study runner is `tools/ced_bench.py`, using `build/ced-check`.
+It reconstructs real Harness requests in memory, runs numerical checks and
+then measures cold prefill and generation in separate model processes.
+The checkpoint is `deepseek-ai/DeepSeek-V4.1-Flash-1017`. IQ2 comparisons
+replace its routed experts with the UD-IQ2_XXS shards from
+`unsloth/DeepSeek-V4.1-Flash-1017-GGUF`; dense weights and KV formats retain
+the base checkpoint's quantization behavior.
+Temperature and top-p are 1, the sampling seed is 12345, and thinking effort
+is max (100). Expert substitution and the learned expert predictor are off;
+native expert prefetching remains active. The CED measurements use no DSpark weights. Each candidate is bracketed by ordinary controls at the same
+expert-cache budget. Figures below use the mean control elapsed time.
+Desktop graphics activity was recorded, not isolated. These short comparisons
+do not measure autonomous task completion or long-session steady state.
+The records' `valid` field means execution and resource checks passed;
+it is not a task-quality equivalence score. Approximate CED generation can
+have `valid: true` and `output_matches_full_prefill: false`.
+
+Compact CED retains full computation through layer 20 and processes only
+the retained suffix in layers 21–39. Both replay lengths matched the
+corresponding full-shape attention mask bit-for-bit in the checked caches,
+routes and 16 continuation positions, in MXFP4 and mixed IQ2_XXS. This
+validates the optimization against its approximate mask, not against full
+prefill. The numerical differences from full prefill are reported above.
+
+Cold prefill on the 13,772-token Harness request:
+
+| Expert format | Cache | Full prefill, mean | 128-token CED | Speed ratio | 512-token CED | Speed ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| MXFP4 | 20 GiB | 28.60 s | 18.47 s | 1.55x | 22.21 s | 1.29x |
+| IQ2_XXS mixed | 20 GiB | 25.38 s | 16.14 s | 1.57x | 18.19 s | 1.40x |
+| MXFP4 | 56 GiB | 28.23 s | 19.40 s | 1.46x | 22.19 s | 1.27x |
+| IQ2_XXS mixed | 56 GiB | 25.65 s | 16.27 s | 1.58x | 18.34 s | 1.40x |
+
+At 20 GiB, MXFP4 requested expert reads fell from 289.28 GB to 192.82 GB
+with 128-token replay and 234.84 GB with 512-token replay. At 56 GiB they
+were 195.02 and 239.29 GB respectively. These are aligned application read
+counts. Prefill timing excludes model loading, tokenization and network
+delivery. Those timings cover cold, text-only inputs within one chunk.
+The separate integration checks cover prefix reuse, image requests and
+the chunk boundary; see [Server checks](server.md#requests).
+
+### Second request and generation after CED
+
+A second reconstructed Harness request had 13,587 input tokens. At a fixed
+56 GiB cache, both formats again passed compact-versus-mask checks before
+timing. Dedicated cold-prefill measurements were:
+
+| Expert format | Full prefill, mean (range) | 128-token CED | Speed ratio | 512-token CED | Speed ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| MXFP4 | 26.06 s (25.79–26.33) | 18.04 s | 1.44x | 21.34 s | 1.22x |
+| IQ2_XXS mixed | 23.91 s (23.76–24.06) | 15.34 s | 1.56x | 17.48 s | 1.37x |
+
+A separate generation series compared CED-off controls and the two replay
+lengths on this second request. Generation stopped at EOS or 256 tokens.
+Every CED completion differed from the full-prefill completion. Observed
+decoding throughput therefore describes different sampled trajectories:
+
+| Expert format | CED off, tokens/s (output length) | CED 128 | CED 512 |
+| --- | ---: | ---: | ---: |
+| MXFP4 | 10.07–10.12 (182) | 9.09 (151) | 9.89 (180) |
+| IQ2_XXS mixed | 19.25–19.50 (236) | 18.65 (212) | 19.42 (238) |
+
+CED changes prefill execution and its resulting local KV state; the normal
+decode layer loop still runs all 40 layers. This series shows no consistent
+decode-throughput benefit. It does not score the changed completions' task
+quality. Prefill times in this generation series also had wider control
+ranges (MXFP4 23.96–30.90 s; IQ2 24.65–28.59 s); all runs are retained, and
+the dedicated prefill table above must not be treated as the prefill timing
+of these generation runs. See
+[ced_extended_results.json](../data/benchmarks/ced_extended_results.json).
+
+The MXFP4 decode difference tracks expert I/O, with essentially unchanged
+main-queue GPU time per emitted token:
+
+| Per emitted token | CED off, control mean | CED 128 | CED 512 |
+| --- | ---: | ---: | ---: |
+| Main-queue GPU time | 33.54 ms | 33.68 ms | 33.51 ms |
+| Requested expert reads | 1.053 GB | 1.218 GB | 1.092 GB |
+| Expert-read waiting | 59.10 ms | 70.34 ms | 61.92 ms |
+
+GPU execution and CPU waits overlap, so their times must not be added as
+independent costs. CED's attention clipping is disabled after prefill. Its
+approximate initial KV state, the resulting different sampled tokens and
+the different experts left resident by prefill can all affect subsequent
+routing and I/O. These aggregate measurements do not separate those effects
+and do not establish an intrinsic decoding penalty from CED. A controlled
+continuation replay would remove token-stream differences; routing and cache
+residency would still need separate accounting.
