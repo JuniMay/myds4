@@ -50,7 +50,20 @@ static Buf final_norm, cs_base, cs_comp;
 static Tensor embed_t;
 static Options opt;
 
+static uint32_t ced_first;
+static int ced_active, ced_compact;
 static ModelForwardInfo forward_info;
+static uint32_t ced_lower(int layer, uint32_t pos) {
+  return ced_active && layer >= 20 && pos >= ced_first ? ced_first : 0;
+}
+
+#ifdef MYDS4_CED_CHECK
+// The research tool selects a full-shape decoder SWA mask or compact execution.
+// The retained tool owns these settings and observes routing after GPU completion.
+static uint32_t ced_check_first;
+static int ced_check_layer = 20, ced_check_compact;
+static void ced_check_routes(int layer, int row, int rows, const int *routes);
+#endif
 
 #define MB 2048     // rows of a prompt batch
 #define TARGET 37   // the first of the layers whose attention input the draft reads
@@ -131,7 +144,7 @@ struct State {
 static State *active;  // the state the layers work on
 
 typedef struct {
-  int at, tap_first;
+  int at, encoder_only, tap_first;
   uint8_t captured[LAYERS];
   char *ring[LAYERS], *cstate[LAYERS], *dring[DRAFTS], *history;
 } PrefixCapture;
@@ -351,12 +364,14 @@ void model_save_predictor(void) {
 }
 
 void model_load(const char *dir, const Options *options) {
+  if (options->ced && options->dump_fd >= 0) die("per-layer dumps require --ced off");
 #ifdef MYDS4_PREDICT_PROBE
   if (predict_probe_enabled() && options->gpu_route)
     die("prediction probe capture does not support --gpu-route; use regular decoding");
 #endif
   lock_model();
   opt = *options;
+  if (opt.ced && (opt.ced < WINDOW || opt.ced > 1 << 20)) die("--ced takes off or 128 to 1048576 replay tokens");
   if (opt.predictor_state) opt.online_predictor = 64;
   if (opt.online_predictor && opt.online_predictor != 64) die("online predictor requires rank 64");
   static const char source[] = {
@@ -904,14 +919,19 @@ static void attend_rows(int l, int m, int pos, int r0, int srow) {
   if (m <= FEW) {  // one row (decoding) or a few (a verify pass), each as decoding runs it
     for (int r = 0; r < m; r++) {
       Att ar = {{p32 + r, base, mod}, 0, visible > 0};
+      ar.first = ced_lower(l, p32 + r);
       attend_one(&Q, q + (size_t)r * HEADS * HEAD_DIM * 4, win, y->ratio ? &src->comp : win, &SEL,
                  sel_off + (size_t)r * (IDX_TOPK + 1) * 4, &y->sink, cs, 0, &O, q + (size_t)r * HEADS * HEAD_DIM * 4, &ar);
     }
   } else {  // many rows: on the matrix units, 32 heads per threadgroup, QB_ROWS rows at a time
-    for (int r = 0; r < m; r += QB_ROWS) {
+    for (int r = 0; r < m;) {
       uint32_t rows = m - r < QB_ROWS ? m - r : QB_ROWS, p = p32 + r;
       size_t qr = q + (size_t)r * HEADS * HEAD_DIM * 4;
       Att ar = {{p, base, mod}, 0, visible > 0};
+      // Prefix queries stay unchanged. Retained queries cannot read them.
+      // Split at the boundary so first never exceeds a dispatched query position.
+      if (ced_active && l >= 20 && p < ced_first && p + rows > ced_first) rows = ced_first - p;
+      ar.first = ced_lower(l, p);
       gpu_kern(K_q_rope);
       gpu_buf(0, &Q, qr), gpu_buf(1, cs, 0), gpu_buf(2, &XB, 0), gpu_bytes(3, &p, 4);
       gpu_go(HEADS * HEAD_DIM / 256, rows, 1, 256, 1, 1);
@@ -920,6 +940,7 @@ static void attend_rows(int l, int m, int pos, int r0, int srow) {
       gpu_buf(3, &SEL, sel_off + (size_t)r * (IDX_TOPK + 1) * 4), gpu_buf(4, &y->sink, 0), gpu_buf(5, &O, qr);
       gpu_bytes(6, &ar, sizeof ar);
       gpu_go(HEADS / 32, rows, 1, 256, 1, 1);
+      r += rows;
     }
   }
   if (m > 1) {  // the batch's last positions become the ring
@@ -1317,7 +1338,13 @@ static void routed_batch(const Batch *b, int l, int ahead, int inflight, int app
   cache_request(l, need, nn);
   cache_demote(l);
   if (full_ahead(m)) read_ahead(l, m, (const int *)PR.ptr);
-  else read_ahead_rows(m, l, (const int *)PR.ptr, ahead, inflight);
+  else {
+    int skip = 0;
+    // At the boundary, discarded rows cannot justify reads for the next layer.
+    if (ced_active && ced_compact && l + 1 > 20 && ced_first > (uint32_t)b->pos)
+      skip = ced_first - b->pos < (uint32_t)m ? (int)ced_first - b->pos : m;
+    if (skip < m) read_ahead_rows(m - skip, l, (const int *)PR.ptr + skip * PREDICT, ahead, inflight);
+  }
   double t1 = now();
   cache_wait(l, need, nn);
   phase_s[3] += t1 - t0, phase_s[2] += now() - t1, phase_s[4] -= now() - t0;
@@ -1753,12 +1780,14 @@ static void step(const int *tokens, int m, int pos) {
 uint64_t model_dense_bytes(void) { return dense_bytes; }
 
 static int prefix_batch(const Batch *b, int l) {
-  return prefix_capture.at > b->pos && prefix_capture.at <= b->pos + b->m;
+  return prefix_capture.at > b->pos && prefix_capture.at <= b->pos + b->m &&
+         (!prefix_capture.encoder_only || l <= 20);
 }
 
 static void prefix_prepare(int at, int pos) {
   prefix_capture = (PrefixCapture){.at = at};
   if (at < 0) return;
+  prefix_capture.encoder_only = ced_compact && ced_first > 0;
   prefix_capture.tap_first = at > WINDOW ? at - WINDOW : 0;
   if (prefix_capture.tap_first < pos) prefix_capture.tap_first = pos;
   if (!active->saved[1]) active->saved[1] = xmalloc(saved_bytes());
@@ -1770,11 +1799,13 @@ static void prefix_prepare(int at, int pos) {
   }
   for (int d = 0; opt.draft && d < DRAFTS; d++) {
     prefix_capture.dring[d] = p, p += D[d].ring.size;
-    if (!prefix_drings[d].obj) prefix_drings[d] = zeros(D[d].ring.size);
-    memcpy(prefix_drings[d].ptr, D[d].ring.ptr, D[d].ring.size);
+    if (!prefix_capture.encoder_only) {
+      if (!prefix_drings[d].obj) prefix_drings[d] = zeros(D[d].ring.size);
+      memcpy(prefix_drings[d].ptr, D[d].ring.ptr, D[d].ring.size);
+    }
   }
   prefix_capture.history = p;
-  if (opt.draft && !prefix_taps.obj)
+  if (opt.draft && !prefix_capture.encoder_only && !prefix_taps.obj)
     prefix_taps = zeros((size_t)WINDOW * 3 * DIM * 4);
 }
 
@@ -1787,7 +1818,7 @@ static void prefix_before(const Batch *b, int l) {
 }
 
 static void prefix_inputs(const Batch *b, int l) {
-  if (prefix_capture.at < 0 || !opt.draft || l < TARGET) return;
+  if (prefix_capture.at < 0 || prefix_capture.encoder_only || !opt.draft || l < TARGET) return;
   int first = b->pos > prefix_capture.tap_first ? b->pos : prefix_capture.tap_first;
   int end = b->pos + b->m < prefix_capture.at ? b->pos + b->m : prefix_capture.at;
   if (first >= end) return;
@@ -1826,9 +1857,9 @@ static void prefix_after(const Batch *b, int l) {
 static void prefix_complete(void) {
   if (prefix_capture.at < 0) return;
   for (int l = 0; l < LAYERS; l++)
-    if (!prefix_capture.captured[l])
+    if ((!prefix_capture.encoder_only || l <= 20) && !prefix_capture.captured[l])
       die("prefix snapshot missed layer %d", l);
-  if (opt.draft) {
+  if (opt.draft && !prefix_capture.encoder_only) {
     Buf original_taps = MAINH, original_rings[DRAFTS];
     MAINH = prefix_taps;
     for (int d = 0; d < DRAFTS; d++) original_rings[d] = D[d].ring, D[d].ring = prefix_drings[d];
@@ -1840,12 +1871,20 @@ static void prefix_complete(void) {
     MAINH = original_taps;
   }
   forward_info.prefix_tokens = prefix_capture.at;
+  forward_info.prefix_encoder_only = prefix_capture.encoder_only;
   prefix_capture.at = -1;
+}
+
+static int decoder_begin(int n, int pos) {
+  if (!ced_compact || ced_first <= (uint32_t)pos) return 0;
+  return ced_first - pos < (uint32_t)n ? (int)ced_first - pos : n;
 }
 
 static void prefill(const int *tokens, int n, int pos0) {
   if (pos0 + n > opt.ctx) die("context full (%d tokens)", opt.ctx);
-  forward_info.chunks++;
+  ced_active = ced_first != 0;
+  int retained = n - decoder_begin(n, pos0);
+  forward_info.chunks++, forward_info.decoder_tokens += retained;
   cache_metrics_begin(PF_PREFILL, n);
   CacheStats c0 = cache_stats;
   prefill_n = n, prefill_layer = 0;
@@ -1869,26 +1908,38 @@ static void prefill(const int *tokens, int n, int pos0) {
   for (int l = 0; l < LAYERS; l++) {
     cache_pass(l);
     if (l == 1 || l == 14) dispatch_group_wait(rr.read[l == 14], DISPATCH_TIME_FOREVER);
-    for (int s = 0; s < n; s += MB) {
+    int begin = 0, next_rows = n;
+    if (ced_compact) {
+      int first = decoder_begin(n, pos0);
+      if (first && all_logits) die("compact prefill cannot return logits for discarded rows");
+      // Layer 20 produces full-context global KV; later layers only consume it.
+      if (l > 20) begin = first;
+      if (l + 1 > 20) next_rows = n - first;
+    }
+    for (int s = begin; s < n; s += MB) {
       Batch b = {n - s < MB ? n - s : MB, pos0 + s, s};
       prefix_before(&b, l);
       gpu_begin();
       if (l == 1 || l == 14) engram(&b, l);
-      capture(&b, l, n, n < WINDOW ? n : WINDOW);
+      capture(&b, l, n, retained < WINDOW ? retained : WINDOW);
       prefix_inputs(&b, l);
       attention(&b, l);
       ffn_front(&b, l);
       shared_expert(b.m, &L[l]);
       gpu_commit();
-      if (s == 0) cache_adapt_pass(l);  // layer l - 1's experts may still be in use
+      if (s == begin) cache_adapt_pass(l);  // layer l - 1's experts may still be in use
       gpu_sync();
       prefix_after(&b, l);
+#ifdef MYDS4_CED_CHECK
+      ced_check_routes(l, pos0 + s, b.m, (const int *)RT.ptr);
+#endif
 #ifdef MYDS4_PREDICT_PROBE
       probe_target(2, b.pos, l, b.m, tokens + s, b.row);
 #endif
 
       gpu_begin();
-      routed_batch(&b, l, opt.substitute > 0 ? SUB_KEEP : n > 2 * MB ? EXPERTS : 8, 2 * EXPERTS, opt.substitute > 0);
+      routed_batch(&b, l, opt.substitute > 0 ? SUB_KEEP : next_rows > 2 * MB ? EXPERTS : 8,
+                   2 * EXPERTS, opt.substitute > 0);
       gpu_commit();
     }
     if (!opt.quiet) fprintf(stderr, "\rprefill: layer %d/%d", l + 1, LAYERS);
@@ -1896,10 +1947,12 @@ static void prefill(const int *tokens, int n, int pos0) {
   }
   cache_pass(-1);
   if (!opt.quiet) fprintf(stderr, "\r                         \r");
-  gpu_begin();
-  hc_pre_norm(1, &HS, (size_t)(n - 1) * HC * DIM * 4, &MF, (size_t)(n - 1) * MIX * 4, &final_norm);
-  head_out(1, &logits);
-  gpu_commit();
+  if (retained) {
+    gpu_begin();
+    hc_pre_norm(1, &HS, (size_t)(n - 1) * HC * DIM * 4, &MF, (size_t)(n - 1) * MIX * 4, &final_norm);
+    head_out(1, &logits);
+    gpu_commit();
+  }
   gpu_sync();
   if (all_logits) {  // every row's logits, for checks
     for (int r = 0; r < n; r++) {
@@ -1915,11 +1968,15 @@ static void prefill(const int *tokens, int n, int pos0) {
   for (int e = 0; e < 2; e++) dispatch_release(rr.read[e]);
   free(rows);
   memset(IMG.ptr, 0, (size_t)n);  // decoding's rows are text
-  if (opt.draft) draft_keys(n < WINDOW ? n : WINDOW, pos0 + n - (n < WINDOW ? n : WINDOW));
+  if (opt.draft && retained) {
+    int keep = retained < WINDOW ? retained : WINDOW;
+    draft_keys(keep, pos0 + n - keep);
+  }
   cache_adapt();
   stats_add(&prefill_stats, &c0);
   prefill_rows += n, prefill_layer = prefill_n = 0;
   cache_metrics_end();
+  ced_active = 0;
 }
 
 
@@ -1930,7 +1987,13 @@ static void prefill(const int *tokens, int n, int pos0) {
 static const float *forward(const int *tokens, int n, int pos, int prefix_pos) {
   if (n < 1 || pos < 0 || n > opt.ctx - pos) die("invalid forward range");
   if (prefix_pos >= 0 && (prefix_pos <= pos || prefix_pos >= pos + n)) die("invalid prefix snapshot position");
-  forward_info = (ModelForwardInfo){.tokens = n};
+  ced_first = 0, ced_compact = 0, ced_active = 0;
+  if (opt.ced && n > opt.ced + BLOCK) ced_first = pos + n - (opt.ced + BLOCK), ced_compact = 1;
+#ifdef MYDS4_CED_CHECK
+  if (!opt.ced) ced_first = ced_check_first, ced_compact = ced_check_compact;
+#endif
+  forward_info = (ModelForwardInfo){.tokens = n, .ced_tokens = opt.ced,
+                                   .ced_applied = ced_compact && ced_first > (uint32_t)pos};
   prefix_prepare(prefix_pos, pos);
   for (int done = 0, k; done < n; done += k) {
     k = n - done < CHUNK ? n - done : CHUNK;
@@ -1943,7 +2006,7 @@ static const float *forward(const int *tokens, int n, int pos, int prefix_pos) {
       for (int i = done; i < done + k; i++) {
         step(tokens + i, 1, pos + i);
         if (opt.draft) draft_keys(1, pos + i);
-        forward_info.chunks++;
+        forward_info.chunks++, forward_info.decoder_tokens++;
       }
     }
   }
@@ -1954,8 +2017,9 @@ static const float *forward(const int *tokens, int n, int pos, int prefix_pos) {
 
 const float *model_forward(const int *tokens, int n, int pos) { return forward(tokens, n, pos, -1); }
 
-const float *model_forward_prefix(const int *tokens, int n, int pos, int prefix_pos) {
+const float *model_forward_prefix(const int *tokens, int n, int pos, int prefix_pos, int *encoder_only) {
   const float *lg = forward(tokens, n, pos, prefix_pos);
+  if (encoder_only) *encoder_only = forward_info.prefix_encoder_only;
   return lg;
 }
 

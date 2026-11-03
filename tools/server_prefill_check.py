@@ -1,0 +1,152 @@
+"""Bounded HTTP checks of joint prefill, queue logs, CED and prefix reuse.
+
+One owned model process runs at a time. Requests, replies and logs stay in RAM.
+This checks serving behavior, not task quality or throughput.
+"""
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import socket
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
+
+from online_predictor_server_check import image_data_url, stop
+from predictor_lab import ROOT, memory_snapshot, process_snapshot, wait_for_gpu
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--checkpoint", type=Path, required=True)
+    ap.add_argument("--binary", type=Path, default=ROOT / "build/myds4-server")
+    ap.add_argument("--experts", type=Path)
+    ap.add_argument("--ced", choices=("off", "128", "512"), default="off")
+    ap.add_argument("--draft", action="store_true")
+    ap.add_argument("--image", action="store_true")
+    args = ap.parse_args()
+    baseline = wait_for_gpu(20, 20, 4, desktop=True)["samples"][-1]["memory"]
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    key = secrets.token_hex(24)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MYDS4_")}
+    env.update(MYDS4_API_KEY=key, MYDS4_LOCK=str(ROOT / "build/myds4.lock"))
+    cmd = [str(args.binary.resolve()), "-m", str(args.checkpoint), "--serve", str(port),
+           "--ctx", "4096", "--cache", "20", "--reserve", "4", "--kv-cache", "1", "--batch", "1",
+           "--ced", args.ced, "--temperature", "1", "--top-p", "1", "--seed", "12345", "--think", "0"]
+    if args.experts:
+        cmd += ["--experts", str(args.experts)]
+    if args.draft:
+        cmd += ["--draft", "2", "--draft-cache", "32", "--draft-trim"]
+    process = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    lines = deque(maxlen=512)
+    halted, failures = threading.Event(), []
+
+    def drain(stream):
+        total = 0
+        for line in stream:
+            total += len(line)
+            if total > 2 << 20:
+                failures.append("diagnostic output exceeded 2 MiB")
+                stop(process)
+                break
+            lines.append(line.rstrip())
+
+    def monitor():
+        while not halted.wait(2) and process.poll() is None:
+            try:
+                mem = memory_snapshot()
+                foreign = process_snapshot(child=process.pid, preflight=False, allow_cpu_helpers=True)
+                if not foreign and mem["compressions"] <= baseline["compressions"] and mem["swapouts"] <= baseline["swapouts"]:
+                    continue
+                failures.append("another compute job or memory compression appeared")
+            except Exception as error:
+                failures.append(type(error).__name__)
+            stop(process)
+            return
+
+    drains = [threading.Thread(target=drain, args=(s,), daemon=True) for s in (process.stdout, process.stderr)]
+    watcher = threading.Thread(target=monitor, daemon=True)
+    for t in [*drains, watcher]:
+        t.start()
+    timer = threading.Timer(360, stop, args=(process,))
+    timer.start()
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def call(path, body=None):
+        request = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
+            data=json.dumps(body).encode() if body else None,
+            headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+        with opener.open(request, timeout=120) as reply:
+            data = reply.read((1 << 20) + 1)
+        if len(data) > 1 << 20:
+            raise RuntimeError("response exceeded 1 MiB")
+        return json.loads(data)
+
+    system = {"role": "system", "content": "Answer briefly. " + "Preserve task state and explain code clearly. " * 24}
+    def request(text, image=False):
+        content = text if not image else [{"type": "text", "text": text},
+                    {"type": "image_url", "image_url": {"url": image_data_url()}}]
+        return {"model": "deepseek-v4.1-flash", "max_tokens": 4,
+                "messages": [system, {"role": "user", "content": content}],
+                "temperature": 1, "top_p": 1, "seed": 12345, "thinking": {"type": "disabled"}}
+
+    try:
+        until = time.monotonic() + 90
+        while True:
+            if process.poll() is not None or time.monotonic() > until:
+                raise RuntimeError("server did not become ready")
+            try:
+                call("/health")
+                break
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
+                time.sleep(0.2)
+        long = "Review this context. " + "The scheduler keeps pending requests and dispatches each task in order. " * 64
+        bodies = [request(long), request("A different request. " + long), request("Suggest a short title.")]
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            replies = list(pool.map(lambda b: call("/v1/chat/completions", b), bodies))
+        repeated = call("/v1/chat/completions", bodies[0])
+        if replies[0]["choices"][0]["message"] != repeated["choices"][0]["message"]:
+            raise AssertionError("repeating a saved prompt changed its seeded reply")
+        if args.image:
+            reply = call("/v1/chat/completions", request("Name the image's main color. " + long, image=True))
+            assert reply["usage"]["completion_tokens"] > 0
+        state = call("/v1/status")
+        assert state["ced_depth"] == (0 if args.ced == "off" else int(args.ced))
+        observed = list(lines)
+        plans = [line for line in observed if "prefill plan:" in line]
+        assert len(plans) >= 4, "missing completed prefill plans"
+        assert any("1 chunks" in line and "prefix=" in line for line in plans)
+        assert any("0 chunks" in line for line in plans), "identical prompt was not reused"
+        if args.ced != "off":
+            assert any("ced_applied=1" in line for line in plans)
+        assert any(re.search(r"queued, waiting=[1-9]", line) for line in observed)
+        assert any("messages," in line for line in observed), "message-count logging is missing"
+        assert not failures, failures
+        print(json.dumps({"server_prefill_check": {"binary": args.binary.name, "ced": args.ced,
+              "experts": "IQ2" if args.experts else "MXFP4", "draft": args.draft, "image": args.image,
+              "requests": len(replies) + 1 + int(args.image), "identical_retry": True,
+              "last_prefill": state["last_prefill"]}}))
+        for line in observed:
+            if any(part in line for part in ("arrived", "queued,", "queue:", "prefill start", "prefill plan", "images encoded")):
+                print(line)
+    except BaseException:
+        print("\n".join(list(lines)[-16:]))
+        raise
+    finally:
+        halted.set()
+        timer.cancel()
+        stop(process)
+        for t in [*drains, watcher]:
+            t.join(timeout=5)
+
+
+if __name__ == "__main__":
+    main()

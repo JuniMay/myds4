@@ -43,6 +43,7 @@ it, saying so on stderr. `lockf(1)` takes the same lock.
 | `--top-p P` | Nucleus probability from 0 to 1; default 1 samples the full distribution. Also sets the server default. Zero retains only the highest-probability token. |
 | `--seed N` | Nonnegative integer seed for repeatable sampling. Also sets the server default; individual requests may override it. Omit it to initialize each CLI run or server request from system randomness. |
 | `--ctx N` | Context capacity in tokens, up to 1,048,576, the model's own (default 16,384; 1,048,576 with `--serve`). The attention state of a conversation takes about 3.1 KB per token and grows with it. |
+| `--ced off\|N` | Approximate prefill, default `off`. A depth from 128 to 1,048,576 retains N decoder tokens plus five rows for cached-request rewinds. All new tokens run through the encoder and global KV projections; only the retained suffix runs through later decoder layers. Shorter inputs use full prefill. Decoding still uses all layers. Local KV and generated output can differ from full prefill. Available in the CLI and both servers. |
 | `--cache GB` | Upper bound on expert memory, including reserved draft pools. After reserving those pools, the budget must hold two backbone layers' experts. The cache adapts to available memory and keeps a reserve for other programs (`--reserve`); the requested budget is not a guaranteed allocation. Slots outside the GPU's mapping limit remain in memory and are mapped when needed. See [Design](design.md#the-expert-cache-and-memory). |
 | `--reserve GB` | The memory the expert cache leaves to other programs, 2 to 1,024 GiB (default 10). The cache starts within the free memory less the reserve, gives slots back when the available memory falls below it, and grows only while the available memory exceeds it by 4 GiB. A smaller reserve keeps more experts in memory and leaves less to other applications; the cache still gives slots back when the kernel reports pressure, swaps or compresses memory while the free memory is below the reserve. |
 | `--cache-half-life N` | Retention-score half-life, 1 to 1,000,000 forward-pass advances; default 50. A decode or verification pass advances once, and prefill advances once at its end. A DSpark pass can emit several tokens, so these are not emitted-token units. |
@@ -58,6 +59,10 @@ it, saying so on stderr. `lockf(1)` takes the same lock.
 | `--perplexity` | Decode the text (without the chat template) one token at a time and print the perplexity of each next token, and how often it was the most likely one. |
 | `--prefill N` | With `--perplexity`: prefill the text's first N tokens in one pass, and score only the tokens after them. |
 | `--logits-fd FD` | With `--perplexity`: write the logits (129,280 float32) that each token is scored on to the file descriptor FD, for comparing two settings by KL divergence. |
+
+Per-layer dumps (`--dump-fd`) and the full-row comparison (`--check-prefill`)
+require `--ced off`. The retained CED checks compare compact execution with
+its corresponding full-shape mask instead.
 
 The program prints the generated text, then statistics: prefill and decode
 speed, expert cache hits, logical expert-read bytes and time spent waiting for reads, GPU
@@ -165,7 +170,10 @@ Each request's system, user, tool and context messages form one prompt. The
 server saves the system prefix during that prompt's prefill, without a
 second pass at the first user turn. Prompts longer than 16,384 new tokens
 still use bounded chunks. Separate requests keep separate attention states.
-
+With CED enabled, a system-prefix snapshot may contain only encoder state.
+The server forks that snapshot only when the new suffix exceeds the replay
+depth plus five rows; otherwise it chooses a complete cached state or
+prefills anew.
 
 While no request runs, the server keeps its experts in memory, so the next
 request finds them as the last one left them. Every second it checks memory
@@ -183,9 +191,10 @@ below the reserve.
 
 The log on stderr has a line per event: each HTTP request's arrival, its body
 size, message and tool counts, queue admission, and waiting-request count.
-Prefill logs show new and reused tokens, actual chunk count, saved prefix, speed and expert reads.
+Prefill logs show new and reused tokens, configured CED depth, actual chunk
+count, encoder and decoder token counts, saved prefix, speed and expert reads.
 Queue admission also reports requests taken together for subsequent prefills.
-`GET /v1/status` includes `last_prefill` with the
+`GET /v1/status` includes `ced_depth` (0 means off) and `last_prefill` with the
 last completed plan. These fields distinguish separate HTTP requests from
 chunks inside one prompt. The log also shows the
 decoding's progress every 10 s, and its end (tokens, speed, expert hits,

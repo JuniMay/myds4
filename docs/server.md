@@ -80,7 +80,7 @@ which saves the predictor state (`--predictor-state`) and returns.
 - **Start and stop.** `myds4_start(config)` takes the model and server
   options (`myds4_config`: the checkpoint, `--experts`, `--ctx`, the cache
   settings, `--substitute`, `--gpu-route`, the draft settings, the online
-  predictor, `--kv-cache`, `--batch`, `--tui` and the address for the view's
+  predictor, `--ced`, `--kv-cache`, `--batch`, `--tui` and the address for the view's
   title). It waits for the model lock (`myds4.lock` beside the executable, or
   `$MYDS4_LOCK`), loads the model on the engine's thread and returns once
   requests are taken. `myds4_stopping()` reports a requested stop, and
@@ -132,20 +132,51 @@ separate requests in queue order while other requests wait to decode.
 Rendering and tokenization precede enqueueing, so HTTP arrival order and
 queue order can differ. The two identifiers in the log expose that timing.
 
+`--ced off|N` controls approximate decoder replay in both servers and the
+CLI. `off` is the default. N is 128 to 1,048,576; the engine retains N plus
+five rewind rows. Shorter inputs run full prefill. CED preserves full-context
+encoder/global KV work and changes the later decoder's local state, so it
+can change generated output. It does not shorten decoding's layer stack.
+An encoder-only system-prefix snapshot can be forked only if the new suffix
+exceeds N plus five rows and rebuilds the decoder window. The engine chooses
+a complete cached state or cold prefill otherwise. C ABI version 3 adds the
+`ced` configuration field; zero selects off.
+
 Arrival logs carry an HTTP identifier, body size, and message/tool counts.
 Queue logs show waiting requests and how many the scheduler admits for
-prefill. Each completed prefill reports its chunks, token count and saved prefix. These are counts, without conversation
-text or API keys. `GET /v1/status` includes the `last_prefill` plan. A separate title request therefore has its own arrival
+prefill. Each completed prefill reports its chunks, encoder/decoder tokens,
+CED application and saved prefix. These are counts, without conversation
+text or API keys. `GET /v1/status` includes configured `ced_depth` and the
+`last_prefill` plan. A separate title request therefore has its own arrival
 and prefill records rather than appearing as a chunk of the main request.
 
 ## Requests
 
-Joint prefill was checked against full prefill at 640 and 16,521 tokens
-with MXFP4 and mixed IQ2 experts and two-token DSpark. Final logits,
-saved prefix state and resumed execution matched bit-for-bit. Four
-synthetic chat-completion requests through the C server checked concurrent
-arrivals, prefix reuse, and identical seeded replies without recomputation
-on retry. These checks do not score task quality.
+The 2026-11-03 joint-prefill integration checks used one owned server at a
+time, a 20 GiB expert cache, a 4 GiB reserve, temperature/top-p 1 and seed
+12345. Fourteen synthetic chat-completion requests passed across these configurations:
+
+| Server | Experts | CED | DSpark | Image request |
+| --- | --- | --- | --- | --- |
+| Rust | MXFP4 | 128 | 2 drafts, 32 slots/stage, trim | yes |
+| C | MXFP4 | off | off | no |
+| C | mixed IQ2_XXS | 512 | 2 drafts, 32 slots/stage, trim | yes |
+
+The checks cover simultaneous arrivals, queue and prefill-plan logs,
+system-prefix forks, identical seeded replies on retry, zero recomputation
+for that retry, and image embedding through the default vision path. They
+do not score answer quality. Run `tools/server_prefill_check.py` with
+`--checkpoint CHECKPOINT`, `--binary EXECUTABLE`, `--ced off|128|512`, and
+optional `--experts GGUF`, `--draft` and `--image`; it checks GPU ownership,
+bounds runtime and retains requests, replies and logs only in memory.
+
+CPU regressions in `tools/prefill_schedule_check.c` cover one forward call
+with a saved system prefix, exact retries after short replies, a changed
+last prompt token, prefix-only requests and encoder-only fork eligibility.
+`tools/attention_candidate_check.c` checks candidate-mask offsets after
+decoder compaction and across prompt batches. The real-model
+`tools/prefill_prefix_check.c` compares prefix state and resumed logits
+at 640 and 16,521 tokens in both expert formats with DSpark enabled.
 
 The server's defaults for requests that do not set a value:
 

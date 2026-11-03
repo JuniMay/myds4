@@ -333,6 +333,7 @@ typedef struct {
   const char *experts;         // a GGUF file (set) whose routed experts replace the checkpoint's, or null
   int quiet;                   // no progress lines on stderr
   int online_predictor;        // rank64 online prefetch corrector; 0 disables it
+  int ced;                    // 0: full prefill; otherwise decoder replay tokens (at least WINDOW)
 } Options;
 void online_predictor_init(int rank, const float *const biases[LAYERS]);
 void online_predictor_reset(void);
@@ -351,9 +352,11 @@ void model_load(const char *dir, const Options *o);
 // Runs the tokens at positions pos.. and returns the logits of the last one.
 const float *model_forward(const int *tokens, int n, int pos);
 // Run one prompt traversal while saving the state at prefix_pos in slot 1.
-const float *model_forward_prefix(const int *tokens, int n, int pos, int prefix_pos);
+// An encoder-only CED snapshot requires more than ced + BLOCK new tokens on reuse.
+const float *model_forward_prefix(const int *tokens, int n, int pos, int prefix_pos, int *encoder_only);
 typedef struct {
-  int tokens, chunks, prefix_tokens;
+  int tokens, chunks, decoder_tokens, ced_tokens, ced_applied;
+  int prefix_tokens, prefix_encoder_only;
 } ModelForwardInfo;
 ModelForwardInfo model_forward_info(void);
 // The DSpark draft for `token` at position pos, every position before it

@@ -7,7 +7,7 @@ use std::ptr;
 use deepseek_recipe::stream::StreamTokenizer;
 use tokio::sync::mpsc;
 
-const ABI: c_int = 2;
+const ABI: c_int = 3;
 const STARTED: c_int = 0;
 const TOKENS: c_int = 1;
 const DONE: c_int = 2;
@@ -35,6 +35,7 @@ struct RawConfig {
     batch: c_int,
     tui: c_int,
     address: *const c_char,
+    ced: c_int,
 }
 
 #[repr(C)]
@@ -112,6 +113,7 @@ pub struct Config {
     pub batch: i32,
     pub tui: bool,
     pub address: String,
+    pub ced: i32,
 }
 
 fn c_string(s: &str) -> CString {
@@ -145,6 +147,7 @@ pub fn start(c: &Config) -> bool {
         batch: c.batch,
         tui: c.tui.into(),
         address: address.as_ptr(),
+        ced: c.ced,
     };
     unsafe { myds4_start(&raw) == 0 }
 }

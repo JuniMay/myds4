@@ -1006,6 +1006,945 @@
         "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017"
       },
       "quant": "mxfp4",
+      "name": "joint-ced-128",
+      "valid": true,
+      "exit_code": 0,
+      "elapsed_seconds": 18.271,
+      "bench": {
+        "ced_keep": 128,
+        "compact": true,
+        "copy_depth": 0,
+        "prompt_tokens": 13772,
+        "generated": 0,
+        "prefill_seconds": 16.819012,
+        "prefill_gpu_seconds": 11.9661261,
+        "prefill_read_bytes": 193655816192,
+        "prefill_read_wait_seconds": 3.500748,
+        "decode_seconds": 0.000533000006,
+        "decode_tokens_per_second": 0,
+        "decode_gpu_seconds": 0,
+        "decode_read_bytes": 9322496,
+        "decode_read_wait_seconds": 0,
+        "computed_rows": 0,
+        "copy_passes": 0,
+        "proposed_tokens": 0,
+        "accepted_tokens": 0,
+        "mean_match_tokens": 0,
+        "search_seconds": 0,
+        "cache_bytes_start": 21460156416,
+        "cache_bytes_min": 21460156416,
+        "cache_bytes_max": 21460156416,
+        "slots_released": 0,
+        "output_token_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "prefill_plan": 2,
+        "prefix_tokens": 12453,
+        "configured_ced_depth": 128,
+        "last_forward_chunks": 1,
+        "last_forward_decoder_tokens": 133,
+        "prefill_logits_sha256": "4723630e4d8c79aa5f2bfcb16cd5b7b5b1b3768b4bcab9be457c35d218283fc9",
+        "proposal_policy": "copy",
+        "tool_tokens": 0,
+        "tool_proposals": 0,
+        "tool_accepted": 0,
+        "decode_remaps": 0,
+        "rnn_prompt_train_seconds": 0,
+        "rnn_decode_update_seconds": 0,
+        "rnn_classes": 0,
+        "rnn_parameters": 0,
+        "rnn_storage_bytes": 0,
+        "rnn_hidden_units": 0,
+        "rnn_epochs": 0,
+        "rnn_first_epoch_loss": 0,
+        "rnn_last_epoch_loss": 0,
+        "logits_match_split_prefill": false
+      },
+      "records": [],
+      "prefetch_metrics": [
+        {
+          "version": 1,
+          "phase": "prefill",
+          "passes": 1,
+          "rows": 13772,
+          "unsupported_gpu_route_passes": 0,
+          "unsupported_gpu_route_rows": 0,
+          "exact_router": {
+            "layer_batches": 166,
+            "unique_demands": {
+              "existing_ready": 37538,
+              "fresh_timely_prefetch": 7249,
+              "pending_prefetch": 1703,
+              "pending_demand": 0,
+              "absent": 769
+            },
+            "requested_payload_bytes": {
+              "existing_ready": 705738424320,
+              "fresh_timely_prefetch": 136285839360,
+              "pending_prefetch": 32017489920,
+              "pending_demand": 0,
+              "absent": 14457692160
+            },
+            "rerequests_after_prefetch_eviction": 0,
+            "absent_after_prefetch_eviction": 0
+          },
+          "served": {
+            "layer_batches": 166,
+            "unique_demands": {
+              "existing_ready": 37538,
+              "fresh_timely_prefetch": 7249,
+              "pending_prefetch": 1703,
+              "pending_demand": 0,
+              "absent": 769
+            },
+            "requested_payload_bytes": {
+              "existing_ready": 705738424320,
+              "fresh_timely_prefetch": 136285839360,
+              "pending_prefetch": 32017489920,
+              "pending_demand": 0,
+              "absent": 14457692160
+            },
+            "rerequests_after_prefetch_eviction": 0,
+            "absent_after_prefetch_eviction": 0
+          },
+          "admissions_by_issuer": {
+            "pc": 0,
+            "h1": 9508,
+            "h2": 0,
+            "prefill_bulk": 384,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "fresh_timely_first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 7175,
+            "h2": 0,
+            "prefill_bulk": 74,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 8574,
+            "h2": 0,
+            "prefill_bulk": 378,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "first_uses_before_io_started_by_issuer": {
+            "pc": 0,
+            "h1": 1377,
+            "h2": 0,
+            "prefill_bulk": 303,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "admission_to_first_use_ns_by_issuer": {
+            "pc": 0,
+            "h1": 5089044983000,
+            "h2": 0,
+            "prefill_bulk": 48558594000,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 8574,
+            "h2": 0,
+            "prefill_bulk": 378,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_first_uses_before_io_started_by_issuer": {
+            "pc": 0,
+            "h1": 1377,
+            "h2": 0,
+            "prefill_bulk": 303,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_admission_to_first_use_ns_by_issuer": {
+            "pc": 0,
+            "h1": 5089044983000,
+            "h2": 0,
+            "prefill_bulk": 48558594000,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "io_timing": {
+            "demand": {
+              "pieces": 7690,
+              "queue_ns": 648605690000,
+              "service_ns": 96581568000
+            },
+            "background": {
+              "pieces": 78266,
+              "queue_ns": 25224137185000,
+              "service_ns": 45753892000
+            },
+            "promoted_prefetch": {
+              "pieces": 16879,
+              "queue_ns": 4513530463000,
+              "service_ns": 165195223000
+            }
+          },
+          "prefetch_first_uses": 8952,
+          "first_uses_outside_observed_routes": 0,
+          "eventual_first_uses_after_target_pass": 0,
+          "bytes_completed_at_first_use": 136700461056,
+          "bytes_remaining_at_first_use": 31896223744,
+          "prefetch_origin_read_bytes": 179183271936,
+          "demand_origin_read_bytes": 14482997248,
+          "unused_prefetches_removed": 760,
+          "unused_prefetch_read_bytes_removed": 8721973248,
+          "unread_bytes_cancelled_on_removal": 5591400448,
+          "unconsumed_prefetch_read_bytes_live": 1863483392,
+          "prefetch_bytes_outstanding_live": 1526710272,
+          "prefetch_caused_evictions": 8755,
+          "scope": "backbone only; unions per layer batch; pass IDs are not emitted-token IDs; decode rows include rejected verification rows; read bytes follow admission phase and requested aligned piece lengths; first-use counts follow consumption phase; live byte counters are asynchronous snapshots",
+          "pollution_scope": "observed eviction and rerequest counts, no counterfactual baseline"
+        },
+        {
+          "version": 1,
+          "phase": "decode",
+          "passes": 0,
+          "rows": 0,
+          "unsupported_gpu_route_passes": 0,
+          "unsupported_gpu_route_rows": 0,
+          "exact_router": {
+            "layer_batches": 0,
+            "unique_demands": {
+              "existing_ready": 0,
+              "fresh_timely_prefetch": 0,
+              "pending_prefetch": 0,
+              "pending_demand": 0,
+              "absent": 0
+            },
+            "requested_payload_bytes": {
+              "existing_ready": 0,
+              "fresh_timely_prefetch": 0,
+              "pending_prefetch": 0,
+              "pending_demand": 0,
+              "absent": 0
+            },
+            "rerequests_after_prefetch_eviction": 0,
+            "absent_after_prefetch_eviction": 0
+          },
+          "served": {
+            "layer_batches": 0,
+            "unique_demands": {
+              "existing_ready": 0,
+              "fresh_timely_prefetch": 0,
+              "pending_prefetch": 0,
+              "pending_demand": 0,
+              "absent": 0
+            },
+            "requested_payload_bytes": {
+              "existing_ready": 0,
+              "fresh_timely_prefetch": 0,
+              "pending_prefetch": 0,
+              "pending_demand": 0,
+              "absent": 0
+            },
+            "rerequests_after_prefetch_eviction": 0,
+            "absent_after_prefetch_eviction": 0
+          },
+          "admissions_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "fresh_timely_first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "first_uses_before_io_started_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "admission_to_first_use_ns_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_first_uses_before_io_started_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_admission_to_first_use_ns_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "io_timing": {
+            "demand": {
+              "pieces": 0,
+              "queue_ns": 0,
+              "service_ns": 0
+            },
+            "background": {
+              "pieces": 0,
+              "queue_ns": 0,
+              "service_ns": 0
+            },
+            "promoted_prefetch": {
+              "pieces": 0,
+              "queue_ns": 0,
+              "service_ns": 0
+            }
+          },
+          "prefetch_first_uses": 0,
+          "first_uses_outside_observed_routes": 0,
+          "eventual_first_uses_after_target_pass": 0,
+          "bytes_completed_at_first_use": 0,
+          "bytes_remaining_at_first_use": 0,
+          "prefetch_origin_read_bytes": 0,
+          "demand_origin_read_bytes": 0,
+          "unused_prefetches_removed": 0,
+          "unused_prefetch_read_bytes_removed": 0,
+          "unread_bytes_cancelled_on_removal": 0,
+          "unconsumed_prefetch_read_bytes_live": 0,
+          "prefetch_bytes_outstanding_live": 0,
+          "prefetch_caused_evictions": 0,
+          "scope": "backbone only; unions per layer batch; pass IDs are not emitted-token IDs; decode rows include rejected verification rows; read bytes follow admission phase and requested aligned piece lengths; first-use counts follow consumption phase; live byte counters are asynchronous snapshots",
+          "pollution_scope": "observed eviction and rerequest counts, no counterfactual baseline"
+        }
+      ],
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 0.0,
+            "renderer_percent": 0.0,
+            "gpu_resident_gib": 1.8,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 38.0,
+            "memory": {
+              "free_gib": 64.47151184082031,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 30.0,
+            "renderer_percent": 30.0,
+            "gpu_resident_gib": 1.64,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 38.0,
+            "memory": {
+              "free_gib": 64.56170654296875,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 31.0,
+            "renderer_percent": 31.0,
+            "gpu_resident_gib": 1.74,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 38.0,
+            "memory": {
+              "free_gib": 64.55036926269531,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          }
+        ]
+      },
+      "gpu_activity": [
+        {
+          "elapsed_seconds": 2.109,
+          "model_gpu_client_visible": true,
+          "device_percent": 24.0,
+          "renderer_percent": 24.0,
+          "gpu_resident_gib": 19.89
+        },
+        {
+          "elapsed_seconds": 12.569,
+          "model_gpu_client_visible": true,
+          "device_percent": 99.0,
+          "renderer_percent": 98.0,
+          "gpu_resident_gib": 33.14
+        }
+      ],
+      "background_cpu_helpers": [],
+      "error": null,
+      "original_diagnostic_fields": {
+        "ced_keep": 0,
+        "compact": false
+      }
+    },
+    {
+      "settings": {
+        "binary_sha256": "f1e118ff096a9e94ba2d33ab191ce23ca1aa0c96e8f31c47f3ef1695166bb9e8",
+        "request_sha256": "3cd83e9632fc48f83b567a44f5b5ec09a76b92b0e76e3e330dc31474f6041bc8",
+        "tokens": 256,
+        "prompt_tokens": 13772,
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 12345,
+        "cache_gib": 20.0,
+        "reserve_gib": 4.0,
+        "reasoning_effort": "max",
+        "copy_min_match": 4,
+        "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+      },
+      "quant": "mxfp4",
+      "name": "joint-ced-512",
+      "valid": true,
+      "exit_code": 0,
+      "elapsed_seconds": 25.111,
+      "bench": {
+        "ced_keep": 512,
+        "compact": true,
+        "copy_depth": 0,
+        "prompt_tokens": 13772,
+        "generated": 0,
+        "prefill_seconds": 23.686661,
+        "prefill_gpu_seconds": 16.3804185,
+        "prefill_read_bytes": 236157452288,
+        "prefill_read_wait_seconds": 6.023831,
+        "decode_seconds": 0.000492000006,
+        "decode_tokens_per_second": 0,
+        "decode_gpu_seconds": 0,
+        "decode_read_bytes": 6291456,
+        "decode_read_wait_seconds": 0,
+        "computed_rows": 0,
+        "copy_passes": 0,
+        "proposed_tokens": 0,
+        "accepted_tokens": 0,
+        "mean_match_tokens": 0,
+        "search_seconds": 0,
+        "cache_bytes_start": 21460156416,
+        "cache_bytes_min": 21460156416,
+        "cache_bytes_max": 21460156416,
+        "slots_released": 0,
+        "output_token_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "prefill_plan": 2,
+        "prefix_tokens": 12453,
+        "configured_ced_depth": 512,
+        "last_forward_chunks": 1,
+        "last_forward_decoder_tokens": 517,
+        "prefill_logits_sha256": "05c1476e602de7dcbb2c8794dbb3d41f43a1d1a431f73d224b66c85a697d0d57",
+        "proposal_policy": "copy",
+        "tool_tokens": 0,
+        "tool_proposals": 0,
+        "tool_accepted": 0,
+        "decode_remaps": 0,
+        "rnn_prompt_train_seconds": 0,
+        "rnn_decode_update_seconds": 0,
+        "rnn_classes": 0,
+        "rnn_parameters": 0,
+        "rnn_storage_bytes": 0,
+        "rnn_hidden_units": 0,
+        "rnn_epochs": 0,
+        "rnn_first_epoch_loss": 0,
+        "rnn_last_epoch_loss": 0,
+        "logits_match_split_prefill": false
+      },
+      "records": [],
+      "prefetch_metrics": [
+        {
+          "version": 1,
+          "phase": "prefill",
+          "passes": 1,
+          "rows": 13772,
+          "unsupported_gpu_route_passes": 0,
+          "unsupported_gpu_route_rows": 0,
+          "exact_router": {
+            "layer_batches": 166,
+            "unique_demands": {
+              "existing_ready": 37538,
+              "fresh_timely_prefetch": 7507,
+              "pending_prefetch": 2889,
+              "pending_demand": 0,
+              "absent": 1385
+            },
+            "requested_payload_bytes": {
+              "existing_ready": 705738424320,
+              "fresh_timely_prefetch": 141136404480,
+              "pending_prefetch": 54315048960,
+              "pending_demand": 0,
+              "absent": 26038886400
+            },
+            "rerequests_after_prefetch_eviction": 0,
+            "absent_after_prefetch_eviction": 0
+          },
+          "served": {
+            "layer_batches": 166,
+            "unique_demands": {
+              "existing_ready": 37538,
+              "fresh_timely_prefetch": 7507,
+              "pending_prefetch": 2889,
+              "pending_demand": 0,
+              "absent": 1385
+            },
+            "requested_payload_bytes": {
+              "existing_ready": 705738424320,
+              "fresh_timely_prefetch": 141136404480,
+              "pending_prefetch": 54315048960,
+              "pending_demand": 0,
+              "absent": 26038886400
+            },
+            "rerequests_after_prefetch_eviction": 0,
+            "absent_after_prefetch_eviction": 0
+          },
+          "admissions_by_issuer": {
+            "pc": 0,
+            "h1": 10934,
+            "h2": 0,
+            "prefill_bulk": 384,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "fresh_timely_first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 7435,
+            "h2": 0,
+            "prefill_bulk": 72,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 10018,
+            "h2": 0,
+            "prefill_bulk": 378,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "first_uses_before_io_started_by_issuer": {
+            "pc": 0,
+            "h1": 2582,
+            "h2": 0,
+            "prefill_bulk": 305,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "admission_to_first_use_ns_by_issuer": {
+            "pc": 0,
+            "h1": 7026098523000,
+            "h2": 0,
+            "prefill_bulk": 47130854000,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 10018,
+            "h2": 0,
+            "prefill_bulk": 378,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_first_uses_before_io_started_by_issuer": {
+            "pc": 0,
+            "h1": 2582,
+            "h2": 0,
+            "prefill_bulk": 305,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_admission_to_first_use_ns_by_issuer": {
+            "pc": 0,
+            "h1": 7026098523000,
+            "h2": 0,
+            "prefill_bulk": 47130854000,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "io_timing": {
+            "demand": {
+              "pieces": 13850,
+              "queue_ns": 1991278326000,
+              "service_ns": 172179520000
+            },
+            "background": {
+              "pieces": 82668,
+              "queue_ns": 28388378445000,
+              "service_ns": 47728484000
+            },
+            "promoted_prefetch": {
+              "pieces": 28879,
+              "queue_ns": 12446495209000,
+              "service_ns": 331311706000
+            }
+          },
+          "prefetch_first_uses": 10396,
+          "first_uses_outside_observed_routes": 0,
+          "eventual_first_uses_after_target_pass": 0,
+          "bytes_completed_at_first_use": 141388726272,
+          "bytes_remaining_at_first_use": 54403678208,
+          "prefetch_origin_read_bytes": 210081857536,
+          "demand_origin_read_bytes": 26083983360,
+          "unused_prefetches_removed": 778,
+          "unused_prefetch_read_bytes_removed": 12546146304,
+          "unread_bytes_cancelled_on_removal": 2106212352,
+          "unconsumed_prefetch_read_bytes_live": 1741209600,
+          "prefetch_bytes_outstanding_live": 970997760,
+          "prefetch_caused_evictions": 10181,
+          "scope": "backbone only; unions per layer batch; pass IDs are not emitted-token IDs; decode rows include rejected verification rows; read bytes follow admission phase and requested aligned piece lengths; first-use counts follow consumption phase; live byte counters are asynchronous snapshots",
+          "pollution_scope": "observed eviction and rerequest counts, no counterfactual baseline"
+        },
+        {
+          "version": 1,
+          "phase": "decode",
+          "passes": 0,
+          "rows": 0,
+          "unsupported_gpu_route_passes": 0,
+          "unsupported_gpu_route_rows": 0,
+          "exact_router": {
+            "layer_batches": 0,
+            "unique_demands": {
+              "existing_ready": 0,
+              "fresh_timely_prefetch": 0,
+              "pending_prefetch": 0,
+              "pending_demand": 0,
+              "absent": 0
+            },
+            "requested_payload_bytes": {
+              "existing_ready": 0,
+              "fresh_timely_prefetch": 0,
+              "pending_prefetch": 0,
+              "pending_demand": 0,
+              "absent": 0
+            },
+            "rerequests_after_prefetch_eviction": 0,
+            "absent_after_prefetch_eviction": 0
+          },
+          "served": {
+            "layer_batches": 0,
+            "unique_demands": {
+              "existing_ready": 0,
+              "fresh_timely_prefetch": 0,
+              "pending_prefetch": 0,
+              "pending_demand": 0,
+              "absent": 0
+            },
+            "requested_payload_bytes": {
+              "existing_ready": 0,
+              "fresh_timely_prefetch": 0,
+              "pending_prefetch": 0,
+              "pending_demand": 0,
+              "absent": 0
+            },
+            "rerequests_after_prefetch_eviction": 0,
+            "absent_after_prefetch_eviction": 0
+          },
+          "admissions_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "fresh_timely_first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "first_uses_before_io_started_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "admission_to_first_use_ns_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_first_uses_before_io_started_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_admission_to_first_use_ns_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "io_timing": {
+            "demand": {
+              "pieces": 0,
+              "queue_ns": 0,
+              "service_ns": 0
+            },
+            "background": {
+              "pieces": 0,
+              "queue_ns": 0,
+              "service_ns": 0
+            },
+            "promoted_prefetch": {
+              "pieces": 0,
+              "queue_ns": 0,
+              "service_ns": 0
+            }
+          },
+          "prefetch_first_uses": 0,
+          "first_uses_outside_observed_routes": 0,
+          "eventual_first_uses_after_target_pass": 0,
+          "bytes_completed_at_first_use": 0,
+          "bytes_remaining_at_first_use": 0,
+          "prefetch_origin_read_bytes": 0,
+          "demand_origin_read_bytes": 0,
+          "unused_prefetches_removed": 0,
+          "unused_prefetch_read_bytes_removed": 0,
+          "unread_bytes_cancelled_on_removal": 0,
+          "unconsumed_prefetch_read_bytes_live": 0,
+          "prefetch_bytes_outstanding_live": 0,
+          "prefetch_caused_evictions": 0,
+          "scope": "backbone only; unions per layer batch; pass IDs are not emitted-token IDs; decode rows include rejected verification rows; read bytes follow admission phase and requested aligned piece lengths; first-use counts follow consumption phase; live byte counters are asynchronous snapshots",
+          "pollution_scope": "observed eviction and rerequest counts, no counterfactual baseline"
+        }
+      ],
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 24.0,
+            "renderer_percent": 24.0,
+            "gpu_resident_gib": 1.86,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 38.0,
+            "memory": {
+              "free_gib": 64.58006286621094,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 24.0,
+            "renderer_percent": 24.0,
+            "gpu_resident_gib": 1.59,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 38.0,
+            "memory": {
+              "free_gib": 64.62619018554688,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 23.0,
+            "renderer_percent": 23.0,
+            "gpu_resident_gib": 1.84,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 38.0,
+            "memory": {
+              "free_gib": 64.62959289550781,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          }
+        ]
+      },
+      "gpu_activity": [
+        {
+          "elapsed_seconds": 2.091,
+          "model_gpu_client_visible": true,
+          "device_percent": 10.0,
+          "renderer_percent": 10.0,
+          "gpu_resident_gib": 19.72
+        },
+        {
+          "elapsed_seconds": 12.524,
+          "model_gpu_client_visible": true,
+          "device_percent": 100.0,
+          "renderer_percent": 100.0,
+          "gpu_resident_gib": 33.16
+        },
+        {
+          "elapsed_seconds": 22.892,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 32.73
+        }
+      ],
+      "background_cpu_helpers": [],
+      "error": null,
+      "original_diagnostic_fields": {
+        "ced_keep": 0,
+        "compact": false
+      }
+    },
+    {
+      "settings": {
+        "binary_sha256": "f1e118ff096a9e94ba2d33ab191ce23ca1aa0c96e8f31c47f3ef1695166bb9e8",
+        "request_sha256": "3cd83e9632fc48f83b567a44f5b5ec09a76b92b0e76e3e330dc31474f6041bc8",
+        "tokens": 256,
+        "prompt_tokens": 13772,
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 12345,
+        "cache_gib": 20.0,
+        "reserve_gib": 4.0,
+        "reasoning_effort": "max",
+        "copy_min_match": 4,
+        "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+      },
+      "quant": "mxfp4",
       "name": "joint-split-control-b",
       "valid": true,
       "exit_code": 0,
@@ -2471,6 +3410,938 @@
         "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017"
       },
       "quant": "q2",
+      "name": "joint-ced-128",
+      "valid": true,
+      "exit_code": 0,
+      "elapsed_seconds": 17.7,
+      "bench": {
+        "ced_keep": 128,
+        "compact": true,
+        "copy_depth": 0,
+        "prompt_tokens": 13772,
+        "generated": 0,
+        "prefill_seconds": 16.245454,
+        "prefill_gpu_seconds": 13.09004,
+        "prefill_read_bytes": 100212981760,
+        "prefill_read_wait_seconds": 1.909074,
+        "decode_seconds": 0.000517,
+        "decode_tokens_per_second": 0,
+        "decode_gpu_seconds": 0,
+        "decode_read_bytes": 8323072,
+        "decode_read_wait_seconds": 0,
+        "computed_rows": 0,
+        "copy_passes": 0,
+        "proposed_tokens": 0,
+        "accepted_tokens": 0,
+        "mean_match_tokens": 0,
+        "search_seconds": 0,
+        "cache_bytes_start": 21466054656,
+        "cache_bytes_min": 21466054656,
+        "cache_bytes_max": 21466054656,
+        "slots_released": 0,
+        "output_token_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "prefill_plan": 2,
+        "prefix_tokens": 12453,
+        "configured_ced_depth": 128,
+        "last_forward_chunks": 1,
+        "last_forward_decoder_tokens": 133,
+        "prefill_logits_sha256": "fcd5903e4711716f0c44f9d03b9718c576dcde4de85af2fefe90065b921352f8",
+        "proposal_policy": "copy",
+        "tool_tokens": 0,
+        "tool_proposals": 0,
+        "tool_accepted": 0,
+        "decode_remaps": 0,
+        "rnn_prompt_train_seconds": 0,
+        "rnn_decode_update_seconds": 0,
+        "rnn_classes": 0,
+        "rnn_parameters": 0,
+        "rnn_storage_bytes": 0,
+        "rnn_hidden_units": 0,
+        "rnn_epochs": 0,
+        "rnn_first_epoch_loss": 0,
+        "rnn_last_epoch_loss": 0,
+        "logits_match_split_prefill": false
+      },
+      "records": [],
+      "prefetch_metrics": [
+        {
+          "version": 1,
+          "phase": "prefill",
+          "passes": 1,
+          "rows": 13772,
+          "unsupported_gpu_route_passes": 0,
+          "unsupported_gpu_route_rows": 0,
+          "exact_router": {
+            "layer_batches": 166,
+            "unique_demands": {
+              "existing_ready": 37813,
+              "fresh_timely_prefetch": 7512,
+              "pending_prefetch": 1862,
+              "pending_demand": 0,
+              "absent": 397
+            },
+            "requested_payload_bytes": {
+              "existing_ready": 338774630400,
+              "fresh_timely_prefetch": 67664885760,
+              "pending_prefetch": 20768532480,
+              "pending_demand": 0,
+              "absent": 4569569280
+            },
+            "rerequests_after_prefetch_eviction": 0,
+            "absent_after_prefetch_eviction": 0
+          },
+          "served": {
+            "layer_batches": 166,
+            "unique_demands": {
+              "existing_ready": 37813,
+              "fresh_timely_prefetch": 7512,
+              "pending_prefetch": 1862,
+              "pending_demand": 0,
+              "absent": 397
+            },
+            "requested_payload_bytes": {
+              "existing_ready": 338774630400,
+              "fresh_timely_prefetch": 67664885760,
+              "pending_prefetch": 20768532480,
+              "pending_demand": 0,
+              "absent": 4569569280
+            },
+            "rerequests_after_prefetch_eviction": 0,
+            "absent_after_prefetch_eviction": 0
+          },
+          "admissions_by_issuer": {
+            "pc": 0,
+            "h1": 10082,
+            "h2": 0,
+            "prefill_bulk": 384,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "fresh_timely_first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 7413,
+            "h2": 0,
+            "prefill_bulk": 99,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 8996,
+            "h2": 0,
+            "prefill_bulk": 378,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "first_uses_before_io_started_by_issuer": {
+            "pc": 0,
+            "h1": 1582,
+            "h2": 0,
+            "prefill_bulk": 277,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "admission_to_first_use_ns_by_issuer": {
+            "pc": 0,
+            "h1": 5163666703000,
+            "h2": 0,
+            "prefill_bulk": 31990209000,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 8996,
+            "h2": 0,
+            "prefill_bulk": 378,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_first_uses_before_io_started_by_issuer": {
+            "pc": 0,
+            "h1": 1582,
+            "h2": 0,
+            "prefill_bulk": 277,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_admission_to_first_use_ns_by_issuer": {
+            "pc": 0,
+            "h1": 5163666703000,
+            "h2": 0,
+            "prefill_bulk": 31990209000,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "io_timing": {
+            "demand": {
+              "pieces": 2584,
+              "queue_ns": 111325779000,
+              "service_ns": 29018534000
+            },
+            "background": {
+              "pieces": 49776,
+              "queue_ns": 8656960425000,
+              "service_ns": 23340160000
+            },
+            "promoted_prefetch": {
+              "pieces": 12344,
+              "queue_ns": 1732648310000,
+              "service_ns": 121511754000
+            }
+          },
+          "prefetch_first_uses": 9374,
+          "first_uses_outside_observed_routes": 0,
+          "eventual_first_uses_after_target_pass": 0,
+          "bytes_completed_at_first_use": 68044718080,
+          "bytes_remaining_at_first_use": 20848230400,
+          "prefetch_origin_read_bytes": 95632359424,
+          "demand_origin_read_bytes": 4588945408,
+          "unused_prefetches_removed": 681,
+          "unused_prefetch_read_bytes_removed": 6555484160,
+          "unread_bytes_cancelled_on_removal": 519340032,
+          "unconsumed_prefetch_read_bytes_live": 183926784,
+          "prefetch_bytes_outstanding_live": 4652302336,
+          "prefetch_caused_evictions": 8705,
+          "scope": "backbone only; unions per layer batch; pass IDs are not emitted-token IDs; decode rows include rejected verification rows; read bytes follow admission phase and requested aligned piece lengths; first-use counts follow consumption phase; live byte counters are asynchronous snapshots",
+          "pollution_scope": "observed eviction and rerequest counts, no counterfactual baseline"
+        },
+        {
+          "version": 1,
+          "phase": "decode",
+          "passes": 0,
+          "rows": 0,
+          "unsupported_gpu_route_passes": 0,
+          "unsupported_gpu_route_rows": 0,
+          "exact_router": {
+            "layer_batches": 0,
+            "unique_demands": {
+              "existing_ready": 0,
+              "fresh_timely_prefetch": 0,
+              "pending_prefetch": 0,
+              "pending_demand": 0,
+              "absent": 0
+            },
+            "requested_payload_bytes": {
+              "existing_ready": 0,
+              "fresh_timely_prefetch": 0,
+              "pending_prefetch": 0,
+              "pending_demand": 0,
+              "absent": 0
+            },
+            "rerequests_after_prefetch_eviction": 0,
+            "absent_after_prefetch_eviction": 0
+          },
+          "served": {
+            "layer_batches": 0,
+            "unique_demands": {
+              "existing_ready": 0,
+              "fresh_timely_prefetch": 0,
+              "pending_prefetch": 0,
+              "pending_demand": 0,
+              "absent": 0
+            },
+            "requested_payload_bytes": {
+              "existing_ready": 0,
+              "fresh_timely_prefetch": 0,
+              "pending_prefetch": 0,
+              "pending_demand": 0,
+              "absent": 0
+            },
+            "rerequests_after_prefetch_eviction": 0,
+            "absent_after_prefetch_eviction": 0
+          },
+          "admissions_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "fresh_timely_first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "first_uses_before_io_started_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "admission_to_first_use_ns_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_first_uses_before_io_started_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_admission_to_first_use_ns_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "io_timing": {
+            "demand": {
+              "pieces": 0,
+              "queue_ns": 0,
+              "service_ns": 0
+            },
+            "background": {
+              "pieces": 0,
+              "queue_ns": 0,
+              "service_ns": 0
+            },
+            "promoted_prefetch": {
+              "pieces": 0,
+              "queue_ns": 0,
+              "service_ns": 0
+            }
+          },
+          "prefetch_first_uses": 0,
+          "first_uses_outside_observed_routes": 0,
+          "eventual_first_uses_after_target_pass": 0,
+          "bytes_completed_at_first_use": 0,
+          "bytes_remaining_at_first_use": 0,
+          "prefetch_origin_read_bytes": 0,
+          "demand_origin_read_bytes": 0,
+          "unused_prefetches_removed": 0,
+          "unused_prefetch_read_bytes_removed": 0,
+          "unread_bytes_cancelled_on_removal": 0,
+          "unconsumed_prefetch_read_bytes_live": 0,
+          "prefetch_bytes_outstanding_live": 0,
+          "prefetch_caused_evictions": 0,
+          "scope": "backbone only; unions per layer batch; pass IDs are not emitted-token IDs; decode rows include rejected verification rows; read bytes follow admission phase and requested aligned piece lengths; first-use counts follow consumption phase; live byte counters are asynchronous snapshots",
+          "pollution_scope": "observed eviction and rerequest counts, no counterfactual baseline"
+        }
+      ],
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 0.0,
+            "renderer_percent": 0.0,
+            "gpu_resident_gib": 1.66,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 38.0,
+            "memory": {
+              "free_gib": 64.77719116210938,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 15.0,
+            "renderer_percent": 15.0,
+            "gpu_resident_gib": 1.66,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 38.0,
+            "memory": {
+              "free_gib": 64.79147338867188,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 16.0,
+            "renderer_percent": 16.0,
+            "gpu_resident_gib": 1.64,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 38.0,
+            "memory": {
+              "free_gib": 64.79238891601562,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          }
+        ]
+      },
+      "gpu_activity": [
+        {
+          "elapsed_seconds": 2.096,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 16.76
+        },
+        {
+          "elapsed_seconds": 12.559,
+          "model_gpu_client_visible": true,
+          "device_percent": 99.0,
+          "renderer_percent": 89.0,
+          "gpu_resident_gib": 32.26
+        }
+      ],
+      "background_cpu_helpers": [],
+      "error": null,
+      "original_diagnostic_fields": {
+        "ced_keep": 0,
+        "compact": false
+      }
+    },
+    {
+      "settings": {
+        "binary_sha256": "f1e118ff096a9e94ba2d33ab191ce23ca1aa0c96e8f31c47f3ef1695166bb9e8",
+        "request_sha256": "3cd83e9632fc48f83b567a44f5b5ec09a76b92b0e76e3e330dc31474f6041bc8",
+        "tokens": 256,
+        "prompt_tokens": 13772,
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 12345,
+        "cache_gib": 20.0,
+        "reserve_gib": 4.0,
+        "reasoning_effort": "max",
+        "copy_min_match": 4,
+        "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+      },
+      "quant": "q2",
+      "name": "joint-ced-512",
+      "valid": true,
+      "exit_code": 0,
+      "elapsed_seconds": 19.999,
+      "bench": {
+        "ced_keep": 512,
+        "compact": true,
+        "copy_depth": 0,
+        "prompt_tokens": 13772,
+        "generated": 0,
+        "prefill_seconds": 18.557361,
+        "prefill_gpu_seconds": 13.6268625,
+        "prefill_read_bytes": 128533807104,
+        "prefill_read_wait_seconds": 3.687407,
+        "decode_seconds": 0.000524999996,
+        "decode_tokens_per_second": 0,
+        "decode_gpu_seconds": 0,
+        "decode_read_bytes": 7602176,
+        "decode_read_wait_seconds": 0,
+        "computed_rows": 0,
+        "copy_passes": 0,
+        "proposed_tokens": 0,
+        "accepted_tokens": 0,
+        "mean_match_tokens": 0,
+        "search_seconds": 0,
+        "cache_bytes_start": 21466054656,
+        "cache_bytes_min": 21466054656,
+        "cache_bytes_max": 21466054656,
+        "slots_released": 0,
+        "output_token_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "prefill_plan": 2,
+        "prefix_tokens": 12453,
+        "configured_ced_depth": 512,
+        "last_forward_chunks": 1,
+        "last_forward_decoder_tokens": 517,
+        "prefill_logits_sha256": "6986b332135193975312a05ceb67516d84c3b27a01d4fe98fb8deb32993dddc7",
+        "proposal_policy": "copy",
+        "tool_tokens": 0,
+        "tool_proposals": 0,
+        "tool_accepted": 0,
+        "decode_remaps": 0,
+        "rnn_prompt_train_seconds": 0,
+        "rnn_decode_update_seconds": 0,
+        "rnn_classes": 0,
+        "rnn_parameters": 0,
+        "rnn_storage_bytes": 0,
+        "rnn_hidden_units": 0,
+        "rnn_epochs": 0,
+        "rnn_first_epoch_loss": 0,
+        "rnn_last_epoch_loss": 0,
+        "logits_match_split_prefill": false
+      },
+      "records": [],
+      "prefetch_metrics": [
+        {
+          "version": 1,
+          "phase": "prefill",
+          "passes": 1,
+          "rows": 13772,
+          "unsupported_gpu_route_passes": 0,
+          "unsupported_gpu_route_rows": 0,
+          "exact_router": {
+            "layer_batches": 166,
+            "unique_demands": {
+              "existing_ready": 37813,
+              "fresh_timely_prefetch": 7522,
+              "pending_prefetch": 3958,
+              "pending_demand": 0,
+              "absent": 340
+            },
+            "requested_payload_bytes": {
+              "existing_ready": 338774630400,
+              "fresh_timely_prefetch": 67777228800,
+              "pending_prefetch": 45005414400,
+              "pending_demand": 0,
+              "absent": 3922698240
+            },
+            "rerequests_after_prefetch_eviction": 0,
+            "absent_after_prefetch_eviction": 0
+          },
+          "served": {
+            "layer_batches": 166,
+            "unique_demands": {
+              "existing_ready": 37813,
+              "fresh_timely_prefetch": 7522,
+              "pending_prefetch": 3958,
+              "pending_demand": 0,
+              "absent": 340
+            },
+            "requested_payload_bytes": {
+              "existing_ready": 338774630400,
+              "fresh_timely_prefetch": 67777228800,
+              "pending_prefetch": 45005414400,
+              "pending_demand": 0,
+              "absent": 3922698240
+            },
+            "rerequests_after_prefetch_eviction": 0,
+            "absent_after_prefetch_eviction": 0
+          },
+          "admissions_by_issuer": {
+            "pc": 0,
+            "h1": 12242,
+            "h2": 0,
+            "prefill_bulk": 384,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "fresh_timely_first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 7426,
+            "h2": 0,
+            "prefill_bulk": 96,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 11102,
+            "h2": 0,
+            "prefill_bulk": 378,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "first_uses_before_io_started_by_issuer": {
+            "pc": 0,
+            "h1": 3674,
+            "h2": 0,
+            "prefill_bulk": 280,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "admission_to_first_use_ns_by_issuer": {
+            "pc": 0,
+            "h1": 5944363981000,
+            "h2": 0,
+            "prefill_bulk": 30781322000,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 11102,
+            "h2": 0,
+            "prefill_bulk": 378,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_first_uses_before_io_started_by_issuer": {
+            "pc": 0,
+            "h1": 3674,
+            "h2": 0,
+            "prefill_bulk": 280,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_admission_to_first_use_ns_by_issuer": {
+            "pc": 0,
+            "h1": 5944363981000,
+            "h2": 0,
+            "prefill_bulk": 30781322000,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "io_timing": {
+            "demand": {
+              "pieces": 2263,
+              "queue_ns": 192463916000,
+              "service_ns": 25957255000
+            },
+            "background": {
+              "pieces": 52422,
+              "queue_ns": 11000889797000,
+              "service_ns": 24853385000
+            },
+            "promoted_prefetch": {
+              "pieces": 26344,
+              "queue_ns": 7506581684000,
+              "service_ns": 284540358000
+            }
+          },
+          "prefetch_first_uses": 11480,
+          "first_uses_outside_observed_routes": 0,
+          "eventual_first_uses_after_target_pass": 0,
+          "bytes_completed_at_first_use": 68163944448,
+          "bytes_remaining_at_first_use": 45181370368,
+          "prefetch_origin_read_bytes": 124601139200,
+          "demand_origin_read_bytes": 3940270080,
+          "unused_prefetches_removed": 911,
+          "unused_prefetch_read_bytes_removed": 9844195328,
+          "unread_bytes_cancelled_on_removal": 0,
+          "unconsumed_prefetch_read_bytes_live": 1411629056,
+          "prefetch_bytes_outstanding_live": 1290272768,
+          "prefetch_caused_evictions": 10865,
+          "scope": "backbone only; unions per layer batch; pass IDs are not emitted-token IDs; decode rows include rejected verification rows; read bytes follow admission phase and requested aligned piece lengths; first-use counts follow consumption phase; live byte counters are asynchronous snapshots",
+          "pollution_scope": "observed eviction and rerequest counts, no counterfactual baseline"
+        },
+        {
+          "version": 1,
+          "phase": "decode",
+          "passes": 0,
+          "rows": 0,
+          "unsupported_gpu_route_passes": 0,
+          "unsupported_gpu_route_rows": 0,
+          "exact_router": {
+            "layer_batches": 0,
+            "unique_demands": {
+              "existing_ready": 0,
+              "fresh_timely_prefetch": 0,
+              "pending_prefetch": 0,
+              "pending_demand": 0,
+              "absent": 0
+            },
+            "requested_payload_bytes": {
+              "existing_ready": 0,
+              "fresh_timely_prefetch": 0,
+              "pending_prefetch": 0,
+              "pending_demand": 0,
+              "absent": 0
+            },
+            "rerequests_after_prefetch_eviction": 0,
+            "absent_after_prefetch_eviction": 0
+          },
+          "served": {
+            "layer_batches": 0,
+            "unique_demands": {
+              "existing_ready": 0,
+              "fresh_timely_prefetch": 0,
+              "pending_prefetch": 0,
+              "pending_demand": 0,
+              "absent": 0
+            },
+            "requested_payload_bytes": {
+              "existing_ready": 0,
+              "fresh_timely_prefetch": 0,
+              "pending_prefetch": 0,
+              "pending_demand": 0,
+              "absent": 0
+            },
+            "rerequests_after_prefetch_eviction": 0,
+            "absent_after_prefetch_eviction": 0
+          },
+          "admissions_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "fresh_timely_first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "first_uses_before_io_started_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "admission_to_first_use_ns_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_first_uses_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_first_uses_before_io_started_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "target_pass_admission_to_first_use_ns_by_issuer": {
+            "pc": 0,
+            "h1": 0,
+            "h2": 0,
+            "prefill_bulk": 0,
+            "other": 0,
+            "draft": 0,
+            "h4": 0,
+            "h8": 0
+          },
+          "io_timing": {
+            "demand": {
+              "pieces": 0,
+              "queue_ns": 0,
+              "service_ns": 0
+            },
+            "background": {
+              "pieces": 0,
+              "queue_ns": 0,
+              "service_ns": 0
+            },
+            "promoted_prefetch": {
+              "pieces": 0,
+              "queue_ns": 0,
+              "service_ns": 0
+            }
+          },
+          "prefetch_first_uses": 0,
+          "first_uses_outside_observed_routes": 0,
+          "eventual_first_uses_after_target_pass": 0,
+          "bytes_completed_at_first_use": 0,
+          "bytes_remaining_at_first_use": 0,
+          "prefetch_origin_read_bytes": 0,
+          "demand_origin_read_bytes": 0,
+          "unused_prefetches_removed": 0,
+          "unused_prefetch_read_bytes_removed": 0,
+          "unread_bytes_cancelled_on_removal": 0,
+          "unconsumed_prefetch_read_bytes_live": 0,
+          "prefetch_bytes_outstanding_live": 0,
+          "prefetch_caused_evictions": 0,
+          "scope": "backbone only; unions per layer batch; pass IDs are not emitted-token IDs; decode rows include rejected verification rows; read bytes follow admission phase and requested aligned piece lengths; first-use counts follow consumption phase; live byte counters are asynchronous snapshots",
+          "pollution_scope": "observed eviction and rerequest counts, no counterfactual baseline"
+        }
+      ],
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 14.0,
+            "renderer_percent": 14.0,
+            "gpu_resident_gib": 1.5,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 38.0,
+            "memory": {
+              "free_gib": 64.93635559082031,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 16.0,
+            "renderer_percent": 16.0,
+            "gpu_resident_gib": 1.47,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 38.0,
+            "memory": {
+              "free_gib": 64.95877075195312,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 14.0,
+            "renderer_percent": 14.0,
+            "gpu_resident_gib": 1.49,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 38.0,
+            "memory": {
+              "free_gib": 64.954345703125,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          }
+        ]
+      },
+      "gpu_activity": [
+        {
+          "elapsed_seconds": 2.201,
+          "model_gpu_client_visible": true,
+          "device_percent": 99.0,
+          "renderer_percent": 88.0,
+          "gpu_resident_gib": 16.62
+        },
+        {
+          "elapsed_seconds": 12.687,
+          "model_gpu_client_visible": true,
+          "device_percent": 100.0,
+          "renderer_percent": 100.0,
+          "gpu_resident_gib": 32.66
+        }
+      ],
+      "background_cpu_helpers": [],
+      "error": null,
+      "original_diagnostic_fields": {
+        "ced_keep": 0,
+        "compact": false
+      }
+    },
+    {
+      "settings": {
+        "binary_sha256": "f1e118ff096a9e94ba2d33ab191ce23ca1aa0c96e8f31c47f3ef1695166bb9e8",
+        "request_sha256": "3cd83e9632fc48f83b567a44f5b5ec09a76b92b0e76e3e330dc31474f6041bc8",
+        "tokens": 256,
+        "prompt_tokens": 13772,
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 12345,
+        "cache_gib": 20.0,
+        "reserve_gib": 4.0,
+        "reasoning_effort": "max",
+        "copy_min_match": 4,
+        "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+      },
+      "quant": "q2",
       "name": "joint-split-control-b",
       "valid": true,
       "exit_code": 0,
@@ -2931,5 +4802,6 @@
       "background_cpu_helpers": [],
       "error": null
     }
-  ]
+  ],
+  "metadata_correction": "The benchmark originally emitted ced_keep and compact from diagnostic switches only. For production CED runs these two fields are corrected below using configured_ced_depth and the measured decoder-token count; the original fields are retained. Timings, counts and checksums are unchanged."
 }

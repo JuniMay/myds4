@@ -1923,7 +1923,7 @@ stayed normal.
   image of up to 1,024 tokens): 0.62 to 0.63 s for a letter-size page's 8,424
   patches, about half of it attention (see [Images](#images)).
 
-## Joint prefill
+## Joint prefill and server CED
 
 On 2026-11-03, a 13,772-token reconstructed Harness request was
 measured with a fixed 20 GiB expert cache and 4 GiB reserve. Its system/tool
@@ -1933,12 +1933,12 @@ prefix during a single forward call over the whole prompt. Each measurement
 starts a fresh model process. No generation, substitution, learned predictor
 or DSpark runs in this series. Native prefetch remains enabled.
 
-| Expert format | Split control, mean (range) | Joint prefill | Ratio to control mean |
-| --- | ---: | ---: | ---: |
-| MXFP4 | 44.93 s (41.82–48.05) | 25.10 s | 1.79x |
-| IQ2_XXS mixed | 34.36 s (32.38–36.35) | 27.09 s | 1.27x |
+| Expert format | Split control, mean (range) | Joint, CED off | Ratio to control mean | Joint, CED 128 | Joint, CED 512 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| MXFP4 | 44.93 s (41.82–48.05) | 25.10 s | 1.79x | 16.82 s | 23.69 s |
+| IQ2_XXS mixed | 34.36 s (32.38–36.35) | 27.09 s | 1.27x | 16.25 s | 18.56 s |
 
-Both split controls and the joint run produced identical final
+Both split controls and the joint CED-off run produced identical final
 logits within each expert format. MXFP4 requested expert reads fell from
 about 530.87 GB to 289.28 GB; IQ2 from 283.14 GB to 157.64 GB. The reduction
 comes from one traversal of the layers for the whole prompt. Cache size
@@ -1947,4 +1947,22 @@ The controls show substantial timing variation under desktop activity, and
 each joint setting has one measurement. This is a cold-prefill comparison,
 not a decoding or task-completion benchmark.
 
-The aggregate record is `data/benchmarks/joint_prefill_results.json`.
+Production `--ced 128` and `--ced 512` retain 133 and 517 decoder rows,
+including the server's five-row rewind margin. Their final logits differ
+from full prefill. The numbers above therefore do not establish equal
+quality. Relative to joint CED-off prefill, 128 gives 1.49x on MXFP4 and
+1.67x on IQ2; 512 gives 1.06x and 1.46x in these individual runs.
+The aggregate is `data/benchmarks/joint_prefill_results.json`. It contains
+only timings, counters, digests and resource observations. Its metadata note
+records a correction to two diagnostic-only flags; raw emitted flag values
+remain in the record and timing values are unchanged.
+
+Separate model checks passed on both expert formats at 640 and 16,521
+tokens with two-token DSpark and 32 expert slots per stage. They compare
+final logits, prefix snapshots, resumed execution and draft windows.
+Compact CED matched its full-shape mask at depths 128 and 512. These tests
+exposed and now cover candidate-mask row offsets beyond 16,384 positions;
+candidate masks are retained per prompt row across attention batches.
+The prefill state check also covers all 133 retained local rows, including
+the server's five-row rewind margin. These are implementation checks, not
+task-quality scores.

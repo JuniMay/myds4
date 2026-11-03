@@ -110,7 +110,7 @@ rows of an 8,916-token source file).
 
 ## Numerics
 
-With substitution off and no GGUF override, the engine uses the
+With CED and substitution off and no GGUF override, the engine uses the
 checkpoint's original stored weights, full layer stack and router-selected
 experts. Prefetching changes when weights are read, not which experts run.
 “Exact routing” describes that selection policy. A bitwise optimization check
@@ -184,6 +184,30 @@ window of 128, plus the rows a speculative pass may write for rejected
 drafts); a prompt batch works on a window buffer filled from the ring and
 written back. A KV source keeps the compressor rows of its last 8 positions
 (row p % 8), from which a batch takes the pending group's first row.
+
+### CED prefill
+
+All new prompt rows run through layer 20, which produces full-context
+global KV and index keys. Layers 21 through 39 run only the retained
+suffix. Retained queries in layers 20 through 39 cannot read local keys
+before the replay boundary. Discarded rows do not issue next-layer
+expert prefetches; shorter retained batches use selective prefetching.
+
+Ordinary builds expose `--ced off|N`, default off, through the CLI and both
+servers. They retain N decoder rows plus five rewind rows, and apply replay
+only when the new input is longer than that sum. The replay boundary is
+chosen across the whole forward call, including multi-chunk prompts. They
+preserve all encoder/global KV work and prime DSpark only from computed
+decoder inputs. Decoding runs normally after prefill. A compact prefill can
+change local KV, routing and output; it is not an exact-output optimization.
+
+The retained `tools/prefill_prefix_check.c` compares compact execution
+with the same full-shape attention mask, including DSpark state, prefix
+restoration and chunk boundaries. `tools/server_prefill_check.py`
+checks the option and cache reuse through HTTP. Its shared guard in
+`tools/predictor_lab.py` checks GPU-client ownership, free memory,
+AC power and competing processes, and stops its own workload on resource
+interference. Requests, replies and diagnostic logs remain in memory.
 
 ## Decoding
 
@@ -1371,6 +1395,13 @@ A request runs only the tokens a session does not hold:
   subagent) gets a copy of that session from its slot 1, which leaves the
   session unchanged;
 - new: else a free session, or the least recently used one emptied.
+
+With CED, slot 1 holds encoder state through layer 20. Such a fork needs
+more than the configured replay depth plus BLOCK new tokens, so replay
+excludes missing decoder-prefix keys and rebuilds all rewind rows. Other
+requests reuse a complete state or prefill from the beginning. A fork must
+leave at least one new token to compute logits. Prefill retains all RING
+(133) local rows, including the five rows needed before a saved position.
 
 A session in which a request decodes is never emptied, rewound or freed;
 another request may fork from it. The prompt's last token always runs, for its logits, except when the prompt

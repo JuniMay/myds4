@@ -15,7 +15,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYDS4_ABI 2
+#define MYDS4_ABI 3
 
 // The engine's settings: the C server's model and server options.
 typedef struct {
@@ -38,6 +38,7 @@ typedef struct {
   int batch;                   // --batch: requests decoding together, 1 to 6
   int tui;                     // --tui: the live view on stderr instead of the log
   const char *address;         // "host:port", for the view's title
+  int ced;                     // --ced off|N: 0 or 128 to 1048576 decoder replay tokens; approximate
 } myds4_config;
 
 // Waits for the lock that one model process holds at a time (myds4.lock

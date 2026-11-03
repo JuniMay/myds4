@@ -37,11 +37,12 @@ class GPUUnavailable(RuntimeError):
     pass
 
 
-def process_snapshot(child=None, preflight=True):
+def process_snapshot(child=None, preflight=True, allow_cpu_helpers=False, background=None, gpu_clients=None):
     """Read process names, never arbitrary arguments or prompts.
 
     Standalone Python/temporary/project compute jobs are conservatively treated
-    as possible GPU users. This is an observation, not an exclusive GPU lease.
+    as possible GPU users. Desktop mode records Python and compiler work
+    without an observed GPU client as background CPU work. This is not an exclusive lease.
     """
     output = subprocess.run(["ps", "-axo", "pid=,ppid=,pcpu=,rss=,comm="],
                             capture_output=True, text=True, check=True, timeout=5).stdout
@@ -63,8 +64,21 @@ def process_snapshot(child=None, preflight=True):
             break
         children |= more
     excluded |= children
+    cpu_tools = {"clang", "clang++", "metal", "mtlcompilerservice", "ninja", "cmake", "cargo", "rustc",
+                 "iree-compile", "iree-opt", "ld", "ld64.lld", "lld"}
+    foreign_cpu = [pid for pid, row in processes.items() if pid not in excluded and
+                   (Path(row[3]).name.lower().startswith("python") or Path(row[3]).name.lower() in cpu_tools)]
+    if allow_cpu_helpers and gpu_clients is None and foreign_cpu:
+        gpu_clients = set(gpu_activity()["gpu_client_pids"])
+    ownership_known = bool(gpu_clients) and (child is None or child in gpu_clients)
+    gpu_ancestors = set(gpu_clients or ())
+    for owner in list(gpu_ancestors):
+        parent = processes.get(owner, (0,))[0]
+        while parent and parent not in gpu_ancestors:
+            gpu_ancestors.add(parent)
+            parent = processes.get(parent, (0,))[0]
     competing = []
-    for pid, (_, cpu, rss, path) in processes.items():
+    for pid, (parent, cpu, rss, path) in processes.items():
         if pid in excluded:
             continue
         name = Path(path).name.lower()
@@ -72,9 +86,19 @@ def process_snapshot(child=None, preflight=True):
         temporary_binary = path.startswith(("/private/tmp/", "/tmp/", "/private/var/folders/", "/var/folders/"))
         named_probe = any(word in name for word in ("myds4", "bench", "iree", "gpu_probe", "ane_probe"))
         python_compute = name.startswith("python") and (cpu >= 2 or rss >= 256 * 1024)
+        python_gpu = name.startswith("python") and pid in gpu_ancestors
+        details = {"pid": pid, "name": Path(path).name, "cpu_percent": cpu, "rss_mib": round(rss / 1024, 1),
+                   "parent_pid": parent, "parent_name": Path(processes.get(parent, (0, 0, 0, "unknown"))[3]).name,
+                   "gpu_client_in_process_tree": pid in gpu_ancestors if ownership_known else None}
+        if allow_cpu_helpers and ownership_known and pid not in gpu_ancestors and (python_compute or name in cpu_tools):
+            if background is not None and (cpu >= 2 or rss >= 256 * 1024):
+                background.append(details)
+            python_compute = False
+            if name in cpu_tools:
+                continue
         compiler = preflight and cpu >= 2 and name in ("clang", "clang++", "metal", "mtlcompilerservice")
-        if project_binary or temporary_binary or named_probe or python_compute or compiler:
-            competing.append({"pid": pid, "name": Path(path).name, "cpu_percent": cpu, "rss_mib": round(rss / 1024, 1)})
+        if project_binary or temporary_binary or named_probe or python_compute or python_gpu or compiler:
+            competing.append(details)
     return competing
 
 
@@ -87,9 +111,8 @@ def memory_snapshot():
             "compressions": pages("Compressions"), "swapouts": pages("Swapouts")}
 
 
-def gpu_snapshot(cache_gib):
-    busy = process_snapshot()
-    raw = subprocess.run(["ioreg", "-r", "-c", "IOAccelerator", "-a"],
+def gpu_activity():
+    raw = subprocess.run(["ioreg", "-r", "-c", "IOAccelerator", "-a", "-l"],
                          capture_output=True, check=True, timeout=5).stdout
     if len(raw) > 8 * 1024**2:
         raise GPUUnavailable("GPU registry response exceeded its diagnostic bound")
@@ -100,31 +123,59 @@ def gpu_snapshot(cache_gib):
     device = max(float(s.get("Device Utilization %", 0)) for s in stats)
     renderer = max(float(s.get("Renderer Utilization %", 0)) for s in stats)
     resident = sum(int(s.get("In use system memory", 0)) for s in stats) / 1024**3
+    clients = set()
+    def owners(node):
+        creator = node.get("IOUserClientCreator", "")
+        match = re.search(r"\bpid\s+(\d+)\b", creator) if isinstance(creator, str) else None
+        if match:
+            clients.add(int(match[1]))
+        for child in node.get("IORegistryEntryChildren", []):
+            owners(child)
+    for entry in entries:
+        owners(entry)
+    return {"device_percent": device, "renderer_percent": renderer, "gpu_resident_gib": round(resident, 2),
+            "gpu_client_pids": sorted(clients)}
+
+
+def gpu_snapshot(cache_gib, reserve_gib=10, desktop=False):
+    activity = gpu_activity()
+    background = []
+    busy = process_snapshot(allow_cpu_helpers=desktop, background=background,
+                            gpu_clients=set(activity["gpu_client_pids"]))
+    device, renderer, resident = (activity[k] for k in ("device_percent", "renderer_percent", "gpu_resident_gib"))
     memory = memory_snapshot()
     power = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, check=True, timeout=5).stdout
     on_ac = "AC Power" in power.splitlines()[0]
     reasons = []
     if busy:
         reasons.append("another compute process is present")
-    if device > 20:
+    # Aggregate activity cannot identify a model job. Desktop studies record
+    # it and rely on process/ownership checks and the shared model lock.
+    if not desktop and device > 20:
         reasons.append("GPU device activity exceeds 20 percent")
     if resident > 8:
         reasons.append("another workload retains more than 8 GiB of GPU memory")
-    if memory["free_gib"] < cache_gib + 24:
+    # Dense weights, DSpark and working buffers have stayed below 14 GiB in
+    # the bounded checks. Keep the requested engine reserve in addition.
+    required_free = cache_gib + 14 + reserve_gib
+    if memory["free_gib"] < required_free:
         reasons.append("insufficient free memory for cache, runtime and reserve")
     if not on_ac:
         reasons.append("large model tests require AC power")
     return {"device_percent": device, "renderer_percent": renderer, "gpu_resident_gib": round(resident, 2),
-            "memory": memory, "ac_power": on_ac, "competing_processes": busy, "reasons": reasons}
+            "desktop_load": desktop,
+            "reserve_gib": reserve_gib, "required_free_gib": required_free,
+            "memory": memory, "ac_power": on_ac, "competing_processes": busy,
+            "background_cpu_helpers": background, "reasons": reasons}
 
 
-def wait_for_gpu(cache_gib, timeout):
+def wait_for_gpu(cache_gib, timeout, reserve_gib=10, desktop=False):
     until = time.monotonic() + timeout
     quiet = []
     announced = False
     while True:
         try:
-            state = gpu_snapshot(cache_gib)
+            state = gpu_snapshot(cache_gib, reserve_gib, desktop)
         except (subprocess.SubprocessError, OSError, ValueError) as error:
             raise GPUUnavailable("GPU preflight inspection failed") from error
         if state["reasons"]:
@@ -142,22 +193,39 @@ def wait_for_gpu(cache_gib, timeout):
         time.sleep(5 if state["reasons"] else 2)
 
 
-def guarded_process(command, env, timeout, baseline):
-    process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def guarded_process(command, env, timeout, baseline, observe_graphics=False, allow_cpu_helpers=False, input_data=None):
+    process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stop = threading.Event()
     interference = []
+    activity_samples = []
+    helper_samples = []
+    started = time.monotonic()
     def monitor():
+        next_activity = started
         while not stop.wait(2):
             if process.poll() is not None:
                 return
             try:
-                busy = process_snapshot(child=process.pid, preflight=False)
+                background = []
+                busy = process_snapshot(child=process.pid, preflight=False,
+                                        allow_cpu_helpers=allow_cpu_helpers, background=background)
                 memory = memory_snapshot()
+                if background and len(helper_samples) < 32:
+                    helper_samples.append({"elapsed_seconds": round(time.monotonic() - started, 3), "processes": background})
+                if observe_graphics and time.monotonic() >= next_activity:
+                    activity = gpu_activity()
+                    visible = process.pid in activity.pop("gpu_client_pids")
+                    activity_samples.append({"elapsed_seconds": round(time.monotonic() - started, 3),
+                                             "model_gpu_client_visible": visible, **activity})
+                    next_activity = time.monotonic() + 10
+                if process.poll() is not None:
+                    return  # snapshots after the child ended are not interference with its run
                 if busy or memory["compressions"] > baseline["compressions"] or memory["swapouts"] > baseline["swapouts"]:
                     interference.append({"competing_processes": busy, "memory": memory})
                 else:
                     continue
-            except (subprocess.SubprocessError, OSError, ValueError) as error:
+            except (subprocess.SubprocessError, OSError, ValueError, GPUUnavailable) as error:
                 interference.append({"inspection_error": type(error).__name__})
             try:
                 process.send_signal(signal.SIGINT)
@@ -167,7 +235,7 @@ def guarded_process(command, env, timeout, baseline):
     watcher = threading.Thread(target=monitor, daemon=True)
     watcher.start()
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
+        stdout, stderr = process.communicate(input=input_data, timeout=timeout)
     except subprocess.TimeoutExpired:
         process.kill()
         process.communicate()
@@ -187,7 +255,10 @@ def guarded_process(command, env, timeout, baseline):
     if interference:
         print("GPU_RUN_DISCARDED " + json.dumps(interference), flush=True)
         raise GPUUnavailable("another workload appeared or memory was compressed; this run is not a performance result")
-    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    result.gpu_activity_samples = activity_samples
+    result.background_cpu_helpers = helper_samples
+    return result
 
 
 def run(args, quant, prompt, mode, variant, expected):

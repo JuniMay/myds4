@@ -66,7 +66,7 @@ build/myds4 -m "$CHECKPOINT" --experts "$EXPERTS" -p "What is the capital of Fra
 ```
 
 Without `--experts`, myds4 uses the checkpoint's native MXFP4 experts and
-original output head. With substitution off, it runs the full model
+original output head. With CED and substitution off, it runs the full model
 using the router's selected experts. Numerical differences from the reference
 runtime remain; see [Numerics](docs/design.md#numerics).
 The server needs an API key:
@@ -84,6 +84,11 @@ Chat Completions protocol and the key file's contents (see
 [Usage](docs/usage.md#deepseek-harness)). Each run takes most of the memory,
 so one runs at a time: a second waits for the first's lock.
 
+Both servers and the CLI accept `--ced off|N` for approximate decoder replay
+during prefill, with `off` as the default. For example, `--ced 128` retains
+128 decoder tokens plus five rewind rows. This can change output; see the
+[option and cache behavior](docs/usage.md) and the
+[measured comparisons](docs/performance.md#joint-prefill-and-server-ced).
 Each new conversation's system prefix is saved within the same prefill as
 its remaining messages. Arrival and prefill logs show request counts,
 queue depth and actual chunks without logging conversation text.

@@ -24,6 +24,8 @@ static void usage(void) {
         "                each takes a <｜deepseek_image｜> of the prompt instead\n"
         "  --vision-fd FD  write the --image images' feature rows (BF16, 5120 per token) to FD and exit\n"
         "  --ctx N       context capacity in tokens, at most 1048576 (default 16384; with --serve 1048576)\n"
+        "  --ced off|N   approximate prefill: replay N decoder tokens, 128-1048576 (default off);\n"
+        "                keeps five additional rows for cached-request rewinds; decoding uses all layers\n"
         "  --cache GB    expert cache budget (default: from available memory)\n"
         "  --reserve GB  memory the expert cache leaves to other programs, 2-1024 (default 10)\n"
         "  --cache-half-life N  score half-life in forward passes, 1-1000000 (default 50)\n"
@@ -166,6 +168,13 @@ int main(int argc, char **argv) {
       if (end == v || *end || n < 0 || n > 100) die("--think takes 0 (off) or 1 to 100");
       think = (int)n;
       think_set = 1;
+    } else if (!strcmp(a, "--ced")) {
+      char *end;
+      errno = 0;
+      long n = !strcmp(v, "off") ? 0 : strtol(v, &end, 10);
+      if (strcmp(v, "off") && (end == v || *end || errno || n < WINDOW || n > 1 << 20))
+        die("--ced takes off or 128 to 1048576 replay tokens");
+      o.ced = (int)n;
     } else if (!strcmp(a, "--ctx")) o.ctx = atoi(v), ctx_set = 1;
     else if (!strcmp(a, "--cache")) o.budget_gb = atof(v);
     else if (!strcmp(a, "--reserve")) {
@@ -225,6 +234,7 @@ int main(int argc, char **argv) {
   if (o.draft < 0 || o.draft > BLOCK) die("--draft takes 1 to %d drafts", BLOCK);
   if (o.draft_cache && !o.draft) die("--draft-cache needs --draft");
   if (o.draft_trim && !o.draft) die("--draft-trim needs --draft");
+  if (o.ced && (o.dump_fd >= 0 || check)) die("--dump-fd and --check-prefill require --ced off; they inspect every prompt row");
   if (o.predictor_state) shutdown_watch();
   if (so.port) {
     so.temp = temp;

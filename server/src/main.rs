@@ -38,6 +38,7 @@ const USAGE: &str = "usage: myds4-server -m MODEL --serve PORT [options]
   --seed N        the seed of requests that set none (default: random for each)
   --think N       thinking effort 1-100 of requests that set none; 0 turns thinking off (default 75)
   --ctx N         context capacity in tokens, at most 1048576 (default 1048576)
+  --ced off|N     approximate prefill: replay N decoder tokens, 128-1048576 (default off), plus five rewind rows
   --cache GB      expert cache budget (default: from available memory)
   --reserve GB    memory the expert cache leaves to other programs, 2-1024 (default 10)
   --cache-half-life N  score half-life in forward passes, 1-1000000 (default 50)
@@ -65,6 +66,21 @@ fn die(message: &str) -> ! {
 
 fn value<T: std::str::FromStr>(flag: &str, v: &str) -> T {
     v.parse().unwrap_or_else(|_| die(&format!("{flag}: not a valid value: {v}")))
+}
+
+fn ced_depth(v: &str) -> Option<i32> {
+    if v == "off" { Some(0) } else { v.parse().ok().filter(|n| (128..=1 << 20).contains(n)) }
+}
+
+#[test]
+fn ced_accepts_off_or_a_bounded_replay_depth() {
+    assert_eq!(ced_depth("off"), Some(0));
+    assert_eq!(ced_depth("128"), Some(128));
+    assert_eq!(ced_depth("512"), Some(512));
+    assert_eq!(ced_depth("1048576"), Some(1048576));
+    for v in ["", "on", "0", "127", "-1", "1048577", "128.0", "128x"] {
+        assert_eq!(ced_depth(v), None, "{v}");
+    }
 }
 
 struct Args {
@@ -103,6 +119,7 @@ fn parse() -> Args {
                     "-m" => e.model = v.clone(),
                     "--experts" => e.experts = Some(v.clone()),
                     "--ctx" => e.ctx = value(flag, v),
+                    "--ced" => e.ced = ced_depth(v).unwrap_or_else(|| die("--ced takes off or 128 to 1048576 replay tokens")),
                     "--cache" => e.cache_gb = value(flag, v),
                     "--reserve" => e.reserve_gb = value(flag, v),
                     "--cache-half-life" => e.cache_half_life = value(flag, v),

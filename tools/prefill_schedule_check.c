@@ -11,7 +11,7 @@ static ModelForwardInfo spy_info;
 static const float *spy_forward(const int *tokens, int n, int pos) {
   if (forwards < 8) forward_calls[forwards] = (typeof(*forward_calls)){n, pos};
   forwards++;
-  spy_info = (ModelForwardInfo){.tokens = n, .chunks = 1};
+  spy_info = (ModelForwardInfo){.tokens = n, .chunks = 1, .decoder_tokens = n};
   return fixture_logits;
 }
 static State *spy_new(void) { return (State *)(uintptr_t)1; }
@@ -24,8 +24,9 @@ static void spy_save(int slot) { saved_mask |= 1 << slot; }
 static void spy_restore(int slot) {}
 static void spy_seek(const int *tokens, int pos) {}
 static void spy_images(const Image *images, int count) {}
-static const float *spy_prefix(const int *tokens, int n, int pos, int prefix) {
+static const float *spy_prefix(const int *tokens, int n, int pos, int prefix, int *encoder_only) {
   spy_save(1);
+  if (encoder_only) *encoder_only = 0;
   const float *lg = spy_forward(tokens, n, pos);
   spy_info.prefix_tokens = prefix;
   return lg;
@@ -93,7 +94,15 @@ int main(void) {
   pick(prompt, 4, &from, &how);
   int short_prompt = from < 4;
   printf("prefix-only request: reused=%d (must leave a token for logits)\n", from);
+  int fork_tokens[256] = {1, 2, 3, 4, 77};
+  opt.ced = 128;
+  g.s->base_encoder_only = 1;
+  pick(fork_tokens, 4 + 128 + BLOCK, &from, &how);
+  int guarded = from == 0;
+  pick(fork_tokens, 4 + 128 + BLOCK + 1, &from, &how);
+  guarded &= from == 4 && !strcmp(how, "forked");
+  printf("encoder-only prefix: short suffix skipped, full replay forked=%d\n", guarded);
   free(g.p);
   for (int i = 0; i < SESSIONS; i++) free(sessions[i].ids), free(sessions[i].logits);
-  return !(accepted && one_prompt && retained && short_prompt && retry_ok && changed_ok && started_events == 3);
+  return !(accepted && one_prompt && retained && short_prompt && guarded && retry_ok && changed_ok && started_events == 3);
 }

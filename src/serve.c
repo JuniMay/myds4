@@ -80,6 +80,7 @@ typedef struct {
   int saved;      // the position of the rows saved in slot 0 (its last prompt's end), -1 if none
   float *logits;  // the logits of that prompt's last token
   int base;       // the position of the rows saved in slot 1 (its first user turn), -1 if none
+  int base_encoder_only;  // CED saved only layers 0..20; reuse must rebuild the decoder window
   int busy;       // a request decodes in it
   int number;
   double used;
@@ -176,6 +177,7 @@ static Session *empty(const Session *keep) {
     live++;
   }
   s->n = 0, s->saved = s->base = -1, s->number = ++session_numbers, s->hits = 0;
+  s->base_encoder_only = 0;
   pthread_mutex_unlock(&st_lock);
   return s;
 }
@@ -197,7 +199,8 @@ static Session *pick(const int *p, int n, int *from, const char **how) {
     Session *c = &sessions[i];
     if (!c->st) continue;
     int w, r = c->busy ? 0 : reusable(c, p, n, &w), k = common(p, n, c->ids, c->n);  // a busy one only forks
-    int f = c->base > 1 && c->base < n && k >= c->base ? c->base : 0;
+    int f = c->base > 1 && c->base < n && k >= c->base &&
+            (!c->base_encoder_only || (opt.ced && n - c->base > opt.ced + BLOCK)) ? c->base : 0;
     if (r > *from) *from = r, saved = w, s = c, src = 0;
     if (f > *from) *from = f, src = c, s = 0;
   }
@@ -216,6 +219,7 @@ static Session *pick(const int *p, int n, int *from, const char **how) {
     model_state_restore(1);
     pthread_mutex_lock(&st_lock);
     s->base = src->base;
+    s->base_encoder_only = src->base_encoder_only;
     memcpy(s->ids, p, (size_t)*from * sizeof *p), s->n = *from;
     hit(src, *from), status.kinds[3]++;
     pthread_mutex_unlock(&st_lock);
@@ -678,7 +682,7 @@ static int begin(Job *j, Gen *g) {
   pthread_mutex_lock(&q_lock);
   int queued = waiting;
   pthread_mutex_unlock(&q_lock);
-  say("req %d: prefill start, waiting=%d, new_tokens=%d", j->number, queued, n - g->from);
+  say("req %d: prefill start, waiting=%d, new_tokens=%d, ced_depth=%d", j->number, queued, n - g->from, opt.ced);
   int encoded = 0;  // the ViT runs for the images the prefill reaches; the others are in the session's rows
   for (int i = 0; i < g->nims; i++)
     if (g->ims[i].start + image_span(&g->ims[i]) > g->from) model_image(&g->ims[i]), encoded++;
@@ -695,7 +699,7 @@ static int begin(Job *j, Gen *g) {
     int z = 0;
     while (!g->from && z < n && g->p[z] != user) z++;
     if (z > 1 && z < n - 1) {
-      lg = model_forward_prefix(g->p, n, 0, z);
+      lg = model_forward_prefix(g->p, n, 0, z, &s->base_encoder_only);
       s->base = z;
     } else lg = model_forward(g->p + g->from, n - g->from, g->from);
     plan = model_forward_info();
@@ -712,8 +716,9 @@ static int begin(Job *j, Gen *g) {
   g->t1 = g->tick = now();
   say("req %d: prefill of %d tokens in %.2f s (%.0f tokens/s), %.2f GB of experts read", j->number, n - g->from,
       g->t1 - t0, (n - g->from) / fmax(g->t1 - t0, 1e-9), (cache_stats.bytes - c0.bytes) / 1e9);
-  say("req %d: prefill plan: %d chunks, %d tokens, prefix=%d",
-      j->number, plan.chunks, plan.tokens, plan.prefix_tokens);
+  say("req %d: prefill plan: %d chunks, %d encoder tokens, %d decoder tokens, ced_applied=%d, prefix=%d (%s)",
+      j->number, plan.chunks, plan.tokens, plan.decoder_tokens, plan.ced_applied,
+      plan.prefix_tokens, plan.prefix_encoder_only ? "encoder only" : "full");
   if (j->stream) chunk(&g->o, "{\"role\": \"assistant\", \"content\": \"\"}", 0);
   parser_init(&g->ps, len >= 7 && !strcmp(g->text + len - 7, "<think>"));
   g->ps.text = on_text, g->ps.call = on_call, g->ps.ctx = &g->o;
@@ -1092,8 +1097,11 @@ static void report(int fd) {
              "\"totals\": {\"requests\": %llu, \"prompt_tokens\": %llu, \"generated_tokens\": %llu}, ",
              kv_bytes() / GiB, cfg.kv_gb, (unsigned long long)status.requests,
              (unsigned long long)status.prompt_tokens, (unsigned long long)status.generated_tokens);
-  str_printf(&b, "\"last_prefill\": {\"chunks\": %d, \"tokens\": %d, \"prefix_tokens\": %d}, ",
-             status.prefill.chunks, status.prefill.tokens, status.prefill.prefix_tokens);
+  str_printf(&b, "\"ced_depth\": %d, \"last_prefill\": {\"chunks\": %d, \"tokens\": %d, \"decoder_tokens\": %d, "
+             "\"ced_applied\": %s, \"prefix_tokens\": %d, \"prefix_encoder_only\": %s}, ",
+             opt.ced, status.prefill.chunks, status.prefill.tokens, status.prefill.decoder_tokens,
+             status.prefill.ced_applied ? "true" : "false", status.prefill.prefix_tokens,
+             status.prefill.prefix_encoder_only ? "true" : "false");
   pthread_mutex_unlock(&st_lock);
   CacheStats c = cache_stats;
   str_printf(&b, "\"expert_cache\": {\"slots\": %d, \"gib\": %.1f, \"hits\": %llu, \"misses\": %llu, \"read_gb\": %.1f}, "
@@ -1212,7 +1220,8 @@ void serve(const char *model, const Options *o, const Serve *s) {
   shutdown_watch();
   say("kv cache: up to %.1f GiB (--kv-cache); a session takes %.0f MiB at first, %.2f GiB at %d tokens", cfg.kv_gb,
       model_state_bytes(0, 0) / 1048576.0, model_state_bytes(0, opt.ctx) / GiB, opt.ctx);
-  say("prefill: system prefix saved within the prompt pass");
+  say("prefill: ced_depth=%d (%s); system prefix saved within the prompt pass", opt.ced,
+      opt.ced ? "approximate, plus five rewind rows" : "off");
   if (ntohl(addr.sin_addr.s_addr) >> 24 != 127)
     say("warning: plain HTTP on %s: keys and conversations cross the network unencrypted", host);
   say("serving %s at http://%s:%d/v1 (context %d tokens%s%s)", MODEL_ID, host, cfg.port, opt.ctx,
