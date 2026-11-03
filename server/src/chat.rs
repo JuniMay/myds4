@@ -118,8 +118,8 @@ fn effort_of(v: Option<&Value>, default: u32) -> u32 {
     if (1..=100).contains(&e) { e as u32 } else { default }
 }
 
-/// Rewrites what the C server accepts and recipe's schema refuses or reads
-/// otherwise (docs/server.md, Compatibility steps), and takes out the
+/// Rewrites the request forms the server accepts that recipe's schema refuses
+/// or reads otherwise (docs/server.md, Compatibility steps), and takes out the
 /// settings the server reads itself.
 fn compatible(root: &mut Map<String, Value>, d: &Defaults) -> Result<Settings, Error> {
     let number = |v: Option<Value>, default: f64| match v {
@@ -366,7 +366,7 @@ fn response_id() -> String {
 }
 
 /// The engine's events as recipe's inference chunks. The end token goes on as
-/// one token without text, as the C server counts it; the server's stop sets
+/// one token without text, as the engine counts it; the server's stop sets
 /// `stopped` and ends the chunks without a finish.
 fn inference(
     first: Event,
@@ -643,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn requests_take_the_c_servers_forms() {
+    fn requests_take_the_compatible_forms() {
         let (root, s) = settings(json!({
             "messages": [
                 {"role": "developer", "content": "be brief"},

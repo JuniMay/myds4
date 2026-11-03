@@ -1,12 +1,14 @@
 //! myds4-server: the OpenAI Chat Completions API over myds4's engine, with
 //! DeepSeek's deepseek-recipe for requests, prompts and output
-//! (docs/server.md). It takes the C server's options: the engine (src/engine.c
-//! behind src/engine.h) owns the model, the sessions, the queue, the batching,
-//! the live view and the stop on SIGINT, SIGTERM or the view's q key.
+//! (docs/server.md). The engine (src/engine/engine.c behind
+//! src/engine/engine.h) owns the model, the sessions, the queue, the batching
+//! and the stop on SIGINT or SIGTERM; the live view (--tui) is view.rs.
 
 mod chat;
 mod engine;
+mod view;
 
+use std::io::IsTerminal;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::process::exit;
 use std::sync::Arc;
@@ -25,14 +27,15 @@ use sha2::{Digest, Sha256};
 use crate::chat::{Defaults, MODEL_ID};
 
 const USAGE: &str = "usage: myds4-server -m MODEL --serve PORT [options]
-  The C server's options (build/myds4 --serve); see docs/server.md.
+  See docs/server.md.
   -m DIR          the checkpoint directory
   --serve PORT    serve OpenAI Chat Completions at http://HOST:PORT/v1 (needs MYDS4_API_KEY or --api-key-file)
   --host ADDR     the IPv4 address to serve on (default 127.0.0.1)
   --api-key-file FILE  the API key clients must send (16 to 256 characters)
   --kv-cache GB   bound of the conversations' attention state kept between requests (default 8)
   --batch N       requests decoding together at most, 1 to 6 (default 4)
-  --tui           a live view in the terminal instead of the log on stderr
+  --tui           a live view in the terminal (requests, speed, experts, memory, sessions) instead of the
+                  log on stderr; q stops the server, and the last log lines print on exit
   -t T, --temperature T  the temperature of requests that set none (default 1; 0 is greedy)
   --top-p P       the top_p of requests that set none, 0 to 1 (default 1)
   --seed N        the seed of requests that set none (default: random for each)
@@ -60,6 +63,7 @@ fn usage() -> ! {
 }
 
 fn die(message: &str) -> ! {
+    view::leave();
     eprintln!("myds4-server: {message}");
     exit(1)
 }
@@ -90,6 +94,7 @@ struct Args {
     key_file: Option<String>,
     defaults: Defaults,
     render: Option<String>,
+    tui: bool,
 }
 
 fn parse() -> Args {
@@ -100,18 +105,23 @@ fn parse() -> Args {
         key_file: None,
         defaults: Defaults { temperature: 1.0, top_p: 1.0, seed: None, thinking: true, effort: 75 },
         render: None,
+        tui: false,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
+        if flag == "--tui" {
+            a.tui = true;
+            i += 1;
+            continue;
+        }
         let e = &mut a.engine;
         match flag {
             "--cache-read-cost" => e.cache_read_cost = true,
             "--gpu-route" => e.gpu_route = true,
             "--draft-trim" => e.draft_trim = true,
             "--online-predictor" => e.online_predictor = true,
-            "--tui" => e.tui = true,
             _ => {
                 let Some(v) = args.get(i + 1) else { usage() };
                 i += 1;
@@ -306,9 +316,29 @@ fn main() {
     listener.set_nonblocking(true).unwrap_or_else(|e| die(&format!("cannot configure the listening socket: {e}")));
 
     let mut config = a.engine;
-    config.address = format!("{host}:{port}");
+    // The live view takes the log from the start; until it is on the screen,
+    // the lines go to stderr as well.
+    let tui = a.tui && std::io::stderr().is_terminal();
+    if tui {
+        config.on_log = Some(view::on_log);
+        config.on_die = Some(view::on_die);
+    }
     if !engine::start(&config) {
         exit(2);
+    }
+    let mut title = format!(
+        "myds4 · {host}:{port} · {MODEL_ID} · {} experts",
+        if config.experts.is_some() { "GGUF" } else { "MXFP4" }
+    );
+    if config.substitute > 0.0 {
+        title += &format!(" · --substitute {}", config.substitute);
+    }
+    if config.draft > 0 {
+        title += &format!(" · --draft {}", config.draft);
+    }
+    let live = if tui { view::start(title) } else { None };
+    if a.tui && live.is_none() {
+        engine::log("--tui: stderr is not a terminal; the log stays on stderr");
     }
     if !host.is_loopback() {
         engine::log(&format!("warning: plain HTTP on {host}: keys and conversations cross the network unencrypted"));
@@ -355,8 +385,9 @@ fn main() {
         .unwrap_or_else(|e| die(&format!("cannot start the runtime: {e}")));
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::from_std(listener).unwrap_or_else(|e| die(&e.to_string()));
-        // The engine owns the stop (SIGINT, SIGTERM, the live view's q): the
-        // server stops accepting, and the engine ends every open response.
+        // The engine owns the stop (SIGINT, SIGTERM, the live view's q through
+        // request_stop): the server stops accepting, and the engine ends every
+        // open response.
         let stopped = async {
             while !engine::stopping() {
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -368,4 +399,7 @@ fn main() {
             .unwrap_or_else(|e| die(&format!("serving: {e}")));
     });
     engine::stop();
+    if let Some(live) = live {
+        live.finish();
+    }
 }

@@ -15,16 +15,16 @@ myds4 is inspired by [ds4](https://github.com/antirez/ds4) and mlx-stream.
 - [Design](docs/design.md): data flow, numerics, the expert cache and memory
   policy, decoding, prefill and images.
 - [Performance](docs/performance.md): the machine's limits and measured results.
-- [The Rust server](docs/server.md): a second server on DeepSeek's
-  `deepseek-recipe` crates over the same engine, its C ABI, and how it
-  differs from the C server (not yet the default).
+- [The server](docs/server.md): the HTTP server, in Rust on DeepSeek's
+  `deepseek-recipe` crates over the C engine: its C ABI, its live view, and
+  where its prompts differ from `encoding.py`.
 
 ## Requirements
 
 - macOS 27 on Apple silicon with Metal 4.1 (developed on an M5 Max with 128 GiB
   of memory and a 2 TB SSD).
 - Xcode command line tools, and yyjson and libjpeg-turbo found through
-  `pkg-config`.
+  `pkg-config`; for the server, a Rust toolchain (`cargo`).
 - The checkpoint (475 GiB) and, for speed, a GGUF expert build (121 to 165 GB)
   on a local SSD.
 
@@ -54,9 +54,12 @@ and ISTA-DASLab's GSQ-RCO `IQ1_M` in all five of its files (121 GB, from
 ```sh
 brew install pkgconf yyjson jpeg-turbo
 make
+make server
 ```
 
 `build/myds4` embeds the Metal kernels, which compile when the program starts.
+It generates text and runs the checks and benchmarks; `build/myds4-server`
+serves the API over the same engine.
 
 ## Run
 
@@ -73,7 +76,7 @@ The server needs an API key:
 
 ```sh
 mkdir -p ~/.config/myds4 && openssl rand -hex 32 > ~/.config/myds4/api-key && chmod 600 ~/.config/myds4/api-key
-build/myds4 -m "$CHECKPOINT" --experts "$EXPERTS" --cache 56 \
+build/myds4-server -m "$CHECKPOINT" --experts "$EXPERTS" --cache 56 \
   --serve 8008 --api-key-file ~/.config/myds4/api-key --tui
 ```
 
@@ -84,7 +87,7 @@ Chat Completions protocol and the key file's contents (see
 [Usage](docs/usage.md#deepseek-harness)). Each run takes most of the memory,
 so one runs at a time: a second waits for the first's lock.
 
-Both servers and the CLI accept `--ced off|N` for approximate decoder replay
+The server and the CLI accept `--ced off|N` for approximate decoder replay
 during prefill, with `off` as the default. For example, `--ced 128` retains
 128 decoder tokens plus five rewind rows. This can change output; see the
 [option and cache behavior](docs/usage.md) and the

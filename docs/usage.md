@@ -14,10 +14,10 @@ environment in `.venv`; the vision check also needs `pillow`. The program
 itself needs no Python.
 
 `build/myds4` embeds the kernels and two tables from `data/`, which
-`tools/gen_data.py` generates from the checkpoint:
+`tools/data/gen_data.py` generates from the checkpoint:
 
 ```sh
-.venv/bin/python tools/gen_data.py /path/to/DeepSeek-V4.1-Flash-1017
+.venv/bin/python tools/data/gen_data.py /path/to/DeepSeek-V4.1-Flash-1017
 ```
 
 - `data/engram.bin`: the Engram hashing constants and the compressed token
@@ -35,15 +35,15 @@ it, saying so on stderr. `lockf(1)` takes the same lock.
 | --- | --- |
 | `-p TEXT`, `-f FILE` | The user message (wrapped in the chat template). |
 | `--raw` | Use the text as is, without the chat template. |
-| `--think N` | Thinking effort 1 to 100; 0 disables thinking. CLI defaults to off; the server defaults to effort 75. |
+| `--think N` | Thinking effort 1 to 100; 0, the default, disables thinking. |
 | `--image FILE` | An image (any format macOS reads; JPEG through libjpeg-turbo) before the prompt's text, up to 16. With `--raw`, each image takes a `<｜deepseek_image｜>` of the prompt instead. The vision encoder's weights (0.97 GB) load at the first image (see [Design](design.md#images)). |
-| `--vision-fd FD` | With `--image`: write the images' feature rows (BF16, 5,120 per token) to the file descriptor FD and exit, for `tools/check.py vision`. |
+| `--vision-fd FD` | With `--image`: write the images' feature rows (BF16, 5,120 per token) to the file descriptor FD and exit, for `tools/reference/check.py vision`. |
 | `-n N` | Tokens to generate (default 128). |
-| `-t T`, `--temperature T` | Finite nonnegative sampling temperature; 0, the default, is greedy. With `--serve` it sets the requests' default, which is then 1. |
-| `--top-p P` | Nucleus probability from 0 to 1; default 1 samples the full distribution. Also sets the server default. Zero retains only the highest-probability token. |
-| `--seed N` | Nonnegative integer seed for repeatable sampling. Also sets the server default; individual requests may override it. Omit it to initialize each CLI run or server request from system randomness. |
-| `--ctx N` | Context capacity in tokens, up to 1,048,576, the model's own (default 16,384; 1,048,576 with `--serve`). The attention state of a conversation takes about 3.1 KB per token and grows with it. |
-| `--ced off\|N` | Approximate prefill, default `off`. A depth from 128 to 1,048,576 retains N decoder tokens plus five rows for cached-request rewinds. All new tokens run through the encoder and global KV projections; only the retained suffix runs through later decoder layers. Shorter inputs use full prefill. Decoding still uses all layers. Local KV and generated output can differ from full prefill. Available in the CLI and both servers. |
+| `-t T`, `--temperature T` | Finite nonnegative sampling temperature; 0, the default, is greedy. |
+| `--top-p P` | Nucleus probability from 0 to 1; default 1 samples the full distribution. Zero retains only the highest-probability token. |
+| `--seed N` | Nonnegative integer seed for repeatable sampling. Omit it to initialize each run from system randomness. |
+| `--ctx N` | Context capacity in tokens, up to 1,048,576, the model's own (default 16,384). The attention state of a conversation takes about 3.1 KB per token and grows with it. |
+| `--ced off\|N` | Approximate prefill, default `off`. A depth from 128 to 1,048,576 retains N decoder tokens plus five rows for cached-request rewinds. All new tokens run through the encoder and global KV projections; only the retained suffix runs through later decoder layers. Shorter inputs use full prefill. Decoding still uses all layers. Local KV and generated output can differ from full prefill. Available in the CLI and the server. |
 | `--cache GB` | Upper bound on expert memory, including reserved draft pools. After reserving those pools, the budget must hold two backbone layers' experts. The cache adapts to available memory and keeps a reserve for other programs (`--reserve`); the requested budget is not a guaranteed allocation. Slots outside the GPU's mapping limit remain in memory and are mapped when needed. See [Design](design.md#the-expert-cache-and-memory). |
 | `--reserve GB` | The memory the expert cache leaves to other programs, 2 to 1,024 GiB (default 10). The cache starts within the free memory less the reserve, gives slots back when the available memory falls below it, and grows only while the available memory exceeds it by 4 GiB. A smaller reserve keeps more experts in memory and leaves less to other applications; the cache still gives slots back when the kernel reports pressure, swaps or compresses memory while the free memory is below the reserve. |
 | `--cache-half-life N` | Retention-score half-life, 1 to 1,000,000 forward-pass advances; default 50. A decode or verification pass advances once, and prefill advances once at its end. A DSpark pass can emit several tokens, so these are not emitted-token units. |
@@ -75,8 +75,12 @@ also the passes and the drafts kept per pass.
 
 ## Server
 
-`--serve PORT` serves the OpenAI Chat Completions API on
+`build/myds4-server --serve PORT` serves the OpenAI Chat Completions API on
 `http://127.0.0.1:PORT/v1`, for clients such as the DeepSeek Harness app.
+`make server` builds it (it needs `cargo`; see [The server](server.md#build)).
+It takes the model and engine options of `build/myds4` above (`-m`,
+`--experts`, `--ctx`, `--ced`, the cache, draft and predictor options,
+`--substitute` and `--gpu-route`) and the server options below.
 Every request but `GET /health` needs the API key, which the server reads
 from `--api-key-file FILE` or from the `MYDS4_API_KEY` environment variable,
 and which clients send as `Authorization: Bearer KEY` (or `x-api-key: KEY`).
@@ -96,6 +100,7 @@ The [README](../README.md#run) shows how to create a key file and start the serv
 | `--think N` | The thinking default: 1–100 enables thinking at that effort; 0 disables it. Without this option, the server enables thinking at effort 75. Request fields take precedence. |
 | `--batch N` | Requests decoded together at most, 1 to 6 (default 4). Requests that overlap then share each forward pass: more tokens per second in all, fewer for each request (see [Performance](performance.md#concurrent-requests)). A request alone runs the same at any N. |
 | `--tui` | A live view on the terminal in place of the log (see below); the `q` key stops the server as Ctrl-C does. |
+| `--render FILE` | Print the prompt of a JSON test case of the checkpoint's `encoding/tests` (or a request's messages, tools, thinking mode and effort) as the server renders it, and exit; for `tools/reference/check.py encoding`. |
 
 Endpoints:
 
@@ -131,7 +136,7 @@ For a sampled server with persistent prefetch learning, set `CHECKPOINT`,
 `API_KEY_FILE` and `PREDICTOR_STATE` to the desired paths, then run:
 
 ```sh
-build/myds4 -m "$CHECKPOINT" --serve 8008 --api-key-file "$API_KEY_FILE" \
+build/myds4-server -m "$CHECKPOINT" --serve 8008 --api-key-file "$API_KEY_FILE" \
   --draft 2 --draft-cache 32 \
   --predictor-state "$PREDICTOR_STATE"
 ```
@@ -154,7 +159,7 @@ earlier turns, whose rows the session holds, are not encoded again. For the
 DeepSeek Harness, the model's entry needs `image` among its inputs
 (`input: [text, image]`).
 
-Requests run in queue order. The Rust server converts and tokenizes a request
+Requests run in queue order. The server converts and tokenizes a request
 before enqueueing it, so a short request can enter first even if another HTTP
 body arrived earlier. A new request is prefilled while the ones
 decoding wait, and then up to `--batch` requests decode together, a token
@@ -205,10 +210,14 @@ refused or unauthorized requests. It never shows keys or conversation text.
 
 With `--tui`, when stderr is a terminal, the server shows a live view there
 in place of the log, redrawn twice a second on the terminal's alternate
-screen. It writes nothing to files. Ctrl-C, SIGTERM or the `q` key stops
-the server after its current step, about a second when idle; the terminal
-comes back with the last 30 log lines. `q` also works in terminals that
-keep Ctrl-C for themselves. Figures are shown as dim labels before
+screen (ratatui on its crossterm backend, from the engine's snapshot,
+`myds4_view`). The lines logged while the model loads stay on the normal
+screen; the view starts once the model is loaded. It writes nothing to
+files. Ctrl-C, SIGTERM or the `q` key stops the server after its current
+step, about a second when idle; the terminal comes back with the last 30 log
+lines. `q` also works in terminals that keep Ctrl-C for themselves. Without
+a keyboard (no terminal to read keys from), the view draws and the signals
+still stop the server. Figures are shown as dim labels before
 bright numbers; a line too long for the terminal ends after its last whole
 figure, with "…". A token here is one position that a decoding step
 computes: a request's next token, or a draft being verified. The view has
@@ -271,12 +280,11 @@ The app stores the key in its own credential file (`~/.dsh/.credentials.yaml`).
 
 | Command | What it checks |
 | --- | --- |
-| `.venv/bin/python tools/check.py tok CHECKPOINT` | The tokenizer against the `tokenizers` library on 17 texts. |
-| `.venv/bin/python tools/check.py encoding CHECKPOINT` | The prompts of the checkpoint's `encoding/tests` cases 1, 2, 3 and 5, and of 1,200 generated conversations (tools, tool calls and results, reasoning, system messages at the start and mid-conversation, content parts, escapes, both thinking modes, every effort form) and 600 with image parts in user turns and tool results (the placeholders' places and the images' order), against `encoding/encoding.py`, byte for byte (a few seconds). |
-| `MYDS4_RENDER=build/myds4-server .venv/bin/python tools/check.py encoding CHECKPOINT` | The same prompts rendered by the Rust server (`make build/myds4-server`) against `encoding.py`; where and why they differ is in [The Rust server](server.md#differences-from-the-c-server). |
-| `MYDS4_CHECKPOINT=CHECKPOINT cargo test --release` in `server/` | The Rust server's compatibility steps and its output path through deepseek-recipe's stream processor, with the checkpoint's tokenizer; no model. |
-| `.venv/bin/python tools/check.py vision CHECKPOINT IMAGE [BINARY...]` | The image's feature rows (`--vision-fd`) against `inference/image_processor.py` and `vision.py` (ViT and Aligner in BF16 on the CPU): their SNR, overall and per row. With BINARY, each of those builds instead of `build/myds4`, against one reference. Needs `pillow`. |
-| `.venv/bin/python tools/check.py model CHECKPOINT [CACHE]` | Every layer's streams, the routing and the logits of 20 decoded positions against DeepSeek's `inference/model.py` on the CPU (about 12 minutes, up to 55 GB of memory; `CACHE` keeps the reference's results in a file for reruns). The reference reads the checkpoint through the page cache, which then holds tens of GB of it: until those pages are reclaimed, myds4 finds less free memory, and its expert reads may come from the page cache instead of the SSD. |
+| `.venv/bin/python tools/reference/check.py tok CHECKPOINT` | The tokenizer against the `tokenizers` library on 17 texts. |
+| `.venv/bin/python tools/reference/check.py encoding CHECKPOINT` | The server's prompts (`build/myds4-server --render`; `MYDS4_RENDER` names another renderer) of the checkpoint's `encoding/tests` cases 1, 2, 3 and 5, and of 1,200 generated conversations (tools, tool calls and results, reasoning, system messages at the start and mid-conversation, content parts, escapes, both thinking modes, every effort form) and 600 with image parts in user turns and tool results (the placeholders' places and the images' order), against `encoding/encoding.py`, byte for byte. The server's renderer differs from `encoding.py` in known places ([Prompts compared with encoding.py](server.md#prompts-compared-with-encodingpy)), so the check reports the equal counts and exits with status 1. |
+| `make server-check` | The server's tests without a model: the compatibility steps, a numeric effort in the prompt, the live view's frames on a test terminal (the title first, every line within the terminal's width, the log below the sessions' tree, the quit keys), and, with `MYDS4_CHECKPOINT=CHECKPOINT`, its output path through deepseek-recipe's stream processor with the checkpoint's tokenizer. |
+| `.venv/bin/python tools/reference/check.py vision CHECKPOINT IMAGE [BINARY...]` | The image's feature rows (`--vision-fd`) against `inference/image_processor.py` and `vision.py` (ViT and Aligner in BF16 on the CPU): their SNR, overall and per row. With BINARY, each of those builds instead of `build/myds4`, against one reference. Needs `pillow`. |
+| `.venv/bin/python tools/reference/check.py model CHECKPOINT [CACHE]` | Every layer's streams, the routing and the logits of 20 decoded positions against DeepSeek's `inference/model.py` on the CPU (about 12 minutes, up to 55 GB of memory; `CACHE` keeps the reference's results in a file for reruns). The reference reads the checkpoint through the page cache, which then holds tens of GB of it: until those pages are reclaimed, myds4 finds less free memory, and its expert reads may come from the page cache instead of the SSD. |
 | `build/myds4 -m CHECKPOINT -p TEXT --check-prefill` | The prompt as two batches (the first of odd length) against one: the final logits must be equal. The batched prefill's logits at every position against token-by-token decoding. |
 | `build/myds4 -m CHECKPOINT -p TEXT --check-batch` | The prompt's next token decoded alone and beside another sequence (`model_forward_rows`), and with `--draft N` in a verify pass: the logits must be equal. With `--gpu-route`, the token decoded alone takes the GPU-routed path and the others do not, so the check compares the two paths. |
 | `make gguf-decode-check [GGUF=FILE]` | IQ1_M expert decoding on the GPU against llama.cpp's `dequantize_row_iq1_m`, value by value: 8,192 random blocks and, with `GGUF`, 768 blocks of each IQ1_M expert tensor of the file (any shard of a split set). No model is loaded. |
@@ -289,22 +297,21 @@ The app stores the key in its own credential file (`~/.dsh/.credentials.yaml`).
 | `make gpu-clock-check` | Checks the GPU clock-keeper calibration with injected host scheduling delay. Uses a tiny Metal kernel and no model weights. |
 | `make build/myds4-predict-lab` | Builds the optional live feature-ablation and cache-action experiment. The ordinary executable does not link its predictor. See [experiment design](design.md#live-predictor-experiment-build). |
 | `make build/predictor-lab-check build/cache-action-check`, then run those two executables | Checks causal learning, signal wiring, victim eligibility and admission ownership without loading the model or running the GPU. |
-| `python3 -B tools/predictor_lab.py --checkpoint CHECKPOINT --q2 GGUF_SHARD --phase shadow --metrics` | Runs exact MXFP4/Q2 controls and real-model signal ablations serially. Shadow mode issues no additional prefetches and is not a throughput benchmark of one predictor. |
-| `python3 -B tools/predictor_lab.py --checkpoint CHECKPOINT --q2 GGUF_SHARD --phase live --policy native --native-router-only --variants embedding --metrics --repeat-control` | Tests learned fetch/abstain and eviction actions using existing router candidates, with a control before and after. No extra DSpark prediction network, traces or saved learner state. |
+| `python3 -B tools/experimental/predictor_lab.py --checkpoint CHECKPOINT --q2 GGUF_SHARD --phase shadow --metrics` | Runs exact MXFP4/Q2 controls and real-model signal ablations serially. Shadow mode issues no additional prefetches and is not a throughput benchmark of one predictor. |
+| `python3 -B tools/experimental/predictor_lab.py --checkpoint CHECKPOINT --q2 GGUF_SHARD --phase live --policy native --native-router-only --variants embedding --metrics --repeat-control` | Tests learned fetch/abstain and eviction actions using existing router candidates, with a control before and after. No extra DSpark prediction network, traces or saved learner state. |
 | `make build/online-predictor-unit`, then `build/online-predictor-unit` | Runs 43 CPU checks of learner math, owned records, pass boundaries, available forecast horizons, native labels, row-count changes, reset, freeze controls and reporting windows. No model or GPU execution. |
 | `make sampling-check` | Runs 19 CPU checks of softmax/nucleus sampling, ties, seed consumption, EOS and sampled draft verification. No model or GPU. |
-| `.venv/bin/python -B tools/online_predictor_cli_check.py` | Runs 39 CLI compatibility and input-validation checks before model loading, including sampled drafts, temperature/top-p settings and the `--reserve` range. Build `build/myds4` first; another build can be passed as the argument. |
+| `.venv/bin/python -B tools/checks/online_predictor_cli_check.py` | Runs 41 CLI compatibility and input-validation checks before model loading, including sampled drafts, temperature/top-p settings and the `--reserve` range. Build `build/myds4` first; another build can be passed as the argument. |
 | `make build/online-predictor-check`, then `build/online-predictor-check --rank 64 --pairs 77 --milliseconds 20` | Runs 20 math checks, including 20,000 update rows with dead or repeated features, followed by a bounded CPU microbenchmark. Uses the live module's shared math; its times exclude inference, I/O and GPU scheduling. |
 | `make build/online-predictor-state-check`, then `build/online-predictor-state-check` | Runs 42 CPU checks of state round trips, identical continued learning, compatibility binding, invalid-file rejection and atomic-save failure handling. Creates bounded temporary state files and removes them. |
 | `make shutdown-check` | Runs 8 CPU checks of shutdown signal handling and safe-boundary notification. No model or GPU execution. |
-| `make predict-probe` | Builds the diagnostic pipe-capture executable. `tools/expert_probe.py` provides its reusable Python capture reader. Captures stay in RAM; synchronous capture changes timing and is unsuitable for speed measurements. |
-| `python3 -B tools/online_predictor_server_check.py --checkpoint CHECKPOINT --temperature 1 --top-p 1 --draft 2 --sampling-check` | Checks concurrent requests, prefix reuse, effective sampler settings, real draft verification, request overrides and online learning. Add `--experts GGUF_SHARD` for Q2, `--image-smoke` for an image request, and `--predictor-state PATH` to check saving. Uses one local server, bounded RAM and no logs. |
-| `python3 tools/check.py idle URL KEYFILE` | A running server (for example `http://127.0.0.1:8008` with its key file) keeps its experts while idle: from 3 s to 10 s after a request, its footprint and expert slots must stay as they were, with more than 11 GiB free. It sends one short request when no request has just ended. |
-| `python3 tools/check.py placeholder URL KEYFILE` | A running server reads the placeholder's text `<｜deepseek_image｜>` in a tool result and a user message as text: it answers the request, and the placeholder adds the tokens of its characters, not one image token. Sends two requests of one generated token. |
-| `python3 tools/check.py view` | The live view (`--tui`) in a 24-row pseudo-terminal, with more log lines than rows: every frame must start with the title and write at most 23 line breaks (one more scrolls the title off); then `q` must stop it within 2 s, with the normal screen back and the stop logged. Compiles `tools/view_check.c`, a stand-in for the server's state, with `src/tui.c`; needs no model. |
-| `python3 tools/check.py demand URL KEYFILE` | An idle server gives expert slots back when another program takes memory: the check takes memory until only 7 GiB is free, for 5 s, and the server must give back at least 1 GiB of slots meanwhile. Run it only while no other large program runs. |
+| `make predict-probe` | Builds the diagnostic pipe-capture executable. `tools/analysis/expert_probe.py` provides its reusable Python capture reader. Captures stay in RAM; synchronous capture changes timing and is unsuitable for speed measurements. |
+| `python3 -B tools/checks/online_predictor_server_check.py --checkpoint CHECKPOINT --temperature 1 --top-p 1 --draft 2 --sampling-check` | Checks concurrent requests, prefix reuse, effective sampler settings, real draft verification, request overrides and online learning. Add `--experts GGUF_SHARD` for Q2, `--image-smoke` for an image request, and `--predictor-state PATH` to check saving. Uses one local `build/myds4-server`, bounded RAM and no logs. |
+| `python3 tools/reference/check.py idle URL KEYFILE` | A running server (for example `http://127.0.0.1:8008` with its key file) keeps its experts while idle: from 3 s to 10 s after a request, its footprint and expert slots must stay as they were, with more than 11 GiB free. It sends one short request when no request has just ended. |
+| `python3 tools/reference/check.py placeholder URL KEYFILE` | A running server reads the placeholder's text `<｜deepseek_image｜>` in a tool result and a user message as text: it answers the request, and the placeholder adds the tokens of its characters, not one image token. Sends two requests of one generated token. |
+| `python3 tools/reference/check.py demand URL KEYFILE` | An idle server gives expert slots back when another program takes memory: the check takes memory until only 7 GiB is free, for 5 s, and the server must give back at least 1 GiB of slots meanwhile. Run it only while no other large program runs. |
 | `build/myds4 -m CHECKPOINT --bench` | Kernel bandwidth and matrix throughput on the model's matrices, the index selection against a CPU selection, the CPU-GPU round trip and the GPU's speed after idling. |
-| `build/myds4 -m CHECKPOINT -p PROMPT -n TOKENS --routes-fd 3 3>TRACE`, then `.venv/bin/python tools/cachesim.py TRACE [--front MS --expert MS] SLOTS...` | On the routing trace of a generation, with myds4's predictions: reads per token of seven replacement policies, including Belady's optimal one and myds4's, and decode time of read-ahead policies in a timing model, including oracles that know the experts a given number of layers ahead. A 2,000-token trace is 140 MB. |
+| `build/myds4 -m CHECKPOINT -p PROMPT -n TOKENS --routes-fd 3 3>TRACE`, then `.venv/bin/python tools/analysis/cachesim.py TRACE [--front MS --expert MS] SLOTS...` | On the routing trace of a generation, with myds4's predictions: reads per token of seven replacement policies, including Belady's optimal one and myds4's, and decode time of read-ahead policies in a timing model, including oracles that know the experts a given number of layers ahead. A 2,000-token trace is 140 MB. |
 | `MYDS4_PROFILE=1` (or `prefill`) | Runs every dispatch alone and reports GPU time per kernel for decoding (or for the prefill). The `*_3` kernels are the products of up to three matrices in one dispatch. |
 | `MYDS4_PREFETCH_METRICS=1` | Add two `prefetch_metrics` JSON summaries to stderr at the end of CLI generation, token replay or perplexity scoring. Separates backbone exact-router and served unions, ready/new/pending/absent requests, first-use bytes, queue/service timing and observed eviction/rerequest counts. See [schema and scope](design.md#prefetch-attribution). |
 

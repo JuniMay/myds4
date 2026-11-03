@@ -2,27 +2,45 @@
 
 ## Files
 
+The C sources are in four folders:
+
+- `src/engine/`: the engine. `build/libmyds4.a`, which the server links,
+  holds these files and `src/experimental/online_predictor.c`.
+- `src/cli/`: the command line (`main.c`) for generation, the checks and the
+  benchmarks. `build/myds4` holds it, the engine's files without `engine.c`,
+  and the online predictor.
+- `src/kernels/`: the Metal kernels, which `src/engine/model.c` embeds.
+- `src/experimental/`: opt-in predictor research code. `build/myds4` links the
+  online predictor, which runs only with `--online-predictor`; only
+  `build/myds4-predict-lab` links the predictor lab.
+
+The Makefile adds `-Isrc/engine`, so C files in every folder include the
+engine's headers by name.
+
 | File | Contents |
 | --- | --- |
-| `src/main.c` | Command line, chat template, sampling, statistics, `--check-prefill`, `--perplexity`. |
-| `src/sample.c` | Shared temperature/top-p sampling and DSpark prefix verification. |
-| `src/model.c` | Weights, request state, the forward pass for decoding and prefill, `--bench`. |
-| `src/expert_batch.h` | Row grouping and GPU descriptors for the experimental shared-expert kernels. |
-| `src/online_predictor.c`, `src/online_predictor_math.h` | Online CPU prefetch correction, owned forecast/label records, recursive least-squares updates and learner metrics. |
-| `src/kernels.metal` | The GPU kernels. |
-| `src/gguf.metal`, `src/gguf_grids.metal` | The kernels for routed experts in GGUF codes (`--experts`), and their codebook grids, generated from llama.cpp's `ggml-common.h` (MIT License). |
-| `src/io.c` | SSD reads, the routed-expert cache, memory monitoring. |
-| `src/gpu.c` | Metal through the Objective-C runtime from C, the profiler. |
-| `src/tok.c` | The tokenizer and the embedded tables. |
-| `src/util.c` | Errors, strings, a JSON parser for the model's own files, the safetensors index, GGUF headers. |
-| `src/vision.c` | Images: decoding, the reference's grid, Pillow's resize and padding, the vision encoder's patches and RoPE angles, an image's span of tokens. |
-| `src/vision.metal` | The vision encoder's kernels. |
-| `src/chat.c` | Chat Completions requests as prompts (after the checkpoint's `encoding/encoding.py`), and the model's output as reasoning, content and tool calls. |
-| `src/serve.c` | The HTTP server: authentication, the request queue, the sessions' attention state, the log, the live view's snapshot of the server. |
-| `src/engine.c`, `src/engine.h` | The engine behind a C ABI for the Rust server: `serve.c`'s queue, sessions, batching, status and log without HTTP or JSON (see [The Rust server](server.md)). |
-| `src/tui.c` | The server's live view (`--tui`): the terminal, the statistics windows, the frame. |
-| `server/` | The Rust server on `deepseek-recipe`: HTTP, request conversion, prompts, output (see [The Rust server](server.md)). |
-| `tools/` | Table generation and checks (Python); `view_check.c`, a stand-in for the server's state that `check.py view` draws with `src/tui.c`. |
+| `src/engine/model.c` | Weights, request state, the forward pass for decoding and prefill, `--bench`. |
+| `src/engine/io.c` | SSD reads, the routed-expert cache, memory monitoring. |
+| `src/engine/gpu.c` | Metal through the Objective-C runtime from C, the profiler. |
+| `src/engine/tok.c` | The tokenizer and the embedded tables. |
+| `src/engine/util.c` | Errors, strings, a JSON parser for the model's own files, the safetensors index, GGUF headers. |
+| `src/engine/vision.c` | Images: decoding, the reference's grid, Pillow's resize and padding, the vision encoder's patches and RoPE angles, an image's span of tokens. |
+| `src/engine/sample.c` | Shared temperature/top-p sampling and DSpark prefix verification. |
+| `src/engine/expert_batch.h` | Row grouping and GPU descriptors for the experimental shared-expert kernels. |
+| `src/engine/engine.c`, `src/engine/engine.h` | The engine behind a C ABI for the server: the queue, sessions, batching, the status, the live view's snapshot and the log, without HTTP or JSON (see [The server](server.md)). |
+| `src/kernels/kernels.metal` | The GPU kernels. |
+| `src/kernels/gguf.metal`, `src/kernels/gguf_grids.metal` | The kernels for routed experts in GGUF codes (`--experts`), and their codebook grids, generated from llama.cpp's `ggml-common.h` (MIT License). |
+| `src/kernels/vision.metal` | The vision encoder's kernels. |
+| `src/cli/main.c` | Command line, chat template, sampling, statistics, `--check-prefill`, `--perplexity`. |
+| `src/experimental/online_predictor.c`, `src/experimental/online_predictor_math.h` | Online CPU prefetch correction, owned forecast/label records, recursive least-squares updates and learner metrics. |
+| `src/experimental/predictor_lab.c`, `src/experimental/predictor_lab.h` | The predictor experiment build (see [Live predictor experiment build](#live-predictor-experiment-build)). |
+| `server/` | The server, in Rust on `deepseek-recipe`: HTTP, request conversion, prompts, output and the live view (`--tui`; see [The server](server.md)). |
+| `tools/checks/` | Regression checks: C programs that the Makefile builds (most need no model or GPU), and Python checks of the command line and the server. |
+| `tools/reference/` | `check.py`: myds4 against the checkpoint's references (tokenizer, the server's prompts, vision encoder, model), and checks of a running server. `gguf_decode_check.c`: IQ1_M decoding against llama.cpp's. |
+| `tools/bench/` | Serial benchmarks, and `gpu_guard.py`, the GPU, memory and power guard that they and the other model runners share. |
+| `tools/analysis/` | `cachesim.py`, the expert-cache simulator for routing traces, and `expert_probe.py`, the reader of `build/myds4-predict-probe` captures. |
+| `tools/data/` | `gen_data.py`, which generates the embedded tables in `data/` from the checkpoint. |
+| `tools/experimental/` | Checks and runners of the experimental code: the online predictor's checks, the predictor lab's checks and runner (`predictor_lab.py`), and the capture code of `build/myds4-predict-probe` (`predict_probe.c`). |
 
 Metal is used from C: every message goes through `objc_msgSend` cast to the
 method's exact type, so the project has no Objective-C or C++ sources besides
@@ -136,8 +154,8 @@ weights as stored, with the activations in half, which holds the quantized
 activations exactly unless a block's largest magnitude is below 0.007 (its
 smallest codes then round).
 
-`tools/check.py model` decodes a 20-token prompt and continuation with myds4
-and with the reference (eager FP32 PyTorch on the CPU with the kernels'
+`tools/reference/check.py model` decodes a 20-token prompt and continuation with
+myds4 and with the reference (eager FP32 PyTorch on the CPU with the kernels'
 arithmetic). The two differ by ulp-level differences between GPU and CPU
 math, including the order in which products are summed. With the build of
 2026-10-31, at layer 0 the streams match to a median SNR of 105 dB, the
@@ -202,13 +220,13 @@ preserve all encoder/global KV work and prime DSpark only from computed
 decoder inputs. Decoding runs normally after prefill. A compact prefill can
 change local KV, routing and output; it is not an exact-output optimization.
 
-The retained `tools/prefill_prefix_check.c` compares compact execution
+The retained `tools/checks/prefill_prefix_check.c` compares compact execution
 with the same full-shape attention mask, including DSpark state, prefix
-restoration and chunk boundaries. `tools/server_prefill_check.py`
+restoration and chunk boundaries. `tools/checks/server_prefill_check.py`
 checks the option and cache reuse through HTTP. Its shared guard in
-`tools/predictor_lab.py` checks GPU-client ownership, free memory,
-AC power and competing processes, and stops its own workload on resource
-interference. Requests, replies and diagnostic logs remain in memory.
+`tools/bench/gpu_guard.py` checks GPU-client ownership, free memory, AC power
+and competing processes, and stops its own workload on resource interference.
+Requests, replies and diagnostic logs remain in memory.
 
 ## Decoding
 
@@ -315,7 +333,7 @@ The retained checks are:
 | `build/expert-batch-check` | Synthetic GPU comparison against the scalar kernels, including all one-to-six-row sizes, three sharing patterns and whole/split/empty-first read phases. `--check-only` omits timing; `--format` selects a supported code. |
 | `build/expert-batch-model-check` | Experimental engine: compare all six verification rows' logits with sequential decoding from the same saved state. Arguments are the checkpoint directory and, optionally, the expert GGUF file. |
 | `build/expert-batch-model-control` | The same all-row check with the ordinary engine. |
-| `tools/expert_batch_bench.py` | Serial ordinary/grouped comparisons with identical prompts, sampling, draft settings and cache budgets. It checks output identity, actual cache bounds and that the candidate issued grouped work. |
+| `tools/bench/expert_batch_bench.py` | Serial ordinary/grouped comparisons with identical prompts, sampling, draft settings and cache budgets. It checks output identity, actual cache bounds and that the candidate issued grouped work. |
 
 The GPU checks take the same model lock as inference. The benchmark runner
 also checks device activity, other compute processes, AC power and memory;
@@ -371,11 +389,11 @@ The diagnostic `--compact --keep N` instead retains exactly N decoder rows.
 `--cache GIB`, `--reserve GIB` and `--experts GGUF` choose cache bounds and
 expert format. Sampling verification uses the main model's requested draws.
 
-`tools/ced_bench.py` reconstructs an append-only, text-only Harness request
-from a supplied session path and event cutoff, using Python 3.14 or later.
-Recorded tool calls are data and are never executed. It checks the recorded
-input-token count, GPU ownership, memory and actual cache bounds, then runs
-serial controls and candidates. Phases are `validate`, `prefill`,
+`tools/bench/ced_bench.py` reconstructs an append-only, text-only Harness
+request from a supplied session path and event cutoff, using Python 3.14 or
+later. Recorded tool calls are data and are never executed. It checks the
+recorded input-token count, GPU ownership, memory and actual cache bounds, then
+runs serial controls and candidates. Phases are `validate`, `prefill`,
 `joint-prefill`, `ced-generation` and `dspark`; `all` runs numerical checks
 and cold-prefill comparisons. Candidate timings require matching validation
 where applicable. Output and diagnostics stay in RAM; aggregate reports are
@@ -601,7 +619,7 @@ CPU validation is available independently of model execution:
 | Check | Scope |
 | --- | --- |
 | `make build/online-predictor-unit`, then `build/online-predictor-unit` | 43 module checks: math, record ownership, native labels, available horizons, causal updates, changed row counts, reset, freeze boundaries and windows. |
-| `.venv/bin/python -B tools/online_predictor_cli_check.py` | 39 CLI checks of boolean enable, state paths, removed options, compatible modes and existing constraints, before model loading. Includes empty and nonempty profiler values and the `--reserve` range. |
+| `.venv/bin/python -B tools/checks/online_predictor_cli_check.py` | 41 CLI checks of boolean enable, state paths, removed options, compatible modes and existing constraints, before model loading. Includes empty and nonempty profiler values and the `--reserve` range. |
 | `make build/online-predictor-state-check`, then `build/online-predictor-state-check` | 42 CPU checks of round-trip and continued-learning identity, file validation, binding mismatch, unsafe paths and atomic-save failures. Temporary files are removed. |
 | `make shutdown-check` | 8 CPU checks of signal handling and safe-boundary shutdown notification. |
 | `make build/online-predictor-check`, then `build/online-predictor-check --rank 64 --pairs 77 --milliseconds 20` | 20 shared-math checks with 20,000 dead/repeated-feature update rows, followed by a bounded CPU microbenchmark. |
@@ -613,11 +631,12 @@ from model runs belongs in [Performance](performance.md).
 ### Live predictor experiment build
 
 `make build/myds4-predict-lab` builds the optional experiment module in
-`src/predictor_lab.c`. The ordinary executable does not link this module.
-`tools/predictor_lab.py` runs serial CLI controls and experiments with bounded
-output held in RAM. It does not save traces, model output or learned weights.
-The runner stops on changed output, process failure, cache shrinkage,
-compression or swap. A repeat control measures timing drift across a trial.
+`src/experimental/predictor_lab.c`. The ordinary executable does not link this
+module. `tools/experimental/predictor_lab.py` runs serial CLI controls and
+experiments with bounded output held in RAM. It does not save traces, model
+output or learned weights. The runner stops on changed output, process failure,
+cache shrinkage, compression or swap. A repeat control measures timing drift
+across a trial.
 
 Before every run, the runner requires three quiet GPU/memory samples. It
 checks process names for other model, IREE, kernel-probe and substantial Python
@@ -1091,7 +1110,7 @@ accumulate in FP32. The probabilities pass from the scores' layout to the
 second product's through `get_left_input_cooperative_tensor`, which needs a
 source of its own element type (a float source passed this way gave wrong
 rows), so a change of the products' shapes or types needs
-`tools/check.py vision` again. Each block is a command buffer of
+`tools/reference/check.py vision` again. Each block is a command buffer of
 its own, so that no long buffer holds up the display. The Aligner merges 3 x
 3 patches (zero-padded at the edges) into rows of 9,216, then applies w1,
 GELU and w2 to 5,120; the GELU (erf) runs on the CPU in double precision,
@@ -1124,11 +1143,11 @@ and runs the vision encoder only for the images whose spans reach the part
 of the prompt being prefilled; the others are in the session's rows.
 
 Checked on 2026-10-31, besides the preprocessing (above): the placeholders'
-places and the images' order in prompts (`tools/check.py encoding`: 600
-conversations with image parts, equal to `encoding.py` byte for byte), and
-the encoder's features (`tools/check.py vision`) for an 800 x 551 photo (40 x
-58 patches, 280 feature rows): 33.2 dB SNR against the reference's BF16 run
-(median row 38.3 dB, worst 17.1 dB; no row equal bit for bit). The
+places and the images' order in prompts (`tools/reference/check.py encoding`:
+600 conversations with image parts, equal to `encoding.py` byte for byte), and
+the encoder's features (`tools/reference/check.py vision`) for an 800 x 551
+photo (40 x 58 patches, 280 feature rows): 33.2 dB SNR against the reference's
+BF16 run (median row 38.3 dB, worst 17.1 dB; no row equal bit for bit). The
 reference's own BF16 run is 28.6 dB from the same reference in FP32 (worst
 row 10.1 dB) and myds4's is 29.7 dB (worst 13.9 dB): the differences are BF16
 rounding with sums in another order, and the weakest rows are the same in
@@ -1428,30 +1447,21 @@ disk reads.
 
 ## Server
 
-[The Rust server](server.md) (`build/myds4-server`) serves the same API
-with the same scheduler, in `src/engine.c` behind a C ABI, and converts
-requests and output with DeepSeek's `deepseek-recipe`; this section
-describes the C server.
-
-`--serve` runs an HTTP/1.1 server for the OpenAI Chat Completions API. A
-thread accepts connections (at most 64 at once) and a thread per connection
-reads one request, at most 64 KB of headers and a body of at most 32 MB
-with a `Content-Length` (chunked bodies are refused), with 60 s timeouts.
-Every request but `GET /health` must carry the API key; the server compares
-SHA-256 digests with `timingsafe_bcmp`, so the comparison takes the same
-time whatever the key sent. Request bodies are parsed by yyjson, which
-checks their syntax and nesting, rather than by the small parser that reads
-the model's own files.
+The server (`build/myds4-server`, see [The server](server.md)) handles HTTP,
+request conversion, prompts and output in Rust with DeepSeek's
+`deepseek-recipe`; the scheduler below runs in `src/engine/engine.c`, behind
+a C ABI.
 
 A chat completion waits in a queue (at most 16) for the model, which the
-main thread runs. A streamed request gets its headers at once and a comment
-every 15 s while it waits. Between tokens the worker admits waiting requests
-while fewer than `--batch` decode: it renders one, tokenizes it, prefills it
-(the others wait) and samples its first token. Then every request decoding
-advances by a token: alone, with drafts when `--draft` is set;
-else in one step of `model_forward_rows`, one row per request. The
-worker writes each request's output to its client; when a client closes its
-end, its request stops.
+engine's thread runs. A streamed request gets its headers at once and a
+comment every 15 s while it waits. Between tokens the worker admits waiting
+requests while fewer than `--batch` decode: it tokenizes one's rendered
+prompt, prefills it (the others wait) and samples its first token. Then
+every request decoding advances by a token: alone, with drafts when
+`--draft` is set; else in one step of `model_forward_rows`, one row per
+request. The engine hands each step's tokens to the server, which writes
+them to the request's client; when a client closes its end, the server
+cancels its request.
 
 While no request runs, the experts stay in memory as the last request left
 them. The worker wakes every second and resizes the cache as between tokens
@@ -1472,36 +1482,21 @@ later keeps fewer drafts until they refill.
 
 ### Prompts
 
-The prompt follows `encoding/encoding.py` for text: the request's tools go
-into the first system message (a system message is inserted when the first
-message is not one), tool messages become `<tool_result>` blocks of a user
-turn in the order of the calls before them, consecutive user messages merge,
-and assistant tool calls are written back as DSML. In thinking mode the
-reasoning of earlier turns is dropped unless the conversation has tools, as
-the encoding does. Its JSON is written as Python's `json.dumps` writes it,
-numbers as the request wrote them. `--render FILE` prints the prompt of a
-test case of the checkpoint's `encoding/tests`: cases 1, 2, 3 and 5 equal
-their expected prompts byte for byte; case 4 uses DeepSeek's internal `task`
-field (`<｜action｜>`), which the server does not render. `tools/check.py
-encoding` also renders 1,200 generated conversations with both: all were
-equal byte for byte on 2026-10-31. The checkpoint ships no Jinja chat
-template; its README names `encoding.py` as the reference. Where a request
-has tools but no leading system message, the prompt follows DeepSeek's
-request converter (deepseek-recipe), which inserts an empty system message
-for them; the encoding's own case loader would give them to the first
-message whatever its role, and renders tools only for a system message.
-Reasoning effort levels map as that converter maps them for V4.1 (minimal
-and low 50; medium, high and xhigh 75; ultra and max 100; numbers 1 to 100
-as given), and an effort of
-`none` turns thinking off unless the request sets `thinking`. Neither
-reference adds a system prompt of its own.
+The server renders prompts with recipe's `DeepseekV41Encoding`, after
+DeepSeek's request converter ([Prompts and tokens](server.md#prompts-and-tokens));
+[Prompts compared with encoding.py](server.md#prompts-compared-with-encodingpy)
+lists where they differ from the checkpoint's `encoding/encoding.py`. The
+checkpoint ships no Jinja chat template; its README names `encoding.py` as
+the reference. Reasoning effort levels map as the converter maps them for
+V4.1 (minimal and low 50; medium, high and xhigh 75; ultra and max 100;
+numbers 1 to 100 as given), and an effort of `none` turns thinking off
+unless the request sets `thinking`. Neither the converter nor `encoding.py`
+adds a system prompt of its own.
 
-The output parser takes each generated token's text: reasoning until
-`</think>`, then content, then a DSML tool block, from which each completed
-invoke becomes one tool call whose arguments are JSON (string parameters
-as JSON strings; another value as written, or as a string if it is not
-JSON). Text that may begin `</think>`, a tool block or the end token, or a
-character's remaining UTF-8 bytes, waits for the next token.
+recipe's stream processor parses the output: reasoning until `</think>`,
+then content, then the DSML tool calls, each with its arguments as JSON. The
+engine's tokenizer gives it each token's bytes; a character whose UTF-8
+bytes are not all there yet waits for the next token.
 
 ### Sessions
 
@@ -1594,14 +1589,17 @@ so the state of the whole first turn was kept.
 
 ### The live view
 
-`--tui` gives stderr to a thread that every 0.5 s copies the server's state
-(`serve_view`) and draws the whole frame from the copy in one write; `say`
-puts the log lines into a ring of 256 that the frame shows. The copy takes
-the queue's lock for the number of waiting requests and the status lock for
-the requests, the totals and the sessions. Sessions are freed and
-reassigned under the status lock, so the copy never reads a freed session;
-a session's tokens may change while the copy reads them, which at worst
-places a node wrongly for one frame.
+`--tui` gives stderr's alternate screen to a thread of the server
+(`server/src/view.rs`, on ratatui and its crossterm backend) that every
+0.5 s takes the engine's snapshot (`myds4_view`, as JSON) and draws the frame
+from it. The engine writes the log's lines to the server's `on_log`, which
+keeps the last 256 in a ring that the frame shows; the lines logged before
+the view is on the screen (while the model loads) also go to stderr. The
+snapshot takes the queue's lock for the number of waiting requests and the
+status lock for the requests, the totals and the sessions. Sessions are
+freed and reassigned under the status lock, so the snapshot never reads a
+freed session; a session's tokens may change while the snapshot reads them,
+which at worst places a node wrongly for one frame.
 
 The prefix tree covers the 24 most recently used sessions. Depth first, a
 node is the run of positions, from its parent's end, that all sessions of
@@ -1631,25 +1629,26 @@ GiB, and wired memory fell from 56 to 8 GiB. The driver releases them until
 the GPU runs again, so the view splits the resident memory into experts,
 weights and the rest only while it holds them all.
 
-A frame writes a line break between rows only: one after the last row would
-scroll the terminal and push the title off the screen. A row that fills the
-width is not followed by an erase to the end of the row, which would clear
-its last column; a longer row ends after its last whole figure, with "…".
-`tools/check.py view` runs the view in a pseudo-terminal with a stand-in for
-the server's state (`tools/view_check.c`) and checks the line breaks and
-that `q` stops it.
+A frame is a list of lines, at most one per row, that ratatui draws in
+place, so no line break scrolls the title off the screen; a line too long
+for the terminal ends after its last whole figure, with "…". `make
+server-check` draws frames from a fixed snapshot on ratatui's test terminal
+and checks that the title comes first, that every line fits the width and
+that the log fills the rows below the tree.
 
-While the view runs, terminal input is neither echoed nor buffered by line,
-and the cursor is hidden. The view thread waits for its next frame by
-polling stdin: `q`, or a Ctrl-C that reaches stdin as a character, requests
-the stop that SIGINT requests (`shutdown_request`) and logs "q: stopping
-after the current step"; the server's worker and acceptor see the request
-within a second. Once the server runs, SIGINT and SIGTERM request that stop
-too, and `atexit` restores the terminal. At exit (`atexit`, `die`) and on
-SIGHUP and SIGQUIT (and on SIGINT or SIGTERM before the server installs its
-handlers), a handler that makes only async-signal-safe calls restores the
-terminal, leaves the alternate screen, writes the last 30 log lines and, for
-a signal, raises it again.
+While the view runs, the terminal is in raw mode, which neither echoes nor
+buffers input and delivers Ctrl-C as a key, and the cursor is hidden. The
+view's thread waits for its next frame by polling the keys: `q`, or Ctrl-C,
+requests the stop that SIGINT requests (`myds4_request_stop`) and logs "q:
+stopping after the current step"; the server stops accepting within a
+second. SIGINT and SIGTERM request that stop too. When the server ends,
+before a fatal error's message (the engine's `on_die`, or the server's own)
+and after a panic, the view leaves the alternate screen, restores the
+terminal and writes the log lines that stderr has not shown yet, the last 30
+at most. A frame being drawn finishes first. The view takes the snapshot
+before the screen's lock, so an engine that fails while it holds the status
+lock cannot keep the view from restoring the terminal. Without a terminal to
+read keys from, the view draws, and the signals stop the server.
 
 
 ## Rationale
@@ -1971,8 +1970,8 @@ rule.
 ### Eviction and read-ahead predictors
 
 Replayed on two 2,000-token routing traces (a story and a Python module,
-2026-10-30, 3,523 slots) without reading ahead, `tools/cachesim.py` gave
-these demand reads per token:
+2026-10-30, 3,523 slots) without reading ahead, `tools/analysis/cachesim.py`
+gave these demand reads per token:
 
 | Policy | Story, 3,523 slots | Story, 4,400 | Python, 3,523 | Python, 4,400 |
 | --- | ---: | ---: | ---: | ---: |

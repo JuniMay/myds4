@@ -58,7 +58,7 @@ model has never seen these questions during training.
 Run from the repository root:
 
 ```sh
-.venv/bin/python tools/benchmark_suite.py --seed 0 --reasoning 8 --coding 4
+.venv/bin/python tools/bench/benchmark_suite.py --seed 0 --reasoning 8 --coding 4
 ```
 
 This command prints the selected case IDs, checker names and prompt lengths.

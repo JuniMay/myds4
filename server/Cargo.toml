@@ -13,9 +13,14 @@ deepseek-recipe = "=0.2.0"
 deepseek-recipe-core = "=0.2.0"
 deepseek-recipe-encoding = "=0.2.0"
 rand = "0.9"
+# The live view (--tui): ratatui on its crossterm backend; the engine's
+# snapshot is JSON.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+serde = { version = "1", features = ["derive"] }
 # preserve_order: JSON in prompts keeps the request's key order, as Python's
 # json does; float_roundtrip: numbers parse as C's strtod parses them.
 serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-stream = "0.1"
+unicode-width = "0.2"

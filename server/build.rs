@@ -34,10 +34,8 @@ fn main() {
         }
     }
 
-    for file in ["Makefile", "data/engram.bin", "data/unicode.bin"] {
-        println!("cargo:rerun-if-changed={}", root.join(file).display());
-    }
-    for entry in std::fs::read_dir(root.join("src")).expect("the repository's sources").flatten() {
-        println!("cargo:rerun-if-changed={}", entry.path().display());
+    // Cargo scans a directory's whole tree for changes.
+    for path in ["Makefile", "src", "data/engram.bin", "data/unicode.bin"] {
+        println!("cargo:rerun-if-changed={}", root.join(path).display());
     }
 }

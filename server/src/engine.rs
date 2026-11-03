@@ -1,4 +1,4 @@
-//! The engine's C ABI (src/engine.h) and a safe interface over it: a request
+//! The engine's C ABI (src/engine/engine.h) and a safe interface over it: a request
 //! becomes a channel of events, and dropping a [`Cancel`] cancels it.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_long, c_void};
@@ -7,7 +7,7 @@ use std::ptr;
 use deepseek_recipe::stream::StreamTokenizer;
 use tokio::sync::mpsc;
 
-const ABI: c_int = 3;
+const ABI: c_int = 4;
 const STARTED: c_int = 0;
 const TOKENS: c_int = 1;
 const DONE: c_int = 2;
@@ -33,9 +33,9 @@ struct RawConfig {
     predictor_state: *const c_char,
     kv_gb: f64,
     batch: c_int,
-    tui: c_int,
-    address: *const c_char,
     ced: c_int,
+    on_log: Option<extern "C" fn(*const c_char)>,
+    on_die: Option<extern "C" fn()>,
 }
 
 #[repr(C)]
@@ -79,10 +79,12 @@ struct RawRequest {
 unsafe extern "C" {
     fn myds4_start(c: *const RawConfig) -> c_int;
     fn myds4_stopping() -> c_int;
+    fn myds4_request_stop();
     fn myds4_stop();
     fn myds4_submit(r: *const RawRequest, id: *mut u64, message: *mut c_char, cap: usize) -> c_int;
     fn myds4_cancel(id: u64);
     fn myds4_status() -> *mut c_char;
+    fn myds4_view() -> *mut c_char;
     fn myds4_free(p: *mut c_void);
     fn myds4_log(line: *const c_char);
     #[cfg(test)]
@@ -92,7 +94,7 @@ unsafe extern "C" {
     fn myds4_added(id: i32) -> c_int;
 }
 
-/// The engine's settings: the C server's model and server options.
+/// The engine's settings: the server's model and engine options.
 #[derive(Default)]
 pub struct Config {
     pub model: String,
@@ -111,9 +113,12 @@ pub struct Config {
     pub predictor_state: Option<String>,
     pub kv_gb: f64,
     pub batch: i32,
-    pub tui: bool,
-    pub address: String,
     pub ced: i32,
+    /// Receives the log's lines (with their time) instead of stderr; it runs
+    /// under the log's lock and must not call [`log`].
+    pub on_log: Option<extern "C" fn(*const c_char)>,
+    /// Runs before a fatal engine error's message and the process's exit.
+    pub on_die: Option<extern "C" fn()>,
 }
 
 fn c_string(s: &str) -> CString {
@@ -126,7 +131,6 @@ pub fn start(c: &Config) -> bool {
     let model = c_string(&c.model);
     let experts = c.experts.as_deref().map(c_string);
     let state = c.predictor_state.as_deref().map(c_string);
-    let address = c_string(&c.address);
     let raw = RawConfig {
         abi: ABI,
         model: model.as_ptr(),
@@ -145,9 +149,9 @@ pub fn start(c: &Config) -> bool {
         predictor_state: state.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
         kv_gb: c.kv_gb,
         batch: c.batch,
-        tui: c.tui.into(),
-        address: address.as_ptr(),
         ced: c.ced,
+        on_log: c.on_log,
+        on_die: c.on_die,
     };
     unsafe { myds4_start(&raw) == 0 }
 }
@@ -157,12 +161,17 @@ pub fn stopping() -> bool {
     unsafe { myds4_stopping() != 0 }
 }
 
+/// Requests the stop as SIGINT does and returns at once.
+pub fn request_stop() {
+    unsafe { myds4_request_stop() }
+}
+
 /// Ends every request, saves the predictor state and waits for the engine.
 pub fn stop() {
     unsafe { myds4_stop() }
 }
 
-/// A line for the log: stderr with the time, or the live view's log pane.
+/// A line for the log, with the time: on stderr, or to the live view's pane.
 pub fn log(line: &str) {
     let line = c_string(line);
     unsafe { myds4_log(line.as_ptr()) }
@@ -172,6 +181,17 @@ pub fn log(line: &str) {
 pub fn status() -> String {
     unsafe {
         let p = myds4_status();
+        let s = CStr::from_ptr(p).to_string_lossy().into_owned();
+        myds4_free(p.cast());
+        s
+    }
+}
+
+/// The live view's snapshot (JSON): phase, requests, statistics, memory and
+/// the sessions' prefix tree.
+pub fn view() -> String {
+    unsafe {
+        let p = myds4_view();
         let s = CStr::from_ptr(p).to_string_lossy().into_owned();
         myds4_free(p.cast());
         s

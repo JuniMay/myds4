@@ -59,7 +59,8 @@ projections and experts, plus attention over the 128-token window and up to
 ## Limits
 
 The limits below follow from the measured constants above and from routing
-traces replayed in `tools/cachesim.py`; they are computed, not measured runs.
+traces replayed in `tools/analysis/cachesim.py`; they are computed, not measured
+runs.
 
 **Decode.** A decoded token passes through the 40 layers in order and uses
 6 routed experts in each, 240 in all. Two constants follow from the
@@ -105,10 +106,10 @@ A speed target needs both conditions:
 **Cache size.** A cache of S GiB holds 56.9 x S experts. myds4's whole
 memory is the cache plus 8.0 GiB of dense weights and buffers, so a
 whole-program budget of 50 to 65 GiB leaves the cache about 41 to 56 GiB.
-`tools/cachesim.py` replayed the routing of three 2,000-token generations (a
-story, a Python module with tests, an explanatory essay; the first 28 tokens
-warm the cache). Reads per token, under Belady's optimal policy and under
-myds4's eviction by score (see the design):
+`tools/analysis/cachesim.py` replayed the routing of three 2,000-token
+generations (a story, a Python module with tests, an explanatory essay; the
+first 28 tokens warm the cache). Reads per token, under Belady's optimal policy
+and under myds4's eviction by score (see the design):
 
 | Cache (slots) | Story: optimal, myds4 | Python module: optimal, myds4 | Essay: optimal, myds4 |
 | ---: | ---: | ---: | ---: |
@@ -650,7 +651,7 @@ bit in both paths, also with a 12 GiB cache.
 
 Replayed with these experts on two 2,000-token routing traces (a story and
 a Python module, recorded on 2026-10-30 at a 40 GiB cache, 3,523 slots),
-`tools/cachesim.py` gives these demand reads per token without reading
+`tools/analysis/cachesim.py` gives these demand reads per token without reading
 ahead, for myds4's eviction by score (half-life 50 tokens) and for Belady's
 optimal policy, which knows the future:
 
@@ -995,9 +996,9 @@ Correcting fitted maps with rank 128 gives 141.57 ms/output for MXFP4 and
 the more economical candidate for a live cost test. Neither result establishes
 a measured inference speedup or a near-oracle predictor.
 
-The standalone C cost check in `tools/online_predictor_check.c` includes
-feature normalization, stable selection keys and top-six selection. Using one
-Accelerate BLAS thread, median times for all 77 pairs were:
+The standalone C cost check in `tools/experimental/online_predictor_check.c`
+includes feature normalization, stable selection keys and top-six selection.
+Using one Accelerate BLAS thread, median times for all 77 pairs were:
 
 | Rank | Rows per pass | Forward | RLS updates | State payload |
 | --- | ---: | ---: | ---: | ---: |
@@ -1303,9 +1304,9 @@ before use remain distinct problems.
 
 ## Live predictor and cache-action trials
 
-The retained runner is `tools/predictor_lab.py`; the optional experiment
-executable is `build/myds4-predict-lab`. The implementation and feature
-definitions are in [Design](design.md#live-predictor-experiment-build).
+The retained runner is `tools/experimental/predictor_lab.py`; the optional
+experiment executable is `build/myds4-predict-lab`. The implementation and
+feature definitions are in [Design](design.md#live-predictor-experiment-build).
 [Structured results](../data/benchmarks/predictor_lab_results.json) retain
 the completed trial settings, counters and within-quantization output checks.
 Raw routing traces, generated answers and learned parameter files are not
@@ -1512,8 +1513,8 @@ tokens); its attention's work grows with the square of the patches. Through
 the server, a first request with the small photo prefilled its 308 tokens in
 6.15 s from a cold expert cache (76 GB of experts read), and the
 conversation's second turn, which resent the image, reused 338 of its 349
-tokens and prefilled 11 in 0.91 s. `tools/check.py vision` with the small
-photo took 48 s, most of it the reference on the CPU.
+tokens and prefilled 11 in 0.91 s. `tools/reference/check.py vision` with the
+small photo took 48 s, most of it the reference on the CPU.
 
 Attention moved from the ALUs (FP32) to the matrix units on 2026-11-01.
 Each process encoded three letter-size pages (1275 x 1650 pixels, 104 x 81
@@ -1530,7 +1531,7 @@ Other applications used 24 to 33% of the GPU in all rounds; why the later
 rounds' ALU times were slower is not known. The attention's 9.35 TFLOP per
 page run at about 31 TFLOPS, as the ViT's matrix products do (`mm_bf16`,
 217 ms). Feature SNR against the
-checkpoint's CPU BF16 reference (`tools/check.py vision`, after the
+checkpoint's CPU BF16 reference (`tools/reference/check.py vision`, after the
 Aligner), overall / worst row / median row:
 
 | Image | ALUs | Matrix units |
@@ -1706,7 +1707,7 @@ give either way.
 
 ### Optional draft cache and row trimming
 
-On 2026-11-01, `tools/benchmark_suite.py` ran four GSM8K questions, two
+On 2026-11-01, `tools/bench/benchmark_suite.py` ran four GSM8K questions, two
 HumanEval prompts and two original context diagnostics, using greedy exact
 routing and a 512-token output allowance. Each of the six configurations ran
 the same eight prompts once, with order rotated across prompts. All 48 runs
@@ -1866,8 +1867,8 @@ alone (0 of 129,280 logits differ) with every expert build.
 ## Idle server
 
 With the GGUF experts and `--substitute 0.3 --draft 2`, on 2026-10-30
-(`tools/check.py idle` and `demand`): at a 44 GiB cache, from 3 s to 10 s
-after a request, the server's footprint stayed at 54.7 GiB and its cache at
+(`tools/reference/check.py idle` and `demand`): at a 44 GiB cache, from 3 s to
+10 s after a request, the server's footprint stayed at 54.7 GiB and its cache at
 3,281 slots. At a 52 GiB cache the whole cache left 9.9 GiB free, at the
 reserve; when the demand check took 2.9 GiB more, the server gave back 250
 slots (2.8 GiB) within 5 s, nothing was swapped out and the memory pressure
@@ -2132,11 +2133,11 @@ a comparison of IQ2 quality with MXFP4. Records are in
 
 ## Additional CED measurements
 
-The retained study runner is `tools/ced_bench.py`, using `build/ced-check`.
-It reconstructs real Harness requests in memory, runs numerical checks and
-then measures cold prefill and generation in separate model processes.
-The checkpoint is `deepseek-ai/DeepSeek-V4.1-Flash-1017`. IQ2 comparisons
-replace its routed experts with the UD-IQ2_XXS shards from
+The retained study runner is `tools/bench/ced_bench.py`, using
+`build/ced-check`. It reconstructs real Harness requests in memory, runs
+numerical checks and then measures cold prefill and generation in separate model
+processes. The checkpoint is `deepseek-ai/DeepSeek-V4.1-Flash-1017`. IQ2
+comparisons replace its routed experts with the UD-IQ2_XXS shards from
 `unsloth/DeepSeek-V4.1-Flash-1017-GGUF`; dense weights and KV formats retain
 the base checkpoint's quantization behavior.
 Temperature and top-p are 1, the sampling seed is 12345, and thinking effort
