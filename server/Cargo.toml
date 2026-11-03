@@ -12,6 +12,10 @@ data-url = "0.3"
 deepseek-recipe = "=0.2.0"
 deepseek-recipe-core = "=0.2.0"
 deepseek-recipe-encoding = "=0.2.0"
+# The connections and their limits (http.rs): hyper's HTTP/1 server under axum.
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["server", "server-graceful", "service", "tokio"] }
 rand = "0.9"
 # The live view (--tui): ratatui on its crossterm backend; the engine's
 # snapshot is JSON.
@@ -21,6 +25,6 @@ serde = { version = "1", features = ["derive"] }
 # json does; float_roundtrip: numbers parse as C's strtod parses them.
 serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }
 sha2 = "0.10"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-stream = "0.1"
 unicode-width = "0.2"

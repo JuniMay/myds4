@@ -6,6 +6,7 @@
 
 mod chat;
 mod engine;
+mod http;
 mod view;
 
 use std::io::IsTerminal;
@@ -16,8 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use axum::body::Bytes;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
+use axum::body::Body;
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -240,8 +241,23 @@ async fn status() -> Response {
     json(engine::status())
 }
 
-async fn completions(State(s): App, ConnectInfo(peer): ConnectInfo<SocketAddr>, body: Bytes) -> Response {
+/// An error answered before the response starts, and its line in the log.
+fn refused(peer: &str, e: chat::Error) -> Response {
+    engine::log(&format!("{peer}: {}: {}", e.status.as_u16(), e.message));
+    let kind = match e.status {
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        StatusCode::BAD_REQUEST | StatusCode::REQUEST_TIMEOUT | StatusCode::PAYLOAD_TOO_LARGE => "invalid_request_error",
+        _ => "server_error",
+    };
+    chat::error(e.status, kind, &e.message)
+}
+
+async fn completions(State(s): App, ConnectInfo(peer): ConnectInfo<SocketAddr>, body: Body) -> Response {
     let peer = peer.ip().to_string();
+    let body = match http::read_body(body, http::LIMITS).await {
+        Ok(body) => body,
+        Err(e) => return refused(&peer, e),
+    };
     let arrival = s.arrivals.fetch_add(1, Ordering::Relaxed) + 1;
     engine::log(&format!("http {arrival}: arrived from {peer}, {} body bytes", body.len()));
     let defaults = s.defaults.clone();
@@ -265,15 +281,7 @@ async fn completions(State(s): App, ConnectInfo(peer): ConnectInfo<SocketAddr>, 
     .await;
     let (p, cancel, rx) = match queued {
         Ok(Ok(queued)) => queued,
-        Ok(Err(e)) => {
-            engine::log(&format!("{peer}: {}: {}", e.status.as_u16(), e.message));
-            let kind = match e.status {
-                StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
-                StatusCode::BAD_REQUEST => "invalid_request_error",
-                _ => "server_error",
-            };
-            return chat::error(e.status, kind, &e.message);
-        }
+        Ok(Err(e)) => return refused(&peer, e),
         Err(e) => return chat::error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", &e.to_string()),
     };
     if p.stream { chat::stream(p, cancel, rx) } else { chat::whole(p, cancel, rx).await }
@@ -376,7 +384,6 @@ fn main() {
         .route("/chat/completions", post(completions).fallback(use_post))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(shared.clone(), authorize))
-        .layer(DefaultBodyLimit::max(32 << 20))
         .with_state(shared);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -393,10 +400,7 @@ fn main() {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
         };
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-            .with_graceful_shutdown(stopped)
-            .await
-            .unwrap_or_else(|e| die(&format!("serving: {e}")));
+        http::serve(listener, app, stopped, http::LIMITS).await;
     });
     engine::stop();
     if let Some(live) = live {

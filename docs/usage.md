@@ -85,6 +85,12 @@ Every request but `GET /health` needs the API key, which the server reads
 from `--api-key-file FILE` or from the `MYDS4_API_KEY` environment variable,
 and which clients send as `Authorization: Bearer KEY` (or `x-api-key: KEY`).
 The server refuses to start without a key of 16 to 256 characters.
+It takes at most 64 connections at once (503 beyond). A request's line and
+headers must arrive within 60 s and take at most 64 KB (431), each part of
+its body must arrive within 60 s of the one before (408), and the body may
+take at most 32 MB (413). A client that leaves, or stops reading its
+response for 60 s, ends its request (see
+[Connections](server.md#connections)).
 
 The [README](../README.md#run) shows how to create a key file and start the server.
 
@@ -282,7 +288,7 @@ The app stores the key in its own credential file (`~/.dsh/.credentials.yaml`).
 | --- | --- |
 | `.venv/bin/python tools/reference/check.py tok CHECKPOINT` | The tokenizer against the `tokenizers` library on 17 texts. |
 | `.venv/bin/python tools/reference/check.py encoding CHECKPOINT` | The server's prompts (`build/myds4-server --render`; `MYDS4_RENDER` names another renderer) of the checkpoint's `encoding/tests` cases 1, 2, 3 and 5, and of 1,200 generated conversations (tools, tool calls and results, reasoning, system messages at the start and mid-conversation, content parts, escapes, both thinking modes, every effort form) and 600 with image parts in user turns and tool results (the placeholders' places and the images' order), against `encoding/encoding.py`, byte for byte. The server's renderer differs from `encoding.py` in known places ([Prompts compared with encoding.py](server.md#prompts-compared-with-encodingpy)), so the check reports the equal counts and exits with status 1. |
-| `make server-check` | The server's tests without a model: the compatibility steps, a numeric effort in the prompt, the live view's frames on a test terminal (the title first, every line within the terminal's width, the log below the sessions' tree, the quit keys), and, with `MYDS4_CHECKPOINT=CHECKPOINT`, its output path through deepseek-recipe's stream processor with the checkpoint's tokenizer. |
+| `make server-check` | The server's tests without a model: the compatibility steps, a numeric effort in the prompt, the live view's frames on a test terminal (the title first, every line within the terminal's width, the log below the sessions' tree, the quit keys), the connections' limits (503, 431, a late head, 408, 413, a client that leaves or stops reading), and, with `MYDS4_CHECKPOINT=CHECKPOINT`, its output path through deepseek-recipe's stream processor with the checkpoint's tokenizer. |
 | `.venv/bin/python tools/reference/check.py vision CHECKPOINT IMAGE [BINARY...]` | The image's feature rows (`--vision-fd`) against `inference/image_processor.py` and `vision.py` (ViT and Aligner in BF16 on the CPU): their SNR, overall and per row. With BINARY, each of those builds instead of `build/myds4`, against one reference. Needs `pillow`. |
 | `.venv/bin/python tools/reference/check.py model CHECKPOINT [CACHE]` | Every layer's streams, the routing and the logits of 20 decoded positions against DeepSeek's `inference/model.py` on the CPU (about 12 minutes, up to 55 GB of memory; `CACHE` keeps the reference's results in a file for reruns). The reference reads the checkpoint through the page cache, which then holds tens of GB of it: until those pages are reclaimed, myds4 finds less free memory, and its expert reads may come from the page cache instead of the SSD. |
 | `build/myds4 -m CHECKPOINT -p TEXT --check-prefill` | The prompt as two batches (the first of odd length) against one: the final logits must be equal. The batched prefill's logits at every position against token-by-token decoding. |

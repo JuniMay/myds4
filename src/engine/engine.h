@@ -128,9 +128,9 @@ enum { MYDS4_QUEUED, MYDS4_BUSY, MYDS4_INVALID };  // myds4_submit's results
 // order while fewer than --batch decode; a queued prompt is never split.
 int myds4_submit(const myds4_request *r, uint64_t *id, char *message, size_t cap);
 
-// Ends a request: a waiting one is dropped, a running one stops before its
-// next step; either ends with DONE, MYDS4_CANCELLED. Unknown or finished ids
-// are ignored.
+// Ends a request: a waiting one is dropped, without running, when the worker
+// next admits requests; a running one stops before its next step. Either ends
+// with DONE, MYDS4_CANCELLED. Unknown or finished ids are ignored.
 void myds4_cancel(uint64_t id);
 
 // ---- the server's state and log ----

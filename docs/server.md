@@ -13,7 +13,8 @@ serves `POST /v1/chat/completions`, streamed or as one response,
 
 | Part | Language | Files |
 | --- | --- | --- |
-| HTTP: endpoints, the API key, body limits, server-sent events, the options | Rust | `server/src/main.rs` |
+| HTTP: endpoints, the API key, server-sent events, the options | Rust | `server/src/main.rs` |
+| Connections: the accept loop, the limits and timeouts | Rust | `server/src/http.rs` |
 | Requests: the compatibility steps, recipe's Chat Completions conversion, sampling settings, images from `data:` URLs | Rust | `server/src/chat.rs` |
 | Prompts: recipe's V4.1 rendering | Rust | `server/src/chat.rs` |
 | Output: recipe's stream processor (reasoning, content, tool calls, usage) and its Chat Completions chunks | Rust | `server/src/chat.rs` |
@@ -50,8 +51,8 @@ lines. It also does so before a fatal error's message, the engine's
 
 ## A request's path
 
-1. The server reads the request (a body up to 32 MB) and checks the API
-   key: SHA-256 digests compared in constant time, from
+1. The server reads the request within the [connections' limits](#connections)
+   and checks the API key: SHA-256 digests compared in constant time, from
    `Authorization: Bearer KEY` or `x-api-key`.
 2. It applies the [compatibility steps](#compatibility-steps) to the JSON,
    reads the sampling settings itself, and converts the rest with recipe's
@@ -67,8 +68,30 @@ lines. It also does so before a fatal error's message, the engine's
    JSON body at the end. Each engine event becomes an input of recipe's
    `StreamProcessor`, whose Chat Completions chunks are written as they
    come.
-7. When the client closes its connection, or the processor stops early (a
-   stop sequence), the server cancels the request (`myds4_cancel`).
+7. When the client closes its connection or stops reading for 60 s, or the
+   processor stops early (a stop sequence), the server cancels the request
+   (`myds4_cancel`).
+
+## Connections
+
+The server accepts at most 64 connections at once and answers another with
+503 (`too many connections`) before reading its request. Each connection
+sends without delay (`TCP_NODELAY`), so a token's chunk goes out at once.
+
+| Limit | Beyond it |
+| --- | --- |
+| A request's line and headers arrive within 60 s, also on an idle connection between requests | The connection closes. |
+| A request's line and headers take at most 64 KB | 431 |
+| Each part of a body arrives within 60 s of the one before | 408 |
+| A body takes at most 32 MB | 413 |
+| The client takes each write within 60 s | The connection closes, and its request is cancelled. |
+
+A connection that closes before its response ended (its client left, or a
+write waited 60 s) cancels its request: a decoding request stops before its
+next step, and a waiting one is dropped when the worker next admits
+requests, without running. hyper notices a client that closes its
+connection while the server computes the answer, streamed or not, because
+it keeps reading the connection meanwhile; reads have no deadline then.
 
 ## The C ABI
 
@@ -111,9 +134,10 @@ parts:
   `MYDS4_DONE` or `MYDS4_REFUSED` the engine never calls back for that
   request again. A callback must return quickly; it may call only
   `myds4_cancel` and `myds4_log`.
-- **Cancel.** `myds4_cancel(id)` drops a waiting request or stops a running
-  one before its next step. Ids of finished requests are ignored, so the
-  caller may cancel whenever its response ends.
+- **Cancel.** `myds4_cancel(id)` drops a waiting request, without running
+  it, when the worker next admits requests, and stops a running one before
+  its next step. Ids of finished requests are ignored, so the caller may
+  cancel whenever its response ends.
 - **State.** `myds4_status()` returns the JSON of `GET /v1/status` (the
   phase, the requests, the sessions, the caches, memory and totals);
   `myds4_view()` returns the live view's snapshot as JSON (the phase and the
@@ -327,7 +351,7 @@ not call them: prompts and output use the engine's tokenizer.
 | Command | What it checks |
 | --- | --- |
 | `.venv/bin/python tools/reference/check.py encoding CHECKPOINT` | The server's prompts (`build/myds4-server --render FILE`) against `encoding.py` on the test cases and the generated conversations ([above](#prompts-compared-with-encodingpy)). |
-| `make server-check` (`MYDS4_CHECKPOINT=CHECKPOINT` for the tokenizer test) | The compatibility steps, a numeric effort in the prompt, the engine's events through recipe's processor with the checkpoint's tokenizer (reasoning, content, finish, usage), and the live view's frames on a test terminal: the title first, every line within the terminal's width, the log below the sessions' tree, per-request speeds and the quit keys. No model is loaded; without `MYDS4_CHECKPOINT` the tokenizer test is skipped. |
+| `make server-check` (`MYDS4_CHECKPOINT=CHECKPOINT` for the tokenizer test) | The compatibility steps, a numeric effort in the prompt, the engine's events through recipe's processor with the checkpoint's tokenizer (reasoning, content, finish, usage), and the live view's frames on a test terminal: the title first, every line within the terminal's width, the log below the sessions' tree, per-request speeds and the quit keys; and the connections' limits on a local socket, with short timeouts: 503 beyond the connection limit, 431, a late head, 408 and 413, and a client that leaves or stops reading ending its request. No model is loaded; without `MYDS4_CHECKPOINT` the tokenizer test is skipped. |
 
 On 2026-11-01 the server (the UD-IQ1_M experts, `--cache 40`) answered eight
 requests at temperature 0: thinking off; thinking at effort `high` and at
@@ -365,6 +389,17 @@ printed, the last `q: stopping after the current step`.
 `tools/checks/online_predictor_server_check.py` with `--draft 2
 --sampling-check` passed the same day.
 
+The same day the server answered a 70 KB request head with 431 and, while
+64 connections were open, a 65th with 503; once they closed, it served a
+request. With `--batch 1`, a request that was not streamed stopped 0.05 s
+after its client closed its connection while it decoded (`client gone`
+after 256 tokens), and a waiting request whose client closed was dropped,
+without running, when the first one ended (`client gone while waiting`).
+SIGTERM during a streamed response ended it 0.13 s later with an `error`
+event and no `[DONE]`, and the server exited with status 0 after 0.44 s;
+`online_predictor_server_check.py` passed again. The 60 s timeouts were
+checked with shorter ones in `make server-check`.
+
 `--render FILE` renders a test case as the server renders a request with its
 messages, tools, thinking mode and effort, with two differences that let it
 take `encoding.py`'s cases: each image part's URL is replaced by a distinct
@@ -375,10 +410,6 @@ with an assistant message is printed without the next turn's start, as
 
 ## Not done yet
 
-- Limits on open connections, and socket timeouts. hyper, the HTTP library,
-  limits a request's header section to 417,792 bytes and 100 fields.
-- Noticing a client that leaves a request that is not streamed before its
-  answer is written.
 - The Responses and Messages endpoints, which recipe converts too.
 - Log probabilities, and the constraints of structured output (recipe
   converts them; the engine does not enforce them).
