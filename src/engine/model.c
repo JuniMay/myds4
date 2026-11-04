@@ -130,7 +130,7 @@ static const Buf *ready_tab;
 uint64_t spec_fixups;  // layers whose experts the CPU computed again
 
 static int K_mm_fp8, K_mm_bf16, K_mv_fp8, K_mv_bf16, K_mvm_fp8, K_mvm_bf16, K_mv_fp8_3, K_mv_bf16_3, K_mvm_fp8_3,
-    K_mvm_bf16_3, K_moe_up, K_moe_down, K_moe_up_m, K_moe_down_m, K_gg_gather, K_act_quant_h,
+    K_mvm_bf16_3, K_moe_up, K_moe_down, K_moe_up_m, K_moe_down_m, K_gg_gather, K_act_quant_h, K_gather_mxfp4, K_act_quant_mxfp4,
     K_moe_combine, K_moe_parts, K_act_quant, K_embed, K_rmsnorm, K_hc_mix, K_hc_pre_norm, K_hc_post, K_swiglu,
     K_kv_window, K_compress, K_index_key, K_index_score, K_index_topk, K_attend_scores, K_attend_values,
     K_attend_combine, K_attn_out, K_route,
@@ -186,9 +186,8 @@ static struct {
 static uint32_t expert_quant[LAYERS][3]; // 0 is native MXFP4; otherwise the GGUF type
 static Buf head_q6;  // the GGUF file's output head in Q6_K, if it has one: used instead of the checkpoint's
 static int K_gg_head1, K_gg_head6;
-// A prompt batch's pairs' rows of XQ and of MH as half, in pair order, for
-// the matrix units (moe_up_m and moe_down_m, or gg_up_m and gg_down_m),
-// padded by 64 rows.
+// A prompt batch's pairs' rows of XQ and MH, in pair order. Native MXFP4
+// keeps half values multiplied by 128; GGUF keeps unscaled half values.
 static Buf XH, MHH;
 
 static void gguf_experts(const char *path) {
@@ -408,6 +407,7 @@ void model_load(const char *dir, const Options *options) {
 #define K(name) K_##name = gpu_kernel(#name)
   K(mm_fp8), K(mm_bf16), K(mv_fp8), K(mv_bf16), K(mvm_fp8), K(mvm_bf16), K(mv_fp8_3), K(mv_bf16_3), K(mvm_fp8_3);
   K(mvm_bf16_3), K(moe_up), K(moe_down), K(moe_up_m), K(moe_down_m), K(gg_gather), K(act_quant_h);
+  K(gather_mxfp4), K(act_quant_mxfp4);
   K(moe_combine), K(moe_parts), K(act_quant), K(embed), K(rmsnorm), K(hc_mix), K(hc_pre_norm), K(hc_post);
 #ifdef MYDS4_EXPERT_BATCH
   K(moe_up_rows), K(moe_down_rows);
@@ -428,6 +428,14 @@ void model_load(const char *dir, const Options *options) {
     char s[128], prefix[32];
     snprintf(prefix, sizeof prefix, "layers.%d", l);
     load_block(y, prefix);
+    if (!opt.experts) {
+      float maximum = 0;
+      for (int d = 0; d < DIM; d++) maximum = fmaxf(maximum, fabsf(((const float *)y->ffn_norm.ptr)[d]));
+      // RMSNorm bounds a channel by sqrt(DIM)*max|weight|. The factor
+      // 1.125 covers BF16 and E4M3 rounding before scaled-half staging.
+      if (!(maximum * sqrtf(DIM) * 1.125f < 511.75f))
+        die("layer %d FFN norm exceeds the MXFP4 activation-staging range", l);
+    }
     y->ratio = ratios[l];
     y->kv_source = is_in(l, kv_sources, 4);
     y->index_source = is_in(l, index_sources, 8);
@@ -1448,13 +1456,13 @@ static void routed_batch(const Batch *b, int l, int ahead, int inflight, int app
   }
   // the pairs' rows as half; tiles of 64 columns of w1 and w3, 128 of w2
   uint32_t np = m * TOPK;
-  gpu_kern(K_gg_gather);
+  gpu_kern(gg ? K_gg_gather : K_gather_mxfp4);
   gpu_buf(0, &XQ, 0), gpu_buf(1, &PTOK, 0), gpu_buf(2, &XH, 0);
   gpu_go(DIM / 4 / 256, np, 1, 256, 1, 1);
   gpu_kern(gg ? gk[l].up_m : K_moe_up_m);
   gpu_buf(0, &TILES, 0), gpu_buf(1, &XH, 0), gpu_buf(2, &PW, 0), gpu_buf(3, &MH, 0), gpu_bytes(4, &np, 4);
   gpu_go(nt, INTER / 64, 1, 128, 1, 1);
-  gpu_kern(K_act_quant_h);
+  gpu_kern(gg ? K_act_quant_h : K_act_quant_mxfp4);
   gpu_buf(0, &MH, 0), gpu_buf(1, &MHH, 0);
   gpu_go(np * INTER / 256, 1, 1, 256, 1, 1);
   gpu_kern(gg ? gk[l].down_m : K_moe_down_m);

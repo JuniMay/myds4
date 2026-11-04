@@ -1599,10 +1599,22 @@ inline Mxfp4 mxfp4(device const uchar *w, device const uchar *s, int k, int n) {
                tensor_blockwise<tensor_plane_scales, device metal_fp8_ue8m0_format, 32, 1>((device uchar *)s));
 }
 
+// E4M3's activation-scale floor gives a smallest step of 2^-31. Scaling by
+// 2^7 makes that step an FP16 subnormal exactly; values up to 511.75 fit.
+// The model checks its FFN norm bound at load, and SwiGLU is bounded by 150.
+// Matrix outputs are scaled back before the reference's BF16 rounding.
+kernel void gather_mxfp4(device const float4 *x [[buffer(0)]], device const int *ptok [[buffer(1)]],
+                          device half4 *out [[buffer(2)]],
+                          uint2 i [[thread_position_in_grid]]) {
+  out[i.y * 1280 + i.x] = half4(x[ptok[i.y] * 1280 + i.x] * 128.0f);
+}
+kernel void act_quant_mxfp4(device const float *x [[buffer(0)]], device half *out [[buffer(1)]],
+                             uint i [[thread_position_in_grid]]) {
+  out[i] = half(fp8_act(x[i]) * 128.0f);
+}
+
 // The matrix units read the MXFP4 weights from the slot and the pairs' rows
-// of x or h as half from device memory, in pair order (gg_gather,
-// act_quant_h): half holds the E4M3-quantized activations exactly unless a
-// block's largest magnitude is below 0.007 (its smallest codes then round).
+// of x or h as half values multiplied by 128, in pair order.
 // Each simdgroup runs its own products of the tile's pairs (32 rows, padded
 // by 64 for the last tile) with 32 columns, in K steps of 128.
 #define MOE_K 128
@@ -1644,7 +1656,7 @@ kernel void moe_up_m(device const MoeTile *tiles [[buffer(0)]], device const hal
         uint col = at[0], r = at[1];
         if (r < tl.count) {
           uint q = tl.start + r;
-          float g = min(bf(c[i]), 10.0f), u = clamp(bf(acc[j][32 * r + col]), -10.0f, 10.0f);
+          float g = min(bf(c[i] * 0x1p-7f), 10.0f), u = clamp(bf(acc[j][32 * r + col] * 0x1p-7f), -10.0f, 10.0f);
           h[q * 2304 + n0 + col] = bf(g / (1.0f + exp(-g)) * u * pw[q]);
         }
       }
@@ -1671,7 +1683,7 @@ kernel void moe_down_m(device const MoeTile *tiles [[buffer(0)]], device const h
     if (c.is_valid_element(i)) {
       auto at = c.get_multidimensional_index(i);
       uint r = at[1];
-      if (r < tl.count) y[(tl.start + r) * 5120 + n0 + at[0]] = bf(c[i]);
+      if (r < tl.count) y[(tl.start + r) * 5120 + n0 + at[0]] = bf(c[i] * 0x1p-7f);
     }
 }
 

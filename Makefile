@@ -7,6 +7,18 @@ SRC = src/cli/main.c src/engine/model.c src/engine/io.c src/engine/gpu.c src/eng
 MODEL_HEADERS = src/engine/myds4.h src/experimental/online_predictor_math.h src/engine/expert_batch.h
 KERNELS = src/kernels/kernels.metal src/kernels/gguf_grids.metal src/kernels/gguf.metal src/kernels/vision.metal
 
+build/activation-format-check: tools/checks/activation_format_check.c tools/reference/activation_format.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/activation_format_check.c
+
+activation-format-check: build/activation-format-check
+	./build/activation-format-check
+
+build/mxfp4-activation-check: tools/checks/mxfp4_activation_check.c tools/reference/activation_format.h src/engine/gpu.c src/engine/util.c src/engine/myds4.h $(KERNELS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/mxfp4_activation_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
+
+
 # CED numerical and prefill/DSpark timing checks.
 build/ced-check: tools/checks/ced_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
 	@mkdir -p build

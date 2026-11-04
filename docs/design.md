@@ -147,12 +147,25 @@ reference keeps in BF16 are rounded to BF16 where it rounds them; activations
 are FP32 in memory otherwise. The attention state's window keys, compressed
 rows and index keys are stored as BF16, which holds their quantized values
 exactly: an E2M1 code times an E4M3 scale has at most 6 significant bits.
-Products accumulate in FP32. In prefill, the matrix units multiply BF16
+Products accumulate in FP32. `tools/reference/activation_format.h` provides
+CPU reference codecs for BF16 and 32-value E4M3 blocks with one E8M0 scale.
+`make activation-format-check` checks finite code values, nearest-even
+rounding, scale boundaries, signed zeros and the FP16 small-value limitation.
+These codecs support representation checks and include the scaled-half
+staging rule used by the native MXFP4 matrix kernels.
+
+In prefill, the matrix units multiply BF16
 tiles for the dense weights: the quantized activations and the dequantized
 weights are both exact in BF16. For the routed experts they read the MXFP4
-weights as stored, with the activations in half, which holds the quantized
-activations exactly unless a block's largest magnitude is below 0.007 (its
-smallest codes then round).
+weights as stored. Their activation staging uses half values multiplied by
+128; the matrix result is divided by 128 before BF16 rounding. The FP8
+quantizer's scale floor gives a minimum step of `2^-31`, which becomes the
+exact FP16 step `2^-24` after this scaling. Values up to 511.75 fit. Loading
+checks the FFN RMSNorm weights against that upper bound, allowing for BF16
+and FP8 rounding; the checkpoint's conservative bound is below 209. The
+weighted SwiGLU output is bounded by 150 before FP8 quantization. This
+preserves small activations while using Metal's supported half × MXFP4
+matrix operation. GGUF matrix kernels retain their existing half staging.
 
 `tools/reference/check.py model` decodes a 20-token prompt and continuation with
 myds4 and with the reference (eager FP32 PyTorch on the CPU with the kernels'
