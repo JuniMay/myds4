@@ -94,6 +94,10 @@ int main(void) {
   predictor_lab_accept(2);
   expect("history uses accepted row", lab.prior_labels[37] == .1f);
   expect("history excludes rejected row", lab.prior_labels[74] == 0);
+  predictor_lab_accept(2);
+  expect("unobserved lookup verification does not reuse DSpark labels", lab.prior_labels[37] == .1f);
+  predictor_lab_accept(16);
+  expect("wide lookup verification needs no DSpark labels", lab.prior_labels[37] == .1f);
   prepare(18);
   for (int i = 1; i < LAB_VARIANTS; i++)
     expect(names[i], memcmp(lab.v[0].phi, lab.v[i].phi, 3 * lab.rank * sizeof(float)) != 0);

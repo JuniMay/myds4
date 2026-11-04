@@ -212,7 +212,7 @@ kernel void gg_up(constant Expert *ex [[buffer(0)]], device const float *x [[buf
 template <typename B>
 kernel void gg_down(constant Expert *ex [[buffer(0)]], device const float *h [[buffer(1)]],
                     device const float *shared_out [[buffer(2)]], device const float *mix [[buffer(3)]],
-                    device const float *res [[buffer(4)]], device float *out [[buffer(5)]],
+                    device const bfloat *res [[buffer(4)]], device bfloat *out [[buffer(5)]],
                     constant uint &n [[buffer(6)]], constant uint &pm [[buffer(7)]], device float *parts [[buffer(8)]],
                     uint tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]],
                     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
@@ -261,7 +261,7 @@ kernel void gg_down(constant Expert *ex [[buffer(0)]], device const float *h [[b
     for (uint k = 0; k < 4; k++) {
       float v = mix[4 + k] * v0;
       for (uint j = 0; j < 4; j++) v += mix[8 + 4 * j + k] * res[j * 5120 + i];
-      out[k * 5120 + i] = bf(v);
+      out[k * 5120 + i] = bfloat(bf(v));
     }
   }
 }

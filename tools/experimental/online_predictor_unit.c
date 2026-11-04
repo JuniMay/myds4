@@ -213,7 +213,8 @@ int main(void) {
   }
   expect("learner reset clears B and restores P", cleared);
   expect("learner reset keeps the seeded A", !memcmp(a_before, online.models[0].a, 768 * ONLINE_RANK * 4));
-  expect("prediction records stay below one MiB", ONLINE_PAIRS * sizeof(OnlineRecord) < 1024 * 1024);
+  expect("prediction records stay below 160 KiB per supported row",
+         ONLINE_PAIRS * sizeof(OnlineRecord) < (size_t)OP_MAX_ROWS * 160 * 1024);
   online_predictor_begin(3, 1);
   fill(0, 3, gp, gl, pr, rt);
   gp[0] = NAN;

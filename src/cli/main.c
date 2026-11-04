@@ -7,6 +7,12 @@
 #include <unistd.h>
 
 #include "myds4.h"
+#include "../experimental/context_lookup.h"
+#ifdef MYDS4_STAGED_DRAFT
+#include "../experimental/draft_queue.h"
+static_assert(DRAFT_QUEUE_MAX == BLOCK, "draft queue matches DSpark's width");
+static_assert(MYDS4_STAGED_DRAFT > 0 && MYDS4_STAGED_DRAFT <= BLOCK, "valid verification chunk");
+#endif
 #ifdef MYDS4_PREDICT_LAB
 #include "../experimental/predictor_lab.h"
 #endif
@@ -18,13 +24,15 @@ static void usage(void) {
         "  --top-p P     nucleus probability in [0, 1] (default 1, full distribution)\n"
         "  --seed N      nonnegative integer sampling seed\n"
         "  --raw         use the prompt as is, without the chat template\n"
+        "  --rendered    use a server-rendered chat prompt; preserve literal image-marker text\n"
         "  --think N     thinking effort 1-100; 0 disables it (default off)\n"
         "  --image FILE  an image (any format macOS reads) before the prompt's text, up to 16; with --raw\n"
         "                each takes a <｜deepseek_image｜> of the prompt instead\n"
         "  --vision-fd FD  write the --image images' feature rows (BF16, 5120 per token) to FD and exit\n"
         "  --ctx N       context capacity in tokens, at most 1048576 (default 16384)\n"
+        "  --prefill-prune  skip decoder batches outside required history (default off); CED and substitution must be off\n"
         "  --ced off|N   approximate prefill: replay N decoder tokens, 128-1048576 (default off);\n"
-        "                keeps five additional rows for cached-request rewinds; decoding uses all layers\n"
+        "                keeps the verification rewind margin; decoding uses all layers\n"
         "  --cache GB    expert cache budget (default: from available memory)\n"
         "  --reserve GB  memory the expert cache leaves to other programs, 2-1024 (default 10)\n"
         "  --cache-half-life N  score half-life in forward passes, 1-1000000 (default 50)\n"
@@ -40,6 +48,8 @@ static void usage(void) {
         "  --check-batch  compare a token decoded alone with the same token decoded beside another sequence\n"
         "                (and, with --draft, in a verify pass): the logits must be equal\n"
         "  --draft N     verify up to N (1-5) DSpark drafts per pass using the requested sampler\n"
+        "  --lookup off|N  verify up to N (1-15) context-copy drafts; --draft supplies fallback (default off)\n"
+        "  --expert-batch  share repeated expert weight loads across verification rows (exact)\n"
         "  --draft-cache N  with --draft: expert slots per stage, 15-128 (default: all 128 preloaded);\n"
         "                smaller caches load the native selections on demand, within --cache\n"
         "  --draft-trim  with --draft: compute only requested final-stage query/FFN rows; keep all five keys\n"
@@ -96,8 +106,13 @@ int main(int argc, char **argv) {
       raw = 1;
       continue;
     }
+    if (!strcmp(a, "--rendered")) {
+      raw = 2;
+      continue;
+    }
     if (!strcmp(a, "--tokenize")) {
-      tokenize = raw = 1;
+      tokenize = 1;
+      if (!raw) raw = 1;
       continue;
     }
     if (!strcmp(a, "--bench")) {
@@ -113,7 +128,8 @@ int main(int argc, char **argv) {
       continue;
     }
     if (!strcmp(a, "--perplexity")) {
-      perplexity = raw = 1;
+      perplexity = 1;
+      if (!raw) raw = 1;
       continue;
     }
     if (!strcmp(a, "--gpu-route")) {
@@ -126,6 +142,14 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(a, "--draft-trim")) {
       o.draft_trim = 1;
+      continue;
+    }
+    if (!strcmp(a, "--expert-batch")) {
+      o.expert_batch = 1;
+      continue;
+    }
+    if (!strcmp(a, "--prefill-prune")) {
+      o.prefill_prune = 1;
       continue;
     }
     if (!strcmp(a, "--online-predictor")) {
@@ -178,6 +202,14 @@ int main(int argc, char **argv) {
     else if (!strcmp(a, "--dump-fd")) o.dump_fd = atoi(v);
     else if (!strcmp(a, "--routes-fd")) o.routes_fd = atoi(v);
     else if (!strcmp(a, "--draft")) o.draft = atoi(v);
+    else if (!strcmp(a, "--lookup")) {
+      char *end;
+      errno = 0;
+      long value = !strcmp(v, "off") ? 0 : strtol(v, &end, 10);
+      if (strcmp(v, "off") && (end == v || *end || errno || value < 0 || value > VERIFY_DRAFTS))
+        die("--lookup takes off or 1 to %d drafts", VERIFY_DRAFTS);
+      o.lookup = (int)value;
+    }
     else if (!strcmp(a, "--draft-cache")) {
       char *end;
       long slots = strtol(v, &end, 10);
@@ -229,7 +261,7 @@ int main(int argc, char **argv) {
                "the value, the more thorough the reasoning)\n\n<｜User｜>%s%s<｜Assistant｜><think>",
                think, user, prompt);
     else snprintf(text, len, "<｜begin▁of▁sentence｜><｜User｜>%s%s<｜Assistant｜></think>", user, prompt);
-    n = raw ? tok_encode(text, tokens, o.ctx)
+    n = raw == 1 ? tok_encode(text, tokens, o.ctx)
             : tok_encode_chat(text, tokens, o.ctx); // --raw: the placeholders place images
   }
   Image ims[16] = {0};
@@ -368,7 +400,19 @@ int main(int argc, char **argv) {
   uint64_t swap0 = mem_swapouts(), comp0 = mem_compressions();
   extern double phase_s[7];
   double g0 = gpu_busy, t0 = now(), p1[7];
-  const float *logits = model_forward(tokens, n, 0);
+  const float *logits;
+#ifdef MYDS4_PREFILL_PREFIX
+  int prefix = 0, user_token = tok_find("<｜User｜>");
+  while (prefix < n && tokens[prefix] != user_token) prefix++;
+  logits = prefix > 1 && prefix < n ? model_forward_prefix(tokens, n, 0, prefix, NULL) : model_forward(tokens, n, 0);
+#else
+  logits = model_forward(tokens, n, 0);
+#endif
+  uint64_t prefill_workspace = model_workspace_bytes();
+  ModelForwardInfo prune_info = model_forward_info();
+  fprintf(stderr, "{\"prefill_prune\":{\"applied\":%s,\"tokens\":%d,\"decoder_tokens\":%d,\"chunks\":%d,\"prefix_tokens\":%d}}\n",
+          prune_info.prune_applied ? "true" : "false", prune_info.tokens, prune_info.decoder_tokens,
+          prune_info.chunks, prune_info.prefix_tokens);
   double t1 = now();
   CacheStats c1 = cache_stats;
   uint64_t rows_before_decode = decode_rows;
@@ -379,16 +423,64 @@ int main(int argc, char **argv) {
   long gaps1 = gpu_gaps;
   uint64_t fix1 = spec_fixups;
   int pos = n, gen = 0, passes = 0, accepted = 0, t = sample_token(logits, VOCAB, &sampler), len;
+  ContextLookup *lookup = o.lookup ? context_lookup_new(o.ctx) : NULL;
+  if (o.lookup && (!lookup || !context_lookup_append(lookup, tokens, n))) die("cannot initialize context lookup");
+  int lookup_attempts = 0, lookup_passes = 0, lookup_offered = 0, lookup_kept = 0;
+#ifdef MYDS4_STAGED_DRAFT
+  DraftQueue pending_draft = {0};
+  int draft_generations = 0, draft_reuses = 0;
+#endif
   uint64_t cache_start = cache_bytes(), cache_min = cache_start, cache_max = cache_start;
   while (gen < ntokens && pos < o.ctx && t != eos && !shutdown_requested()) {
-    // t is the token at pos. Speculatively, a pass runs it with up to
-    // o.draft drafts. Target-model samples confirm a prefix and supply the
-    // next token, consuming exactly the draws used by ordinary sampling.
-    int rows[BLOCK + 1] = {t}, k = o.draft, a = 0, next;
-    if (k > ntokens - gen - 1) k = ntokens - gen - 1;
-    if (k > o.ctx - pos - 1) k = o.ctx - pos - 1;
+    // A verification pass runs the current token and its proposed successors.
+    // Target samples confirm a prefix and supply the next token, consuming
+    // exactly the draws used by ordinary sampling.
+    int rows[VERIFY_DRAFTS + 1] = {t}, k = 0, a = 0, next;
+    int room = ntokens - gen - 1;
+    if (room > o.ctx - pos - 1) room = o.ctx - pos - 1;
+    ContextDraft proposal = {0};
+    if (lookup) {
+      if (!context_lookup_append(lookup, &t, 1)) die("context lookup exceeds the configured context");
+#ifdef MYDS4_CONSENSUS_LOOKUP
+      proposal = context_lookup_propose_consensus(lookup, o.lookup < room ? o.lookup : room);
+#else
+      proposal = context_lookup_propose(lookup, o.lookup < room ? o.lookup : room);
+#endif
+      lookup_attempts++;
+    }
+    if (proposal.count) {
+#ifdef MYDS4_STAGED_DRAFT
+      pending_draft.count = 0;
+#endif
+      k = proposal.count;
+      memcpy(rows + 1, proposal.tokens, (size_t)k * sizeof *rows);
+      lookup_passes++;
+      lookup_offered += k;
+    } else {
+#ifdef MYDS4_STAGED_DRAFT
+      if (room && o.draft && !pending_draft.count) {
+        int guesses[BLOCK], generated = o.draft < room ? o.draft : room;
+#ifdef MYDS4_COUPLED_DRAFT
+        model_draft_coupled(t, pos, guesses, generated, &sampler);
+#else
+        model_draft(t, pos, guesses, generated);
+#endif
+        if (!draft_queue_set(&pending_draft, guesses, generated)) die("invalid staged draft block");
+        draft_generations++;
+      } else if (room && pending_draft.count) draft_reuses++;
+      k = draft_queue_take(&pending_draft, rows + 1, room < MYDS4_STAGED_DRAFT ? room : MYDS4_STAGED_DRAFT);
+#else
+      k = o.draft < room ? o.draft : room;
+      if (k) {
+#ifdef MYDS4_COUPLED_DRAFT
+        model_draft_coupled(t, pos, rows + 1, k, &sampler);
+#else
+        model_draft(t, pos, rows + 1, k);
+#endif
+      }
+#endif
+    }
     if (k > 0) {
-      model_draft(t, pos, rows + 1, k);
       logits = model_verify(rows, k + 1, pos);
       next = sample_verify(logits, VOCAB, rows + 1, k, eos, &sampler, &a);
       model_accept(rows, a + 1, pos);
@@ -397,6 +489,16 @@ int main(int argc, char **argv) {
     } else {
       logits = model_forward(&t, 1, pos);
       next = sample_token(logits, VOCAB, &sampler);
+    }
+#ifdef MYDS4_STAGED_DRAFT
+    if (k && !proposal.count && !draft_queue_accept(&pending_draft, k, a, next))
+      die("invalid staged draft acceptance");
+    if (next == eos) pending_draft.count = 0;
+#endif
+    if (lookup && a && !context_lookup_append(lookup, rows + 1, a)) die("context lookup exceeds the configured context");
+    if (proposal.count) {
+      context_lookup_feedback(lookup, k, a);
+      lookup_kept += a;
     }
     uint64_t current_cache = cache_bytes();
     if (current_cache < cache_min) cache_min = current_cache;
@@ -411,14 +513,27 @@ int main(int argc, char **argv) {
     pos += a + 1;
     t = next;
   }
+  context_lookup_free(lookup);
   if (!gen && shutdown_requested()) {
     fprintf(stderr, "generation interrupted before decoding\n");
     return complete();
   }
   double t2 = now();
+  int verify_limit = o.draft;
+#ifdef MYDS4_STAGED_DRAFT
+  if (verify_limit > MYDS4_STAGED_DRAFT) verify_limit = MYDS4_STAGED_DRAFT;
+#endif
+  if (verify_limit < o.lookup) verify_limit = o.lookup;
   if (passes)
     fprintf(stderr, "speculative: %d passes, %.2f of up to %d drafts kept per pass\n", passes,
-            (double)accepted / passes, o.draft);
+            (double)accepted / passes, verify_limit);
+  if (o.lookup)
+    fprintf(stderr, "{\"context_lookup\":{\"attempts\":%d,\"passes\":%d,\"offered\":%d,\"accepted\":%d}}\n",
+            lookup_attempts, lookup_passes, lookup_offered, lookup_kept);
+#ifdef MYDS4_STAGED_DRAFT
+  fprintf(stderr, "{\"staged_draft\":{\"generated_drafts\":%d,\"chunk_drafts\":%d,\"generations\":%d,\"reused_passes\":%d}}\n",
+          o.draft, MYDS4_STAGED_DRAFT, draft_generations, draft_reuses);
+#endif
   CacheStats c2 = cache_stats;
   uint64_t computed_rows = decode_rows - rows_before_decode;
   fprintf(stderr, "{\"decode_experts\":{\"computed_rows\":%llu,\"selected\":%llu,\"unique_layer_requests\":%llu}}\n",
@@ -428,6 +543,8 @@ int main(int argc, char **argv) {
           (unsigned long long)cache_start, (unsigned long long)cache_min, (unsigned long long)cache_max,
           (unsigned long long)(c2.given_back - c1.given_back));
   double g2 = gpu_busy;
+  fprintf(stderr, "{\"workspace\":{\"resizable_after_prefill_bytes\":%llu,\"resizable_after_decode_bytes\":%llu}}\n",
+          (unsigned long long)prefill_workspace, (unsigned long long)model_workspace_bytes());
   fputc('\n', stdout);
   // hits: requested experts that needed no read on demand (resident, or prefetched)
   double hit1 = 1 - (double)(c1.misses - c0.misses) /

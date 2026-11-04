@@ -19,6 +19,7 @@
 
 #include "engine.h"
 #include "myds4.h"
+#include "../experimental/context_lookup.h"
 
 #define WAITING 16           // requests waiting for the model
 #define SESSIONS 256         // at most, whatever --kv-cache allows
@@ -183,6 +184,7 @@ static Session *empty(const Session *keep) {
 // Else a new session, or the least recently used one emptied. *from: the
 // first token to run.
 static Session *pick(const int *p, int n, int *from, const char **how) {
+  int margin = opt.lookup > BLOCK ? opt.lookup : BLOCK;
   Session *v = live > 1 && mem_pressure() >= 2 ? least_used(current) : 0;
   if (v) release(v, "memory pressure");
   Session *s = 0, *src = 0;
@@ -193,7 +195,7 @@ static Session *pick(const int *p, int n, int *from, const char **how) {
     if (!c->st) continue;
     int w, r = c->busy ? 0 : reusable(c, p, n, &w), k = common(p, n, c->ids, c->n);  // a busy one only forks
     int f = c->base > 1 && c->base < n && k >= c->base &&
-            (!c->base_encoder_only || (opt.ced && n - c->base > opt.ced + BLOCK)) ? c->base : 0;
+            (!c->base_encoder_only || (opt.ced && n - c->base > opt.ced + margin)) ? c->base : 0;
     if (r > *from) *from = r, saved = w, s = c, src = 0;
     if (f > *from) *from = f, src = c, s = 0;
   }
@@ -207,9 +209,8 @@ static Session *pick(const int *p, int n, int *from, const char **how) {
   } else if (src) {
     model_state_use(src->st);
     s = empty(src);
-    model_state_copy(s->st, src->st);
+    model_state_fork(s->st, src->st, *from);
     model_state_use(s->st);
-    model_state_restore(1);
     pthread_mutex_lock(&st_lock);
     s->base = src->base;
     s->base_encoder_only = src->base_encoder_only;
@@ -396,9 +397,11 @@ typedef struct {
   Sampler sp;
   Session *s;
   int *p, n, from, pos, gen, reasoning, thinking, ended, cancelled, t;
-  int32_t out[BLOCK + 1];  // the tokens kept in this step, for MYDS4_TOKENS
+  int32_t out[VERIFY_DRAFTS + 1];  // the tokens kept in this step, for MYDS4_TOKENS
   int nout;
   int draft_passes, draft_accepted;
+  ContextLookup *lookup;
+  int lookup_indexed, lookup_passes, lookup_offered, lookup_accepted;
   long max_new;
   double t1, tick;
   CacheStats c1;
@@ -532,17 +535,26 @@ static int begin(Req *r, Gen *g) {
   g->t1 = g->tick = now();
   say("req %llu: prefill of %d tokens in %.2f s (%.0f tokens/s), %.2f GB of experts read", (unsigned long long)r->id,
       n - g->from, g->t1 - t0, (n - g->from) / fmax(g->t1 - t0, 1e-9), (cache_stats.bytes - c0.bytes) / 1e9);
-  say("req %llu: prefill plan: %d chunks, %d encoder tokens, %d decoder tokens, ced_applied=%d, prefix=%d (%s)",
-      (unsigned long long)r->id, plan.chunks, plan.tokens, plan.decoder_tokens, plan.ced_applied,
+  say("req %llu: prefill plan: %d chunks, %d encoder tokens, %d decoder tokens, ced_applied=%d, prune_applied=%d, prefix=%d (%s)",
+      (unsigned long long)r->id, plan.chunks, plan.tokens, plan.decoder_tokens, plan.ced_applied, plan.prune_applied,
       plan.prefix_tokens, plan.prefix_encoder_only ? "encoder only" : "full");
   event(r, (myds4_event){.kind = MYDS4_STARTED, .prompt = n, .reused = g->from});
   g->thinking = thinking;
   g->pos = n, g->t = sample_token(lg, VOCAB, &g->sp), g->c1 = cache_stats;
+  if (opt.lookup) {
+    g->lookup = context_lookup_new(opt.ctx);
+    if (!g->lookup || !context_lookup_append(g->lookup, g->p, n)) die("cannot initialize context lookup");
+    g->lookup_indexed = n;
+  }
   return 1;
 }
 
 // The token t ran at pos: into the session's tokens and the step's output.
 static void emit(Gen *g, int t) {
+  if (g->lookup && g->lookup_indexed == g->pos) {
+    if (!context_lookup_append(g->lookup, &t, 1)) die("context lookup exceeds the configured context");
+    g->lookup_indexed++;
+  }
   if (g->thinking) g->reasoning++, g->thinking = t != think_end;
   g->s->ids[g->pos++] = t;
   g->s->n = g->pos;
@@ -577,6 +589,10 @@ static void finish(Gen *g, int shutdown) {
       mem_available() / GiB, mem_footprint() / GiB);
   say("req %llu: sampling temperature %.6g, top_p %.6g; %d draft passes, %d drafts accepted", (unsigned long long)r->id,
       g->sp.temp, g->sp.top_p, g->draft_passes, g->draft_accepted);
+  if (g->lookup)
+    say("req %llu: context lookup %d passes, %d offered, %d accepted", (unsigned long long)r->id,
+        g->lookup_passes, g->lookup_offered, g->lookup_accepted);
+  context_lookup_free(g->lookup), g->lookup = NULL;
   fits(g->s, 0);  // a state that grew while decoding may push others out
   pthread_mutex_lock(&st_lock);
   status.requests++, status.prompt_tokens += g->n, status.generated_tokens += g->gen, status.reused_tokens += g->from;
@@ -590,12 +606,25 @@ static void advance(void) {
   const float *lg;
   if (ngens == 1) {
     Gen *g = gens;
-    int rows[BLOCK + 1] = {g->t}, k = opt.draft, a = 0, next;
-    if (k > g->max_new - g->gen - 1) k = (int)g->max_new - g->gen - 1;
-    if (k > opt.ctx - g->pos - 1) k = opt.ctx - g->pos - 1;
+    int rows[VERIFY_DRAFTS + 1] = {g->t}, k = 0, a = 0, next;
+    int room = (int)g->max_new - g->gen - 1;
+    if (room > opt.ctx - g->pos - 1) room = opt.ctx - g->pos - 1;
+    ContextDraft proposal = {0};
+    if (g->lookup) {
+      if (g->lookup_indexed != g->pos || !context_lookup_append(g->lookup, &g->t, 1))
+        die("context lookup history is not aligned with the generation");
+      g->lookup_indexed++;
+      proposal = context_lookup_propose(g->lookup, opt.lookup < room ? opt.lookup : room);
+    }
+    if (proposal.count) {
+      k = proposal.count;
+      memcpy(rows + 1, proposal.tokens, (size_t)k * sizeof *rows);
+      g->lookup_passes++;
+      g->lookup_offered += k;
+    } else k = opt.draft < room ? opt.draft : room;
     model_state_use(g->s->st);
     if (k > 0) { // Sample the target on a matching draft prefix; stop drawing at the first mismatch.
-      model_draft(g->t, g->pos, rows + 1, k);
+      if (!proposal.count) model_draft(g->t, g->pos, rows + 1, k);
       lg = model_verify(rows, k + 1, g->pos);
       next = sample_verify(lg, VOCAB, rows + 1, k, eos, &g->sp, &a);
       g->draft_passes++;
@@ -605,6 +634,10 @@ static void advance(void) {
     } else {
       lg = model_forward(&g->t, 1, g->pos);
       next = sample_token(lg, VOCAB, &g->sp);
+    }
+    if (proposal.count) {
+      context_lookup_feedback(g->lookup, k, a);
+      g->lookup_accepted += a;
     }
     for (int i = 0; i <= a && !g->ended; i++) emit(g, rows[i]);
     g->t = next;
@@ -907,10 +940,11 @@ char *myds4_status(void) {
              "\"totals\": {\"requests\": %llu, \"prompt_tokens\": %llu, \"generated_tokens\": %llu}, ",
              kv_bytes() / GiB, cfg.kv_gb, (unsigned long long)status.requests,
              (unsigned long long)status.prompt_tokens, (unsigned long long)status.generated_tokens);
-  str_printf(&b, "\"ced_depth\": %d, \"last_prefill\": {\"chunks\": %d, \"tokens\": %d, \"decoder_tokens\": %d, "
-             "\"ced_applied\": %s, \"prefix_tokens\": %d, \"prefix_encoder_only\": %s}, ",
-             opt.ced, status.prefill.chunks, status.prefill.tokens, status.prefill.decoder_tokens,
-             status.prefill.ced_applied ? "true" : "false", status.prefill.prefix_tokens,
+  str_printf(&b, "\"ced_depth\": %d, \"lookup_depth\": %d, \"expert_batch\": %s, \"prefill_prune\": %s, \"last_prefill\": {\"chunks\": %d, \"tokens\": %d, \"decoder_tokens\": %d, "
+             "\"ced_applied\": %s, \"prune_applied\": %s, \"prefix_tokens\": %d, \"prefix_encoder_only\": %s}, ",
+             opt.ced, opt.lookup, opt.expert_batch ? "true" : "false", opt.prefill_prune ? "true" : "false",
+             status.prefill.chunks, status.prefill.tokens, status.prefill.decoder_tokens,
+             status.prefill.ced_applied ? "true" : "false", status.prefill.prune_applied ? "true" : "false", status.prefill.prefix_tokens,
              status.prefill.prefix_encoder_only ? "true" : "false");
   pthread_mutex_unlock(&st_lock);
   CacheStats c = cache_stats;
@@ -941,8 +975,9 @@ static void *engine(void *arg) {
   shutdown_watch();
   say("kv cache: up to %.1f GiB (--kv-cache); a session takes %.0f MiB at first, %.2f GiB at %d tokens", cfg.kv_gb,
       model_state_bytes(0, 0) / 1048576.0, model_state_bytes(0, opt.ctx) / GiB, opt.ctx);
-  say("prefill: ced_depth=%d (%s); system prefix saved within the prompt pass", opt.ced,
-      opt.ced ? "approximate, plus five rewind rows" : "off");
+  say("prefill: ced_depth=%d (%s); dependency pruning=%s; rewind margin=%d; context lookup=%d", opt.ced,
+      opt.ced ? "approximate" : "off", opt.prefill_prune ? "on" : "off",
+      opt.lookup > BLOCK ? opt.lookup : BLOCK, opt.lookup);
   pthread_mutex_lock(&ready_lock);
   ready = 1;
   pthread_cond_broadcast(&ready_cond);
@@ -961,6 +996,7 @@ int myds4_start(const myds4_config *c) {
                   : c->ctx < 1 || c->ctx > 1 << 20  ? "--ctx takes 1 to 1048576 tokens (the model's longest context)"
                   : c->batch < 1 || c->batch > FEW  ? "--batch takes 1 to 6 requests"
                   : c->draft < 0 || c->draft > BLOCK ? "--draft takes 1 to 5 drafts"
+                  : c->lookup < 0 || c->lookup > VERIFY_DRAFTS ? "--lookup takes off or 1 to 15 drafts"
                   : c->draft_cache && !c->draft     ? "--draft-cache needs --draft"
                   : c->draft_cache && (c->draft_cache < DRAFT_CACHE_MIN || c->draft_cache > DRAFT_EXPERTS)
                       ? "--draft-cache takes 15 to 128 slots per stage (0 keeps the default)"
@@ -984,7 +1020,8 @@ int myds4_start(const myds4_config *c) {
                   .cache_read_cost = c->cache_read_cost, .dump_fd = -1, .routes_fd = -1, .draft = c->draft,
                   .draft_cache = c->draft_cache, .draft_trim = c->draft_trim, .predictor_state = cfg.predictor_state,
                   .substitute = c->substitute, .gpu_route = c->gpu_route, .experts = cfg.experts, .quiet = 1,
-                  .online_predictor = c->online_predictor || c->predictor_state ? 64 : 0, .ced = c->ced};
+                  .online_predictor = c->online_predictor || c->predictor_state ? 64 : 0, .ced = c->ced,
+                  .lookup = c->lookup, .expert_batch = c->expert_batch, .prefill_prune = c->prefill_prune};
   if (opt.predictor_state) shutdown_watch();  // an interrupt while loading still saves the state
   pthread_attr_t at;
   pthread_attr_init(&at);

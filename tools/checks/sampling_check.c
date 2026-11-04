@@ -59,23 +59,23 @@ int main(void) {
   frequency(2, 1, (double[]){sqrt(.6) / sum, sqrt(.3) / sum, sqrt(.1) / sum},
             "temperature scales logits before sampling");
 
-  enum { N = 7 };
-  float logits[(BLOCK + 1) * N];
-  for (int r = 0; r <= BLOCK; r++)
+  enum { N = 7, VERIFY_DRAFTS = 15 };
+  float logits[(VERIFY_DRAFTS + 1) * N];
+  for (int r = 0; r <= VERIFY_DRAFTS; r++)
     for (int t = 0; t < N; t++) logits[r * N + t] = (float)((r * 17 + t * 13) % 19 - 9) / 3;
   int matches = 1, rng_matches = 1, eos_stops = 1, greedy_matches = 1;
   for (int trial = 0; trial < 1000; trial++)
-    for (int k = 0; k <= BLOCK; k++) {
+    for (int k = 0; k <= VERIFY_DRAFTS; k++) {
       Sampler original = {.temp = trial % 3 ? 1 : 0, .top_p = trial % 2 ? 1 : .8};
       sampler_seed(&original, 98317u * (unsigned)trial + 12457);
-      Sampler serial = original, after[BLOCK + 1];
-      int expected[BLOCK + 1];
+      Sampler serial = original, after[VERIFY_DRAFTS + 1];
+      int expected[VERIFY_DRAFTS + 1];
       for (int r = 0; r <= k; r++) {
         expected[r] = sample_token(logits + r * N, N, &serial);
         after[r] = serial;
       }
       for (int mismatch = 0; mismatch <= k; mismatch++) {
-        int drafts[BLOCK];
+        int drafts[VERIFY_DRAFTS];
         for (int r = 0; r < k; r++) drafts[r] = expected[r];
         if (mismatch < k) drafts[mismatch] = (drafts[mismatch] + 1) % N;
         Sampler speculative = original;
@@ -86,7 +86,7 @@ int main(void) {
         if (original.temp == 0) greedy_matches &= accepted == mismatch && next == expected[mismatch];
       }
       if (k > 0) {
-        int drafts[BLOCK];
+        int drafts[VERIFY_DRAFTS];
         for (int r = 0; r < k; r++) drafts[r] = expected[r];
         Sampler speculative = original;
         int accepted;
@@ -99,6 +99,31 @@ int main(void) {
   expect("verification preserves the serial random stream", rng_matches);
   expect("EOS stops verification without consuming later draws", eos_stops);
   expect("greedy verification remains exact", greedy_matches);
+  int coupled_equal = 1, coupled_exact = 1;
+  for (int trial = 0; trial < 256; trial++) {
+    Sampler initial = {.temp = 1, .top_p = trial % 2 ? 1 : .8};
+    sampler_seed(&initial, 98317u * (unsigned)trial + 91);
+    for (int changed = 0; changed < 2; changed++) {
+      Sampler proposal = initial, target = initial, reference = initial;
+      int drafts[5], accepted, expected[6];
+      Sampler after[6];
+      for (int r = 0; r < 6; r++) {
+        expected[r] = sample_token(logits + r * N, N, &reference);
+        after[r] = reference;
+        if (r < 5) {
+          float q[N];
+          for (int i = 0; i < N; i++) q[i] = logits[r * N + (changed ? (i + r + 1) % N : i)];
+          drafts[r] = sample_token(q, N, &proposal);
+        }
+      }
+      int next = sample_verify(logits, N, drafts, 5, -1, &target, &accepted);
+      if (!changed) coupled_equal &= accepted == 5;
+      for (int r = 0; r < accepted; r++) coupled_exact &= drafts[r] == expected[r];
+      coupled_exact &= next == expected[accepted] && !memcmp(target.seed, after[accepted].seed, sizeof target.seed);
+    }
+  }
+  expect("shared uniforms accept an identical draft distribution", coupled_equal);
+  expect("shared uniforms preserve target tokens and RNG with a different draft distribution", coupled_exact);
   fprintf(stderr, "sampling: %d/%d CPU checks passed\n", checks - failures, checks);
   return failures != 0;
 }

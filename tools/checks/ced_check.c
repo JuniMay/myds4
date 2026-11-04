@@ -5,7 +5,7 @@
 
 typedef struct { uint64_t count, different; double signal, error, max_abs; } Error;
 static int prompt_n, observed[LAYERS][WINDOW][TOPK], reference_routes[LAYERS][WINDOW][TOPK];
-static uint16_t reference_ring[LAYERS][RING * HEAD_DIM];
+static uint16_t reference_ring[LAYERS][(WINDOW + VERIFY_DRAFTS) * HEAD_DIM];
 static uint16_t *reference_global[LAYERS][2];
 static int prefill_plan;  // 0: ordinary forward; 1: split at first user; 2: save prefix inside forward
 
@@ -125,7 +125,7 @@ static void snapshot(void) {
   gpu_sync();
   memcpy(reference_routes, observed, sizeof observed);
   for (int l = 0; l < LAYERS; l++) {
-    memcpy(reference_ring[l], L[l].ring.ptr, sizeof reference_ring[l]);
+    memcpy(reference_ring[l], L[l].ring.ptr, L[l].ring.size);
     if (!L[l].kv_source) continue;
     for (int k = 0; k < 2; k++) {
       size_t bytes = global_values(l, k) * sizeof(uint16_t);

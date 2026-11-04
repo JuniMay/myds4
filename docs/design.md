@@ -27,6 +27,7 @@ engine's headers by name.
 | `src/engine/vision.c` | Images: decoding, the reference's grid, Pillow's resize and padding, the vision encoder's patches and RoPE angles, an image's span of tokens. |
 | `src/engine/sample.c` | Shared temperature/top-p sampling and DSpark prefix verification. |
 | `src/engine/expert_batch.h` | Row grouping and GPU descriptors for the experimental shared-expert kernels. |
+| `src/experimental/context_lookup.c`, `src/experimental/context_lookup.h` | Bounded CPU history matching for the CLI and server's context-copy drafts. |
 | `src/engine/engine.c`, `src/engine/engine.h` | The engine behind a C ABI for the server: the queue, sessions, batching, the status, the live view's snapshot and the log, without HTTP or JSON (see [The server](server.md)). |
 | `src/kernels/kernels.metal` | The GPU kernels. |
 | `src/kernels/gguf.metal`, `src/kernels/gguf_grids.metal` | The kernels for routed experts in GGUF codes (`--experts`), and their codebook grids, generated from llama.cpp's `ggml-common.h` (MIT License). |
@@ -144,7 +145,10 @@ with power-of-two scales per 32 before every FP8 and FP4 product, window keys
 to E4M3, compressed keys to E2M1 with E4M3 scales per 16, and indexer
 queries and keys to E2M1 with power-of-two scales per 32. Values the
 reference keeps in BF16 are rounded to BF16 where it rounds them; activations
-are FP32 in memory otherwise. The attention state's window keys, compressed
+are explicitly rounded at those boundaries. The four residual streams use
+BF16 storage in both backbone and draft layers. Their mixing and reductions
+still use FP32 arithmetic. Other activation workspaces retain FP32 storage.
+The attention state's window keys, compressed
 rows and index keys are stored as BF16, which holds their quantized values
 exactly: an E2M1 code times an E4M3 scale has at most 6 significant bits.
 Products accumulate in FP32. `tools/reference/activation_format.h` provides
@@ -166,6 +170,7 @@ and FP8 rounding; the checkpoint's conservative bound is below 209. The
 weighted SwiGLU output is bounded by 150 before FP8 quantization. This
 preserves small activations while using Metal's supported half × MXFP4
 matrix operation. GGUF matrix kernels retain their existing half staging.
+Diagnostic stream dumps expand BF16 back to FP32 and keep their wire format.
 
 `tools/reference/check.py model` decodes a 20-token prompt and continuation with
 myds4 and with the reference (eager FP32 PyTorch on the CPU with the kernels'
@@ -211,11 +216,11 @@ decoding, up to 2048 rows of a prompt. Per layer:
    scores weight them), the shared expert, the routed experts, and the sum
    in expert order, as the reference adds them.
 
-The window keys of a layer live in a ring of 133 rows (row p % 133: the
-window of 128, plus the rows a speculative pass may write for rejected
-drafts); a prompt batch works on a window buffer filled from the ring and
-written back. A KV source keeps the compressor rows of its last 8 positions
-(row p % 8), from which a batch takes the pending group's first row.
+The window keys of a layer live in a ring of `128 + max(5, lookup_depth)`
+rows: the window plus positions a speculative pass may write for rejected
+drafts. A prompt batch works on a window buffer filled from the ring and
+written back. A KV source keeps 8 compressor rows normally and 32 for
+wider lookup, from which a batch takes the pending group's first row.
 
 ### CED prefill
 
@@ -226,7 +231,8 @@ before the replay boundary. Discarded rows do not issue next-layer
 expert prefetches; shorter retained batches use selective prefetching.
 
 Ordinary builds expose `--ced off|N`, default off, through the CLI and both
-servers. They retain N decoder rows plus five rewind rows, and apply replay
+servers. They retain N decoder rows plus the verification rewind margin
+(`max(5, lookup_depth)`), and apply replay
 only when the new input is longer than that sum. The replay boundary is
 chosen across the whole forward call, including multi-chunk prompts. They
 preserve all encoder/global KV work and prime DSpark only from computed
@@ -311,8 +317,9 @@ first.
 
 ### Experimental sharing across expert rows
 
-`build/myds4-expert-batch` enables `MYDS4_EXPERT_BATCH` in the common model
-code. In batches of two to six rows, it groups up to three uses of the same
+`--expert-batch` enables expert sharing in the CLI and server. The
+`build/myds4-expert-batch` diagnostic build enables it by default. In
+batches of two to sixteen rows, it groups up to three uses of the same
 resident expert. Each group shares weight loads and decoding while keeping
 an accumulator, routing weight and output position for each row. Fixed loop
 sizes let the compiler keep those accumulators in registers. The available
@@ -329,7 +336,7 @@ those kernels.
 The CPU groups entries after routing and substitution have selected the
 experts. Ready experts run before the SSD wait; late experts run afterward.
 Each layer has separate descriptors for those phases, held until the GPU
-finishes the pass. The descriptor allocation is 180 KiB. This preserves the
+finishes the pass. The descriptor allocation is 480 KiB when sharing is enabled. This preserves the
 existing overlap of expert computation and reads. The SSD request path
 already requests the union of selected experts across rows; grouping targets
 GPU weight traffic and decoding work.
@@ -396,7 +403,7 @@ full prefill.
 
 `--bench N` measures prefill and up to N generated tokens; zero times only
 prefill. `--prefill-plan split|joint` compares system-prefix scheduling.
-`--ced off|N` uses production replay, including its five-row rewind margin.
+`--ced off|N` uses production replay, including its verification rewind margin.
 The diagnostic `--compact --keep N` instead retains exactly N decoder rows.
 `--dspark N` enables 1–5 native drafts, 32 expert slots per stage and trimming.
 `--cache GIB`, `--reserve GIB` and `--experts GGUF` choose cache bounds and
@@ -490,7 +497,8 @@ IDs. Learner initialization clears B, restores covariance and discards pending
 records; an explicit learner reset does the same while retaining A. Learned
 state belongs to the engine and survives KV resets, session switches and new
 requests. Persistence is explicit through `--predictor-state`. Tensor payloads use
-about 23 MiB, and owned prediction records use about 0.8 MiB. Working buffers,
+about 23 MiB, and owned prediction records use about 2.2 MB for up to 16
+verification rows, below 160 KiB per supported row. Working buffers,
 allocator overhead and library memory are additional.
 
 At the routing synchronization point, the model thread copies forecast and
@@ -813,6 +821,9 @@ history and delayed action learning without a model. `build/cache-action-check`
 checks victim eligibility, abstention, ownership and rejection of invalid
 choices without GPU execution. Live results belong in Performance; the
 experiment build is not a production speed recommendation.
+The lab updates accepted-row history once for each observed DSpark pass.
+Context-copy passes provide no DSpark features and do not reuse its previous
+labels. The ordinary online predictor can still observe their target rows.
 
 ### Approximate decoding and prefill
 
@@ -946,11 +957,12 @@ choosing a victim, and the previous GPU use of that stage's buffers finishes
 before a slot is reused. Bounded pools fetch the native draft selections
 even when backbone substitution is enabled.
 
-Rejected rows need no undo: the rows they write in the window rings and the
-compressor rows are never read by later positions (hence the ring of 133
-and the 8 compressor rows), compressed and index rows are rewritten before
-use, the Engram history is rebuilt from the kept tokens, and the draft's
-windows receive the kept positions only.
+Rejected rows leave no local attention state that a resumed position reads.
+The window ring retains `128 + max(5, lookup_depth)` rows. Compressor state
+retains eight rows for native DSpark widths and 32 for wider context-copy
+verification. Compressed and index rows are rewritten before use, the
+Engram history is rebuilt from the kept tokens, and the draft's windows
+receive only the kept positions.
 
 With exact expert routing, verification uses the main model's requested
 sampling distribution. Cache settings change which experts must be read; trimming changes
@@ -972,19 +984,79 @@ backbone. Draft length controls proposal count; every enabled length loads
 all three DSpark stages. The draft experts remain native MXFP4 even when
 the backbone uses GGUF experts.
 
-Rejected rows need no undo: the rows they write in the window rings and the
-compressor rows are never read by later positions (hence the ring of 133
-and the 8 compressor rows), compressed and index rows are rewritten before
-use, the Engram history is rebuilt from the kept tokens, and the draft's
-windows receive the kept positions only.
+### Context-copy candidate generator
 
-With exact expert routing, verification uses the main model's requested
-sampling distribution. Cache settings change which experts must be read; trimming changes
-which unused final-stage outputs are computed. Neither changes the routing
-rule. With backbone substitution, output depends on cache state and timing.
-Validation and measured performance are recorded in
-[Performance](performance.md#speculative-decoding). Prompts of up to six
-tokens use the same row kernels in prefill.
+`--lookup off|N` enables context-copy drafting in the CLI and server, with
+one to fifteen candidates and `off` as the default. The candidate generator
+runs on the CPU. The caller appends committed token history to a bounded
+per-sequence index.
+Separate indexes link occurrences of twelve-token and four-token suffixes.
+A query searches the twelve-token index first. After a successful draft,
+it can search the four-token index if no longer match supplied a candidate.
+Each index examines at most 64 occurrences and extends each suffix match
+backward by at most 64 tokens. It prefers the longest match, then the longest available
+continuation, then the most recent occurrence. Negative image-placeholder
+IDs end matches and continuations.
+
+The initial minimum match is 12 tokens. Two verifications that accept no
+drafts raise it to 16. A fully accepted proposal allows a four-token match;
+a partial acceptance returns to 12. Feedback counts actual offered tokens,
+up to 15; an empty proposal does not change the feedback state. The caller
+may request fewer candidates. Every candidate is copied from existing
+history and verified by the target model. With `--draft`, DSpark supplies
+candidates when lookup finds no eligible continuation. Without `--draft`,
+that case uses ordinary decoding and does not load the DSpark weights.
+When the server batches separate requests, it uses one ordinary row per
+request and keeps each request's lookup history up to date.
+
+The indexes allocate twelve bytes per configured history token plus at most
+512 KiB for hash buckets. Reset reuses this allocation. The CPU fixture
+compares incremental proposals against a direct scan over 32,768 prefixes
+and checks search bounds, capacity failures, reset and feedback transitions.
+It also checks that frequent short endings cannot hide a matching long suffix.
+The model verifies up to sixteen rows, including the current token. Dense
+products split these into groups of at most six to preserve the existing
+scalar-equivalent arithmetic; routed experts request the union across all
+rows. The local KV ring has `128 + max(5, lookup_depth)` rows. Wider lookup
+uses 32 compressor-state rows so rejected drafts cannot overwrite state
+needed to resume. DSpark retains its own five-position architecture.
+
+The sampler checks up to 15 proposals, every rejection point, EOS and random
+state preservation. GPU checks compare all sixteen rows with serial
+decoding and resume after accepting 1, 2, 6, 15 or 16 rows. These checks
+cover MXFP4 and IQ2, including an MXFP4 run with DSpark, online prefetching
+and GPU routing. Candidate tests alone do not measure model acceptance or
+throughput. The CLI prints exact lookup attempt, offered and accepted
+counts; the server logs them per request and exposes `lookup_depth` and
+`expert_batch` in status. Copy-heavy and reconstructed Harness timings are
+reported separately in [Performance](performance.md#context-copy-drafting).
+
+The experimental `build/myds4-consensus-lookup` keeps the longer-match
+path and adds a four-token fallback. It requires at least two earlier
+occurrences and 80% agreement on the whole proposed continuation. Each
+fallback supplies at most four tokens. Two failed verifications disable
+this fallback until a longer match succeeds. The ordinary build uses the
+long/short index without this consensus fallback.
+
+Frequency-based selection and adaptive speculation lengths are also studied
+in [SuffixDecoding](https://arxiv.org/html/2411.04975v3). This experiment
+verifies one linear chain using the engine's existing causal attention.
+CPU replay measures token agreement; live inference must establish whether
+that agreement saves enough expert reads and computation.
+
+The experimental `build/myds4-consensus-prefetch1` limits new prefetch
+admissions during verification to forecasts from its first row. Refinement
+still retains forecasts from every row, including the original offsets for
+the next two layers. Ordinary concurrent requests and substitution retain
+their existing policies. This experiment changes read admission only;
+every selected expert needed for verification is still loaded.
+
+The separate `build/myds4-consensus-row-credit` experiment adds cache
+priority for repeated uses of an expert within a verification batch.
+Reads remain deduplicated, and hit, miss and first-use counters retain
+their existing definitions. Priority counts all computed verification
+rows, including rows later rejected by sampling. The ordinary build does
+not apply this extra priority.
 
 ### Temperature and nucleus sampling
 
@@ -1018,8 +1090,26 @@ the combined target pass; each sequence retains its own random state.
 
 A prompt runs layer by layer over all of its rows, in batches of up to 2048,
 so each layer's experts are read from the SSD at most once per pass. A pass
-keeps every row's streams and Engram rows (88 KB a row), so a prompt longer
+keeps every row's streams, selections and Engram rows (about 56 KB a row,
+plus candidate masks), so a prompt longer
 than 16,384 tokens runs as passes of 16,384, each reading the experts again.
+Request buffers for residual streams, mixing coefficients, selections,
+candidate masks, image flags and Engram rows grow with the prompt. The first
+small forward pass afterward reduces them to `max(5, lookup_depth) + 1`
+rows. It waits for submitted GPU work before releasing buffers.
+Changing the number of rows within that small-batch capacity requires no
+reallocation. Candidate masks reserve only these request rows; their width
+still follows the configured context limit.
+
+Temporary layer buffers also shrink for decoding: queries, attention
+outputs, matrix staging, routed-expert activations and index scores retain
+only the required small-batch capacity. A later prefill grows them again.
+Draft-history projection can temporarily require up to 128 rows, and image
+encoding reserves the full matrix staging capacity. Resizing waits for GPU
+completion and updates cache residency. Router tables retain separate slots
+for queued layers when GPU routing is enabled. FP32 logits, persistent KV,
+draft history and saved prefix state have independent lifetimes.
+
 The index scores of a batch (a row of scores per row, as long as the
 context) are computed in tiles of as many rows as 256 MB hold: the whole
 batch up to a 32,768-token context, 64 rows at 1,048,576; tiles of any size
@@ -1035,7 +1125,9 @@ columns, K tiles of 64, each tile serving 128 rows (two products of 64),
 each thread loading its share of the next K tile before the products of this
 one. The routed experts run as grouped products: the (token, expert) pairs
 grouped by expert, each pair's row of the input copied once as half, in
-pair order, which the matrix units read from device memory. For the
+pair order, which the matrix units read from device memory. Native MXFP4
+staging multiplies activations by 128 and rescales the products as described
+in Numerics. For the
 checkpoint's MXFP4 experts a tile is up to 32 pairs of one expert, and each
 simdgroup runs its own products of the tile's pairs with 32 columns, K tiles
 of 128, the matrix units reading the MXFP4 weights from the slot: a
@@ -1070,6 +1162,41 @@ The CPU feeds the pass so that the GPU rarely waits:
   prefill](#approximate-decoding-and-prefill)).
 - The cache's bookkeeping for a layer (cooling finished layers, resizing)
   runs while the GPU works on the layer's first batch.
+
+### Optional dependency-pruned prefill
+
+`--prefill-prune` keeps all work in layers 0 through 20,
+including every global KV and index-key producer. Layers 21 through 39
+carry information between token positions only through their causal
+128-token local windows. A change can move at most 127 positions forward
+per layer. Token-local operations do not extend that distance.
+
+The plan conservatively retains `2668 + max(5, lookup_depth)` positions
+before the final state and before the saved prefix checkpoint. It rounds
+the starts down and the checkpoint end up to the original 2,048-row matrix
+batch boundaries, merges overlapping regions, and skips whole batches
+outside them in layers 21 through 39. Those skipped rows cannot affect the
+retained local state. Global attention still has the complete encoder KV.
+The attention masks and numerical kernels remain unchanged.
+
+The CLI and server expose the plan through `--prefill-prune`, off by
+default. The engine's `myds4_config.prefill_prune` field selects the same
+path. `build/myds4-prefill-prune` enables it for diagnostic comparisons.
+The paired benchmark builds
+`build/myds4-prefix-prefill` and `build/myds4-prefix-prune` both save the
+first-user prefix checkpoint.
+The plan applies only with substitution and CED off and without full-row
+logits or activation/route dumps. Validation compares
+logits, global and local state, prefix restore and DSpark history, as well
+as checking the dependency plan on small causal graphs. See
+[validation records](../data/benchmarks/prefill_prune_results.json).
+
+Changing prefill's work changes the expert cache left for decoding. The
+long MXFP4 comparison reduced total request time despite slower decoding.
+The option therefore does not promise a decode-throughput improvement.
+The server reports the configured `prefill_prune` flag and the last
+prefill's `prune_applied` flag separately; short prompts or incompatible
+diagnostics can leave pruning unused.
 
 ## Images
 
@@ -1519,9 +1646,10 @@ windows and the Engram history. The compressed rows and index keys take
 3,200 bytes per position (3.125 KiB) in BF16; a state starts with room for 16,384 positions
 (66 MiB with its saved rows) and doubles its room when a forward pass
 needs more, up to `--ctx` (3.14 GiB at 1,048,576), keeping the rows it
-holds; a reset gives the room back. The layers use one session's state at a time. A ring holds its
-layer's last 133 positions for a window of 128, and the compressor rows the
-last 8, so a state can continue at any of its last 5 positions (BLOCK).
+holds; a reset gives the room back. The layers use one session's state at a
+time. A ring holds its layer's last `128 + max(5, lookup_depth)` positions.
+The compressor keeps 8 rows normally and 32 for wider lookup. Server prefix
+reuse can continue at any of the last 5 positions (BLOCK).
 After each prompt's prefill the session saves those rows (slot 0, about 6
 MB). A new conversation also saves the state before its first user turn
 (slot 1), during the same prefill. Each layer copies the prefix's last ring
@@ -1573,12 +1701,24 @@ A request runs only the tokens a session does not hold:
   session unchanged;
 - new: else a free session, or the least recently used one emptied.
 
+A fork sizes its destination from the saved prefix length, with the usual
+initial capacity and growth rule. It copies the prefix's compressed global
+rows and index keys, including each layout's guard row. The window rings,
+compressor state, draft rings and Engram history come directly from slot 1.
+The fork retains its own copy of that prefix snapshot. Its next completed
+prompt creates a new slot-0 checkpoint. CPU host-buffer checks cover odd
+and even prefix lengths, both compression ratios, draft state, capacity
+reduction and source independence. Real-model resume validation has passed
+the 257-token MXFP4 model check at a 128-token
+prefix, with unchanged resumed logits and source state.
+
 With CED, slot 1 holds encoder state through layer 20. Such a fork needs
-more than the configured replay depth plus BLOCK new tokens, so replay
+more than the configured replay depth plus `max(5, lookup_depth)` new tokens, so replay
 excludes missing decoder-prefix keys and rebuilds all rewind rows. Other
 requests reuse a complete state or prefill from the beginning. A fork must
-leave at least one new token to compute logits. Prefill retains all RING
-(133) local rows, including the five rows needed before a saved position.
+leave at least one new token to compute logits. Prefill retains the local
+rows required by its configured verification margin and the five rows
+needed before a saved server position.
 
 A session in which a request decodes is never emptied, rewound or freed;
 another request may fork from it. The prompt's last token always runs, for its logits, except when the prompt

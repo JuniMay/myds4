@@ -1,5 +1,5 @@
-// Kernels for DeepSeek-V4.1-Flash. Activations are FP32 in memory; values
-// the reference keeps in BF16 are rounded to BF16 where it rounds them, and
+// Kernels for DeepSeek-V4.1-Flash. Residual streams are BF16 in memory;
+// other values the reference keeps in BF16 are rounded where it rounds them, and
 // its activation quantization (FP8 E4M3, FP4 E2M1 with block scales) is
 // applied exactly, so the GPU computes what inference/model.py computes.
 #include <metal_stdlib>
@@ -344,7 +344,7 @@ kernel void moe_up(constant Expert *ex [[buffer(0)]], device const float *x [[bu
 // pm, each expert with an entry writes its part to parts instead.
 kernel void moe_down(constant Expert *ex [[buffer(0)]], device const float *h [[buffer(1)]],
                      device const float *shared_out [[buffer(2)]], device const float *mix [[buffer(3)]],
-                     device const float *res [[buffer(4)]], device float *out [[buffer(5)]],
+                     device const bfloat *res [[buffer(4)]], device bfloat *out [[buffer(5)]],
                      constant uint &n [[buffer(6)]], constant uint &pm [[buffer(7)]], device float *parts [[buffer(8)]],
                      uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
                      uint lane [[thread_index_in_simdgroup]]) {
@@ -371,7 +371,7 @@ kernel void moe_down(constant Expert *ex [[buffer(0)]], device const float *h [[
     for (uint k = 0; k < 4; k++) {
       float v = mix[4 + k] * v0;
       for (uint j = 0; j < 4; j++) v += mix[8 + 4 * j + k] * res[j * 5120 + i];
-      out[k * 5120 + i] = bf(v);
+      out[k * 5120 + i] = bfloat(bf(v));
     }
   }
 }
@@ -380,8 +380,8 @@ kernel void moe_down(constant Expert *ex [[buffer(0)]], device const float *h [[
 // pm: row i's part of expert e at parts[8 i + e]), summed and expanded into
 // the four streams exactly as those kernels do it.
 kernel void moe_parts(device const float *parts [[buffer(0)]], device const float *shared_out [[buffer(1)]],
-                      device const float *mix [[buffer(2)]], device const float *res [[buffer(3)]],
-                      device float *out [[buffer(4)]], constant uint &n [[buffer(5)]],
+                      device const float *mix [[buffer(2)]], device const bfloat *res [[buffer(3)]],
+                      device bfloat *out [[buffer(4)]], constant uint &n [[buffer(5)]],
                       uint i [[thread_position_in_grid]]) {
   float y = 0;
   for (uint e = 0; e < n; e++) y += parts[i * 8 + e];
@@ -389,7 +389,7 @@ kernel void moe_parts(device const float *parts [[buffer(0)]], device const floa
   for (uint k = 0; k < 4; k++) {
     float v = mix[4 + k] * v0;
     for (uint j = 0; j < 4; j++) v += mix[8 + 4 * j + k] * res[j * 5120 + i];
-    out[k * 5120 + i] = bf(v);
+    out[k * 5120 + i] = bfloat(bf(v));
   }
 }
 
@@ -516,10 +516,10 @@ kernel void act_quant(device const float *x [[buffer(0)]], device float *y [[buf
 }
 
 // Rows of the embedding table (BF16, staged per token) into the four streams.
-kernel void embed(device const ushort *row [[buffer(0)]], device float *h [[buffer(1)]],
+kernel void embed(device const ushort *row [[buffer(0)]], device bfloat *h [[buffer(1)]],
                   uint2 i [[thread_position_in_grid]]) {
   float v = as_type<float>(uint(row[i.y * 5120 + i.x]) << 16);
-  for (uint c = 0; c < 4; c++) h[i.y * 20480 + c * 5120 + i.x] = v;
+  for (uint c = 0; c < 4; c++) h[i.y * 20480 + c * 5120 + i.x] = bfloat(v);
 }
 
 // Kernels that work on token rows take the row from the last grid dimension.
@@ -545,7 +545,7 @@ kernel void rmsnorm(device const float *x [[buffer(0)]], device const float *w [
 
 // Hyper-connection mixes, part 1: 24 dot products with the flattened four
 // streams and their sum of squares, split over 16 threadgroups of 256.
-kernel void hc_mix(device const float *fn [[buffer(0)]], device const float *x [[buffer(1)]],
+kernel void hc_mix(device const float *fn [[buffer(0)]], device const bfloat *x [[buffer(1)]],
                    device float *part [[buffer(2)]], uint2 g [[threadgroup_position_in_grid]],
                    uint t [[thread_index_in_threadgroup]]) {
   threadgroup float tmp[25][8];
@@ -607,7 +607,7 @@ inline void hc_split(device const float *part, device const float *scale, device
 // sum_k a_k (p_k A + sum_j C_jk x_j) for attention output A, so its residual
 // part is sum_j (sum_k a_k C_jk) x_j. Writes it RMS-normalized times the
 // FFN norm weight w. 1024 threads.
-inline void residual(device const float *x, device const float *mix, device const float *w, device float *y,
+inline void residual(device const bfloat *x, device const float *mix, device const float *w, device float *y,
                      threadgroup float *tmp, uint t) {
   float c[4], v[5], ss = 0;
   for (uint j = 0; j < 4; j++)
@@ -626,7 +626,7 @@ inline void residual(device const float *x, device const float *mix, device cons
 // it: from part 1's sums at buffer 5, scale and base into the mixes at 8;
 // then, if res, the residual part of the row's FFN input from x and these
 // mixes, with the norm weights at 9, into buffer 10.
-kernel void hc_pre_norm(device const float *x [[buffer(0)]], device const float *mix [[buffer(1)]],
+kernel void hc_pre_norm(device const bfloat *x [[buffer(0)]], device const float *mix [[buffer(1)]],
                         device const float *w [[buffer(2)]], device float *y [[buffer(3)]],
                         device float *q [[buffer(4)]], device const float *part [[buffer(5)]],
                         device const float *scale [[buffer(6)]], device const float *base [[buffer(7)]],
@@ -661,14 +661,14 @@ kernel void hc_pre_norm(device const float *x [[buffer(0)]], device const float 
 
 // out[k] = bf16(post[k] y + sum_j comb[j][k] res[j]).
 kernel void hc_post(device const float *y [[buffer(0)]], device const float *mix [[buffer(1)]],
-                    device const float *res [[buffer(2)]], device float *out [[buffer(3)]],
+                    device const bfloat *res [[buffer(2)]], device bfloat *out [[buffer(3)]],
                     uint2 i [[thread_position_in_grid]]) {
   uint d = i.x;
   y += i.y * 5120, mix += i.y * 24, res += i.y * 20480, out += i.y * 20480;
   for (uint k = 0; k < 4; k++) {
     float v = mix[4 + k] * y[d];
     for (uint j = 0; j < 4; j++) v += mix[8 + 4 * j + k] * res[j * 5120 + d];
-    out[k * 5120 + d] = bf(v);
+    out[k * 5120 + d] = bfloat(bf(v));
   }
 }
 
@@ -1353,10 +1353,10 @@ kernel void spin(constant uint &iters [[buffer(0)]], device float *out [[buffer(
 
 // The draft's input from a target layer (part 0 to 2): the mean of the row's
 // four streams, as BF16, into its third of a row of 3 x 5120.
-kernel void hc_mean(device const float *h [[buffer(0)]], device float *out [[buffer(1)]],
+kernel void hc_mean(device const bfloat *h [[buffer(0)]], device float *out [[buffer(1)]],
                     constant uint &part [[buffer(2)]], uint2 i [[thread_position_in_grid]]) {
   h += i.y * 20480, out += i.y * 15360 + part * 5120;
-  out[i.x] = bf((h[i.x] + h[5120 + i.x] + h[10240 + i.x] + h[15360 + i.x]) * 0.25f);
+  out[i.x] = bf((float(h[i.x]) + float(h[5120 + i.x]) + float(h[10240 + i.x]) + float(h[15360 + i.x])) * 0.25f);
 }
 
 // The Markov head's bias for the previous drafted token: logits[v] +=
@@ -1415,7 +1415,7 @@ kernel void engram_rows(device const uchar *codes [[buffer(0)]], device const uc
 
 // h_c += sigmoid(signed sqrt(normalized h_c . (qk_c key_c))) value. One
 // threadgroup of 1024 per stream.
-kernel void engram_gate(device float *h [[buffer(0)]], device const float *kv [[buffer(1)]],
+kernel void engram_gate(device bfloat *h [[buffer(0)]], device const float *kv [[buffer(1)]],
                         device const float *qk [[buffer(2)]], device const uchar *img [[buffer(3)]],
                         uint2 gp [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
   threadgroup float tmp[32];
@@ -1434,7 +1434,7 @@ kernel void engram_gate(device float *h [[buffer(0)]], device const float *kv [[
   dot = tg_sum(dot, tmp, t, 1024);
   float g = dot * rsqrt(hh / 5120 + 1e-20f) * rsqrt(kk / 5120 + 1e-20f) * 0.013975424859373685f;
   g = 1.0f / (1.0f + exp(-copysign(sqrt(max(fabs(g), 1e-6f)), g)));
-  for (uint d = t; d < 5120; d += 1024) h[c * 5120 + d] = bf(h[c * 5120 + d] + g * kv[20480 + d]);
+  for (uint d = t; d < 5120; d += 1024) h[c * 5120 + d] = bfloat(bf(float(h[c * 5120 + d]) + g * kv[20480 + d]));
 }
 
 // ---- matrix products for many rows (prefill) ----
@@ -1691,7 +1691,7 @@ kernel void moe_down_m(device const MoeTile *tiles [[buffer(0)]], device const h
 // then hc_post into the four streams. tp[r] lists its pairs in expert order.
 kernel void moe_combine(device const float *y [[buffer(0)]], device const int *tp [[buffer(1)]],
                         device const float *shared_out [[buffer(2)]], device const float *mix [[buffer(3)]],
-                        device const float *res [[buffer(4)]], device float *out [[buffer(5)]],
+                        device const bfloat *res [[buffer(4)]], device bfloat *out [[buffer(5)]],
                         uint2 i [[thread_position_in_grid]]) {
   uint d = i.x, r = i.y;
   float v = 0;
@@ -1701,6 +1701,6 @@ kernel void moe_combine(device const float *y [[buffer(0)]], device const int *t
   for (uint k = 0; k < 4; k++) {
     float o = mix[4 + k] * v;
     for (uint j = 0; j < 4; j++) o += mix[8 + 4 * j + k] * res[j * 5120 + d];
-    out[k * 5120 + d] = bf(o);
+    out[k * 5120 + d] = bfloat(bf(o));
   }
 }

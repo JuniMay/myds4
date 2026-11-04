@@ -290,11 +290,31 @@ def parse_metrics(stderr):
     stderr = stderr.replace("\r", "\n")
     metrics = {}
     for line in stderr.splitlines():
+        if line.startswith('{"workspace":'):
+            try:
+                metrics["workspace"] = json.loads(line)["workspace"]
+            except (ValueError, KeyError, TypeError):
+                metrics["workspace_parse_error"] = True
         if line.startswith('{"decode_cache":'):
             try:
                 metrics["decode_cache"] = json.loads(line)["decode_cache"]
             except (ValueError, KeyError, TypeError):
                 metrics["decode_cache_parse_error"] = True
+        if line.startswith('{"context_lookup":'):
+            try:
+                metrics["context_lookup"] = json.loads(line)["context_lookup"]
+            except (ValueError, KeyError, TypeError):
+                metrics["context_lookup_parse_error"] = True
+        if line.startswith('{"staged_draft":'):
+            try:
+                metrics["staged_draft"] = json.loads(line)["staged_draft"]
+            except (ValueError, KeyError):
+                metrics["staged_draft_parse_error"] = True
+        if line.startswith('{"prefill_prune":'):
+            try:
+                metrics["prefill_prune"] = json.loads(line)["prefill_prune"]
+            except (ValueError, KeyError, TypeError):
+                metrics["prefill_prune_parse_error"] = True
         if line.startswith('{"decode_experts":'):
             try:
                 metrics["decode_experts"] = json.loads(line)["decode_experts"]

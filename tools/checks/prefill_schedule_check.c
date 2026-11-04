@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int forwards, saved_mask, started_events;
+static int forwards, saved_mask, started_events, forked_at = -1;
 static struct { int n, pos; } forward_calls[8];
 static float fixture_logits[VOCAB];
 static ModelForwardInfo spy_info;
@@ -17,7 +17,7 @@ static const float *spy_forward(const int *tokens, int n, int pos) {
 static State *spy_new(void) { return (State *)(uintptr_t)1; }
 static void spy_use(State *s) {}
 static void spy_free(State *s) {}
-static void spy_copy(State *to, const State *from) {}
+static void spy_fork(State *to, const State *from, int positions) { forked_at = positions; }
 static size_t spy_bytes(const State *s, int positions) { return 8192; }
 static void spy_reset(void) {}
 static void spy_save(int slot) { saved_mask |= 1 << slot; }
@@ -39,7 +39,7 @@ static ModelForwardInfo spy_forward_info(void) { return spy_info; }
 #define model_state_new spy_new
 #define model_state_use spy_use
 #define model_state_free spy_free
-#define model_state_copy spy_copy
+#define model_state_fork spy_fork
 #define model_state_bytes spy_bytes
 #define model_reset spy_reset
 #define model_state_save spy_save
@@ -100,7 +100,7 @@ int main(void) {
   pick(fork_tokens, 4 + 128 + BLOCK, &from, &how);
   int guarded = from == 0;
   pick(fork_tokens, 4 + 128 + BLOCK + 1, &from, &how);
-  guarded &= from == 4 && !strcmp(how, "forked");
+  guarded &= from == 4 && !strcmp(how, "forked") && forked_at == from;
   printf("encoder-only prefix: short suffix skipped, full replay forked=%d\n", guarded);
   free(g.p);
   for (int i = 0; i < SESSIONS; i++) free(sessions[i].ids), free(sessions[i].logits);

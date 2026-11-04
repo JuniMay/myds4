@@ -108,6 +108,15 @@ int main(void) {
   expect("default clock doubles weight over 50 advances", near(weight, 2));
   expect("clock counts forward advances", token == 60);
   expect("aging preserves raw history between rescalings", escore[0] == 1 && score[0] == 1);
+  slots[0].used = token;
+  CacheStats stats_before = cache_stats;
+  double added = weight * 2;
+  cache_repeat_credit(0, 0, 2);
+  expect("repeated row uses update resident and persistent priority", near(score[0], 1 + added) && score[0] == escore[0]);
+  expect("repeated row uses add no read or cache events", !memcmp(&stats_before, &cache_stats, sizeof stats_before));
+  expect("repeated use protects the more frequent expert", victim() == 1);
+  cache_repeat_credit(0, 0, 0);
+  expect("zero repeated uses leave priority unchanged", near(score[0], 1 + added));
   rejected("negative half-life rejected", bad_half);
   rejected("excessive half-life rejected", too_large_half);
   rejected("invalid weighting flag rejected", bad_cost);

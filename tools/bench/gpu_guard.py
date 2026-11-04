@@ -75,13 +75,20 @@ def process_snapshot(child=None, preflight=True, allow_cpu_helpers=False, backgr
         details = {"pid": pid, "name": Path(path).name, "cpu_percent": cpu, "rss_mib": round(rss / 1024, 1),
                    "parent_pid": parent, "parent_name": Path(processes.get(parent, (0, 0, 0, "unknown"))[3]).name,
                    "gpu_client_in_process_tree": pid in gpu_ancestors if ownership_known else None}
+        # The native app can keep an idle Metal UI open without loading the
+        # engine. A loaded model exceeds this small host-memory allowance;
+        # child inference processes are checked independently below.
+        if path.endswith("/MyDS4.app/Contents/MacOS/MyDS4") and rss < 256 * 1024:
+            if background is not None:
+                background.append({**details, "idle_app_shell": True})
+            continue
         if allow_cpu_helpers and ownership_known and pid not in gpu_ancestors and (python_compute or name in cpu_tools):
             if background is not None and (cpu >= 2 or rss >= 256 * 1024):
                 background.append(details)
             python_compute = False
             if name in cpu_tools:
                 continue
-        compiler = preflight and cpu >= 2 and name in ("clang", "clang++", "metal", "mtlcompilerservice")
+        compiler = preflight and cpu >= 2 and name in cpu_tools
         if project_binary or temporary_binary or named_probe or python_compute or python_gpu or compiler:
             competing.append(details)
     return competing
@@ -122,7 +129,7 @@ def gpu_activity():
             "gpu_client_pids": sorted(clients)}
 
 
-def gpu_snapshot(cache_gib, reserve_gib=10, desktop=False):
+def gpu_snapshot(cache_gib, reserve_gib=10, desktop=False, quiet_cpu=False):
     activity = gpu_activity()
     background = []
     busy = process_snapshot(allow_cpu_helpers=desktop, background=background,
@@ -134,6 +141,8 @@ def gpu_snapshot(cache_gib, reserve_gib=10, desktop=False):
     reasons = []
     if busy:
         reasons.append("another compute process is present")
+    if quiet_cpu and sum(p["cpu_percent"] for p in background) > 100:
+        reasons.append("background CPU builds exceed one CPU core")
     # Aggregate activity cannot identify a model job. Desktop studies record
     # it and rely on process/ownership checks and the shared model lock.
     if not desktop and device > 20:
@@ -154,13 +163,13 @@ def gpu_snapshot(cache_gib, reserve_gib=10, desktop=False):
             "background_cpu_helpers": background, "reasons": reasons}
 
 
-def wait_for_gpu(cache_gib, timeout, reserve_gib=10, desktop=False):
+def wait_for_gpu(cache_gib, timeout, reserve_gib=10, desktop=False, quiet_cpu=False):
     until = time.monotonic() + timeout
     quiet = []
     announced = False
     while True:
         try:
-            state = gpu_snapshot(cache_gib, reserve_gib, desktop)
+            state = gpu_snapshot(cache_gib, reserve_gib, desktop, quiet_cpu)
         except (subprocess.SubprocessError, OSError, ValueError) as error:
             raise GPUUnavailable("GPU preflight inspection failed") from error
         if state["reasons"]:
@@ -171,23 +180,29 @@ def wait_for_gpu(cache_gib, timeout, reserve_gib=10, desktop=False):
         else:
             quiet.append(state)
             if len(quiet) == 3:
-                print("GPU_READY " + json.dumps({"samples": quiet}), flush=True)
+                print("GPU_READY " + json.dumps({"free_gib": quiet[-1]["memory"]["free_gib"],
+                      "required_free_gib": quiet[-1]["required_free_gib"], "device_percent": quiet[-1]["device_percent"],
+                      "desktop_load": desktop, "samples": len(quiet)}), flush=True)
                 return {"method": "process scan and three GPU/memory samples; not an exclusive reservation", "samples": quiet}
         if time.monotonic() >= until:
             raise GPUUnavailable("GPU did not become available within the bounded wait")
         time.sleep(5 if state["reasons"] else 2)
 
 
-def guarded_process(command, env, timeout, baseline, observe_graphics=False, allow_cpu_helpers=False, input_data=None):
+def guarded_process(command, env, timeout, baseline, observe_graphics=False, allow_cpu_helpers=False,
+                    input_data=None, abort_cpu_contention=False):
     process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stop = threading.Event()
     interference = []
     activity_samples = []
     helper_samples = []
+    helper_peak = 0.0
     started = time.monotonic()
     def monitor():
+        nonlocal helper_peak
         next_activity = started
+        next_progress = started + 60
         while not stop.wait(2):
             if process.poll() is not None:
                 return
@@ -196,6 +211,8 @@ def guarded_process(command, env, timeout, baseline, observe_graphics=False, all
                 busy = process_snapshot(child=process.pid, preflight=False,
                                         allow_cpu_helpers=allow_cpu_helpers, background=background)
                 memory = memory_snapshot()
+                cpu_total = sum(row["cpu_percent"] for row in background)
+                helper_peak = max(helper_peak, cpu_total)
                 if background and len(helper_samples) < 32:
                     helper_samples.append({"elapsed_seconds": round(time.monotonic() - started, 3), "processes": background})
                 if observe_graphics and time.monotonic() >= next_activity:
@@ -204,10 +221,16 @@ def guarded_process(command, env, timeout, baseline, observe_graphics=False, all
                     activity_samples.append({"elapsed_seconds": round(time.monotonic() - started, 3),
                                              "model_gpu_client_visible": visible, **activity})
                     next_activity = time.monotonic() + 10
+                if observe_graphics and time.monotonic() >= next_progress:
+                    print("GPU_PROGRESS " + json.dumps({"elapsed_seconds": round(time.monotonic() - started),
+                          "free_gib": round(memory["free_gib"], 1), "background_cpu_percent": cpu_total}), flush=True)
+                    next_progress = time.monotonic() + 60
                 if process.poll() is not None:
                     return  # snapshots after the child ended are not interference with its run
-                if busy or memory["compressions"] > baseline["compressions"] or memory["swapouts"] > baseline["swapouts"]:
-                    interference.append({"competing_processes": busy, "memory": memory})
+                if (busy or memory["compressions"] > baseline["compressions"] or
+                        memory["swapouts"] > baseline["swapouts"] or (abort_cpu_contention and cpu_total > 100)):
+                    interference.append({"competing_processes": busy, "memory": memory,
+                                         "background_cpu_percent": cpu_total})
                 else:
                     continue
             except (subprocess.SubprocessError, OSError, ValueError, GPUUnavailable) as error:
@@ -243,4 +266,5 @@ def guarded_process(command, env, timeout, baseline, observe_graphics=False, all
     result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
     result.gpu_activity_samples = activity_samples
     result.background_cpu_helpers = helper_samples
+    result.background_cpu_peak = helper_peak
     return result

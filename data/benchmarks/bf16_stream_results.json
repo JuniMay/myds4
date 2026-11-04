@@ -1,0 +1,2166 @@
+{
+  "schema_version": 1,
+  "kind": "representation",
+  "runs": [
+    {
+      "date_utc": "2026-11-03T22:22:37.683976+00:00",
+      "role": "control",
+      "settings": {
+        "workload": "cache-review",
+        "prompt_tokens": 8175,
+        "prompt_sha256": "7b6260cb11f0ad64b0d22bf4699ca349bee35b2747c5702b748be28d4c89fd86",
+        "checkpoint_name": "DeepSeek-V4.1-Flash-1017",
+        "expert_file": null,
+        "requested_tokens": 256,
+        "context": 32768,
+        "cache_gib": 56.0,
+        "reserve_gib": 4.0,
+        "quant": "mxfp4",
+        "kind": "representation",
+        "control_binary": "myds4-float-buffer-control",
+        "candidate_binary": "myds4-bf16-streams",
+        "control_binary_sha256": "488a5daf17318a1b334eb9bff1efd824d50187030a61b0e07680c381804ebfe9",
+        "candidate_binary_sha256": "2cb9806ae312f3ab4a304c9dc8431b6cb93579a90314dbc69323c4d47f11abbd",
+        "control_args": [],
+        "candidate_args": [],
+        "desktop_load": true,
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 12345,
+        "think": 75,
+        "draft": 2,
+        "draft_cache": 32,
+        "draft_trim": true,
+        "online_predictor": false,
+        "substitute": false
+      },
+      "valid": true,
+      "exit": 0,
+      "wall_seconds": 51.298,
+      "output_sha256": "8f17f09ff177f1aad84c9d52642d7237b347b3da1ee4847d53d7bafb92cf88d7",
+      "output_matches_control": null,
+      "metrics": {
+        "decode_experts": {
+          "computed_rows": 304,
+          "selected": 72960,
+          "unique_layer_requests": 56129
+        },
+        "decode_cache": {
+          "bytes_at_start": 60114862080,
+          "min_bytes": 60114862080,
+          "max_bytes": 60114862080,
+          "slots_released": 0
+        },
+        "prefill": {
+          "tokens": 8175,
+          "seconds": 22.93,
+          "tokens_per_second": 356.51,
+          "existing_slot_hit_percent": 100.0,
+          "logical_read_gb_reported": 289.28,
+          "read_wait_seconds": 10.02,
+          "main_queue_gpu_seconds": 11.76
+        },
+        "decode": {
+          "tokens": 256,
+          "seconds": 26.67,
+          "tokens_per_second": 9.6,
+          "existing_slot_hit_percent": 86.2,
+          "logical_read_gb_reported": 319.6,
+          "read_wait_seconds": 19.19,
+          "main_queue_gpu_seconds": 7.59
+        },
+        "draft": {
+          "passes": 101,
+          "accepted_per_pass_reported": 1.52,
+          "maximum_drafts": 2,
+          "acceptance_is_rounded": true
+        },
+        "cache": {
+          "main_slots_at_end": 3089,
+          "gib_including_draft_at_end": 56.0,
+          "cumulative_evictions": 32487
+        },
+        "cache_initial": {
+          "main_slots": 3089,
+          "main_gib": 54.3
+        },
+        "draft_cache_initial": {
+          "slots_per_stage": 32,
+          "reserved_gib": 1.7,
+          "loading": "on_demand"
+        },
+        "reads_per_emitted_token": {
+          "demand": 31.3,
+          "prefetch_admitted": 48.0,
+          "prefetch_used": 26.7,
+          "prefetch_late": 23.8,
+          "prefetch_cancelled": 10.7
+        }
+      },
+      "grouping": null,
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 32.0,
+            "renderer_percent": 32.0,
+            "gpu_resident_gib": 2.14,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 74.0,
+            "memory": {
+              "free_gib": 76.81971740722656,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 0.0,
+            "renderer_percent": 0.0,
+            "gpu_resident_gib": 1.97,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 74.0,
+            "memory": {
+              "free_gib": 76.66514587402344,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 0.0,
+            "renderer_percent": 0.0,
+            "gpu_resident_gib": 1.76,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 74.0,
+            "memory": {
+              "free_gib": 76.72735595703125,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          }
+        ]
+      },
+      "gpu_activity_during_run": [
+        {
+          "elapsed_seconds": 2.087,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 22.02
+        },
+        {
+          "elapsed_seconds": 12.54,
+          "model_gpu_client_visible": true,
+          "device_percent": 99.0,
+          "renderer_percent": 90.0,
+          "gpu_resident_gib": 57.39
+        },
+        {
+          "elapsed_seconds": 22.906,
+          "model_gpu_client_visible": true,
+          "device_percent": 100.0,
+          "renderer_percent": 90.0,
+          "gpu_resident_gib": 54.74
+        },
+        {
+          "elapsed_seconds": 33.293,
+          "model_gpu_client_visible": true,
+          "device_percent": 75.0,
+          "renderer_percent": 12.0,
+          "gpu_resident_gib": 51.04
+        },
+        {
+          "elapsed_seconds": 43.669,
+          "model_gpu_client_visible": true,
+          "device_percent": 82.0,
+          "renderer_percent": 39.0,
+          "gpu_resident_gib": 49.36
+        }
+      ],
+      "background_cpu_helpers": [],
+      "timing_environment": "recorded desktop load; GPU not isolated",
+      "details": [
+        "expert cache: 3089 slots (54.3 GiB) to start, up to 1984 mapped for the GPU, 67.7 GiB free and 0.0 GiB of file cache beyond the kernel's share, 4.0 GiB kept for other programs, GPU resident memory 1.9 GiB (50.6 GiB below the GPU's limit), GPU working set 107.5 GiB",
+        "cache:   3089 slots, 56.0 GiB, 32487 evictions; available memory 10.6 GiB, footprint 67.2 GiB, GPU resident memory (all processes) 54.4 GiB; 0 pages swapped out and 0 compressed by the system meanwhile, this process's memory compressed at most 0 MiB",
+        "decode reads per token: 31.3 on demand, 48.0 ahead (26.7 used, 23.8 of them late), 10.7 cancelled; 0.0 experts substituted, 66.5 mapped for the GPU again",
+        "decode per token (ms): rows 0.2, waits 22.2, loads 72.9, prefetch 1.8, encode 0.2, adapt 0.6, drafting 5.1; GPU idle between command buffers 71.2 (22.9 gaps over 100 us); 0.0 layers' experts recomputed"
+      ],
+      "error": null,
+      "correctness_valid": true,
+      "timing_valid": true
+    },
+    {
+      "date_utc": "2026-11-03T22:23:33.064339+00:00",
+      "role": "candidate",
+      "settings": {
+        "workload": "cache-review",
+        "prompt_tokens": 8175,
+        "prompt_sha256": "7b6260cb11f0ad64b0d22bf4699ca349bee35b2747c5702b748be28d4c89fd86",
+        "checkpoint_name": "DeepSeek-V4.1-Flash-1017",
+        "expert_file": null,
+        "requested_tokens": 256,
+        "context": 32768,
+        "cache_gib": 56.0,
+        "reserve_gib": 4.0,
+        "quant": "mxfp4",
+        "kind": "representation",
+        "control_binary": "myds4-float-buffer-control",
+        "candidate_binary": "myds4-bf16-streams",
+        "control_binary_sha256": "488a5daf17318a1b334eb9bff1efd824d50187030a61b0e07680c381804ebfe9",
+        "candidate_binary_sha256": "2cb9806ae312f3ab4a304c9dc8431b6cb93579a90314dbc69323c4d47f11abbd",
+        "control_args": [],
+        "candidate_args": [],
+        "desktop_load": true,
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 12345,
+        "think": 75,
+        "draft": 2,
+        "draft_cache": 32,
+        "draft_trim": true,
+        "online_predictor": false,
+        "substitute": false
+      },
+      "valid": true,
+      "exit": 0,
+      "wall_seconds": 51.102,
+      "output_sha256": "8f17f09ff177f1aad84c9d52642d7237b347b3da1ee4847d53d7bafb92cf88d7",
+      "output_matches_control": true,
+      "metrics": {
+        "decode_experts": {
+          "computed_rows": 304,
+          "selected": 72960,
+          "unique_layer_requests": 56129
+        },
+        "decode_cache": {
+          "bytes_at_start": 60114862080,
+          "min_bytes": 60114862080,
+          "max_bytes": 60114862080,
+          "slots_released": 0
+        },
+        "prefill": {
+          "tokens": 8175,
+          "seconds": 22.86,
+          "tokens_per_second": 357.62,
+          "existing_slot_hit_percent": 100.0,
+          "logical_read_gb_reported": 289.28,
+          "read_wait_seconds": 9.71,
+          "main_queue_gpu_seconds": 11.95
+        },
+        "decode": {
+          "tokens": 256,
+          "seconds": 26.6,
+          "tokens_per_second": 9.62,
+          "existing_slot_hit_percent": 86.2,
+          "logical_read_gb_reported": 319.3,
+          "read_wait_seconds": 19.1,
+          "main_queue_gpu_seconds": 7.66
+        },
+        "draft": {
+          "passes": 101,
+          "accepted_per_pass_reported": 1.52,
+          "maximum_drafts": 2,
+          "acceptance_is_rounded": true
+        },
+        "cache": {
+          "main_slots_at_end": 3089,
+          "gib_including_draft_at_end": 56.0,
+          "cumulative_evictions": 32486
+        },
+        "cache_initial": {
+          "main_slots": 3089,
+          "main_gib": 54.3
+        },
+        "draft_cache_initial": {
+          "slots_per_stage": 32,
+          "reserved_gib": 1.7,
+          "loading": "on_demand"
+        },
+        "reads_per_emitted_token": {
+          "demand": 31.3,
+          "prefetch_admitted": 48.0,
+          "prefetch_used": 26.8,
+          "prefetch_late": 23.6,
+          "prefetch_cancelled": 10.7
+        }
+      },
+      "grouping": null,
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 17.0,
+            "renderer_percent": 15.0,
+            "gpu_resident_gib": 1.85,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 74.0,
+            "memory": {
+              "free_gib": 75.86259460449219,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 25.0,
+            "renderer_percent": 25.0,
+            "gpu_resident_gib": 2.12,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 74.0,
+            "memory": {
+              "free_gib": 75.786376953125,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 28.0,
+            "renderer_percent": 28.0,
+            "gpu_resident_gib": 1.99,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 74.0,
+            "memory": {
+              "free_gib": 75.71609497070312,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          }
+        ]
+      },
+      "gpu_activity_during_run": [
+        {
+          "elapsed_seconds": 2.092,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 21.94
+        },
+        {
+          "elapsed_seconds": 12.551,
+          "model_gpu_client_visible": true,
+          "device_percent": 100.0,
+          "renderer_percent": 94.0,
+          "gpu_resident_gib": 58.75
+        },
+        {
+          "elapsed_seconds": 22.946,
+          "model_gpu_client_visible": true,
+          "device_percent": 100.0,
+          "renderer_percent": 100.0,
+          "gpu_resident_gib": 57.03
+        },
+        {
+          "elapsed_seconds": 33.354,
+          "model_gpu_client_visible": true,
+          "device_percent": 82.0,
+          "renderer_percent": 53.0,
+          "gpu_resident_gib": 54.47
+        },
+        {
+          "elapsed_seconds": 43.728,
+          "model_gpu_client_visible": true,
+          "device_percent": 77.0,
+          "renderer_percent": 26.0,
+          "gpu_resident_gib": 53.86
+        }
+      ],
+      "background_cpu_helpers": [],
+      "timing_environment": "recorded desktop load; GPU not isolated",
+      "details": [
+        "expert cache: 3089 slots (54.3 GiB) to start, up to 1974 mapped for the GPU, 66.7 GiB free and 0.0 GiB of file cache beyond the kernel's share, 4.0 GiB kept for other programs, GPU resident memory 2.2 GiB (50.3 GiB below the GPU's limit), GPU working set 107.5 GiB",
+        "cache:   3089 slots, 56.0 GiB, 32486 evictions; available memory 10.6 GiB, footprint 67.1 GiB, GPU resident memory (all processes) 52.9 GiB; 0 pages swapped out and 0 compressed by the system meanwhile, this process's memory compressed at most 0 MiB",
+        "decode reads per token: 31.3 on demand, 48.0 ahead (26.8 used, 23.6 of them late), 10.7 cancelled; 0.0 experts substituted, 61.8 mapped for the GPU again",
+        "decode per token (ms): rows 0.1, waits 22.4, loads 72.6, prefetch 1.8, encode 0.2, adapt 0.5, drafting 5.1; GPU idle between command buffers 70.7 (22.5 gaps over 100 us); 0.0 layers' experts recomputed"
+      ],
+      "error": null,
+      "correctness_valid": true,
+      "timing_valid": true
+    },
+    {
+      "date_utc": "2026-11-03T22:24:34.272687+00:00",
+      "role": "control",
+      "settings": {
+        "workload": "cache-review",
+        "prompt_tokens": 8175,
+        "prompt_sha256": "7b6260cb11f0ad64b0d22bf4699ca349bee35b2747c5702b748be28d4c89fd86",
+        "checkpoint_name": "DeepSeek-V4.1-Flash-1017",
+        "expert_file": null,
+        "requested_tokens": 256,
+        "context": 32768,
+        "cache_gib": 56.0,
+        "reserve_gib": 4.0,
+        "quant": "mxfp4",
+        "kind": "representation",
+        "control_binary": "myds4-float-buffer-control",
+        "candidate_binary": "myds4-bf16-streams",
+        "control_binary_sha256": "488a5daf17318a1b334eb9bff1efd824d50187030a61b0e07680c381804ebfe9",
+        "candidate_binary_sha256": "2cb9806ae312f3ab4a304c9dc8431b6cb93579a90314dbc69323c4d47f11abbd",
+        "control_args": [],
+        "candidate_args": [],
+        "desktop_load": true,
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 12345,
+        "think": 75,
+        "draft": 2,
+        "draft_cache": 32,
+        "draft_trim": true,
+        "online_predictor": false,
+        "substitute": false
+      },
+      "valid": false,
+      "exit": 0,
+      "wall_seconds": 56.937,
+      "output_sha256": "8f17f09ff177f1aad84c9d52642d7237b347b3da1ee4847d53d7bafb92cf88d7",
+      "output_matches_control": true,
+      "metrics": {
+        "decode_experts": {
+          "computed_rows": 304,
+          "selected": 72960,
+          "unique_layer_requests": 56129
+        },
+        "decode_cache": {
+          "bytes_at_start": 60114862080,
+          "min_bytes": 60114862080,
+          "max_bytes": 60114862080,
+          "slots_released": 0
+        },
+        "prefill": {
+          "tokens": 8175,
+          "seconds": 24.26,
+          "tokens_per_second": 336.99,
+          "existing_slot_hit_percent": 100.0,
+          "logical_read_gb_reported": 289.28,
+          "read_wait_seconds": 3.91,
+          "main_queue_gpu_seconds": 19.24
+        },
+        "decode": {
+          "tokens": 256,
+          "seconds": 30.86,
+          "tokens_per_second": 8.3,
+          "existing_slot_hit_percent": 86.5,
+          "logical_read_gb_reported": 328.32,
+          "read_wait_seconds": 18.93,
+          "main_queue_gpu_seconds": 9.25
+        },
+        "draft": {
+          "passes": 101,
+          "accepted_per_pass_reported": 1.52,
+          "maximum_drafts": 2,
+          "acceptance_is_rounded": true
+        },
+        "cache": {
+          "main_slots_at_end": 3089,
+          "gib_including_draft_at_end": 56.0,
+          "cumulative_evictions": 32634
+        },
+        "cache_initial": {
+          "main_slots": 3089,
+          "main_gib": 54.3
+        },
+        "draft_cache_initial": {
+          "slots_per_stage": 32,
+          "reserved_gib": 1.7,
+          "loading": "on_demand"
+        },
+        "reads_per_emitted_token": {
+          "demand": 30.7,
+          "prefetch_admitted": 49.2,
+          "prefetch_used": 27.4,
+          "prefetch_late": 21.0,
+          "prefetch_cancelled": 10.2
+        }
+      },
+      "grouping": null,
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 19.0,
+            "renderer_percent": 18.0,
+            "gpu_resident_gib": 2.01,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 74.0,
+            "memory": {
+              "free_gib": 75.80477905273438,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 26.0,
+            "renderer_percent": 26.0,
+            "gpu_resident_gib": 2.04,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 74.0,
+            "memory": {
+              "free_gib": 75.77336120605469,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 31.0,
+            "renderer_percent": 31.0,
+            "gpu_resident_gib": 2.1,
+            "desktop_load": true,
+            "reserve_gib": 4.0,
+            "required_free_gib": 74.0,
+            "memory": {
+              "free_gib": 75.58651733398438,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          }
+        ]
+      },
+      "gpu_activity_during_run": [
+        {
+          "elapsed_seconds": 2.183,
+          "model_gpu_client_visible": true,
+          "device_percent": 99.0,
+          "renderer_percent": 97.0,
+          "gpu_resident_gib": 21.94
+        },
+        {
+          "elapsed_seconds": 12.609,
+          "model_gpu_client_visible": true,
+          "device_percent": 100.0,
+          "renderer_percent": 100.0,
+          "gpu_resident_gib": 58.0
+        },
+        {
+          "elapsed_seconds": 22.979,
+          "model_gpu_client_visible": true,
+          "device_percent": 100.0,
+          "renderer_percent": 100.0,
+          "gpu_resident_gib": 61.08
+        },
+        {
+          "elapsed_seconds": 33.806,
+          "model_gpu_client_visible": true,
+          "device_percent": 43.0,
+          "renderer_percent": 25.0,
+          "gpu_resident_gib": 57.07
+        },
+        {
+          "elapsed_seconds": 44.901,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 54.85
+        },
+        {
+          "elapsed_seconds": 55.856,
+          "model_gpu_client_visible": true,
+          "device_percent": 50.0,
+          "renderer_percent": 32.0,
+          "gpu_resident_gib": 55.16
+        }
+      ],
+      "background_cpu_helpers": [
+        {
+          "elapsed_seconds": 27.126,
+          "processes": [
+            {
+              "pid": 74272,
+              "name": "cargo",
+              "cpu_percent": 4.9,
+              "rss_mib": 17.7,
+              "parent_pid": 74179,
+              "parent_name": "make",
+              "gpu_client_in_process_tree": false
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 29.233,
+          "processes": [
+            {
+              "pid": 74272,
+              "name": "cargo",
+              "cpu_percent": 9.5,
+              "rss_mib": 85.6,
+              "parent_pid": 74179,
+              "parent_name": "make",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74286,
+              "name": "rustc",
+              "cpu_percent": 28.5,
+              "rss_mib": 128.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74290,
+              "name": "rustc",
+              "cpu_percent": 14.7,
+              "rss_mib": 87.8,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74291,
+              "name": "rustc",
+              "cpu_percent": 14.5,
+              "rss_mib": 87.6,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74294,
+              "name": "rustc",
+              "cpu_percent": 15.3,
+              "rss_mib": 88.7,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74296,
+              "name": "rustc",
+              "cpu_percent": 12.9,
+              "rss_mib": 84.6,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74297,
+              "name": "rustc",
+              "cpu_percent": 20.9,
+              "rss_mib": 98.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74299,
+              "name": "rustc",
+              "cpu_percent": 5.7,
+              "rss_mib": 116.6,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74300,
+              "name": "rustc",
+              "cpu_percent": 2.2,
+              "rss_mib": 109.3,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74301,
+              "name": "rustc",
+              "cpu_percent": 2.5,
+              "rss_mib": 100.0,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 31.465,
+          "processes": [
+            {
+              "pid": 74272,
+              "name": "cargo",
+              "cpu_percent": 6.2,
+              "rss_mib": 85.8,
+              "parent_pid": 74179,
+              "parent_name": "make",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74407,
+              "name": "rustc",
+              "cpu_percent": 7.8,
+              "rss_mib": 185.0,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74409,
+              "name": "rustc",
+              "cpu_percent": 40.2,
+              "rss_mib": 197.7,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74437,
+              "name": "rustc",
+              "cpu_percent": 38.7,
+              "rss_mib": 267.4,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74456,
+              "name": "rustc",
+              "cpu_percent": 39.7,
+              "rss_mib": 161.0,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74522,
+              "name": "rustc",
+              "cpu_percent": 35.1,
+              "rss_mib": 147.6,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74523,
+              "name": "rustc",
+              "cpu_percent": 43.2,
+              "rss_mib": 146.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74529,
+              "name": "rustc",
+              "cpu_percent": 34.9,
+              "rss_mib": 134.8,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74538,
+              "name": "rustc",
+              "cpu_percent": 37.1,
+              "rss_mib": 138.9,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74544,
+              "name": "rustc",
+              "cpu_percent": 35.8,
+              "rss_mib": 134.0,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74549,
+              "name": "rustc",
+              "cpu_percent": 38.4,
+              "rss_mib": 122.6,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74551,
+              "name": "rustc",
+              "cpu_percent": 41.0,
+              "rss_mib": 129.4,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74554,
+              "name": "rustc",
+              "cpu_percent": 38.4,
+              "rss_mib": 111.3,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74555,
+              "name": "rustc",
+              "cpu_percent": 41.5,
+              "rss_mib": 121.9,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74559,
+              "name": "rustc",
+              "cpu_percent": 15.5,
+              "rss_mib": 59.9,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 33.722,
+          "processes": [
+            {
+              "pid": 74272,
+              "name": "cargo",
+              "cpu_percent": 6.3,
+              "rss_mib": 85.8,
+              "parent_pid": 74179,
+              "parent_name": "make",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74409,
+              "name": "rustc",
+              "cpu_percent": 39.5,
+              "rss_mib": 256.0,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74437,
+              "name": "rustc",
+              "cpu_percent": 40.7,
+              "rss_mib": 319.9,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74522,
+              "name": "rustc",
+              "cpu_percent": 41.7,
+              "rss_mib": 238.4,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74523,
+              "name": "rustc",
+              "cpu_percent": 43.5,
+              "rss_mib": 230.9,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74538,
+              "name": "rustc",
+              "cpu_percent": 39.5,
+              "rss_mib": 245.6,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74559,
+              "name": "rustc",
+              "cpu_percent": 45.9,
+              "rss_mib": 201.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74588,
+              "name": "rustc",
+              "cpu_percent": 2.4,
+              "rss_mib": 126.9,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74593,
+              "name": "rustc",
+              "cpu_percent": 41.1,
+              "rss_mib": 167.9,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74603,
+              "name": "clang",
+              "cpu_percent": 42.3,
+              "rss_mib": 51.9,
+              "parent_pid": 74602,
+              "parent_name": "clang",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74647,
+              "name": "rustc",
+              "cpu_percent": 41.3,
+              "rss_mib": 120.2,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74653,
+              "name": "rustc",
+              "cpu_percent": 32.4,
+              "rss_mib": 113.7,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74654,
+              "name": "rustc",
+              "cpu_percent": 31.6,
+              "rss_mib": 110.8,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74658,
+              "name": "rustc",
+              "cpu_percent": 30.2,
+              "rss_mib": 117.9,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74661,
+              "name": "rustc",
+              "cpu_percent": 18.7,
+              "rss_mib": 96.2,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74664,
+              "name": "rustc",
+              "cpu_percent": 6.0,
+              "rss_mib": 45.6,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74666,
+              "name": "rustc",
+              "cpu_percent": 3.1,
+              "rss_mib": 25.8,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 36.013,
+          "processes": [
+            {
+              "pid": 74437,
+              "name": "rustc",
+              "cpu_percent": 65.1,
+              "rss_mib": 389.1,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74522,
+              "name": "rustc",
+              "cpu_percent": 60.7,
+              "rss_mib": 313.0,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74523,
+              "name": "rustc",
+              "cpu_percent": 58.8,
+              "rss_mib": 315.2,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74538,
+              "name": "rustc",
+              "cpu_percent": 9.0,
+              "rss_mib": 287.7,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74559,
+              "name": "rustc",
+              "cpu_percent": 48.1,
+              "rss_mib": 174.4,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74593,
+              "name": "rustc",
+              "cpu_percent": 14.8,
+              "rss_mib": 207.6,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74679,
+              "name": "rustc",
+              "cpu_percent": 20.4,
+              "rss_mib": 133.8,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74707,
+              "name": "rustc",
+              "cpu_percent": 65.4,
+              "rss_mib": 190.4,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74712,
+              "name": "rustc",
+              "cpu_percent": 67.1,
+              "rss_mib": 195.7,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74714,
+              "name": "rustc",
+              "cpu_percent": 63.6,
+              "rss_mib": 156.2,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74720,
+              "name": "rustc",
+              "cpu_percent": 65.6,
+              "rss_mib": 178.2,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74723,
+              "name": "rustc",
+              "cpu_percent": 68.2,
+              "rss_mib": 163.1,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74729,
+              "name": "rustc",
+              "cpu_percent": 54.5,
+              "rss_mib": 138.3,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74733,
+              "name": "rustc",
+              "cpu_percent": 52.5,
+              "rss_mib": 103.1,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74740,
+              "name": "clang",
+              "cpu_percent": 39.1,
+              "rss_mib": 50.4,
+              "parent_pid": 74737,
+              "parent_name": "clang",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74744,
+              "name": "clang",
+              "cpu_percent": 9.4,
+              "rss_mib": 26.5,
+              "parent_pid": 74742,
+              "parent_name": "clang++",
+              "gpu_client_in_process_tree": false
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 38.275,
+          "processes": [
+            {
+              "pid": 74522,
+              "name": "rustc",
+              "cpu_percent": 12.5,
+              "rss_mib": 347.7,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74538,
+              "name": "rustc",
+              "cpu_percent": 2.5,
+              "rss_mib": 242.2,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74559,
+              "name": "rustc",
+              "cpu_percent": 29.5,
+              "rss_mib": 175.0,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74593,
+              "name": "rustc",
+              "cpu_percent": 40.2,
+              "rss_mib": 187.2,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74707,
+              "name": "rustc",
+              "cpu_percent": 60.4,
+              "rss_mib": 270.7,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74712,
+              "name": "rustc",
+              "cpu_percent": 61.2,
+              "rss_mib": 259.2,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74720,
+              "name": "rustc",
+              "cpu_percent": 7.9,
+              "rss_mib": 151.0,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74723,
+              "name": "rustc",
+              "cpu_percent": 19.3,
+              "rss_mib": 195.1,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74729,
+              "name": "rustc",
+              "cpu_percent": 17.2,
+              "rss_mib": 210.7,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74744,
+              "name": "clang",
+              "cpu_percent": 22.2,
+              "rss_mib": 63.7,
+              "parent_pid": 74742,
+              "parent_name": "clang++",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74753,
+              "name": "rustc",
+              "cpu_percent": 61.3,
+              "rss_mib": 194.3,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74763,
+              "name": "rustc",
+              "cpu_percent": 55.5,
+              "rss_mib": 152.6,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74770,
+              "name": "rustc",
+              "cpu_percent": 53.2,
+              "rss_mib": 133.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74774,
+              "name": "rustc",
+              "cpu_percent": 37.9,
+              "rss_mib": 122.2,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74778,
+              "name": "rustc",
+              "cpu_percent": 10.6,
+              "rss_mib": 76.4,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74779,
+              "name": "clang",
+              "cpu_percent": 3.0,
+              "rss_mib": 14.6,
+              "parent_pid": 74650,
+              "parent_name": "build-script-build",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74780,
+              "name": "clang",
+              "cpu_percent": 3.0,
+              "rss_mib": 14.9,
+              "parent_pid": 74592,
+              "parent_name": "build-script-build",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74781,
+              "name": "clang",
+              "cpu_percent": 6.7,
+              "rss_mib": 31.7,
+              "parent_pid": 74779,
+              "parent_name": "clang",
+              "gpu_client_in_process_tree": false
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 40.451,
+          "processes": [
+            {
+              "pid": 74272,
+              "name": "cargo",
+              "cpu_percent": 3.3,
+              "rss_mib": 85.8,
+              "parent_pid": 74179,
+              "parent_name": "make",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74538,
+              "name": "rustc",
+              "cpu_percent": 40.4,
+              "rss_mib": 256.3,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74712,
+              "name": "rustc",
+              "cpu_percent": 3.7,
+              "rss_mib": 322.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74763,
+              "name": "rustc",
+              "cpu_percent": 23.3,
+              "rss_mib": 246.6,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74770,
+              "name": "rustc",
+              "cpu_percent": 44.5,
+              "rss_mib": 114.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74815,
+              "name": "rustc",
+              "cpu_percent": 45.7,
+              "rss_mib": 179.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74844,
+              "name": "rustc",
+              "cpu_percent": 33.4,
+              "rss_mib": 168.1,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74875,
+              "name": "rustc",
+              "cpu_percent": 41.2,
+              "rss_mib": 132.4,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74900,
+              "name": "rustc",
+              "cpu_percent": 39.4,
+              "rss_mib": 124.6,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74902,
+              "name": "rustc",
+              "cpu_percent": 46.3,
+              "rss_mib": 130.3,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74946,
+              "name": "rustc",
+              "cpu_percent": 5.4,
+              "rss_mib": 63.2,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 42.625,
+          "processes": [
+            {
+              "pid": 74272,
+              "name": "cargo",
+              "cpu_percent": 2.2,
+              "rss_mib": 85.8,
+              "parent_pid": 74179,
+              "parent_name": "make",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74538,
+              "name": "rustc",
+              "cpu_percent": 34.6,
+              "rss_mib": 253.6,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74712,
+              "name": "rustc",
+              "cpu_percent": 29.3,
+              "rss_mib": 328.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74875,
+              "name": "rustc",
+              "cpu_percent": 24.4,
+              "rss_mib": 217.3,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74946,
+              "name": "rustc",
+              "cpu_percent": 57.7,
+              "rss_mib": 253.3,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75000,
+              "name": "rustc",
+              "cpu_percent": 13.4,
+              "rss_mib": 178.4,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75062,
+              "name": "rustc",
+              "cpu_percent": 53.3,
+              "rss_mib": 129.7,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75071,
+              "name": "rustc",
+              "cpu_percent": 53.7,
+              "rss_mib": 142.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75074,
+              "name": "rustc",
+              "cpu_percent": 54.1,
+              "rss_mib": 148.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75081,
+              "name": "rustc",
+              "cpu_percent": 58.2,
+              "rss_mib": 193.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75084,
+              "name": "rustc",
+              "cpu_percent": 51.8,
+              "rss_mib": 138.4,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75097,
+              "name": "rustc",
+              "cpu_percent": 45.7,
+              "rss_mib": 121.4,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75112,
+              "name": "rustc",
+              "cpu_percent": 18.1,
+              "rss_mib": 87.1,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75117,
+              "name": "rustc",
+              "cpu_percent": 31.3,
+              "rss_mib": 95.3,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 44.824,
+          "processes": [
+            {
+              "pid": 74712,
+              "name": "rustc",
+              "cpu_percent": 34.8,
+              "rss_mib": 330.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74875,
+              "name": "rustc",
+              "cpu_percent": 2.2,
+              "rss_mib": 189.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74946,
+              "name": "rustc",
+              "cpu_percent": 59.3,
+              "rss_mib": 320.0,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75062,
+              "name": "rustc",
+              "cpu_percent": 23.9,
+              "rss_mib": 159.9,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75097,
+              "name": "rustc",
+              "cpu_percent": 24.4,
+              "rss_mib": 145.7,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75140,
+              "name": "rustc",
+              "cpu_percent": 55.9,
+              "rss_mib": 189.8,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75141,
+              "name": "rustc",
+              "cpu_percent": 11.3,
+              "rss_mib": 190.3,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75146,
+              "name": "rustc",
+              "cpu_percent": 53.8,
+              "rss_mib": 199.2,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75148,
+              "name": "rustc",
+              "cpu_percent": 58.9,
+              "rss_mib": 219.8,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75166,
+              "name": "rustc",
+              "cpu_percent": 30.8,
+              "rss_mib": 166.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75169,
+              "name": "rustc",
+              "cpu_percent": 7.8,
+              "rss_mib": 120.9,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75178,
+              "name": "rustc",
+              "cpu_percent": 51.0,
+              "rss_mib": 150.2,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75187,
+              "name": "rustc",
+              "cpu_percent": 45.3,
+              "rss_mib": 121.9,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75190,
+              "name": "rustc",
+              "cpu_percent": 48.4,
+              "rss_mib": 118.6,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 47.174,
+          "processes": [
+            {
+              "pid": 74272,
+              "name": "cargo",
+              "cpu_percent": 3.1,
+              "rss_mib": 85.8,
+              "parent_pid": 74179,
+              "parent_name": "make",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74712,
+              "name": "rustc",
+              "cpu_percent": 0.0,
+              "rss_mib": 258.8,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74946,
+              "name": "rustc",
+              "cpu_percent": 50.3,
+              "rss_mib": 384.1,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75146,
+              "name": "rustc",
+              "cpu_percent": 27.8,
+              "rss_mib": 225.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75148,
+              "name": "rustc",
+              "cpu_percent": 45.6,
+              "rss_mib": 279.6,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75190,
+              "name": "rustc",
+              "cpu_percent": 9.0,
+              "rss_mib": 218.1,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75204,
+              "name": "rustc",
+              "cpu_percent": 4.1,
+              "rss_mib": 203.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75221,
+              "name": "rustc",
+              "cpu_percent": 10.0,
+              "rss_mib": 154.1,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75222,
+              "name": "rustc",
+              "cpu_percent": 6.1,
+              "rss_mib": 144.2,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75227,
+              "name": "rustc",
+              "cpu_percent": 29.1,
+              "rss_mib": 130.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75229,
+              "name": "rustc",
+              "cpu_percent": 57.2,
+              "rss_mib": 153.8,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75232,
+              "name": "rustc",
+              "cpu_percent": 31.4,
+              "rss_mib": 136.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75233,
+              "name": "rustc",
+              "cpu_percent": 37.7,
+              "rss_mib": 122.7,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75234,
+              "name": "rustc",
+              "cpu_percent": 40.2,
+              "rss_mib": 124.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75235,
+              "name": "rustc",
+              "cpu_percent": 25.9,
+              "rss_mib": 127.8,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75237,
+              "name": "rustc",
+              "cpu_percent": 20.6,
+              "rss_mib": 64.7,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75239,
+              "name": "rustc",
+              "cpu_percent": 11.4,
+              "rss_mib": 98.3,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 49.321,
+          "processes": [
+            {
+              "pid": 74712,
+              "name": "rustc",
+              "cpu_percent": 161.6,
+              "rss_mib": 294.7,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 74946,
+              "name": "rustc",
+              "cpu_percent": 7.5,
+              "rss_mib": 404.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75146,
+              "name": "rustc",
+              "cpu_percent": 73.1,
+              "rss_mib": 202.8,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75148,
+              "name": "rustc",
+              "cpu_percent": 72.1,
+              "rss_mib": 379.2,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75190,
+              "name": "rustc",
+              "cpu_percent": 21.8,
+              "rss_mib": 187.0,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75204,
+              "name": "rustc",
+              "cpu_percent": 55.1,
+              "rss_mib": 168.4,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75229,
+              "name": "rustc",
+              "cpu_percent": 61.4,
+              "rss_mib": 147.1,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75232,
+              "name": "rustc",
+              "cpu_percent": 13.3,
+              "rss_mib": 222.3,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75234,
+              "name": "rustc",
+              "cpu_percent": 51.0,
+              "rss_mib": 145.9,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75237,
+              "name": "rustc",
+              "cpu_percent": 69.1,
+              "rss_mib": 284.0,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75252,
+              "name": "rustc",
+              "cpu_percent": 8.7,
+              "rss_mib": 199.2,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75257,
+              "name": "rustc",
+              "cpu_percent": 66.1,
+              "rss_mib": 111.8,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75264,
+              "name": "rustc",
+              "cpu_percent": 43.6,
+              "rss_mib": 117.9,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75265,
+              "name": "rustc",
+              "cpu_percent": 10.3,
+              "rss_mib": 44.4,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 51.506,
+          "processes": [
+            {
+              "pid": 74946,
+              "name": "rustc",
+              "cpu_percent": 139.2,
+              "rss_mib": 366.7,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75146,
+              "name": "rustc",
+              "cpu_percent": 13.0,
+              "rss_mib": 199.8,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75148,
+              "name": "rustc",
+              "cpu_percent": 81.4,
+              "rss_mib": 404.2,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75232,
+              "name": "rustc",
+              "cpu_percent": 66.6,
+              "rss_mib": 191.6,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75237,
+              "name": "rustc",
+              "cpu_percent": 66.6,
+              "rss_mib": 349.9,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75265,
+              "name": "rustc",
+              "cpu_percent": 50.6,
+              "rss_mib": 217.6,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75269,
+              "name": "rustc",
+              "cpu_percent": 36.9,
+              "rss_mib": 199.8,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75270,
+              "name": "rustc",
+              "cpu_percent": 15.3,
+              "rss_mib": 187.7,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75274,
+              "name": "rustc",
+              "cpu_percent": 21.0,
+              "rss_mib": 63.3,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 53.695,
+          "processes": [
+            {
+              "pid": 75148,
+              "name": "rustc",
+              "cpu_percent": 236.3,
+              "rss_mib": 436.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75237,
+              "name": "rustc",
+              "cpu_percent": 68.3,
+              "rss_mib": 416.9,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75265,
+              "name": "rustc",
+              "cpu_percent": 52.7,
+              "rss_mib": 229.8,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75269,
+              "name": "rustc",
+              "cpu_percent": 69.4,
+              "rss_mib": 280.0,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75270,
+              "name": "rustc",
+              "cpu_percent": 43.6,
+              "rss_mib": 161.9,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75274,
+              "name": "rustc",
+              "cpu_percent": 72.0,
+              "rss_mib": 260.2,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 55.815,
+          "processes": [
+            {
+              "pid": 75237,
+              "name": "rustc",
+              "cpu_percent": 97.5,
+              "rss_mib": 520.9,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            },
+            {
+              "pid": 75274,
+              "name": "rustc",
+              "cpu_percent": 97.2,
+              "rss_mib": 390.5,
+              "parent_pid": 74272,
+              "parent_name": "cargo",
+              "gpu_client_in_process_tree": false
+            }
+          ]
+        }
+      ],
+      "timing_environment": "recorded desktop load; GPU not isolated",
+      "details": [
+        "expert cache: 3089 slots (54.3 GiB) to start, up to 1988 mapped for the GPU, 66.7 GiB free and 0.0 GiB of file cache beyond the kernel's share, 4.0 GiB kept for other programs, GPU resident memory 1.8 GiB (50.6 GiB below the GPU's limit), GPU working set 107.5 GiB",
+        "cache:   3089 slots, 56.0 GiB, 32634 evictions; available memory 9.9 GiB, footprint 67.2 GiB, GPU resident memory (all processes) 54.2 GiB; 0 pages swapped out and 0 compressed by the system meanwhile, this process's memory compressed at most 0 MiB",
+        "decode reads per token: 30.7 on demand, 49.2 ahead (27.4 used, 21.0 of them late), 10.2 cancelled; 0.0 experts substituted, 58.7 mapped for the GPU again",
+        "decode per token (ms): rows 0.2, waits 34.5, loads 71.9, prefetch 3.3, encode 1.0, adapt 1.0, drafting 6.0; GPU idle between command buffers 79.8 (28.4 gaps over 100 us); 0.0 layers' experts recomputed"
+      ],
+      "error": null,
+      "correctness_valid": true,
+      "timing_valid": false,
+      "timing_exclusion": "A background Rust build exceeded one CPU core; excluded from speed comparisons. Output and cache checks passed."
+    }
+  ],
+  "model_name": "DeepSeek-V4.1-Flash-1017",
+  "checkpoint_id": "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+}

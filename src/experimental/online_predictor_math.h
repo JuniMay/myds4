@@ -16,7 +16,7 @@
 #include <unistd.h>
 
 #define OP_K 6
-#define OP_MAX_ROWS 6
+#define OP_MAX_ROWS 16
 #define OP_COV_LIMIT 1000000.0f
 typedef struct {
   int e, f, r, active;

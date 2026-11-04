@@ -38,7 +38,7 @@ typedef struct {
   uint8_t missing[EXPERTS];
 } LongHead;
 static struct {
-  int initialized, enabled, live, count, rank, pos, rows, pending, prepared, active;
+  int initialized, enabled, live, count, rank, pos, rows, pending, prepared, active, accept_pending;
   int warmup, width, horizon, distance, base, learn, previous_accepted, policy, completed, issuer, explored, victim_limit;
   unsigned collect_mask;
   float gain;
@@ -215,7 +215,7 @@ int predictor_lab_enabled(void) {
 void predictor_lab_begin(int pos, int drafts, const uint16_t *seed) {
   if (!predictor_lab_enabled()) return;
   if (drafts < 1 || drafts > BLOCK || lab.active) die("invalid predictor lab draft boundary");
-  lab.pos = pos, lab.rows = drafts + 1, lab.pending = 1, lab.prepared = 0;
+  lab.pos = pos, lab.rows = drafts + 1, lab.pending = 1, lab.prepared = 0, lab.accept_pending = 0;
   lab.explored = 0;
   memset(lab.stage, 0, sizeof lab.stage);
   memset(lab.embedding, 0, sizeof lab.embedding);
@@ -490,12 +490,15 @@ void predictor_lab_end(void) {
   lab.action_fit_s += now() - action_start;
   lab.scored_passes += lab.passes >= (uint64_t)lab.warmup;
   lab.passes++, lab.rows_seen += lab.rows;
-  lab.active = 0;
+  lab.active = 0, lab.accept_pending = 1;
 }
 
 void predictor_lab_accept(int rows) {
   if (!lab.enabled) return;
+  // Context-copy passes have no DSpark observation or labels to accept.
+  if (!lab.accept_pending && !lab.active) return;
   if (rows < 1 || rows > lab.rows || lab.active) die("invalid predictor lab accepted prefix");
+  lab.accept_pending = 0;
   memset(lab.history, 0, sizeof lab.history);
   for (int i = 0; i < LAB_OUTPUTS; i++) lab.prior_labels[i] = .9f * lab.prior_labels[i] + .1f * lab.labels[rows - 1][i];
   sketch(lab.history, lab.prior_labels, LAB_OUTPUTS, 301);

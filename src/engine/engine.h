@@ -15,7 +15,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYDS4_ABI 4
+#define MYDS4_ABI 5
 
 // The engine's settings: the server's model and engine options.
 typedef struct {
@@ -37,6 +37,9 @@ typedef struct {
   double kv_gb;                // --kv-cache: bound of the sessions' attention state in GiB
   int batch;                   // --batch: requests decoding together, 1 to 6
   int ced;                     // --ced off|N: 0 or 128 to 1048576 decoder replay tokens; approximate
+  int lookup;                  // --lookup off|N: 0 or 1 to 15 context-copy drafts
+  int expert_batch;            // --expert-batch: share repeated expert loads across rows
+  int prefill_prune;           // --prefill-prune: preserve dependencies while skipping unused decoder batches
   // The log's lines, each with its time, go to on_log instead of stderr when
   // it is set. It runs on the thread that logs, one line at a time under the
   // log's lock: it must return quickly and must not call myds4_log.

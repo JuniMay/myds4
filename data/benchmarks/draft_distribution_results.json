@@ -1,0 +1,46 @@
+{
+  "checkpoint_id": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "prompt_tokens": 8187,
+  "prompt_sha256": "b9966d292e8dec88f0521be16013f5ae2ee475a2bba38e6849ac4f0481fd806f",
+  "result": {
+    "draft_distribution": {
+      "prompt_tokens": 8187,
+      "generated_tokens": 255,
+      "passes": 128,
+      "observed_first_accepted": 86,
+      "observed_total_accepted": 127,
+      "greedy_first_probability": 0.6253381,
+      "target_temperature": 1,
+      "top_p": 1,
+      "rows": [
+        {
+          "draft_temperature": 0.5,
+          "maximal_first_acceptance": 0.728966854,
+          "shared_uniform_first_acceptance": 0.679200168
+        },
+        {
+          "draft_temperature": 0.75,
+          "maximal_first_acceptance": 0.757309256,
+          "shared_uniform_first_acceptance": 0.691147363
+        },
+        {
+          "draft_temperature": 1.0,
+          "maximal_first_acceptance": 0.765579153,
+          "shared_uniform_first_acceptance": 0.687487273
+        },
+        {
+          "draft_temperature": 1.5,
+          "maximal_first_acceptance": 0.674281502,
+          "shared_uniform_first_acceptance": 0.564575417
+        },
+        {
+          "draft_temperature": 2.0,
+          "maximal_first_acceptance": 0.447292981,
+          "shared_uniform_first_acceptance": 0.338756135
+        }
+      ],
+      "scope": "first-draft distributions on the greedy-draft trajectory; not multi-token acceptance or throughput"
+    }
+  },
+  "scope": "Probability diagnostic only; timings include CPU probability analysis and are not performance results."
+}

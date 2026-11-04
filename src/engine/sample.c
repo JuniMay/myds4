@@ -70,11 +70,11 @@ int sample_token(const float *logits, int count, Sampler *s) {
   return last; // Floating-point accumulation can leave a final rounding residue.
 }
 
-// DSpark supplies deterministic proposals. Sampling from the target and
+// Draft sources supply deterministic proposals. Sampling from the target and
 // keeping a matching prefix preserves its distribution and random stream.
 // A mismatch is already the next token: never draw it a second time.
 int sample_verify(const float *logits, int count, const int *drafts, int ndraft, int eos, Sampler *s, int *accepted) {
-  if (ndraft < 0 || ndraft > BLOCK) die("invalid draft verification size");
+  if (ndraft < 0 || count < 1 || count > VOCAB) die("invalid draft verification size");
   int n = 0;
   for (;;) {
     int next = sample_token(logits + (size_t)n * count, count, s);

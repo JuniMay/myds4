@@ -78,6 +78,13 @@ def main():
             "--image works",
         ),
         ("sampled drafts", ["--draft", "2", "-t", "1"], None, missing_tokenizer),
+        ("context lookup", ["--lookup", "15", "-t", "1", "--top-p", "1"], None, missing_tokenizer),
+        ("context lookup off", ["--lookup", "off"], None, missing_tokenizer),
+        ("context lookup with DSpark", ["--lookup", "15", "--draft", "2", "--draft-cache", "32"], None, missing_tokenizer),
+        ("context lookup with shared experts", ["--lookup", "15", "--expert-batch"], None, missing_tokenizer),
+        ("dependency-pruned prefill", ["--prefill-prune", "--ced", "off"], None, missing_tokenizer),
+        ("pruned prefill with lookup", ["--prefill-prune", "--lookup", "15", "--expert-batch"], None, missing_tokenizer),
+        ("invalid context lookup", ["--lookup", "16"], None, "--lookup"),
         (
             "temperature and nucleus sampling",
             ["--draft", "2", "-t", "1", "--top-p", "1", "--seed", "42"],

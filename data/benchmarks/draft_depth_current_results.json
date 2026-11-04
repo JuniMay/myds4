@@ -1,0 +1,2466 @@
+{
+  "scope": "Serial configuration screen at the same total expert-cache budget. Output identity is required; this short run is not a general speed recommendation.",
+  "runs": [
+    {
+      "date_utc": "2026-11-04T00:31:06.424266+00:00",
+      "role": "plain",
+      "settings": {
+        "configuration": "plain",
+        "draft": 0,
+        "draft_cache": 0,
+        "draft_trim": false,
+        "prompt_tokens": 8187,
+        "prompt_sha256": "b9966d292e8dec88f0521be16013f5ae2ee475a2bba38e6849ac4f0481fd806f",
+        "context": 32768,
+        "cache_gib": 56,
+        "reserve_gib": 4,
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 12345,
+        "think": 75,
+        "lookup": 0,
+        "expert_batch": true,
+        "substitute": false,
+        "online_predictor": false,
+        "control_binary_sha256": "2d8cababe423a20267f597742d25e939303962f3a8302314e1a2b03c0c0d72f1",
+        "candidate_binary_sha256": "2d8cababe423a20267f597742d25e939303962f3a8302314e1a2b03c0c0d72f1",
+        "checkpoint_id": "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+      },
+      "valid": true,
+      "exit": 0,
+      "wall_seconds": 45.921,
+      "correctness_valid": true,
+      "timing_valid": true,
+      "timing_exclusion": null,
+      "output_sha256": "dee494eb10ec7878851293d06f8ca6783b004406ec5484cfe9be0ec93a5da20b",
+      "output_matches_control": null,
+      "output_shape": {
+        "bytes": 1217,
+        "think_close_seen": false,
+        "bytes_before_think_close": null,
+        "bytes_after_think_close": null
+      },
+      "copy_exact": null,
+      "metrics": {
+        "decode_experts": {
+          "computed_rows": 256,
+          "selected": 61440,
+          "unique_layer_requests": 61440
+        },
+        "decode_cache": {
+          "bytes_at_start": 60114862080,
+          "min_bytes": 60114862080,
+          "max_bytes": 60114862080,
+          "slots_released": 0
+        },
+        "workspace": {
+          "resizable_after_prefill_bytes": 2600014963,
+          "resizable_after_decode_bytes": 9743750
+        },
+        "prefill": {
+          "tokens": 8187,
+          "seconds": 22.74,
+          "tokens_per_second": 360.0,
+          "existing_slot_hit_percent": 100.0,
+          "logical_read_gb_reported": 289.28,
+          "read_wait_seconds": 10.32,
+          "main_queue_gpu_seconds": 11.31
+        },
+        "decode": {
+          "tokens": 256,
+          "seconds": 21.67,
+          "tokens_per_second": 11.81,
+          "existing_slot_hit_percent": 91.7,
+          "logical_read_gb_reported": 220.3,
+          "read_wait_seconds": 12.07,
+          "main_queue_gpu_seconds": 8.39
+        },
+        "cache": {
+          "main_slots_at_end": 3185,
+          "gib_including_draft_at_end": 56.0,
+          "cumulative_evictions": 25343
+        },
+        "cache_initial": {
+          "main_slots": 3185,
+          "main_gib": 56.0
+        },
+        "reads_per_emitted_token": {
+          "demand": 20.0,
+          "prefetch_admitted": 31.5,
+          "prefetch_used": 16.8,
+          "prefetch_late": 15.3,
+          "prefetch_cancelled": 5.1
+        }
+      },
+      "grouping": {
+        "scope": "all small backbone batches",
+        "calls": 0,
+        "row_expert_pairs": 0,
+        "weight_groups": 0
+      },
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 6.0,
+            "renderer_percent": 6.0,
+            "gpu_resident_gib": 0.58,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 74,
+            "memory": {
+              "free_gib": 75.10786437988281,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [
+              {
+                "pid": 95479,
+                "name": "MyDS4",
+                "cpu_percent": 0.0,
+                "rss_mib": 97.2,
+                "parent_pid": 1,
+                "parent_name": "launchd",
+                "gpu_client_in_process_tree": true,
+                "idle_app_shell": true
+              }
+            ],
+            "reasons": []
+          },
+          {
+            "device_percent": 5.0,
+            "renderer_percent": 5.0,
+            "gpu_resident_gib": 0.58,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 74,
+            "memory": {
+              "free_gib": 75.10885620117188,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [
+              {
+                "pid": 95479,
+                "name": "MyDS4",
+                "cpu_percent": 0.0,
+                "rss_mib": 97.2,
+                "parent_pid": 1,
+                "parent_name": "launchd",
+                "gpu_client_in_process_tree": true,
+                "idle_app_shell": true
+              }
+            ],
+            "reasons": []
+          },
+          {
+            "device_percent": 6.0,
+            "renderer_percent": 6.0,
+            "gpu_resident_gib": 0.6,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 74,
+            "memory": {
+              "free_gib": 75.10784912109375,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [
+              {
+                "pid": 95479,
+                "name": "MyDS4",
+                "cpu_percent": 0.0,
+                "rss_mib": 97.2,
+                "parent_pid": 1,
+                "parent_name": "launchd",
+                "gpu_client_in_process_tree": true,
+                "idle_app_shell": true
+              }
+            ],
+            "reasons": []
+          }
+        ]
+      },
+      "gpu_activity_during_run": [
+        {
+          "elapsed_seconds": 2.142,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 17.95
+        },
+        {
+          "elapsed_seconds": 12.535,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 58.83
+        },
+        {
+          "elapsed_seconds": 22.922,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 54.02
+        },
+        {
+          "elapsed_seconds": 33.291,
+          "model_gpu_client_visible": true,
+          "device_percent": 87.0,
+          "renderer_percent": 43.0,
+          "gpu_resident_gib": 51.43
+        },
+        {
+          "elapsed_seconds": 43.668,
+          "model_gpu_client_visible": true,
+          "device_percent": 62.0,
+          "renderer_percent": 1.0,
+          "gpu_resident_gib": 53.79
+        }
+      ],
+      "background_cpu_helpers": [
+        {
+          "elapsed_seconds": 2.112,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 4.224,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 6.298,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 8.372,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 10.443,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 12.514,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 14.61,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 16.683,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 18.757,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 20.827,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 22.9,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 24.989,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 27.059,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 29.125,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 31.193,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 33.266,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 35.357,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 37.427,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 39.502,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 41.576,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 43.644,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 45.749,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": null,
+              "idle_app_shell": true
+            }
+          ]
+        }
+      ],
+      "background_cpu_peak": 0.0,
+      "timing_environment": "recorded desktop load; GPU not isolated",
+      "details": [
+        "expert cache: 3185 slots (56.0 GiB) to start, up to 2198 mapped for the GPU, 66.6 GiB free and 0.0 GiB of file cache beyond the kernel's share, 4.0 GiB kept for other programs, GPU resident memory 0.6 GiB (51.9 GiB below the GPU's limit), GPU working set 107.5 GiB",
+        "cache:   3185 slots, 56.0 GiB, 25343 evictions; available memory 12.1 GiB, footprint 64.4 GiB, GPU resident memory (all processes) 54.2 GiB; 0 pages swapped out and 0 compressed by the system meanwhile, this process's memory compressed at most 0 MiB",
+        "decode reads per token: 20.0 on demand, 31.5 ahead (16.8 used, 15.3 of them late), 5.1 cancelled; 0.0 experts substituted, 53.6 mapped for the GPU again",
+        "decode per token (ms): rows 0.2, waits 34.0, loads 47.1, prefetch 1.3, encode 0.3, adapt 0.4, drafting 0.0; GPU idle between command buffers 51.0 (33.3 gaps over 100 us); 0.0 layers' experts recomputed"
+      ],
+      "error": null
+    },
+    {
+      "date_utc": "2026-11-04T00:32:07.654899+00:00",
+      "role": "dspark5",
+      "settings": {
+        "configuration": "dspark5",
+        "draft": 5,
+        "draft_cache": 32,
+        "draft_trim": true,
+        "prompt_tokens": 8187,
+        "prompt_sha256": "b9966d292e8dec88f0521be16013f5ae2ee475a2bba38e6849ac4f0481fd806f",
+        "context": 32768,
+        "cache_gib": 56,
+        "reserve_gib": 4,
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 12345,
+        "think": 75,
+        "lookup": 0,
+        "expert_batch": true,
+        "substitute": false,
+        "online_predictor": false,
+        "control_binary_sha256": "2d8cababe423a20267f597742d25e939303962f3a8302314e1a2b03c0c0d72f1",
+        "candidate_binary_sha256": "2d8cababe423a20267f597742d25e939303962f3a8302314e1a2b03c0c0d72f1",
+        "checkpoint_id": "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+      },
+      "valid": true,
+      "exit": 0,
+      "wall_seconds": 56.976,
+      "correctness_valid": true,
+      "timing_valid": true,
+      "timing_exclusion": null,
+      "output_sha256": "dee494eb10ec7878851293d06f8ca6783b004406ec5484cfe9be0ec93a5da20b",
+      "output_matches_control": true,
+      "output_shape": {
+        "bytes": 1217,
+        "think_close_seen": false,
+        "bytes_before_think_close": null,
+        "bytes_after_think_close": null
+      },
+      "copy_exact": null,
+      "metrics": {
+        "decode_experts": {
+          "computed_rows": 646,
+          "selected": 155040,
+          "unique_layer_requests": 92390
+        },
+        "decode_cache": {
+          "bytes_at_start": 60114862080,
+          "min_bytes": 60114862080,
+          "max_bytes": 60114862080,
+          "slots_released": 0
+        },
+        "workspace": {
+          "resizable_after_prefill_bytes": 2600014963,
+          "resizable_after_decode_bytes": 11578758
+        },
+        "prefill": {
+          "tokens": 8187,
+          "seconds": 22.75,
+          "tokens_per_second": 359.88,
+          "existing_slot_hit_percent": 100.0,
+          "logical_read_gb_reported": 289.28,
+          "read_wait_seconds": 10.3,
+          "main_queue_gpu_seconds": 11.37
+        },
+        "decode": {
+          "tokens": 256,
+          "seconds": 32.66,
+          "tokens_per_second": 7.84,
+          "existing_slot_hit_percent": 89.5,
+          "logical_read_gb_reported": 392.12,
+          "read_wait_seconds": 23.15,
+          "main_queue_gpu_seconds": 10.57
+        },
+        "draft": {
+          "passes": 109,
+          "accepted_per_pass_reported": 1.34,
+          "maximum_drafts": 5,
+          "acceptance_is_rounded": true
+        },
+        "cache": {
+          "main_slots_at_end": 3089,
+          "gib_including_draft_at_end": 56.0,
+          "cumulative_evictions": 37624
+        },
+        "cache_initial": {
+          "main_slots": 3089,
+          "main_gib": 54.3
+        },
+        "draft_cache_initial": {
+          "slots_per_stage": 32,
+          "reserved_gib": 1.7,
+          "loading": "on_demand"
+        },
+        "reads_per_emitted_token": {
+          "demand": 38.8,
+          "prefetch_admitted": 60.5,
+          "prefetch_used": 32.4,
+          "prefetch_late": 27.3,
+          "prefetch_cancelled": 15.1
+        }
+      },
+      "grouping": {
+        "scope": "all small backbone batches",
+        "calls": 5642,
+        "row_expert_pairs": 145476,
+        "weight_groups": 91387
+      },
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 0.0,
+            "renderer_percent": 0.0,
+            "gpu_resident_gib": 0.59,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 74,
+            "memory": {
+              "free_gib": 74.8804931640625,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [
+              {
+                "pid": 95479,
+                "name": "MyDS4",
+                "cpu_percent": 0.0,
+                "rss_mib": 97.2,
+                "parent_pid": 1,
+                "parent_name": "launchd",
+                "gpu_client_in_process_tree": true,
+                "idle_app_shell": true
+              }
+            ],
+            "reasons": []
+          },
+          {
+            "device_percent": 5.0,
+            "renderer_percent": 5.0,
+            "gpu_resident_gib": 0.58,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 74,
+            "memory": {
+              "free_gib": 74.91078186035156,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [
+              {
+                "pid": 95479,
+                "name": "MyDS4",
+                "cpu_percent": 0.0,
+                "rss_mib": 97.2,
+                "parent_pid": 1,
+                "parent_name": "launchd",
+                "gpu_client_in_process_tree": true,
+                "idle_app_shell": true
+              }
+            ],
+            "reasons": []
+          },
+          {
+            "device_percent": 6.0,
+            "renderer_percent": 6.0,
+            "gpu_resident_gib": 0.58,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 74,
+            "memory": {
+              "free_gib": 74.92671203613281,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [
+              {
+                "pid": 95479,
+                "name": "MyDS4",
+                "cpu_percent": 0.0,
+                "rss_mib": 97.2,
+                "parent_pid": 1,
+                "parent_name": "launchd",
+                "gpu_client_in_process_tree": true,
+                "idle_app_shell": true
+              }
+            ],
+            "reasons": []
+          }
+        ]
+      },
+      "gpu_activity_during_run": [
+        {
+          "elapsed_seconds": 2.142,
+          "model_gpu_client_visible": true,
+          "device_percent": 99.0,
+          "renderer_percent": 74.0,
+          "gpu_resident_gib": 20.32
+        },
+        {
+          "elapsed_seconds": 12.567,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 60.76
+        },
+        {
+          "elapsed_seconds": 22.966,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 51.36
+        },
+        {
+          "elapsed_seconds": 33.358,
+          "model_gpu_client_visible": true,
+          "device_percent": 83.0,
+          "renderer_percent": 24.0,
+          "gpu_resident_gib": 54.51
+        },
+        {
+          "elapsed_seconds": 43.727,
+          "model_gpu_client_visible": true,
+          "device_percent": 72.0,
+          "renderer_percent": 5.0,
+          "gpu_resident_gib": 55.3
+        },
+        {
+          "elapsed_seconds": 54.096,
+          "model_gpu_client_visible": true,
+          "device_percent": 82.0,
+          "renderer_percent": 1.0,
+          "gpu_resident_gib": 54.44
+        }
+      ],
+      "background_cpu_helpers": [
+        {
+          "elapsed_seconds": 2.103,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 4.252,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 6.327,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 8.401,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 10.474,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 12.546,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 14.638,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 16.718,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 18.794,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 20.869,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 22.943,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 25.04,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 27.118,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 29.187,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 31.255,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 33.333,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 35.427,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 37.492,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 39.566,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 41.638,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 43.702,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 45.793,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 47.862,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 49.938,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 52.01,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 54.074,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 56.168,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        }
+      ],
+      "background_cpu_peak": 0.0,
+      "timing_environment": "recorded desktop load; GPU not isolated",
+      "details": [
+        "expert cache: 3089 slots (54.3 GiB) to start, up to 2064 mapped for the GPU, 65.7 GiB free and 0.0 GiB of file cache beyond the kernel's share, 4.0 GiB kept for other programs, GPU resident memory 0.6 GiB (51.9 GiB below the GPU's limit), GPU working set 107.5 GiB",
+        "cache:   3089 slots, 56.0 GiB, 37624 evictions; available memory 11.3 GiB, footprint 65.1 GiB, GPU resident memory (all processes) 54.8 GiB; 0 pages swapped out and 0 compressed by the system meanwhile, this process's memory compressed at most 0 MiB",
+        "decode reads per token: 38.8 on demand, 60.5 ahead (32.4 used, 27.3 of them late), 15.1 cancelled; 0.0 experts substituted, 69.0 mapped for the GPU again",
+        "decode per token (ms): rows 0.2, waits 29.0, loads 89.0, prefetch 1.7, encode 0.2, adapt 0.6, drafting 5.8; GPU idle between command buffers 83.3 (22.0 gaps over 100 us); 0.0 layers' experts recomputed"
+      ],
+      "error": null
+    },
+    {
+      "date_utc": "2026-11-04T00:33:11.000309+00:00",
+      "role": "coupled5",
+      "settings": {
+        "configuration": "coupled5",
+        "draft": 5,
+        "draft_cache": 32,
+        "draft_trim": true,
+        "prompt_tokens": 8187,
+        "prompt_sha256": "b9966d292e8dec88f0521be16013f5ae2ee475a2bba38e6849ac4f0481fd806f",
+        "context": 32768,
+        "cache_gib": 56,
+        "reserve_gib": 4,
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 12345,
+        "think": 75,
+        "lookup": 0,
+        "expert_batch": true,
+        "substitute": false,
+        "online_predictor": false,
+        "control_binary_sha256": "b30ce17a5875b2cf71b4e1b6619e49502fd6796102495c9c90a3cf8cd9d04fe7",
+        "candidate_binary_sha256": "b30ce17a5875b2cf71b4e1b6619e49502fd6796102495c9c90a3cf8cd9d04fe7",
+        "checkpoint_id": "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+      },
+      "valid": true,
+      "exit": 0,
+      "wall_seconds": 59.082,
+      "correctness_valid": true,
+      "timing_valid": true,
+      "timing_exclusion": null,
+      "output_sha256": "dee494eb10ec7878851293d06f8ca6783b004406ec5484cfe9be0ec93a5da20b",
+      "output_matches_control": true,
+      "output_shape": {
+        "bytes": 1217,
+        "think_close_seen": false,
+        "bytes_before_think_close": null,
+        "bytes_after_think_close": null
+      },
+      "copy_exact": null,
+      "metrics": {
+        "decode_experts": {
+          "computed_rows": 596,
+          "selected": 143040,
+          "unique_layer_requests": 86044
+        },
+        "decode_cache": {
+          "bytes_at_start": 60114862080,
+          "min_bytes": 60114862080,
+          "max_bytes": 60114862080,
+          "slots_released": 0
+        },
+        "workspace": {
+          "resizable_after_prefill_bytes": 2600014963,
+          "resizable_after_decode_bytes": 11578758
+        },
+        "prefill": {
+          "tokens": 8187,
+          "seconds": 23.01,
+          "tokens_per_second": 355.76,
+          "existing_slot_hit_percent": 100.0,
+          "logical_read_gb_reported": 289.28,
+          "read_wait_seconds": 4.48,
+          "main_queue_gpu_seconds": 17.49
+        },
+        "decode": {
+          "tokens": 256,
+          "seconds": 34.33,
+          "tokens_per_second": 7.46,
+          "existing_slot_hit_percent": 89.1,
+          "logical_read_gb_reported": 391.95,
+          "read_wait_seconds": 21.19,
+          "main_queue_gpu_seconds": 12.87
+        },
+        "draft": {
+          "passes": 100,
+          "accepted_per_pass_reported": 1.55,
+          "maximum_drafts": 5,
+          "acceptance_is_rounded": true
+        },
+        "cache": {
+          "main_slots_at_end": 3089,
+          "gib_including_draft_at_end": 56.0,
+          "cumulative_evictions": 37250
+        },
+        "cache_initial": {
+          "main_slots": 3089,
+          "main_gib": 54.3
+        },
+        "draft_cache_initial": {
+          "slots_per_stage": 32,
+          "reserved_gib": 1.7,
+          "loading": "on_demand"
+        },
+        "reads_per_emitted_token": {
+          "demand": 37.5,
+          "prefetch_admitted": 60.4,
+          "prefetch_used": 32.2,
+          "prefetch_late": 22.7,
+          "prefetch_cancelled": 14.4
+        }
+      },
+      "grouping": {
+        "scope": "all small backbone batches",
+        "calls": 5100,
+        "row_expert_pairs": 134064,
+        "weight_groups": 84800
+      },
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 0.0,
+            "renderer_percent": 0.0,
+            "gpu_resident_gib": 0.59,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 74,
+            "memory": {
+              "free_gib": 74.74102783203125,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [
+              {
+                "pid": 95479,
+                "name": "MyDS4",
+                "cpu_percent": 0.0,
+                "rss_mib": 97.2,
+                "parent_pid": 1,
+                "parent_name": "launchd",
+                "gpu_client_in_process_tree": true,
+                "idle_app_shell": true
+              }
+            ],
+            "reasons": []
+          },
+          {
+            "device_percent": 5.0,
+            "renderer_percent": 5.0,
+            "gpu_resident_gib": 0.6,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 74,
+            "memory": {
+              "free_gib": 74.7406005859375,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [
+              {
+                "pid": 95479,
+                "name": "MyDS4",
+                "cpu_percent": 0.0,
+                "rss_mib": 97.2,
+                "parent_pid": 1,
+                "parent_name": "launchd",
+                "gpu_client_in_process_tree": true,
+                "idle_app_shell": true
+              }
+            ],
+            "reasons": []
+          },
+          {
+            "device_percent": 5.0,
+            "renderer_percent": 5.0,
+            "gpu_resident_gib": 0.58,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 74,
+            "memory": {
+              "free_gib": 74.74734497070312,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [
+              {
+                "pid": 95479,
+                "name": "MyDS4",
+                "cpu_percent": 0.0,
+                "rss_mib": 97.2,
+                "parent_pid": 1,
+                "parent_name": "launchd",
+                "gpu_client_in_process_tree": true,
+                "idle_app_shell": true
+              }
+            ],
+            "reasons": []
+          }
+        ]
+      },
+      "gpu_activity_during_run": [
+        {
+          "elapsed_seconds": 2.094,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 20.3
+        },
+        {
+          "elapsed_seconds": 12.491,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 54.19
+        },
+        {
+          "elapsed_seconds": 22.892,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 55.37
+        },
+        {
+          "elapsed_seconds": 33.309,
+          "model_gpu_client_visible": true,
+          "device_percent": 46.0,
+          "renderer_percent": 1.0,
+          "gpu_resident_gib": 56.2
+        },
+        {
+          "elapsed_seconds": 43.749,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 54.88
+        },
+        {
+          "elapsed_seconds": 54.152,
+          "model_gpu_client_visible": true,
+          "device_percent": 71.0,
+          "renderer_percent": 7.0,
+          "gpu_resident_gib": 54.27
+        }
+      ],
+      "background_cpu_helpers": [
+        {
+          "elapsed_seconds": 2.072,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 4.175,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 6.248,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 8.322,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 10.398,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 12.469,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 14.568,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 16.641,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 18.716,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 20.796,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 22.87,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 24.964,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 27.043,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 29.121,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 31.206,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 33.286,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 35.389,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 37.475,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 39.55,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 41.637,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 43.72,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 45.834,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 47.913,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 49.988,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 52.061,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 54.129,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 56.223,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 58.292,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        }
+      ],
+      "background_cpu_peak": 0.0,
+      "timing_environment": "recorded desktop load; GPU not isolated",
+      "details": [
+        "expert cache: 3089 slots (54.3 GiB) to start, up to 2064 mapped for the GPU, 65.6 GiB free and 0.0 GiB of file cache beyond the kernel's share, 4.0 GiB kept for other programs, GPU resident memory 0.6 GiB (51.9 GiB below the GPU's limit), GPU working set 107.5 GiB",
+        "cache:   3089 slots, 56.0 GiB, 37250 evictions; available memory 11.3 GiB, footprint 65.1 GiB, GPU resident memory (all processes) 53.6 GiB; 0 pages swapped out and 0 compressed by the system meanwhile, this process's memory compressed at most 0 MiB",
+        "decode reads per token: 37.5 on demand, 60.4 ahead (32.2 used, 22.7 of them late), 14.4 cancelled; 0.0 experts substituted, 50.3 mapped for the GPU again",
+        "decode per token (ms): rows 0.2, waits 38.8, loads 81.3, prefetch 1.7, encode 0.3, adapt 4.1, drafting 6.6; GPU idle between command buffers 79.7 (25.8 gaps over 100 us); 0.0 layers' experts recomputed"
+      ],
+      "error": null
+    },
+    {
+      "date_utc": "2026-11-04T00:34:01.364411+00:00",
+      "role": "plain_repeat",
+      "settings": {
+        "configuration": "plain_repeat",
+        "draft": 0,
+        "draft_cache": 0,
+        "draft_trim": false,
+        "prompt_tokens": 8187,
+        "prompt_sha256": "b9966d292e8dec88f0521be16013f5ae2ee475a2bba38e6849ac4f0481fd806f",
+        "context": 32768,
+        "cache_gib": 56,
+        "reserve_gib": 4,
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 12345,
+        "think": 75,
+        "lookup": 0,
+        "expert_batch": true,
+        "substitute": false,
+        "online_predictor": false,
+        "control_binary_sha256": "2d8cababe423a20267f597742d25e939303962f3a8302314e1a2b03c0c0d72f1",
+        "candidate_binary_sha256": "2d8cababe423a20267f597742d25e939303962f3a8302314e1a2b03c0c0d72f1",
+        "checkpoint_id": "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+      },
+      "valid": true,
+      "exit": 0,
+      "wall_seconds": 46.092,
+      "correctness_valid": true,
+      "timing_valid": true,
+      "timing_exclusion": null,
+      "output_sha256": "dee494eb10ec7878851293d06f8ca6783b004406ec5484cfe9be0ec93a5da20b",
+      "output_matches_control": true,
+      "output_shape": {
+        "bytes": 1217,
+        "think_close_seen": false,
+        "bytes_before_think_close": null,
+        "bytes_after_think_close": null
+      },
+      "copy_exact": null,
+      "metrics": {
+        "decode_experts": {
+          "computed_rows": 256,
+          "selected": 61440,
+          "unique_layer_requests": 61440
+        },
+        "decode_cache": {
+          "bytes_at_start": 60114862080,
+          "min_bytes": 60114862080,
+          "max_bytes": 60114862080,
+          "slots_released": 0
+        },
+        "workspace": {
+          "resizable_after_prefill_bytes": 2600014963,
+          "resizable_after_decode_bytes": 9743750
+        },
+        "prefill": {
+          "tokens": 8187,
+          "seconds": 22.78,
+          "tokens_per_second": 359.44,
+          "existing_slot_hit_percent": 100.0,
+          "logical_read_gb_reported": 289.28,
+          "read_wait_seconds": 7.38,
+          "main_queue_gpu_seconds": 14.39
+        },
+        "decode": {
+          "tokens": 256,
+          "seconds": 21.83,
+          "tokens_per_second": 11.73,
+          "existing_slot_hit_percent": 91.7,
+          "logical_read_gb_reported": 220.79,
+          "read_wait_seconds": 11.97,
+          "main_queue_gpu_seconds": 8.39
+        },
+        "cache": {
+          "main_slots_at_end": 3185,
+          "gib_including_draft_at_end": 56.0,
+          "cumulative_evictions": 25346
+        },
+        "cache_initial": {
+          "main_slots": 3185,
+          "main_gib": 56.0
+        },
+        "reads_per_emitted_token": {
+          "demand": 19.9,
+          "prefetch_admitted": 31.5,
+          "prefetch_used": 16.9,
+          "prefetch_late": 14.9,
+          "prefetch_cancelled": 5.1
+        }
+      },
+      "grouping": {
+        "scope": "all small backbone batches",
+        "calls": 0,
+        "row_expert_pairs": 0,
+        "weight_groups": 0
+      },
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 0.0,
+            "renderer_percent": 0.0,
+            "gpu_resident_gib": 0.58,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 74,
+            "memory": {
+              "free_gib": 74.728759765625,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [
+              {
+                "pid": 95479,
+                "name": "MyDS4",
+                "cpu_percent": 0.0,
+                "rss_mib": 97.2,
+                "parent_pid": 1,
+                "parent_name": "launchd",
+                "gpu_client_in_process_tree": true,
+                "idle_app_shell": true
+              }
+            ],
+            "reasons": []
+          },
+          {
+            "device_percent": 5.0,
+            "renderer_percent": 5.0,
+            "gpu_resident_gib": 0.6,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 74,
+            "memory": {
+              "free_gib": 74.76165771484375,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [
+              {
+                "pid": 95479,
+                "name": "MyDS4",
+                "cpu_percent": 0.0,
+                "rss_mib": 97.2,
+                "parent_pid": 1,
+                "parent_name": "launchd",
+                "gpu_client_in_process_tree": true,
+                "idle_app_shell": true
+              }
+            ],
+            "reasons": []
+          },
+          {
+            "device_percent": 5.0,
+            "renderer_percent": 5.0,
+            "gpu_resident_gib": 0.58,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 74,
+            "memory": {
+              "free_gib": 74.75616455078125,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [
+              {
+                "pid": 95479,
+                "name": "MyDS4",
+                "cpu_percent": 0.0,
+                "rss_mib": 97.2,
+                "parent_pid": 1,
+                "parent_name": "launchd",
+                "gpu_client_in_process_tree": true,
+                "idle_app_shell": true
+              }
+            ],
+            "reasons": []
+          }
+        ]
+      },
+      "gpu_activity_during_run": [
+        {
+          "elapsed_seconds": 2.135,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 17.95
+        },
+        {
+          "elapsed_seconds": 12.574,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 57.93
+        },
+        {
+          "elapsed_seconds": 22.962,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 55.09
+        },
+        {
+          "elapsed_seconds": 33.357,
+          "model_gpu_client_visible": true,
+          "device_percent": 64.0,
+          "renderer_percent": 9.0,
+          "gpu_resident_gib": 53.15
+        },
+        {
+          "elapsed_seconds": 43.728,
+          "model_gpu_client_visible": true,
+          "device_percent": 58.0,
+          "renderer_percent": 2.0,
+          "gpu_resident_gib": 51.2
+        }
+      ],
+      "background_cpu_helpers": [
+        {
+          "elapsed_seconds": 2.111,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 4.264,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 6.337,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 8.413,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 10.48,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 12.552,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 14.652,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 16.725,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 18.803,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 20.869,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 22.94,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 25.033,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 27.102,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 29.176,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 31.258,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 33.334,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 35.426,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 37.492,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 39.566,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 41.638,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 43.705,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        },
+        {
+          "elapsed_seconds": 45.805,
+          "processes": [
+            {
+              "pid": 95479,
+              "name": "MyDS4",
+              "cpu_percent": 0.0,
+              "rss_mib": 97.2,
+              "parent_pid": 1,
+              "parent_name": "launchd",
+              "gpu_client_in_process_tree": true,
+              "idle_app_shell": true
+            }
+          ]
+        }
+      ],
+      "background_cpu_peak": 0.0,
+      "timing_environment": "recorded desktop load; GPU not isolated",
+      "details": [
+        "expert cache: 3185 slots (56.0 GiB) to start, up to 2199 mapped for the GPU, 66.3 GiB free and 0.0 GiB of file cache beyond the kernel's share, 4.0 GiB kept for other programs, GPU resident memory 0.6 GiB (51.9 GiB below the GPU's limit), GPU working set 107.5 GiB",
+        "cache:   3185 slots, 56.0 GiB, 25346 evictions; available memory 11.8 GiB, footprint 64.4 GiB, GPU resident memory (all processes) 50.4 GiB; 0 pages swapped out and 0 compressed by the system meanwhile, this process's memory compressed at most 0 MiB",
+        "decode reads per token: 19.9 on demand, 31.5 ahead (16.9 used, 14.9 of them late), 5.1 cancelled; 0.0 experts substituted, 56.6 mapped for the GPU again",
+        "decode per token (ms): rows 0.2, waits 34.9, loads 46.8, prefetch 1.3, encode 0.3, adapt 0.5, drafting 0.0; GPU idle between command buffers 51.6 (34.1 gaps over 100 us); 0.0 layers' experts recomputed"
+      ],
+      "error": null
+    }
+  ]
+}

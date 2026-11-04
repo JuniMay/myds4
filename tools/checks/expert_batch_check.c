@@ -1,6 +1,7 @@
 // Exact expert-row checks and bounded GPU timings; synthetic weights, no SSD reads.
 #include "myds4.h"
 #include "expert_batch.h"
+#include "../reference/activation_format.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,7 +51,7 @@ static void sum(int m) {
   for (int r = 0; r < m; r++) {
     gpu_kern(combine);
     gpu_buf(0, &parts, r * K * 8 * 4), gpu_buf(1, &shared, r * K * 4), gpu_buf(2, &mix, r * 24 * 4);
-    gpu_buf(3, &res, r * 4 * K * 4), gpu_buf(4, &out, r * 4 * K * 4), gpu_bytes(5, &n, 4);
+    gpu_buf(3, &res, r * 4 * K * STREAM_BYTES), gpu_buf(4, &out, r * 4 * K * STREAM_BYTES), gpu_bytes(5, &n, 4);
     gpu_go(K / 256, 1, 1, 256, 1, 1);
   }
 }
@@ -64,7 +65,7 @@ static void scalar(int m, int separated) {
     gpu_kern(down);
     gpu_buf(0, &refs, r * N * sizeof(Ref)), gpu_buf(1, &h, r * N * H * 4);
     gpu_buf(2, &shared, r * K * 4), gpu_buf(3, &mix, r * 24 * 4);
-    gpu_buf(4, &res, r * 4 * K * 4), gpu_buf(5, &out, r * 4 * K * 4);
+    gpu_buf(4, &res, r * 4 * K * STREAM_BYTES), gpu_buf(5, &out, r * 4 * K * STREAM_BYTES);
     gpu_bytes(6, &n, 4), gpu_bytes(7, &pm, 4), gpu_buf(8, &parts, r * K * 8 * 4);
     gpu_go(K / (code_bytes ? 8 : 4), 1, 1, N * 32 * (code_bytes ? 2 : 1), 1, 1);
   }
@@ -169,14 +170,14 @@ int main(int argc, char **argv) {
   groups = gpu_alloc(2 * UNIQUE * sizeof(ExpertRows));
   x = gpu_alloc(ROWS * K * 4), h = gpu_alloc(ROWS * N * H * 4);
   shared = gpu_alloc(ROWS * K * 4), mix = gpu_alloc(ROWS * 24 * 4);
-  res = gpu_alloc(ROWS * 4 * K * 4), out = gpu_alloc(ROWS * 4 * K * 4), parts = gpu_alloc(ROWS * K * 8 * 4);
+  res = gpu_alloc(ROWS * 4 * K * STREAM_BYTES), out = gpu_alloc(ROWS * 4 * K * STREAM_BYTES), parts = gpu_alloc(ROWS * K * 8 * 4);
   for (int r = 0; r < ROWS; r++)
     for (int i = 0; i < K; i++) {
       const float scale[ROWS] = {.125f, 0x1p-16f, 4, 0, 0x1p-30f, 64};
       ((float *)x.ptr)[r * K + i] = ((int)(random_bits() % 257) - 128) * scale[r];
       ((float *)shared.ptr)[r * K + i] = ((int)(random_bits() % 257) - 128) / 256.0f;
       for (int j = 0; j < 4; j++)
-        ((float *)res.ptr)[(r * 4 + j) * K + i] = ((int)(random_bits() % 257) - 128) / 256.0f;
+        ((uint16_t *)res.ptr)[(r * 4 + j) * K + i] = ref_bf16(((int)(random_bits() % 257) - 128) / 256.0f);
     }
   for (int i = 0; i < ROWS * 24; i++) ((float *)mix.ptr)[i] = (random_bits() % 65) / 64.0f;
   float *want = xmalloc(out.size), *want_h = xmalloc(h.size), *want_parts = xmalloc(parts.size);
@@ -186,16 +187,16 @@ int main(int argc, char **argv) {
     for (int m = 1; m <= ROWS; m++) {
       setup(m, pattern);
       run(m, 0, 1);
-      memcpy(want, out.ptr, m * 4 * K * 4);
+      memcpy(want, out.ptr, m * 4 * K * STREAM_BYTES);
       run(m, 1, 1);
-      compare("scalar parts expansion", want, out.ptr, m * 4 * K, 1, 1);
+      compare("scalar parts expansion", want, out.ptr, m * K * STREAM_BYTES, 1, 1);
       memcpy(want_h, h.ptr, m * N * H * 4), memcpy(want_parts, parts.ptr, m * K * 8 * 4);
       for (int mode = 2; mode <= 4; mode++) {
         memset(h.ptr, 0xcd, h.size), memset(parts.ptr, 0xcd, parts.size), memset(out.ptr, 0xcd, out.size);
         run(m, mode, 1);
         compare("grouped up", want_h, h.ptr, m * N * H, 1, 1);
         compare("grouped down", want_parts, parts.ptr, m * K * 8, 8, N);
-        compare("grouped expansion", want, out.ptr, m * 4 * K, 1, 1);
+        compare("grouped expansion", want, out.ptr, m * K * STREAM_BYTES, 1, 1);
       }
       if (check_only) continue;
       double times[3][3];

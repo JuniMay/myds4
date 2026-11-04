@@ -96,12 +96,15 @@ it keeps reading the connection meanwhile; reads have no deadline then.
 ## The C ABI
 
 [`src/engine/engine.h`](../src/engine/engine.h) is the whole interface. Its
-parts:
+version is `MYDS4_ABI = 5`. Callers must use the matching `myds4_config`
+layout, including the `lookup`, `expert_batch` and `prefill_prune` fields
+before the log callbacks, and rebuild with the engine. Its parts:
 
 - **Start and stop.** `myds4_start(config)` takes the model and engine
   options (`myds4_config`: the checkpoint, `--experts`, `--ctx`, the cache
   settings, `--substitute`, `--gpu-route`, the draft settings, the online
-  predictor, `--ced`, `--kv-cache` and `--batch`) and two hooks: `on_log`,
+  predictor, `--ced`, `--prefill-prune`, `--lookup`, `--expert-batch`,
+  `--kv-cache` and `--batch`) and two hooks: `on_log`,
   which receives the log's lines instead of stderr (the live view's pane),
   and `on_die`, which runs before a fatal error's message (the live view
   gives the terminal back). It waits for the model lock (`myds4.lock` beside
@@ -161,20 +164,39 @@ queue order can differ. The two identifiers in the log expose that timing.
 
 `--ced off|N` controls approximate decoder replay in the server and the
 CLI. `off` is the default. N is 128 to 1,048,576; the engine retains N plus
-five rewind rows. Shorter inputs run full prefill. CED preserves full-context
+`max(5, lookup_depth)` rewind rows. Shorter inputs run full prefill. CED preserves full-context
 encoder/global KV work and changes the later decoder's local state, so it
 can change generated output. It does not shorten decoding's layer stack.
 An encoder-only system-prefix snapshot can be forked only if the new suffix
-exceeds N plus five rows and rebuilds the decoder window. The engine chooses
+exceeds N plus that rewind margin and rebuilds the decoder window. The engine chooses
 a complete cached state or cold prefill otherwise. `myds4_config.ced` is 0
 for off.
+
+`--prefill-prune` enables dependency-preserving decoder prefill, off by
+default. All encoder/global KV work remains complete. The later layers
+retain enough history for the final state and any saved system prefix,
+then skip batches outside those dependencies. CED, substitution and
+full-row diagnostics disable this plan. Short prompts may have nothing
+to skip. It can improve prefill while changing the cache left for decoding;
+the measured long MXFP4 request finished sooner but decoded more slowly.
+
+`--lookup off|N` enables CPU context-copy proposals with a maximum of one
+to fifteen tokens. The target model verifies every proposal using the
+request's sampler. With one active request, lookup supplies eligible copied
+continuations before `--draft` supplies any DSpark fallback. Without
+`--draft`, the server does not load DSpark weights. With multiple active
+requests, each request uses ordinary one-token decoding and retains its
+own lookup history. `--expert-batch` lets verification rows share repeated
+expert weight loads. Both options are off by default.
 
 Arrival logs carry an HTTP identifier, body size, and message/tool counts.
 Queue logs show waiting requests and how many the scheduler admits for
 prefill. Each completed prefill reports its chunks, encoder/decoder tokens,
 CED application and saved prefix. These are counts, without conversation
-text or API keys. `GET /v1/status` includes configured `ced_depth` and the
-`last_prefill` plan. A separate title request therefore has its own arrival
+text or API keys. `GET /v1/status` includes configured `ced_depth`,
+`lookup_depth`, `expert_batch`, `prefill_prune` and the `last_prefill` plan.
+`last_prefill.prune_applied` reports whether that pass actually skipped
+decoder work. A separate title request therefore has its own arrival
 and prefill records rather than appearing as a chunk of the main request.
 
 ## Requests
@@ -187,7 +209,11 @@ system-prefix forks, identical seeded replies on retry, zero recomputation
 for that retry, and image embedding through the default vision path. They
 do not score answer quality. Run `tools/checks/server_prefill_check.py` with
 `--checkpoint CHECKPOINT`, `--binary EXECUTABLE`, `--ced off|128|512`, and
-optional `--experts GGUF`, `--draft` and `--image`; it checks GPU ownership,
+optional `--experts GGUF`, `--draft`, `--lookup N`, `--expert-batch`, `--prefill-prune`,
+`--batch N` and `--image`. Add `--long-prefill --prefill-prune` to require
+that a prompt actually exercises dependency pruning. This longer server
+case is provided for integration testing; it has not yet been run.
+The tool checks GPU ownership,
 bounds runtime and retains requests, replies and logs only in memory.
 
 CPU regressions in `tools/checks/prefill_schedule_check.c` cover one forward

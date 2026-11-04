@@ -2039,10 +2039,291 @@ paths do not support a hypothesis that lower worker priority or synchronous
 socket writes explain the CLI's read-bound result. Server throughput was
 not measured in this check.
 
+## CPU workspace, prefix and candidate checks
+
+The 2026-11-03 checks use host-backed buffer fixtures and load no model or
+Metal device. With a 4,096-token context, draft staging and GPU routing, the
+64-row request and layer workspaces occupy 67,372,480 logical bytes. A small
+decoding pass reduces them to 10,971,526 bytes. These are fixture allocation
+sizes, not process RSS. All 21 checks of growth, shrinkage, synchronization,
+matrix-staging capacity, buffer guards and cache-clock preservation pass.
+Workspace maintenance resizes the cache without advancing its usage clock.
+
+A prefix-fork fixture has one ratio-2 global KV/index source with
+20,972,800 allocated bytes. A 33-token prefix requires copying 21,760 of
+those bytes, including guard rows. The destination uses capacity for the
+prefix and restores its local state from the saved prefix snapshot. All
+78 checks pass across odd/even lengths, both compression ratios and draft
+state. A real MXFP4 check at a 128-token prefix of a 257-token prompt also
+has identical resumed logits and unchanged source state.
+
+The activation-format reference passes 21 CPU checks, including finite
+BF16/E4M3 code values, rounding boundaries and scales. It confirms that
+BF16 retains the small E4M3-scaled value `2^-26`, while FP16 does not. The
+MXFP4 staging scales by 128 before its FP16 storage and inversely scales
+matrix products before BF16 rounding. On a synthetic all-one expert, the
+old path lost 25,344 small activation values; the corrected path matches
+the scalar reference on those values, ordinary values and the down product.
+An additional GPU check covers positive and negative `2^-31` inputs,
+including half subnormals after staging. The gather and down products have
+no differing values in that check.
+
+The experimental context-copy index passes 33 CPU checks, including
+agreement with a direct history scan over 32,768 prefixes. The shared
+sampler passes 21 CPU checks with up to 15 proposals, including every
+rejection point and random-state preservation. Real-model checks compare
+all sixteen target-verification rows and rollback after keeping 1, 2, 6,
+15 or 16 rows. MXFP4 and IQ2 pass with no differing logits. MXFP4 also
+passes with DSpark, online prefetching and GPU routing together, and at a
+16,521-token context. These are correctness checks, not timing results.
+
+### Resizable workspace memory
+
+On a reconstructed 13,772-token Harness request, with 256 emitted tokens,
+a fixed 48 GiB expert cache, 4 GiB reserve, temperature/top-p 1 and seed
+12345, the final process footprint falls from 58.4 GiB to 56.4 GiB. The
+candidate reports 2,914,433,708 bytes of resizable workspace after prefill
+and 9,743,750 after decoding. The old build already released request-row
+buffers; the additional reduction comes from layer scratch buffers.
+
+Decode takes 26.31 seconds, within the two controls' 26.27–26.56 seconds.
+All output bytes match. This establishes a memory reduction without a
+demonstrated throughput improvement on this request. Prefill timings vary
+with recorded desktop activity and do not establish a prefill speedup.
+[Measurements](../data/benchmarks/layer_workspace_results.json) retain the
+exact settings and environmental samples.
+
+### Dependency-pruned prefill checks
+
+The experimental dependency plan passes 109,440 small causal-graph cases,
+including 83,132 that skip work while retaining final and saved-prefix
+state. The model checks preserve every encoder/global-KV producer and
+skip only later decoder batches outside the required windows.
+
+On an 8,192-token synthetic prompt with a 1,024-token prefix checkpoint,
+6,144 decoder positions are computed. On a 16,521-token prompt with an
+8,192-token prefix checkpoint, 8,329 decoder positions are computed.
+MXFP4 and IQ2 checks report zero differing bytes in logits, stored state,
+prefix state, global KV/index arrays, eight continuation positions and
+resumed logits; DSpark's next drafts also match. These are correctness
+checks, not throughput measurements. [Records](../data/benchmarks/prefill_prune_results.json)
+distinguish the tested plans and configurations.
+
+The real 13,772-token DSH prompt also passes in both formats. Its saved
+prefix is at token 12,453, and the pruned path computes 5,580 decoder
+positions. Logits, stored global/local state, the prefix snapshot, eight
+continuation positions and prefix-resume results match byte-for-byte.
+
+Fresh-process timings on that prompt use a fixed 56 GiB cache, a 4 GiB
+reserve, temperature/top-p 1, seed 12345 and 256 output tokens. Both arms
+save the same prefix checkpoint. CED, substitution, DSpark and online
+prediction are off; expert sharing is enabled in both.
+
+| Experts | Full-prefill controls | Pruned prefill | Prefill throughput change |
+| --- | ---: | ---: | ---: |
+| MXFP4 | 24.20, 24.76 s | 23.41 s | +4.6% versus mean control |
+| IQ2 | 23.57, 23.91 s | 19.37 s | +22.6% versus mean control |
+
+All generated output matches within each format. Read bytes are unchanged
+on this single-chunk prompt: 289.28 GB for MXFP4 and 157.64 GB for IQ2.
+GPU time falls, but the unchanged reads limit MXFP4's wall-clock gain.
+These are prefill improvements; decode throughput does not improve in this
+comparison. [Timing records](../data/benchmarks/prefill_prune_speed_results.json)
+retain both phases and the environment samples.
+
+The long MXFP4 comparison uses the 107,934-token DSH request, an 8,192-token
+output and the same 56 GiB cache. Every arm saves the 12,453-token prefix.
+All output bytes match the existing 8K reference. CED and substitution are off.
+
+| Configuration | Prefill seconds | Decode seconds | Decode tokens/s |
+| --- | ---: | ---: | ---: |
+| Full prefill, plain decode | 251.60 | 675.36 | 12.13 |
+| Pruned prefill, plain decode | 138.73 | 705.91 | 11.60 |
+| Pruned prefill, consensus copy | 149.86 | 731.87 | 11.19 |
+| Pruned prefill, consensus copy with repeated-row priority | 151.90 | 719.02 | 11.39 |
+
+Pruned prefill computes 9,630 decoder positions and reduces prefill reads
+from 1,751.84 to about 1,131.5 GB. Its plain-decode arm finishes prefill
+1.81 times as fast and prefill plus decode about 9% sooner. Decode itself
+is slower in this comparison: GPU time and read bytes stay close, but
+waiting for reads increases. These runs do not establish a decode-speed
+gain or explain all of the waiting-time difference. They remain subject to
+follow-up cache-policy checks. The entire generated segment stays within
+the model's thinking section.
+[Long comparison](../data/benchmarks/long_optimization_results.json)
+contains the individual results and resource samples.
+
+The dependency-preserving plan is available as `--prefill-prune`, off by
+default in both executables. The timings above precede the cache-clock
+maintenance correction described in the workspace checks. A later
+512-output-token cache-priority experiment completed only its pruned-prefill
+control (138.82 s prefill, 10.88 decode tokens/s). Background CPU activity
+stopped the candidate, so this does not establish a cache-policy speedup.
+The decode-only priority policy remains confined to experimental builds.
+[Incomplete comparison](../data/benchmarks/prefill_priority_results.json)
+contains only the completed control.
+
+### Activation representation
+
+The isolated BF16 residual-storage comparison uses an 8,175-token review
+prompt, 256 output tokens, two DSpark drafts and a fixed 56 GiB cache.
+The uncontended pair measures 9.60 versus 9.62 tokens/s with identical
+output. A closing control overlapped a large Rust build and is excluded
+from speed comparisons. The result does not establish a throughput gain.
+[Measurements](../data/benchmarks/bf16_stream_results.json) distinguish
+numerical validity from timing validity.
+
+A separate GPU prototype reads E4M3 activation codes and their E8M0 scales
+directly in an MXFP4 expansion kernel. It preserves all tested output
+values while reducing input storage from 20,480 to 5,280 bytes per row.
+With alternating timing order, expanded/packed times are 0.146656/0.148849
+ms for one row, 0.440227/0.446740 ms for three, and 0.879669/0.891102 ms
+for six. Packing costs are excluded, and the packed reader is already
+1.3–1.5% slower in this fixture. The prototype is not used by inference.
+[Numerical and kernel records](../data/benchmarks/activation_storage_results.json)
+also record the supported operand checks and the staging correction.
+
+### Context-copy drafting
+
+The 2026-11-03 comparisons use DeepSeek-V4.1-Flash-1017
+(`deepseek-ai/DeepSeek-V4.1-Flash-1017`). The IQ2 comparison replaces the
+experts and output head with the `UD-IQ2_XXS` files from
+`unsloth/DeepSeek-V4.1-Flash-1017-GGUF`. Temperature and top-p are both 1,
+with seed 12345. CED, substitution, DSpark and the online predictor are off.
+The model timings below use the initial two-token lookup index. The later
+twelve-/four-token index has separate CPU replay results below.
+Both arms enable `--expert-batch`; the candidate adds `--lookup 15`.
+Native read-ahead remains enabled. Each process starts fresh, keeps a fixed
+expert cache, and runs serially. Recorded desktop activity is allowed;
+competing model jobs and substantial background builds invalidate timings.
+
+The copy-heavy fixture asks the model to reproduce 48 command lines from
+an 8,185-token prompt. Those commands are text and are never executed.
+Every completed answer reproduces all 48 lines exactly. Within each
+quantization, generated output also matches byte-for-byte across settings.
+The two formats generate different amounts of reasoning, so their token
+counts differ. These results measure drafting on repeated text, not a full
+agent task or relative model quality.
+
+| Experts; 48 GiB cache | Emitted tokens | Control tokens/s, before and after | Lookup tokens/s | Accepted / offered drafts |
+| --- | ---: | ---: | ---: | ---: |
+| Native MXFP4 | 837 | 15.82, 15.89 | 21.40 | 665 / 705 (94.3%) |
+| IQ2 | 767 | 27.12, 24.21 | 46.33 | 662 / 690 (95.9%) |
+
+MXFP4's candidate takes 39.10 seconds versus 52.90 and 52.66 seconds:
+about 35% higher throughput. Its main-queue GPU time falls from
+27.61–27.67 to 14.32 seconds, and requested expert reads from
+549.94–551.29 to 474.72 GB. Read waiting rises from 22.62–22.68 to
+26.79 seconds; fewer passes and less GPU work still reduce total time.
+The IQ2 candidate takes 16.56 seconds versus 28.28 and 31.69 seconds,
+or 1.71–1.91 times the control throughput. It requests 178.10 GB of
+expert reads versus 202.91–211.06 GB. These byte counts are engine read
+accounting, not independent physical SSD counters.
+[MXFP4 records](../data/benchmarks/context_lookup_mxfp4_results.json) and
+[IQ2 records](../data/benchmarks/context_lookup_iq2_results.json) include
+cache stability, binary identity and environmental observations.
+
+A separate reconstructed DeepSeek Harness request has 13,772 input tokens.
+Its first 256 output tokens give little opportunity to copy. With a fixed
+52 GiB cache, MXFP4 controls reach 10.19 and 10.01 tokens/s; lookup depth
+15 reaches 9.78 tokens/s and accepts 15 of 30 proposed tokens in two
+passes. Output is identical, but throughput is about 3% lower than the
+mean control. An exploratory depth-three run reaches 9.97 tokens/s and
+accepts 12 of 18 proposals. Neither establishes a gain on that continuation.
+[Harness records](../data/benchmarks/context_lookup_harness_results.json)
+identify the reconstructed request and comparison scope. No recorded tool
+call is executed during replay. Context-copy drafting remains opt-in.
+
+With an 8,192-token output limit, that same request ends naturally at 308
+tokens. At a fixed 56 GiB cache, its controls reach 10.73 and 10.72
+tokens/s, while lookup reaches 9.91 and accepts 21 of 60 proposals.
+All output bytes match. This measures the full short reply, not 8,192
+emitted tokens. [Full-reply records](../data/benchmarks/context_lookup_harness_full_reply_results.json)
+retain that distinction.
+
+The longer DSH comparison uses a later request from the same session,
+reconstructed as 107,934 input tokens with an 8,192-token output limit and
+a fixed 56 GiB expert cache. All three MXFP4 runs emit exactly 8,192 tokens,
+and all output bytes match. The controls take 680.76 and 680.27 seconds
+to decode (12.03 and 12.04 tokens/s). Context copy takes 695.18 seconds
+(11.78 tokens/s), about 2.1% lower throughput than the mean control.
+It accepts 127 of 435 proposals across 29 verification passes. Only
+1.6% of emitted tokens come from accepted copies; rejected proposals add
+308 computed rows. Requested expert reads rise from 6,652.84–6,660.63 GB
+to 6,922.74 GB, and read waiting rises from 351.38–353.87 to 368.79 seconds.
+Main-queue GPU time is similar: 289.81–291.89 seconds for the controls,
+291.62 for lookup. This is a measured slowdown on one long DSH continuation,
+not evidence of a general gain on agentic work.
+
+Prefill varies from 263.15 to 295.51 seconds across these runs. The model
+still performs full prefill with CED off; these timings do not establish
+an effect of lookup on prefill speed. [Long DSH records](../data/benchmarks/context_lookup_harness_long_results.json)
+retain the separate timings, settings and resource observations.
+
+At 54 GiB cache, the IQ2 comparison on that same 107,934-token request
+emits 8,192 tokens in each arm. Plain decoding takes 383.51 seconds
+(21.36 tokens/s); context copy takes 388.38 seconds (21.09 tokens/s).
+Both outputs match byte-for-byte. Lookup accepts 158 of 540 proposed
+tokens and increases requested reads from 2,467.49 to 2,572.92 GB.
+This one pair establishes no speedup. A 56 GiB attempt did not start
+because it failed the free-memory check; both measured arms use 54 GiB.
+[IQ2 long-request records](../data/benchmarks/context_lookup_harness_long_iq2_results.json)
+include separate prefill timings and the memory checks.
+
+### Lookup index replay
+
+The twelve-/four-token index passes two additional CPU cases in which
+frequent short endings hide a sixteen-token match from a bounded two-token
+search. On recorded DSH reasoning, however, it mostly reduces search work.
+For a retokenized 8,190-token continuation it examines 13,649 candidates
+instead of 137,914, while both versions accept 324 of 1,185 proposals.
+On another 8,192-token continuation it accepts 657 instead of 632 tokens,
+but offers 2,085 instead of 1,995. These are offline comparisons with
+recorded tokens, not live sampling or throughput measurements.
+[Replay records](../data/benchmarks/context_lookup_replay_results.json)
+retain the prompt lengths, token digests and per-case counters.
+
+A research fallback proposes up to four tokens when at least two prior
+four-token matches support the whole continuation and support remains at
+least 80% of the original matching set. On the same 8,190-token recorded
+continuation, it accepts 1,191 of 2,087 proposals, compared with 324 of
+1,185 for the longer index alone. Its computed-row proxy is 9,086 versus
+9,051. This is an offline matching result, not a throughput estimate.
+`build/myds4-consensus-lookup` enables this fallback for model experiments;
+the ordinary build does not use it.
+
+The short real-model admission experiment keeps the revised consensus
+policy fixed and limits new prefetches to its first verification row,
+while retaining forecasts from all rows. It measures 10.35 tokens/s
+against controls of 10.39 and 10.34: no demonstrated gain. The separate
+repeated-row cache-priority experiment measures 10.45 against 10.41 and
+10.35, a difference below 1% in a short run. Both preserve output; neither
+establishes a general throughput improvement. See the
+[admission records](../data/benchmarks/verification_prefetch_results.json)
+and [priority records](../data/benchmarks/verification_row_credit_results.json).
+
+### Overlapping expert reads and computation
+
+A separate probe reads six native MXFP4 experts with synthetic activations.
+The same six experts serve every row and are all absent initially. It
+compares reading all bytes before GPU execution with reading the gate/up
+matrices and scales first, starting their computation, and reading the
+down matrix concurrently. Alignment pages are partitioned so a late CPU
+read never writes bytes that the GPU's gate/up kernels access.
+
+All intermediate and final output comparisons pass. Median full/phased
+times are 9.158/8.986 ms for one row, 9.324/9.001 ms for three rows and
+9.632/9.165 ms for six rows. The first sample per size is excluded from
+these medians. This favorable isolated case is not a model-throughput
+measurement, and the engine does not yet use phased reads.
+[Probe records](../data/benchmarks/expert_stream_results.json) contain all
+paired samples and the unchanged byte counts.
+
 ## Experimental expert-row sharing
 
-The retained build is `build/myds4-expert-batch`; the normal executable does
-not enable this path. On the 8,171-token repository-review request, with
+The normal CLI and server enable this path with `--expert-batch`; it is off
+by default. The diagnostic build `build/myds4-expert-batch` enables it
+automatically. On the 8,171-token repository-review request, with
 1,024 emitted tokens, two DSpark drafts, a fixed 20 GiB cache, a 4 GiB
 reserve, temperature/top-p 1 and seed 12345, MXFP4 controls took 187.36 and
 188.68 seconds. The shared-expert run took 186.25 seconds, about 0.9% less
@@ -2056,6 +2337,71 @@ The kernel fixtures and all-row model checks are recorded in
 They distinguish synthetic kernel timings, real-model logit checks and
 emitted-token timing. See [Design](design.md#experimental-sharing-across-expert-rows)
 for supported formats, fallback behavior and resource limits.
+
+A later runtime comparison uses an 8,187-token repository-review prompt,
+256 generated tokens, a 56 GiB cache, two DSpark drafts, 32 draft slots
+per stage and final-stage trimming. The controls reach 10.19 and 10.00
+tokens/s; `--expert-batch` reaches 10.25. GPU time falls from 9.16–9.72
+to 8.12 seconds, while read waiting remains 16.28–16.63 seconds. All
+outputs match. This short comparison confirms less GPU work, with only
+a small difference in overall throughput.
+[Runtime records](../data/benchmarks/shared_expert_runtime_results.json)
+retain the paired settings and environmental observations.
+
+### Shared-uniform DSpark experiment
+
+`build/myds4-coupled-draft` samples draft logits with a copy of the target
+sampler's state, instead of choosing each draft's largest logit. The main
+sampler is left untouched. Verification still draws each target token from
+its original random stream and stops at the first mismatch, so the draft
+changes neither those draws nor the committed prefix.
+
+On the same short review request, with expert sharing in both arms, this
+raises accepted drafts per pass from 0.99 to 1.07. Throughput is 10.28
+tokens/s versus controls of 10.26 and 9.98. All 256 output tokens match.
+The test establishes no material throughput gain, and the ordinary CLI
+and server retain greedy DSpark proposals. This experiment adds CPU
+sampling and a synchronization per draft position.
+[Experiment records](../data/benchmarks/coupled_draft_results.json) retain
+the measurements. `build/draft-distribution-probe` measures first-draft
+probability overlap separately; its output is not a throughput result.
+
+On the same review prompt, the probability probe measures a mean 0.625
+target probability for the greedy first draft. A shared-uniform sampler
+would agree on that first token with mean probability 0.687 at draft
+temperature 1; the maximum coupling overlap is 0.766. Draft temperature
+0.75 changes shared-uniform overlap only to 0.691. These are first-token
+statistics on contexts reached with greedy drafting, not estimates of
+multi-token acceptance or model speed. [Probability records](../data/benchmarks/draft_distribution_results.json)
+contain the temperature sweep.
+
+### Staged DSpark verification
+
+The experimental staged builds generate five drafts but initially verify
+only two. If the full prefix matches and the target's next sampled token
+also matches the next held draft, they reuse the remaining guesses in a
+later verification pass. A mismatch discards the remaining guesses. The
+target sampler and committed tokens stay unchanged. The queue bookkeeping
+passes 11 CPU checks, and the sampled model outputs match the plain control.
+
+On the 8,187-token review request, with 256 output tokens and a 56 GiB total
+expert cache, the configuration screen gives:
+
+| Configuration | Decode tokens/s | Computed target rows | Requested read GB |
+| --- | ---: | ---: | ---: |
+| Plain controls | 11.73–11.81 | 256 | 220.30–220.79 |
+| Five greedy drafts, one verification pass | 7.84 | 646 | 392.12 |
+| Five shared-uniform drafts, one verification pass | 7.46 | 596 | 391.95 |
+| Five greedy drafts, two-draft verification chunks | 10.17 | 390 | 287.56 |
+| Five shared-uniform drafts, two-draft verification chunks | 10.15 | 373 | 285.71 |
+
+Staging reduces wasted verification, but both staged variants remain slower
+than plain decoding on this request. The staged comparison's own plain
+controls reach 11.60 and 11.81 tokens/s. These are short configuration
+screens, not general performance guarantees. All use temperature/top-p 1,
+seed 12345, expert sharing, and 32 draft slots per stage when drafting.
+See the [depth screen](../data/benchmarks/draft_depth_current_results.json)
+and [staged screen](../data/benchmarks/staged_draft_results.json).
 
 ## Decoder replay numerical comparison
 

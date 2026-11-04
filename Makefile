@@ -3,8 +3,8 @@ CC = clang
 CFLAGS = -std=c23 -O2 -Wall -Wextra -Wno-unused-parameter -Isrc/engine $(shell pkg-config --cflags yyjson libjpeg)
 LDLIBS = -framework Metal -framework Foundation -framework IOKit -framework ImageIO -framework CoreGraphics -framework Accelerate -lobjc \
          $(shell pkg-config --libs yyjson libjpeg)
-SRC = src/cli/main.c src/engine/model.c src/engine/io.c src/engine/gpu.c src/engine/tok.c src/engine/util.c src/engine/vision.c src/experimental/online_predictor.c src/engine/sample.c
-MODEL_HEADERS = src/engine/myds4.h src/experimental/online_predictor_math.h src/engine/expert_batch.h
+SRC = src/cli/main.c src/engine/model.c src/engine/io.c src/engine/gpu.c src/engine/tok.c src/engine/util.c src/engine/vision.c src/experimental/online_predictor.c src/experimental/context_lookup.c src/engine/sample.c
+MODEL_HEADERS = src/engine/myds4.h src/experimental/online_predictor_math.h src/experimental/context_lookup.h src/engine/expert_batch.h src/experimental/prefill_prune.h
 KERNELS = src/kernels/kernels.metal src/kernels/gguf_grids.metal src/kernels/gguf.metal src/kernels/vision.metal
 
 build/activation-format-check: tools/checks/activation_format_check.c tools/reference/activation_format.h
@@ -18,6 +18,74 @@ build/mxfp4-activation-check: tools/checks/mxfp4_activation_check.c tools/refere
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/mxfp4_activation_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
 
+build/packed-activation-check: tools/checks/packed_activation_check.c tools/checks/packed_activation.metal tools/reference/activation_format.h src/engine/gpu.c src/engine/util.c src/engine/myds4.h $(KERNELS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/packed_activation_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
+
+build/context-lookup-check: tools/checks/context_lookup_check.c src/experimental/context_lookup.c src/experimental/context_lookup.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/context_lookup_check.c src/experimental/context_lookup.c
+
+context-lookup-check: build/context-lookup-check
+	./build/context-lookup-check
+
+build/context-lookup-replay: tools/experimental/context_lookup_replay.c src/experimental/context_lookup.c src/experimental/context_lookup.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/experimental/context_lookup_replay.c src/experimental/context_lookup.c
+
+build/expert-stream-probe: tools/experimental/expert_stream_probe.c src/engine/io.c src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS) $(KERNELS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/experimental/expert_stream_probe.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
+
+build/draft-distribution-probe: tools/experimental/draft_distribution_probe.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/experimental/draft_distribution_probe.c $(filter-out src/cli/main.c src/engine/model.c,$(SRC)) $(LDLIBS)
+
+build/prefill-prune-check: tools/checks/prefill_prune_check.c src/experimental/prefill_prune.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/prefill_prune_check.c
+
+build/prefill-prune-model-check: tools/checks/prefill_prune_model_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/prefill_prune_model_check.c $(filter-out src/cli/main.c src/engine/model.c,$(SRC)) $(LDLIBS)
+
+build/draft-queue-check: tools/checks/draft_queue_check.c src/experimental/draft_queue.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/draft_queue_check.c
+
+# Host-backed workspace checks; no Metal device or model weights are opened.
+build/workspace-check: tools/checks/workspace_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/workspace_check.c $(filter-out src/cli/main.c src/engine/model.c,$(SRC)) $(LDLIBS)
+
+workspace-check: build/workspace-check
+	./build/workspace-check
+
+build/state-fork-check: tools/checks/state_fork_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/state_fork_check.c $(filter-out src/cli/main.c src/engine/model.c,$(SRC)) $(LDLIBS)
+
+state-fork-check: build/state-fork-check
+	./build/state-fork-check
+
+build/verification-schedule-check: tools/checks/verification_schedule_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/verification_schedule_check.c $(filter-out src/cli/main.c src/engine/model.c,$(SRC)) $(LDLIBS)
+
+build/verification-prefetch-check: tools/checks/verification_prefetch_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/verification_prefetch_check.c $(filter-out src/cli/main.c src/engine/model.c,$(SRC)) $(LDLIBS)
+
+build/prefill-priority-check: tools/checks/prefill_priority_check.c src/engine/io.c src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/prefill_priority_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
+
+verification-schedule-check: build/verification-schedule-check
+	./build/verification-schedule-check
+
+build/verification-model-check: tools/checks/verification_model_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_EXPERT_BATCH -o $@ tools/checks/verification_model_check.c $(filter-out src/cli/main.c,$(SRC)) $(LDLIBS)
 
 # CED numerical and prefill/DSpark timing checks.
 build/ced-check: tools/checks/ced_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
@@ -44,7 +112,7 @@ build/attention-candidate-check: tools/checks/attention_candidate_check.c $(SRC)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/attention_candidate_check.c $(filter-out src/cli/main.c src/engine/model.c,$(SRC)) $(LDLIBS)
 
-build/expert-batch-check: tools/checks/expert_batch_check.c src/engine/gpu.c src/engine/util.c src/engine/myds4.h src/engine/expert_batch.h src/kernels/kernels.metal src/kernels/gguf_grids.metal src/kernels/gguf.metal
+build/expert-batch-check: tools/checks/expert_batch_check.c tools/reference/activation_format.h src/engine/gpu.c src/engine/util.c src/engine/myds4.h src/engine/expert_batch.h src/kernels/kernels.metal src/kernels/gguf_grids.metal src/kernels/gguf.metal
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/expert_batch_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
 
@@ -52,6 +120,55 @@ build/expert-batch-check: tools/checks/expert_batch_check.c src/engine/gpu.c src
 build/myds4-expert-batch: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -DMYDS4_EXPERT_BATCH -o $@ $(SRC) $(LDLIBS)
+
+# Experimental draft sampling with copied target uniforms; ordinary sampling is unchanged.
+build/myds4-coupled-draft: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_COUPLED_DRAFT -o $@ $(SRC) $(LDLIBS)
+
+build/myds4-consensus-lookup: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_CONSENSUS_LOOKUP -o $@ $(SRC) $(LDLIBS)
+
+build/myds4-staged-draft: $(SRC) $(MODEL_HEADERS) src/experimental/draft_queue.h $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_STAGED_DRAFT=2 -o $@ $(SRC) $(LDLIBS)
+
+build/myds4-staged-coupled-draft: $(SRC) $(MODEL_HEADERS) src/experimental/draft_queue.h $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_STAGED_DRAFT=2 -DMYDS4_COUPLED_DRAFT -o $@ $(SRC) $(LDLIBS)
+
+build/myds4-prefill-prune: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_PREFILL_PRUNE -o $@ $(SRC) $(LDLIBS)
+
+build/myds4-prefix-prefill: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_PREFILL_PREFIX -o $@ $(SRC) $(LDLIBS)
+
+build/myds4-prefix-prune: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_PREFILL_PREFIX -DMYDS4_PREFILL_PRUNE -o $@ $(SRC) $(LDLIBS)
+
+build/myds4-prefix-decode-score: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_PREFILL_PREFIX -DMYDS4_DECODE_ONLY_SCORE -o $@ $(SRC) $(LDLIBS)
+
+build/myds4-prune-decode-score: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_PREFILL_PREFIX -DMYDS4_PREFILL_PRUNE -DMYDS4_DECODE_ONLY_SCORE -o $@ $(SRC) $(LDLIBS)
+
+build/myds4-prefix-prune-consensus: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_PREFILL_PREFIX -DMYDS4_PREFILL_PRUNE -DMYDS4_CONSENSUS_LOOKUP -o $@ $(SRC) $(LDLIBS)
+
+build/myds4-consensus-prefetch1: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_PREFILL_PREFIX -DMYDS4_PREFILL_PRUNE -DMYDS4_CONSENSUS_LOOKUP -DMYDS4_VERIFY_PREFETCH_ROWS=1 -o $@ $(SRC) $(LDLIBS)
+
+build/myds4-consensus-row-credit: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_PREFILL_PREFIX -DMYDS4_PREFILL_PRUNE -DMYDS4_CONSENSUS_LOOKUP -DMYDS4_VERIFY_ROW_CREDIT -o $@ $(SRC) $(LDLIBS)
 
 build/expert-batch-model-check: tools/checks/expert_batch_model_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
 	@mkdir -p build
@@ -80,7 +197,7 @@ build/myds4: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
 
 # The engine behind src/engine/engine.h, for the Rust server (server/): the sources
 # of build/myds4 without those in src/cli/, and with engine.c.
-LIB_SRC = src/engine/model.c src/engine/io.c src/engine/gpu.c src/engine/tok.c src/engine/util.c src/engine/vision.c src/experimental/online_predictor.c src/engine/sample.c src/engine/engine.c
+LIB_SRC = src/engine/model.c src/engine/io.c src/engine/gpu.c src/engine/tok.c src/engine/util.c src/engine/vision.c src/experimental/online_predictor.c src/experimental/context_lookup.c src/engine/sample.c src/engine/engine.c
 LIB_OBJ = $(LIB_SRC:src/%.c=build/lib/%.o)
 
 build/lib/%.o: src/%.c $(MODEL_HEADERS) src/engine/engine.h $(KERNELS) data/engram.bin data/unicode.bin
@@ -200,4 +317,4 @@ memory-available-check: build/memory-available-check
 clean:
 	rm -rf build
 
-.PHONY: clean server server-check predict-probe gguf-decode-check cache-ready-check draft-cache-check prefetch-metrics-check prefetch-queue-check cache-policy-check memory-available-check shutdown-check sampling-check gpu-clock-check
+.PHONY: clean server server-check predict-probe gguf-decode-check cache-ready-check draft-cache-check prefetch-metrics-check prefetch-queue-check cache-policy-check memory-available-check shutdown-check sampling-check gpu-clock-check activation-format-check workspace-check state-fork-check context-lookup-check verification-schedule-check

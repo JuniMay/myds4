@@ -8,6 +8,7 @@
 // ---- model shape (config.json of DeepSeek-V4.1-Flash) ----
 enum {
   DIM = 5120, LAYERS = 40, VOCAB = 129280, HC = 4, MIX = 24,
+  STREAM_BYTES = 2,  // residual streams store the reference's BF16 values
   HEADS = 64, HEAD_DIM = 512, ROPE_DIM = 64, QRANK = 1280, OGROUPS = 8, ORANK = 1024,
   WINDOW = 128, EXPERTS = 384, TOPK = 6, INTER = 2304,
   IDX_HEADS = 32, IDX_DIM = 128, IDX_TOPK = 512,
@@ -17,6 +18,7 @@ enum {
   // uses 3, drafting BLOCK tokens from the attention inputs of the last three
   // layers (37 to 39); the drafted rows after the first are the NOISE token.
   DRAFTS = 3, DRAFT_EXPERTS = 128, DRAFT_TOPK = 3, BLOCK = 5, NOISE = 128799,
+  VERIFY_DRAFTS = 15,  // target verification capacity, independent of DSpark
   DRAFT_CACHE_MIN = BLOCK * DRAFT_TOPK,  // one stage's largest union of native selections
   CACHE_LAYERS = LAYERS + DRAFTS,  // the expert cache's layers: the backbone's, then the stages'
 };
@@ -63,6 +65,8 @@ int sampler_valid(const Sampler *s);
 void sampler_seed(Sampler *s, uint64_t seed);
 int sample_argmax(const float *logits, int count);
 int sample_token(const float *logits, int count, Sampler *s);
+// logits contains ndraft + 1 rows of count values; drafts contains ndraft
+// tokens. The sampler is independent of the model's verification row limit.
 int sample_verify(const float *logits, int count, const int *drafts, int ndraft, int eos, Sampler *s, int *accepted);
 typedef struct {
   char *p;
@@ -212,6 +216,7 @@ void cache_load(int layer, const int *experts, int n);  // makes them resident
 // Starts making the experts resident. Returns how many had pending reads
 // when each was checked; prefetch lateness uses that same completion check.
 int cache_request(int layer, const int *experts, int n);
+void cache_repeat_credit(int layer, int expert, int repeats); // extra row uses after one deduplicated request
 void cache_wait(int layer, const int *experts, int n);     // waits for their reads
 int cache_slot(int layer, int expert);   // it has a slot: resident, or being read
 int cache_ready(int layer, int expert);  // resident and read
@@ -325,6 +330,8 @@ typedef struct {
   int dump_fd;        // -1, or a pipe receiving per-layer streams
   int routes_fd;      // -1, or a pipe receiving every decoded token's routes, predictions and router logits
   int draft;          // keep the DSpark stages' windows, for model_draft
+  int lookup;         // 0: off; otherwise up to VERIFY_DRAFTS context-copy candidates
+  int expert_batch;   // share repeated experts' weight loads across verification rows
   int draft_cache;    // draft expert slots per stage; 0 = all 128 preloaded
   int draft_trim;     // final draft stage: only requested query/FFN rows; keep all five keys
   const char *predictor_state; // load or create online state; save on clean completion
@@ -333,7 +340,8 @@ typedef struct {
   const char *experts;         // a GGUF file (set) whose routed experts replace the checkpoint's, or null
   int quiet;                   // no progress lines on stderr
   int online_predictor;        // rank64 online prefetch corrector; 0 disables it
-  int ced;                    // 0: full prefill; otherwise decoder replay tokens (at least WINDOW)
+  int ced;                    // 0: no approximate replay; otherwise decoder replay tokens (at least WINDOW)
+  int prefill_prune;          // skip decoder batches outside the final and saved-prefix dependencies
 } Options;
 void online_predictor_init(int rank, const float *const biases[LAYERS]);
 void online_predictor_reset(void);
@@ -352,16 +360,18 @@ void model_load(const char *dir, const Options *o);
 // Runs the tokens at positions pos.. and returns the logits of the last one.
 const float *model_forward(const int *tokens, int n, int pos);
 // Run one prompt traversal while saving the state at prefix_pos in slot 1.
-// An encoder-only CED snapshot requires more than ced + BLOCK new tokens on reuse.
+// An encoder-only CED snapshot requires more than ced + max(BLOCK, lookup)
+// new tokens on reuse, so verification can rewind safely.
 const float *model_forward_prefix(const int *tokens, int n, int pos, int prefix_pos, int *encoder_only);
 typedef struct {
-  int tokens, chunks, decoder_tokens, ced_tokens, ced_applied;
+  int tokens, chunks, decoder_tokens, ced_tokens, ced_applied, prune_applied;
   int prefix_tokens, prefix_encoder_only;
 } ModelForwardInfo;
 ModelForwardInfo model_forward_info(void);
 // The DSpark draft for `token` at position pos, every position before it
 // having run (with Options.draft): the tokens it drafts for pos + 1 .. pos + BLOCK.
 void model_draft(int token, int pos, int *drafts, int n); // the first n of BLOCK drafts
+void model_draft_coupled(int token, int pos, int *drafts, int n, const Sampler *sampler); // experimental shared uniforms
 // Speculative decoding: runs the token at pos and its drafts (m rows) and
 // returns each row's logits; model_accept keeps the first n of the rows.
 const float *model_verify(const int *tokens, int m, int pos);
@@ -374,7 +384,9 @@ void model_reset(void);
 typedef struct State State;
 State *model_state_new(void);    // zeroed; the first takes over the state model_load made
 void model_state_free(State *s);  // not the one in use
-void model_state_copy(State *dst, const State *src);  // dst: not the one in use
+// Fork slot 1 at its saved token count into an inactive destination. Copy
+// only the prefix's global rows and restore its local state and history.
+void model_state_fork(State *dst, const State *src, int positions);
 size_t model_state_bytes(const State *s, int positions);  // s (null: a new state) holding that many
 void model_state_use(State *s);
 // The rows of the state in use that later positions overwrite, saved in
@@ -404,3 +416,4 @@ extern uint64_t decode_rows, prefill_rows;
 extern double decode_gpu_s, decode_s;
 extern int prefill_layer, prefill_n;  // a prompt pass's layer (0 between prompts) and rows
 uint64_t model_dense_bytes(void);
+uint64_t model_workspace_bytes(void); // resizable request/layer buffers; excludes fixed scratch, weights and KV

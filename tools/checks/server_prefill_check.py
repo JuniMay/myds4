@@ -31,6 +31,11 @@ def main():
     ap.add_argument("--experts", type=Path)
     ap.add_argument("--ced", choices=("off", "128", "512"), default="off")
     ap.add_argument("--draft", action="store_true")
+    ap.add_argument("--lookup", type=int, choices=range(16), default=0)
+    ap.add_argument("--expert-batch", action="store_true")
+    ap.add_argument("--prefill-prune", action="store_true")
+    ap.add_argument("--long-prefill", action="store_true", help="use a prompt long enough to skip dependency-free decoder batches")
+    ap.add_argument("--batch", type=int, choices=range(1, 7), default=1)
     ap.add_argument("--image", action="store_true")
     args = ap.parse_args()
     baseline = wait_for_gpu(20, 20, 4, desktop=True)["samples"][-1]["memory"]
@@ -41,12 +46,16 @@ def main():
     env = {k: v for k, v in os.environ.items() if not k.startswith("MYDS4_")}
     env.update(MYDS4_API_KEY=key, MYDS4_LOCK=str(ROOT / "build/myds4.lock"))
     cmd = [str(args.binary.resolve()), "-m", str(args.checkpoint), "--serve", str(port),
-           "--ctx", "4096", "--cache", "20", "--reserve", "4", "--kv-cache", "1", "--batch", "1",
-           "--ced", args.ced, "--temperature", "1", "--top-p", "1", "--seed", "12345", "--think", "0"]
+           "--ctx", "16384" if args.long_prefill else "4096", "--cache", "20", "--reserve", "4", "--kv-cache", "1", "--batch", str(args.batch),
+           "--ced", args.ced, "--lookup", str(args.lookup), "--temperature", "1", "--top-p", "1", "--seed", "12345", "--think", "0"]
     if args.experts:
         cmd += ["--experts", str(args.experts)]
     if args.draft:
         cmd += ["--draft", "2", "--draft-cache", "32", "--draft-trim"]
+    if args.expert_batch:
+        cmd += ["--expert-batch"]
+    if args.prefill_prune:
+        cmd += ["--prefill-prune"]
     process = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     lines = deque(maxlen=512)
     halted, failures = threading.Event(), []
@@ -110,7 +119,7 @@ def main():
                 break
             except (urllib.error.URLError, TimeoutError, ConnectionError):
                 time.sleep(0.2)
-        long = "Review this context. " + "The scheduler keeps pending requests and dispatches each task in order. " * 64
+        long = "Review this context. " + "The scheduler keeps pending requests and dispatches each task in order. " * (640 if args.long_prefill else 64)
         bodies = [request(long), request("A different request. " + long), request("Suggest a short title.")]
         with ThreadPoolExecutor(max_workers=3) as pool:
             replies = list(pool.map(lambda b: call("/v1/chat/completions", b), bodies))
@@ -120,8 +129,21 @@ def main():
         if args.image:
             reply = call("/v1/chat/completions", request("Name the image's main color. " + long, image=True))
             assert reply["usage"]["completion_tokens"] > 0
+        if args.lookup:
+            copied = "\n".join(f"case {i}: alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu" for i in range(6))
+            body = request("Repeat the following six lines exactly. Output only those lines, without a code fence.\n" + copied)
+            body["max_tokens"] = 256
+            first_copy = call("/v1/chat/completions", body)
+            second_copy = call("/v1/chat/completions", body)
+            first_message = first_copy["choices"][0]["message"]
+            assert first_message == second_copy["choices"][0]["message"], "lookup retry changed its seeded reply"
+            assert first_message["content"].strip() == copied, "lookup copy request did not reproduce the requested text"
         state = call("/v1/status")
         assert state["ced_depth"] == (0 if args.ced == "off" else int(args.ced))
+        assert state["lookup_depth"] == args.lookup
+        assert state["expert_batch"] == args.expert_batch
+        assert state["prefill_prune"] == args.prefill_prune
+        assert isinstance(state["last_prefill"]["prune_applied"], bool)
         observed = list(lines)
         plans = [line for line in observed if "prefill plan:" in line]
         assert len(plans) >= 4, "missing completed prefill plans"
@@ -129,12 +151,20 @@ def main():
         assert any("0 chunks" in line for line in plans), "identical prompt was not reused"
         if args.ced != "off":
             assert any("ced_applied=1" in line for line in plans)
+        if args.prefill_prune and args.long_prefill and args.ced == "off":
+            assert any("prune_applied=1" in line for line in plans), "long prompt did not exercise prefill pruning"
         assert any(re.search(r"queued, waiting=[1-9]", line) for line in observed)
         assert any("messages," in line for line in observed), "message-count logging is missing"
+        if args.batch > 1:
+            assert any(re.search(r"batch: [2-6] requests decoding together", line) for line in observed), "requests did not decode together"
+        if args.lookup:
+            assert any(re.search(r"context lookup [1-9][0-9]* passes", line) for line in observed), "lookup did not verify any proposals"
         assert not failures, failures
         print(json.dumps({"server_prefill_check": {"binary": args.binary.name, "ced": args.ced,
-              "experts": "IQ2" if args.experts else "MXFP4", "draft": args.draft, "image": args.image,
-              "requests": len(replies) + 1 + int(args.image), "identical_retry": True,
+              "experts": "IQ2" if args.experts else "MXFP4", "draft": args.draft, "lookup": args.lookup,
+              "expert_batch": args.expert_batch, "prefill_prune": args.prefill_prune,
+              "long_prefill": args.long_prefill, "image": args.image, "batch": args.batch,
+              "requests": len(replies) + 1 + int(args.image) + 2 * bool(args.lookup), "identical_retry": True,
               "last_prefill": state["last_prefill"]}}))
         for line in observed:
             if any(part in line for part in ("arrived", "queued,", "queue:", "prefill start", "prefill plan", "images encoded")):

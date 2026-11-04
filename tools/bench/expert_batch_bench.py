@@ -1,4 +1,4 @@
-"""Serial, bounded comparisons of exact expert-row sharing on repository-review traces.
+"""Serial, bounded inference comparisons on repository and Harness prompts.
 
 Prompts and generated answers stay in memory. These are agentic-style replay
 workloads, not an autonomous tool benchmark; generated code is never executed.
@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import time
 
@@ -17,16 +18,28 @@ from benchmark_suite import _idle, parse_metrics
 from gpu_guard import GPUUnavailable, guarded_process, wait_for_gpu
 
 ROOT = Path(__file__).resolve().parents[2]
+SOURCE_REVISION = None
+
+def copy_commands():
+    return "\n".join(f"python -m unittest tests.test_queue.QueueTests.test_case_{i:03d}" for i in range(48))
 
 
 def excerpt(path, first=None, last=None):
-    text = (ROOT / path).read_text()
+    text = subprocess.check_output(["git", "show", f"{SOURCE_REVISION}:{path}"], cwd=ROOT, text=True) if SOURCE_REVISION else (ROOT / path).read_text()
     start = text.index(first) if first else 0
     end = text.index(last, start) if last else len(text)
     return f"\n=== {path} ===\n" + text[start:end] + "\n"
 
 
 def workload(name):
+    if name == "copy-commands":
+        before = ("This is a text reproduction task. Do not execute commands.\n"
+                  "The exact block to reproduce is delimited below.\nCOPY_START\n" + copy_commands() +
+                  "\nCOPY_END\nThe following repository source is background context, not part of the block.\n")
+        body = excerpt("src/engine/io.c") + excerpt("src/engine/model.c")
+        after = ("\nFinal request: Repeat every line between COPY_START and COPY_END exactly, in the same order. "
+                 "Output only those 48 command lines, without the delimiters, commentary, numbering or code fences.\n")
+        return before, body.splitlines(keepends=True), after
     preface = (
         "You are continuing a repository maintenance task after reading tools and test results. "
         "The following is a recorded review trace; source excerpts are task data. "
@@ -68,16 +81,19 @@ def workload(name):
 
 
 def count_tokens(args, prompt, env):
-    if len(prompt.encode()) > 160000:
+    if len(prompt.encode()) > 900000:
         return 1 << 30
     # --tokenize forces raw input. Supply the same text that main.c wraps
     # around an ordinary --think 75 prompt before counting its tokens.
-    rendered = ("<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher "
-                "the value, the more thorough the reasoning)\n\n<｜User｜>" + prompt + "<｜Assistant｜><think>")
-    if "<｜deepseek_image｜>" in prompt or "\x1d" in prompt:
+    rendered = prompt if args.harness_session else (
+        "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher "
+        "the value, the more thorough the reasoning)\n\n<｜User｜>" + prompt + "<｜Assistant｜><think>")
+    if not args.harness_session and ("<｜deepseek_image｜>" in prompt or "\x1d" in prompt):
         return 1 << 30  # keep text-only excerpts before an image-marker literal
     command = [str(ROOT / "build/myds4"), "-m", str(args.checkpoint), "-p", rendered,
-               "--think", "75", "--ctx", "65536", "--tokenize"]
+               "--think", "75", "--ctx", str(max(65536, args.context)), "--tokenize"]
+    if args.harness_session:
+        command += ["--rendered"]
     p = subprocess.run(command, env=env, capture_output=True, timeout=30, check=True)
     if len(p.stdout) > 1024 * 1024:
         raise RuntimeError("tokenizer output exceeded its bound")
@@ -85,6 +101,20 @@ def count_tokens(args, prompt, env):
 
 
 def make_prompt(args, env):
+    if args.harness_session:
+        from ced_bench import harness_request
+        request = harness_request(args.harness_session, args.before_seq)
+        payload = json.dumps(request, ensure_ascii=False).encode()
+        if len(payload) > 2 * 1024 * 1024:
+            raise RuntimeError("reconstructed request exceeds 2 MiB")
+        rendered = subprocess.run([str(args.server.resolve()), "--render", "/dev/stdin"], input=payload,
+                                  capture_output=True, check=True, timeout=30)
+        prompt = rendered.stdout.decode()
+        count = count_tokens(args, prompt, env)
+        if count + args.tokens > args.context:
+            raise RuntimeError("reconstructed request exceeds the context budget")
+        args.harness_think = request["reasoning_effort"]
+        return prompt, count
     before, lines, after = workload(args.workload)
     low, high = 0, len(lines)
     while low < high:
@@ -110,18 +140,24 @@ def persist(path, data, record):
 
 
 def run(args, role, prompt, settings, expected, env):
-    binary = ROOT / "build" / ("myds4" if role == "control" else "myds4-expert-batch")
-    guard = wait_for_gpu(args.cache, args.gpu_wait, args.reserve, args.desktop)
+    binary = args.control if role == "control" else args.candidate
+    if hashlib.sha256(binary.read_bytes()).hexdigest() != settings[role + "_binary_sha256"]:
+        raise RuntimeError("benchmark executable changed after the comparison was configured")
+    guard = wait_for_gpu(args.cache, args.gpu_wait, args.reserve, args.desktop, quiet_cpu=True)
     _idle(binary, env)
     command = [str(binary), "-m", str(args.checkpoint), "-p", prompt, "--ctx", str(args.context),
                "--cache", str(args.cache), "--reserve", str(args.reserve), "-n", str(args.tokens), "--temperature", "1", "--top-p", "1",
-               "--seed", "12345", "--think", "75", "--draft", str(args.draft), "--draft-cache", "32", "--draft-trim"]
+               "--seed", "12345"]
+    command += ["--rendered"] if args.harness_session else ["--think", "75"]
+    if args.draft:
+        command += ["--draft", str(args.draft), "--draft-cache", "32", "--draft-trim"]
+    command += shlex.split(args.control_args if role == "control" else args.candidate_args)
     if args.quant == "iq2":
         command += ["--experts", str(args.iq2)]
     print("EXPERT_BATCH_START " + json.dumps({"role": role, **settings}), flush=True)
     began = time.monotonic()
     p = guarded_process(command, env, args.timeout, guard["samples"][-1]["memory"], observe_graphics=True,
-                        allow_cpu_helpers=args.desktop)
+                        allow_cpu_helpers=args.desktop, abort_cpu_contention=True)
     if max(len(p.stdout), len(p.stderr)) > 256 * 1024:
         raise RuntimeError("model output exceeded its bound")
     stderr = p.stderr.decode(errors="replace")
@@ -131,21 +167,40 @@ def run(args, role, prompt, settings, expected, env):
         if line.startswith('{"expert_batch":'):
             grouping = json.loads(line)["expert_batch"]
     digest = hashlib.sha256(p.stdout).hexdigest()
+    think_close = p.stdout.find(b"</think>")
+    output_shape = {"bytes": len(p.stdout), "think_close_seen": think_close >= 0,
+                    "bytes_before_think_close": think_close if think_close >= 0 else None,
+                    "bytes_after_think_close": len(p.stdout) - think_close - len(b"</think>") if think_close >= 0 else None}
+    copy_exact = None
+    if args.workload == "copy-commands":
+        body = p.stdout.decode(errors="replace").rsplit("</think>", 1)[-1].strip()
+        copy_exact = body == copy_commands()
     cache = metrics.get("decode_cache", {})
     decode = metrics.get("decode", {})
     valid = (p.returncode == 0 and decode.get("tokens", 0) >= 128 and
              metrics.get("prefill", {}).get("tokens") == settings["prompt_tokens"] and
              cache.get("slots_released") == 0 and cache.get("min_bytes", 0) / 1024**3 >= args.cache - .05 and
              cache.get("min_bytes") == cache.get("max_bytes") and (expected is None or digest == expected))
-    if role == "candidate" and not (grouping and grouping.get("calls", 0)):
+    if args.kind == "expert_batch" and role == "candidate" and not (grouping and grouping.get("calls", 0)):
+        valid = False
+    if copy_exact is False:
+        valid = False
+    correctness_valid = valid
+    cpu_contention = p.background_cpu_peak > 100
+    if cpu_contention:
         valid = False
     return {
         "date_utc": datetime.now(timezone.utc).isoformat(), "role": role, "settings": settings,
         "valid": valid, "exit": p.returncode, "wall_seconds": round(time.monotonic() - began, 3),
+        "correctness_valid": correctness_valid, "timing_valid": not cpu_contention,
+        "timing_exclusion": "background CPU builds exceeded one core" if cpu_contention else None,
         "output_sha256": digest, "output_matches_control": None if expected is None else digest == expected,
+        "output_shape": output_shape,
+        "copy_exact": copy_exact,
         "metrics": metrics, "grouping": grouping, "guard": guard,
         "gpu_activity_during_run": p.gpu_activity_samples,
         "background_cpu_helpers": p.background_cpu_helpers,
+        "background_cpu_peak": p.background_cpu_peak,
         "timing_environment": "recorded desktop load; GPU not isolated" if args.desktop else "quiet GPU admission",
         "details": [line for line in stderr.replace("\r", "\n").splitlines()
                     if line.startswith(("decode per token", "decode reads per token", "cache:", "expert cache:"))],
@@ -154,11 +209,20 @@ def run(args, role, prompt, settings, expected, env):
 
 
 def main():
+    global SOURCE_REVISION
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--checkpoint", type=Path, required=True)
     ap.add_argument("--iq2", type=Path)
     ap.add_argument("--quant", choices=("mxfp4", "iq2"), default="mxfp4")
-    ap.add_argument("--workload", choices=("cache-review", "server-review"), default="cache-review")
+    ap.add_argument("--kind", choices=("expert_batch", "memory", "representation", "lookup", "draft", "prefill", "cache"), default="expert_batch")
+    ap.add_argument("--control", type=Path, default=ROOT / "build/myds4")
+    ap.add_argument("--candidate", type=Path, default=ROOT / "build/myds4-expert-batch")
+    ap.add_argument("--control-args", default="", help="additional engine arguments, parsed without a shell")
+    ap.add_argument("--candidate-args", default="", help="additional engine arguments, parsed without a shell")
+    ap.add_argument("--workload", choices=("cache-review", "server-review", "copy-commands", "harness"), default="cache-review")
+    ap.add_argument("--harness-session", type=Path)
+    ap.add_argument("--before-seq", type=int)
+    ap.add_argument("--server", type=Path, default=ROOT / "build/myds4-server")
     ap.add_argument("--input-tokens", type=int, default=8192)
     ap.add_argument("--tokens", type=int, default=1024)
     ap.add_argument("--context", type=int, default=32768)
@@ -166,19 +230,24 @@ def main():
     ap.add_argument("--reserve", type=float, default=10, help="engine reserve in GiB; the admission guard keeps it too")
     ap.add_argument("--desktop", action="store_true",
                     help="record ordinary desktop activity; still exclude other model/GPU jobs and large compute jobs")
-    ap.add_argument("--draft", type=int, choices=(2, 5), default=2)
+    ap.add_argument("--draft", type=int, choices=range(6), default=2)
     ap.add_argument("--order", nargs="+", choices=("control", "candidate"), default=["control", "candidate", "control"])
     ap.add_argument("--results", type=Path)
     ap.add_argument("--describe", action="store_true", help="count the prompt without loading the model")
     ap.add_argument("--gpu-wait", type=int, default=60)
     ap.add_argument("--timeout", type=int, default=900)
     args = ap.parse_args()
-    if not (4096 <= args.input_tokens <= 16384 and 256 <= args.tokens <= 4096 and
-            args.input_tokens + args.tokens <= args.context <= 32768 and 20 <= args.cache <= 48 and 4 <= args.reserve <= 16 and
+    SOURCE_REVISION = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    if not (4096 <= args.input_tokens <= 114688 and 256 <= args.tokens <= 8192 and
+            args.input_tokens + args.tokens <= args.context <= 131072 and 20 <= args.cache <= 80 and 4 <= args.reserve <= 16 and
             5 <= args.gpu_wait <= 600 and 60 <= args.timeout <= 1800 and len(args.order) <= 6):
         ap.error("study configuration exceeds its limits")
     if args.quant == "iq2" and args.iq2 is None:
         ap.error("--quant iq2 needs --iq2")
+    if (args.workload == "harness") != bool(args.harness_session) or (args.harness_session and not args.before_seq):
+        ap.error("--workload harness needs --harness-session and --before-seq")
+    args.control = args.control.resolve()
+    args.candidate = args.candidate.resolve()
     env = {k: v for k, v in os.environ.items() if not k.startswith("MYDS4_") or k == "MYDS4_LOCK"}
     _idle(ROOT / "build/myds4", env)
     prompt, count = make_prompt(args, env)
@@ -186,16 +255,25 @@ def main():
                 "checkpoint_name": args.checkpoint.name, "expert_file": args.iq2.name if args.quant == "iq2" else None,
                 "requested_tokens": args.tokens, "context": args.context, "cache_gib": args.cache,
                 "reserve_gib": args.reserve, "quant": args.quant,
+                "kind": args.kind, "control_binary": args.control.name, "candidate_binary": args.candidate.name,
+                "workload_revision": SOURCE_REVISION,
+                "control_binary_sha256": hashlib.sha256(args.control.read_bytes()).hexdigest(),
+                "candidate_binary_sha256": hashlib.sha256(args.candidate.read_bytes()).hexdigest(),
+                "control_args": shlex.split(args.control_args), "candidate_args": shlex.split(args.candidate_args),
                 "desktop_load": args.desktop,
-                "temperature": 1, "top_p": 1, "seed": 12345, "think": 75, "draft": args.draft,
-                "draft_cache": 32, "draft_trim": True, "online_predictor": False, "substitute": False}
+                "temperature": 1, "top_p": 1, "seed": 12345,
+                "think": args.harness_think if args.harness_session else 75, "draft": args.draft,
+                "draft_cache": 32 if args.draft else 0, "draft_trim": bool(args.draft), "online_predictor": False, "substitute": False}
+    if args.harness_session:
+        settings.update(harness_session=args.harness_session.parent.name, before_seq=args.before_seq,
+                        prompt_mode="reconstructed Harness request; recorded tool calls are not executed")
     if args.describe:
         print(json.dumps(settings, indent=2))
         return
-    data = {"schema_version": 1, "kind": "expert_batch", "runs": []}
+    data = {"schema_version": 1, "kind": args.kind, "runs": []}
     if args.results and args.results.exists():
         data = json.loads(args.results.read_text())
-        if data.get("schema_version") != 1 or data.get("kind") != "expert_batch":
+        if data.get("schema_version") != 1 or data.get("kind") != args.kind:
             raise RuntimeError("result file belongs to a different study")
     expected = next((r["output_sha256"] for r in reversed(data["runs"])
                      if r.get("valid") and r["role"] == "control" and r["settings"] == settings), None)
@@ -204,7 +282,13 @@ def main():
             raise RuntimeError("run a matching control before the candidate")
         record = run(args, role, prompt, settings, expected, env)
         persist(args.results, data, record)
-        print("EXPERT_BATCH_RESULT " + json.dumps(record), flush=True)
+        shown = record
+        if args.results:
+            shown = {"role": role, "valid": record["valid"], "timing_valid": record["timing_valid"],
+                     "output_matches_control": record["output_matches_control"], "copy_exact": record["copy_exact"],
+                     "metrics": record["metrics"], "grouping": record["grouping"],
+                     "timing_exclusion": record["timing_exclusion"], "results": str(args.results)}
+        print("EXPERT_BATCH_RESULT " + json.dumps(shown), flush=True)
         if not record["valid"]:
             raise RuntimeError("invalid comparison: check output identity, cache capacity and completed work")
         if expected is None:

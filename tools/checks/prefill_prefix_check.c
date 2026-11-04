@@ -22,20 +22,22 @@ int main(int argc, char **argv) {
   if (argc < 2) die("usage: prefill-prefix-check CHECKPOINT [--experts GGUF] [--long] [--no-draft]");
   Options o = {.ctx = 32768, .budget_gb = 20, .reserve_gb = 4, .draft = 2, .draft_cache = 32,
                .draft_trim = 1, .dump_fd = -1, .routes_fd = -1, .quiet = 1};
-  int longer = 0;
+  int longer = 0, fork_only = 0;
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--long")) longer = 1;
+    else if (!strcmp(argv[i], "--fork-only")) fork_only = 1;
     else if (!strcmp(argv[i], "--no-draft")) o.draft = o.draft_cache = o.draft_trim = 0;
     else if (!strcmp(argv[i], "--experts") && i + 1 < argc) o.experts = argv[++i];
     else die("invalid check argument");
   }
   alarm(600);
   tok_load(argv[1]);
-  int pattern[128], n = longer ? CHUNK + 137 : 640;
+  int pattern[128], n = fork_only ? 257 : longer ? CHUNK + 137 : 640;
   int pn = tok_encode(" Inspect the scheduler and preserve cancellation. alpha beta gamma delta 12345.\n", pattern, 128);
   int *tokens = xmalloc((size_t)n * sizeof *tokens);
   for (int i = 0; i < n; i++) tokens[i] = pattern[i % pn];
   model_load(argv[1], &o);
+  State *source = model_state_new(), *forked = model_state_new();
   float *ref = xmalloc(VOCAB * 4);
   char *state = xmalloc(saved_bytes());
   char *prefix_state = xmalloc(saved_bytes());
@@ -45,14 +47,20 @@ int main(int argc, char **argv) {
     memcpy(ref, model_forward(tokens, n, 0), VOCAB * 4);
     model_state_save(0);
     memcpy(state, active->saved[0], saved_bytes());
-    int cases = longer ? 1 : sizeof boundaries / sizeof *boundaries;
+    int cases = longer || fork_only ? 1 : sizeof boundaries / sizeof *boundaries;
     for (int k = 0; k < cases; k++) {
-      int prefix = longer ? CHUNK + 8 : boundaries[k], encoder_only = -1;
+      int prefix = fork_only ? 128 : longer ? CHUNK + 8 : boundaries[k], encoder_only = -1;
       model_reset();
       const float *lg = model_forward_prefix(tokens, n, 0, prefix, &encoder_only);
       size_t output = different(ref, lg, VOCAB * 4);
       model_state_save(0);
       size_t final = different(state, active->saved[0], saved_bytes());
+      model_state_fork(forked, source, prefix);
+      model_state_use(forked);
+      size_t fork_result = different(ref, model_forward(tokens + prefix, n - prefix, prefix), VOCAB * 4);
+      model_state_use(source);
+      model_state_save(0);
+      size_t source_result = different(state, active->saved[0], saved_bytes());
       model_reset();
       model_forward(tokens, prefix, 0);
       model_state_save(0);
@@ -61,13 +69,13 @@ int main(int argc, char **argv) {
       model_seek(tokens, prefix);
       lg = model_forward(tokens + prefix, n - prefix, prefix);
       size_t resumed = different(ref, lg, VOCAB * 4);
-      printf("prefix=%d draft=%d: logits=%zu final_state=%zu saved_prefix=%zu resumed_logits=%zu encoder_only=%d\n",
-             prefix, o.draft, output, final, saved, resumed, encoder_only);
+      printf("prefix=%d draft=%d: logits=%zu final_state=%zu saved_prefix=%zu resumed_logits=%zu fork_logits=%zu source_state=%zu encoder_only=%d\n",
+             prefix, o.draft, output, final, saved, resumed, fork_result, source_result, encoder_only);
       fflush(stdout);
-      errors += output + final + saved + resumed + (encoder_only != 0);
+      errors += output + final + saved + resumed + fork_result + source_result + (encoder_only != 0);
     }
   }
-  for (int keep = 128; keep <= 512; keep *= 4) {
+  for (int keep = 128; !fork_only && keep <= 512; keep *= 4) {
     int prefix = longer ? CHUNK + 1 : 257, encoder_only = -1;
     // Reference: retain every decoder row, masking only the same local keys.
     opt.ced = 0;
@@ -112,5 +120,6 @@ int main(int argc, char **argv) {
   }
   printf("prefill-prefix-check: differing_bytes_and_failed_conditions=%zu\n", errors);
   free(ref), free(state), free(prefix_state), free(tokens);
+  model_state_free(forked);
   return errors != 0;
 }

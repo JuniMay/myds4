@@ -23,6 +23,7 @@
 
 #include "myds4.h"
 #include "expert_batch.h"
+#include "../experimental/prefill_prune.h"
 #ifdef MYDS4_PREDICT_LAB
 #include "../experimental/predictor_lab.h"
 #endif
@@ -50,6 +51,10 @@ static Buf main_norm, draft_norm, markov_embed, markov_head;
 static Buf final_norm, cs_base, cs_comp;
 static Tensor embed_t;
 static Options opt;
+static int verifying;
+static int replay_margin(void) { return opt.lookup > BLOCK ? opt.lookup : BLOCK; }
+static int small_rows(int m) { return m <= BLOCK + 1 || (verifying && m <= VERIFY_DRAFTS + 1); }
+static int prefill_prune_active, prefill_prune_end;
 
 static uint32_t ced_first;
 static int ced_active, ced_compact;
@@ -72,19 +77,37 @@ static void ced_check_routes(int layer, int row, int rows, const int *routes);
 // ones) must not overwrite rows later positions read: a layer's window keys
 // are a ring of RING rows (row p % RING), and a KV source keeps the
 // compressor rows of its last PENDING positions (row p % PENDING).
-#define RING (WINDOW + BLOCK)
-#define PENDING 8
+#define RING (WINDOW + replay_margin())
+#define PENDING (replay_margin() > BLOCK ? 32 : 8)
 #define PREDICT 16  // experts predicted per row for the next layer
 #define ATT_ROWS (WINDOW + IDX_TOPK)  // the most rows a decoded row attends
-#define FEW (BLOCK + 1)  // a verify pass's rows at most: such batches run each row as decoding does
+#define FEW (VERIFY_DRAFTS + 1)  // maximum target verification rows
 #define ATT_CHUNKS (ATT_ROWS / 64)    // of ATT_CHUNK rows in the kernels
 #define GiB (1024.0 * 1024 * 1024)
 
 // Per row of the request (prompt rows, or row 0 when decoding): the streams,
 // the FFN mixes and the index selections.
 static Buf HS, MF, SEL;
+// Diagnostics retain their FP32 wire format while inference stores BF16.
+// Callers consume this model-thread-owned scratch before the next call.
+static const float *stream_floats(const Buf *b, size_t first, size_t count) {
+  static float *values;
+  static size_t capacity;
+  if (count > capacity) {
+    free(values);
+    values = xmalloc(count * sizeof *values);
+    capacity = count;
+  }
+  const uint16_t *source = (const uint16_t *)b->ptr + first;
+  for (size_t i = 0; i < count; i++) {
+    uint32_t bits = (uint32_t)source[i] << 16;
+    memcpy(values + i, &bits, sizeof bits);
+  }
+  return values;
+}
 static Buf IMG;  // per row: 1 inside an image span (a negative token), set by prefill
 static int request_rows;
+static int work_rows;
 float *all_logits;  // when set, prefill writes every row's logits here
 // BF16 rows for the matrix units: a product's input for mm_fp8 (x_bf16), up
 // to MB rows, padded to 128, of up to XB_K values; or the queries with RoPE
@@ -115,7 +138,6 @@ static Buf ASC, AMAX, APART;
 // experts, then how many of them were missing), and the table of ready
 // experts they come from.
 static Buf RU, PARTS;  // PARTS: decoded rows' experts' down products, row r's at 8 DIM r, of expert e at 8 i + e
-#ifdef MYDS4_EXPERT_BATCH
 static Buf EROWS;
 static int K_moe_up_rows, K_moe_down_rows;
 static uint64_t expert_batch_calls, expert_batch_pairs, expert_batch_groups;
@@ -125,7 +147,6 @@ static void report_expert_batch(void) {
           (unsigned long long)expert_batch_calls, (unsigned long long)expert_batch_pairs,
           (unsigned long long)expert_batch_groups);
 }
-#endif
 static const Buf *ready_tab;
 uint64_t spec_fixups;  // layers whose experts the CPU computed again
 
@@ -179,9 +200,7 @@ static const struct { int type; uint32_t bytes; const char *k[6]; } gg_codes[] =
 enum { GG_CODES = sizeof gg_codes / sizeof gg_codes[0] };
 static struct {
   int up, down, up_m, down_m;
-#ifdef MYDS4_EXPERT_BATCH
   int up_rows, down_rows;
-#endif
 } gk[LAYERS];
 static uint32_t expert_quant[LAYERS][3]; // 0 is native MXFP4; otherwise the GGUF type
 static Buf head_q6;  // the GGUF file's output head in Q6_K, if it has one: used instead of the checkpoint's
@@ -189,6 +208,10 @@ static int K_gg_head1, K_gg_head6;
 // A prompt batch's pairs' rows of XQ and MH, in pair order. Native MXFP4
 // keeps half values multiplied by 128; GGUF keeps unscaled half values.
 static Buf XH, MHH;
+static Buf *const work_buffers[] = {
+    &H1, &MA, &PART, &X, &XQ, &QA, &QR, &QRQ, &Q, &O, &OA, &AO, &KV, &CK, &CS, &LAT,
+    &IK, &QI, &IW, &SC, &GL, &GP, &RT, &PR, &SHG, &SHU, &SHH, &SHO, &EROW, &EX, &EKV,
+    &MH, &YK, &TILES, &XH, &MHH, &XB, &PTOK, &PW, &TP, &WIN};
 
 static void gguf_experts(const char *path) {
   static const char *mat[3] = {"gate", "up", "down"};  // w1, w3, w2
@@ -214,10 +237,8 @@ static void gguf_experts(const char *path) {
     expert_spans[l] = 3;
     gk[l].up = gpu_kernel(gg_codes[code[0]].k[0]), gk[l].down = gpu_kernel(gg_codes[code[2]].k[1]);
     gk[l].up_m = gpu_kernel(gg_codes[code[0]].k[2]), gk[l].down_m = gpu_kernel(gg_codes[code[2]].k[3]);
-#ifdef MYDS4_EXPERT_BATCH
-    if (gg_codes[code[0]].k[4] && gg_codes[code[2]].k[5])
+    if (opt.expert_batch && gg_codes[code[0]].k[4] && gg_codes[code[2]].k[5])
       gk[l].up_rows = gpu_kernel(gg_codes[code[0]].k[4]), gk[l].down_rows = gpu_kernel(gg_codes[code[2]].k[5]);
-#endif
   }
   Gguf h;
   if (gguf_get("output.weight", &h) && h.type == 14 && h.ne[0] == DIM && h.ne[1] == VOCAB) {  // Q6_K
@@ -270,6 +291,45 @@ static Buf zeros(size_t n) {
   return b;
 }
 
+// Temporary layer buffers grow for prefill and shrink for small forward
+// passes. Persistent KV, logits, request rows and draft history are separate.
+static void work_capacity(int rows) {
+  int small = replay_margin() + 1;
+  if (rows > MB) rows = MB;
+  if (rows < small) rows = small;
+  if (rows <= work_rows && !(rows == small && work_rows > small)) return;
+  int resize_cache = work_rows != 0;
+  gpu_sync();
+  for (size_t i = 0; i < sizeof work_buffers / sizeof *work_buffers; i++) gpu_free(work_buffers[i]);
+  size_t m = (size_t)rows, p = m * TOPK;
+  H1 = zeros(m * HC * DIM * STREAM_BYTES), MA = zeros(m * MIX * 4), PART = zeros(m * 400 * 4);
+  X = zeros(m * DIM * 4), XQ = zeros(m * DIM * 4), QA = zeros(m * QRANK * 4), QR = zeros(m * QRANK * 4);
+  QRQ = zeros(m * QRANK * 4), Q = zeros(m * HEADS * HEAD_DIM * 4), O = zeros(m * HEADS * HEAD_DIM * 4);
+  OA = zeros(m * OGROUPS * ORANK * 4), AO = zeros(m * DIM * 4), KV = zeros(m * HEAD_DIM * 4);
+  CK = zeros((m + 2) * HEAD_DIM * 4), CS = zeros((m + 2) * HEAD_DIM * 4), LAT = zeros(m * HEAD_DIM * 4);
+  IK = zeros(m * IDX_DIM * 4), QI = zeros(m * IDX_HEADS * IDX_DIM * 4), IW = zeros(m * IDX_HEADS * 4);
+  sc_rows = (int)((256u << 20) / ((size_t)opt.ctx * 4));
+  if (sc_rows > rows) sc_rows = rows;
+  if (sc_rows < 1) sc_rows = 1;
+  SC = zeros((size_t)sc_rows * opt.ctx * 4);
+  size_t predicted = m > 2 * FEW ? m : 2 * FEW;
+  size_t routed = opt.gpu_route && m < (LAYERS + 2) * FEW ? (LAYERS + 2) * FEW : m;
+  GL = zeros(m * EXPERTS * 4), GP = zeros(predicted * EXPERTS * 4), RT = zeros(routed * 16 * 4);
+  PR = zeros((routed > predicted ? routed : predicted) * PREDICT * 4);
+  SHG = zeros(m * INTER * 4), SHU = zeros(m * INTER * 4), SHH = zeros(m * INTER * 4), SHO = zeros(m * DIM * 4);
+  EROW = zeros(m * DIM * 2), EX = zeros(m * ENGRAM_ROWS * ENGRAM_DIM * 4), EKV = zeros(m * (HC + 1) * DIM * 4);
+  MH = zeros(p * INTER * 4), YK = zeros(p * DIM * 4), TILES = zeros((p / 32 + EXPERTS) * 32);
+  XH = zeros((p + 64) * DIM * 2), MHH = zeros((p + 64) * INTER * 2);
+  size_t matrix = ((m + 127) / 128) * 128 * XB_K * 2;
+  size_t queries = (m < QB_ROWS ? m : QB_ROWS) * HEADS * HEAD_DIM * 2;
+  size_t draft = opt.draft ? 128u * 3 * DIM * 2 : 0;
+  size_t xb = matrix > queries ? matrix : queries;
+  XB = zeros(xb > draft ? xb : draft);
+  PTOK = zeros(p * 4), PW = zeros(p * 4), TP = zeros(p * 4), WIN = zeros((m + WINDOW) * HEAD_DIM * 2);
+  work_rows = rows;
+  if (resize_cache) cache_idle(); // capacity maintenance does not represent another token or pass
+}
+
 // RoPE angles: (cos, sin) for 32 frequencies per position; YaRN for the
 // compressed layers, as precompute_freqs_cis computes them in FP32.
 static Buf rope_table(int ctx, double base, int yarn) {
@@ -304,11 +364,18 @@ static int is_in(int l, const int *set, int n) {
 }
 
 static void request_capacity(int rows) {
-  if (rows <= request_rows) return;
+  if (Q.obj) work_capacity(rows);
+  // Small forward passes overwrite these rows and do not read the prompt's
+  // workspace. Keep room for every verification row without reallocating
+  // between single-token and draft passes.
+  int small = replay_margin() + 1;
+  if (rows <= small) rows = small;
+  if (rows <= request_rows && !(rows == small && request_rows > small)) return;
+  gpu_sync();
   gpu_free(&HS), gpu_free(&MF), gpu_free(&SEL);
-  HS = zeros((size_t)rows * HC * DIM * 4), MF = zeros((size_t)rows * MIX * 4);
+  HS = zeros((size_t)rows * HC * DIM * STREAM_BYTES), MF = zeros((size_t)rows * MIX * 4);
   SEL = zeros((size_t)rows * (IDX_TOPK + 1) * 4);
-  gpu_free(&CAND), CAND = zeros((size_t)(rows > MB ? rows : MB) * cand_words * 4);
+  gpu_free(&CAND), CAND = zeros((size_t)rows * cand_words * 4);
   gpu_free(&IMG), IMG = zeros((size_t)rows);
   for (int e = 0; e < 2; e++) {
     gpu_free(&EC[e]), gpu_free(&ES[e]);
@@ -391,6 +458,13 @@ void model_load(const char *dir, const Options *options) {
 #endif
   lock_model();
   opt = *options;
+#ifdef MYDS4_EXPERT_BATCH
+  opt.expert_batch = 1; // Dedicated diagnostic build; ordinary builds use the option.
+#endif
+#ifdef MYDS4_PREFILL_PRUNE
+  opt.prefill_prune = 1; // Dedicated diagnostic build; ordinary builds use the option.
+#endif
+  if (opt.lookup < 0 || opt.lookup > VERIFY_DRAFTS) die("--lookup takes off or 1 to %d drafts", VERIFY_DRAFTS);
   if (opt.ced && (opt.ced < WINDOW || opt.ced > 1 << 20)) die("--ced takes off or 128 to 1048576 replay tokens");
   if (opt.predictor_state) opt.online_predictor = 64;
   if (opt.online_predictor && opt.online_predictor != 64) die("online predictor requires rank 64");
@@ -409,10 +483,10 @@ void model_load(const char *dir, const Options *options) {
   K(mvm_bf16_3), K(moe_up), K(moe_down), K(moe_up_m), K(moe_down_m), K(gg_gather), K(act_quant_h);
   K(gather_mxfp4), K(act_quant_mxfp4);
   K(moe_combine), K(moe_parts), K(act_quant), K(embed), K(rmsnorm), K(hc_mix), K(hc_pre_norm), K(hc_post);
-#ifdef MYDS4_EXPERT_BATCH
-  K(moe_up_rows), K(moe_down_rows);
-  atexit(report_expert_batch);
-#endif
+  if (opt.expert_batch) {
+    K(moe_up_rows), K(moe_down_rows);
+    atexit(report_expert_batch);
+  }
   K(swiglu), K(kv_window), K(compress), K(index_key), K(index_score), K(index_topk), K(attn_out);
   K(attend_scores), K(attend_values), K(attend_combine);
   K(route), K(engram_rows), K(engram_gate), K(copy_rows), K(copy_keys), K(attend_m), K(hc_mean), K(markov), K(argmax);
@@ -484,36 +558,17 @@ void model_load(const char *dir, const Options *options) {
   cs_comp = rope_table(ctx, 160000, 1);
   fprintf(stderr, "\rloaded %.1f GiB of dense weights in %.1f s\n", dense_bytes / GiB, now() - t0);
 
-  size_t m = MB, p = MB * TOPK;
   cand_words = (ctx / 8 + 31) / 32 + 1;
   request_capacity(1);
-  H1 = zeros(m * HC * DIM * 4), MA = zeros(m * MIX * 4), PART = zeros(m * 400 * 4);
-  X = zeros(m * DIM * 4), XQ = zeros(m * DIM * 4), QA = zeros(m * QRANK * 4), QR = zeros(m * QRANK * 4);
-  QRQ = zeros(m * QRANK * 4), Q = zeros(m * HEADS * HEAD_DIM * 4), O = zeros(m * HEADS * HEAD_DIM * 4);
-  OA = zeros(m * OGROUPS * ORANK * 4), AO = zeros(m * DIM * 4), KV = zeros(m * HEAD_DIM * 4);
-  CK = zeros((m + 2) * HEAD_DIM * 4), CS = zeros((m + 2) * HEAD_DIM * 4), LAT = zeros(m * HEAD_DIM * 4);
-  IK = zeros(m * IDX_DIM * 4), QI = zeros(m * IDX_HEADS * IDX_DIM * 4), IW = zeros(m * IDX_HEADS * 4);
-  sc_rows = (int)((256u << 20) / ((size_t)ctx * 4));  // 256 MB of scores
-  sc_rows = sc_rows > (int)m ? (int)m : sc_rows < FEW ? FEW : sc_rows;
-  SC = zeros((size_t)sc_rows * ctx * 4);
-  GL = zeros(m * EXPERTS * 4), GP = zeros(m * EXPERTS * 4), RT = zeros(m * 16 * 4);
-  PR = zeros(m * PREDICT * 4);
-  SHG = zeros(m * INTER * 4), SHU = zeros(m * INTER * 4), SHH = zeros(m * INTER * 4), SHO = zeros(m * DIM * 4);
-  EROW = zeros(m * DIM * 2), EX = zeros(m * ENGRAM_ROWS * ENGRAM_DIM * 4), EKV = zeros(m * (HC + 1) * DIM * 4);
-  MH = zeros(p * INTER * 4), YK = zeros(p * DIM * 4), TILES = zeros((p / 32 + EXPERTS) * 32);
-  XH = zeros((p + 64) * DIM * 2), MHH = zeros((p + 64) * INTER * 2);
-  XB = zeros((m + 128) * XB_K * 2);
-  PTOK = zeros(p * 4), PW = zeros(p * 4), TP = zeros(p * 4), WIN = zeros((m + WINDOW) * HEAD_DIM * 2);
-  ETAB = zeros((3 * LAYERS * FEW + DRAFTS * BLOCK) * 256), logits = zeros((size_t)(BLOCK + 1) * VOCAB * 4);
+  work_capacity(MB);
+  ETAB = zeros((3 * LAYERS * FEW + DRAFTS * BLOCK) * 256), logits = zeros((size_t)FEW * VOCAB * 4);
   RU = zeros(LAYERS * FEW * 8 * 4), PARTS = zeros(FEW * DIM * 8 * 4);
-#ifdef MYDS4_EXPERT_BATCH
-  EROWS = zeros(2 * LAYERS * FEW * TOPK * sizeof(ExpertRows));
-#endif
+  if (opt.expert_batch) EROWS = zeros(2 * LAYERS * FEW * TOPK * sizeof(ExpertRows));
   XP = zeros(FEW * DIM * 4), PT = zeros(PREDICT * 4), PC = zeros(FEW * PREDICT * 4);
   ASC = zeros(HEADS * ATT_ROWS * 4), AMAX = zeros(ATT_CHUNKS * HEADS * 4), APART = zeros(ATT_CHUNKS * HEADS * 514 * 4);
   if (opt.draft) {
     MAINH = zeros(WINDOW * 3 * DIM * 4), MXA = zeros(WINDOW * DIM * 4), MXN = zeros(WINDOW * DIM * 4);
-    MXQ = zeros(WINDOW * DIM * 4), DHS = zeros(BLOCK * HC * DIM * 4), DMF = zeros(BLOCK * MIX * 4);
+    MXQ = zeros(WINDOW * DIM * 4), DHS = zeros(BLOCK * HC * DIM * STREAM_BYTES), DMF = zeros(BLOCK * MIX * 4);
     BLK = zeros(BLOCK * HEAD_DIM * 2), DSEL = zeros((IDX_TOPK + 1) * 4), DLOG = zeros((size_t)BLOCK * VOCAB * 4);
     DTOK = zeros((BLOCK + 1) * 4), DEROW = zeros(BLOCK * DIM * 2);
     int *sel = (int *)DSEL.ptr;  // every drafted row sees every drafted row's key
@@ -598,8 +653,22 @@ static void linear(const Lin *w, int m, const Buf *in, size_t in_off, uint32_t l
 // the same rows; with up to FEW rows (one when decoding; a verify pass's rows
 // share each weight load, as decoding computes them), in one dispatch.
 static void products(int count, const Prod *p, int m, const Buf *in, size_t in_off, uint32_t lda, int round) {
-  if (m > FEW) {
+  if (!small_rows(m)) {
     for (int j = 0; j < count; j++) linear(p[j].w, m, in, in_off, lda, p[j].out, p[j].off, p[j].ldy, round);
+    return;
+  }
+  // Keep the scalar-equivalent kernels' six-row register bound. Each
+  // segment retains the same per-row product and accumulation order.
+  if (m > BLOCK + 1) {
+    for (int first = 0; first < m; first += BLOCK + 1) {
+      int rows = m - first < BLOCK + 1 ? m - first : BLOCK + 1;
+      Prod part[3];
+      for (int j = 0; j < count; j++) {
+        part[j] = p[j];
+        part[j].off += (size_t)first * p[j].ldy * sizeof(float);
+      }
+      products(count, part, rows, in, in_off + (size_t)first * lda * sizeof(float), lda, round);
+    }
     return;
   }
   MVM q = {mv_params(p[0].w, round), (uint32_t)m, lda, p[0].ldy};
@@ -625,12 +694,12 @@ static void products(int count, const Prod *p, int m, const Buf *in, size_t in_o
 // grouped W (wo_a) multiplies each input slice with its rows.
 static void linear(const Lin *w, int m, const Buf *in, size_t in_off, uint32_t lda, const Buf *out,
                    size_t out_off, uint32_t ldy, int round) {
-  if (m <= FEW) {
+  if (small_rows(m)) {
     products(1, &(Prod){w, out, out_off, ldy}, m, in, in_off, lda, round);
     return;
   }
   int groups = w->group ? w->n / w->group : 1, n = w->n / groups, fp8 = w->s.obj != 0;
-  if (fp8 && (size_t)(m + 127) / 128 * 128 * w->k > (size_t)(MB + 128) * XB_K) die("linear: %d rows of %d", m, w->k);
+  if (fp8 && (size_t)(m + 127) / 128 * 128 * w->k * 2 > XB.size) die("linear: %d rows of %d", m, w->k);
   for (int g = 0; g < groups; g++) {
     MM p = {(uint32_t)m, (uint32_t)n, (uint32_t)w->k, (uint32_t)round, fp8 ? (uint32_t)w->k : lda, ldy};
     size_t row0 = (size_t)g * n, x = in_off + (size_t)g * w->k * 4;
@@ -656,10 +725,13 @@ static void head_out(int m, const Buf *y) {
     linear(&head, m, &X, 0, DIM, y, 0, VOCAB, 0);
     return;
   }
-  uint32_t n = m;
-  gpu_kern(m == 1 ? K_gg_head1 : K_gg_head6);
-  gpu_buf(0, &head_q6, 0), gpu_buf(1, &X, 0), gpu_buf(2, y, 0), gpu_bytes(3, &n, 4);
-  gpu_go(VOCAB / 32, 1, 1, 256, 1, 1);
+  for (int first = 0; first < m; first += BLOCK + 1) {
+    uint32_t n = m - first < BLOCK + 1 ? m - first : BLOCK + 1;
+    gpu_kern(n == 1 ? K_gg_head1 : K_gg_head6);
+    gpu_buf(0, &head_q6, 0), gpu_buf(1, &X, (size_t)first * DIM * 4);
+    gpu_buf(2, y, (size_t)first * VOCAB * 4), gpu_bytes(3, &n, 4);
+    gpu_go(VOCAB / 32, 1, 1, 256, 1, 1);
+  }
 }
 
 static void quant(const Buf *in, const Buf *out, size_t n) {
@@ -750,7 +822,7 @@ typedef struct {
   int row;     // its first row in the request buffers HS, MF and SEL
 } Batch;
 
-static size_t hs_off(const Batch *b) { return (size_t)b->row * HC * DIM * 4; }
+static size_t hs_off(const Batch *b) { return (size_t)b->row * HC * DIM * STREAM_BYTES; }
 static size_t mf_off(const Batch *b) { return (size_t)b->row * MIX * 4; }
 
 static void engram(const Batch *b, int l) {
@@ -800,7 +872,15 @@ static void route_top(int m, const Routing *r, int count, int row);
 // still being read is waited for, not replaced, so there a verify pass's
 // rows read ahead only the next layer's (read_ahead_rows): reading ahead as
 // many as for single rows doubled its reads ahead and took 8% of the speed.
-static int full_ahead(int m) { return m == 1 || (m <= FEW && opt.substitute <= 0); }
+static int full_ahead(int m) { return m == 1 || (small_rows(m) && opt.substitute <= 0); }
+
+static int forecast_rows(int rows) {
+#ifdef MYDS4_VERIFY_PREFETCH_ROWS
+  if (verifying && opt.substitute <= 0 && rows > MYDS4_VERIFY_PREFETCH_ROWS)
+    return MYDS4_VERIFY_PREFETCH_ROWS;
+#endif
+  return rows;
+}
 
 // Decoding (m <= FEW rows): layer l's top KEEP experts predicted from the
 // residual part of each row's FFN input (XP, see hc_mix), known before its
@@ -848,13 +928,13 @@ static void probe_target(uint32_t kind, int pos, int layer, int rows, const int 
   const float *mixes = (const float *)MF.ptr + (size_t)row_base * MIX;
   if (kind == 1 && nrows) {
     for (int r = 0; r < rows; r++) {
-      predict_probe_streams(row_pos[r], layer, 1, (const float *)H1.ptr + (size_t)r * HC * DIM,
+      predict_probe_streams(row_pos[r], layer, 1, stream_floats(&H1, (size_t)r * HC * DIM, HC * DIM),
                             mixes + (size_t)r * MIX);
       predict_probe_target(kind, row_pos[r], layer, 1, DIM, (const float *)X.ptr + (size_t)r * DIM,
                            EXPERTS, (const float *)GL.ptr + (size_t)r * EXPERTS, tokens + r, routes + r * 16, 16);
     }
   } else {
-    predict_probe_streams(pos, layer, rows, (const float *)H1.ptr, mixes);
+    predict_probe_streams(pos, layer, rows, stream_floats(&H1, 0, (size_t)rows * HC * DIM), mixes);
     predict_probe_target(kind, pos, layer, rows, DIM, (const float *)X.ptr,
                          EXPERTS, (const float *)GL.ptr, tokens, routes, 16);
     if (kind == 1 && full_ahead(rows) && layer + 1 < LAYERS) {
@@ -952,7 +1032,7 @@ static void attend_rows(int l, int m, int pos, int r0, int srow) {
       gpu_go(rows, 1, 1, 1024, 1, 1);
     }
   }
-  if (m <= FEW) {  // one row (decoding) or a few (a verify pass), each as decoding runs it
+  if (small_rows(m)) {  // one row or a verify pass, each as decoding runs it
     for (int r = 0; r < m; r++) {
       Att ar = {{p32 + r, base, mod}, 0, visible > 0};
       ar.first = ced_lower(l, p32 + r);
@@ -1167,7 +1247,7 @@ static void experts_go(int l, int r, size_t eo, size_t mf, size_t hs, uint32_t p
   uint32_t n = TOPK, gg = gk[l].up != 0;  // GGUF: 8 rows of w2 per threadgroup, two simdgroups per expert
   gpu_kern(gg ? gk[l].down : K_moe_down);
   gpu_buf(0, &ETAB, eo), gpu_buf(1, &MH, (size_t)r * TOPK * INTER * 4), gpu_buf(2, &SHO, (size_t)r * DIM * 4);
-  gpu_buf(3, &MF, mf), gpu_buf(4, &H1, (size_t)r * HC * DIM * 4), gpu_buf(5, &HS, hs), gpu_bytes(6, &n, 4);
+  gpu_buf(3, &MF, mf), gpu_buf(4, &H1, (size_t)r * HC * DIM * STREAM_BYTES), gpu_buf(5, &HS, hs), gpu_bytes(6, &n, 4);
   gpu_bytes(7, &pm, 4), gpu_buf(8, &PARTS, (size_t)r * DIM * 8 * 4);
   gpu_go(DIM / (gg ? 8 : 4), 1, 1, 32 * TOPK * (gg ? 2 : 1), 1, 1);
 }
@@ -1208,11 +1288,10 @@ static void experts_sum(int r, size_t mf, size_t hs) {
   uint32_t n = TOPK;
   gpu_kern(K_moe_parts);
   gpu_buf(0, &PARTS, (size_t)r * DIM * 8 * 4), gpu_buf(1, &SHO, (size_t)r * DIM * 4), gpu_buf(2, &MF, mf);
-  gpu_buf(3, &H1, (size_t)r * HC * DIM * 4), gpu_buf(4, &HS, hs), gpu_bytes(5, &n, 4);
+  gpu_buf(3, &H1, (size_t)r * HC * DIM * STREAM_BYTES), gpu_buf(4, &HS, hs), gpu_bytes(5, &n, 4);
   gpu_go(DIM / 256, 1, 1, 256, 1, 1);
 }
 
-#ifdef MYDS4_EXPERT_BATCH
 // Each layer keeps distinct early/late descriptors until the GPU finishes.
 // A group shares weight loads, while PARTS retains each row's summation order.
 // Without repeated experts, the caller keeps the ordinary fused down kernel.
@@ -1232,7 +1311,6 @@ static int experts_rows(int l, int m, size_t entries, int late) {
   gpu_go(DIM / 32, ng, 1, 256, 1, 1);
   return 1;
 }
-#endif
 
 // --gpu-route: where in ETAB the resolve kernel writes row r's entries of
 // layer l, apart from the CPU's, so that a fix-up (fix_layer) writes its own
@@ -1260,15 +1338,22 @@ static void resolve(int m, int l) {
 // r PREDICT and (m + r) PREDICT), while fewer than m INFLIGHT are reading.
 static void read_ahead(int l, int m, const int *pr) {
   int keep[FEW * KEEP], next[FEW * AHEAD], after[FEW * AHEAD], nk = 0, n = 0;
+  int admit_rows = forecast_rows(m);
   for (int r = 0; r < m; r++) {
     for (int k = 0; k < KEEP; k++) keep[nk++] = pr[r * PREDICT + k];
-    for (int k = 0; k < AHEAD; k++) next[n] = pr[r * PREDICT + k], after[n++] = pr[(m + r) * PREDICT + k];
+    if (r < admit_rows)
+      for (int k = 0; k < AHEAD; k++) next[n] = pr[r * PREDICT + k], after[n++] = pr[(m + r) * PREDICT + k];
   }
-  if (l + 1 < LAYERS) cache_refine(l + 1, keep, nk), cache_prefetch_from(l + 1, next, n, n, INFLIGHT * m, PF_H1);
-  if (l + 2 < LAYERS) cache_prefetch_from(l + 2, after, n, n, INFLIGHT * m, PF_H2);
+  if (l + 1 < LAYERS) cache_refine(l + 1, keep, nk), cache_prefetch_from(l + 1, next, n, n, INFLIGHT * admit_rows, PF_H1);
+  if (l + 2 < LAYERS) cache_prefetch_from(l + 2, after, n, n, INFLIGHT * admit_rows, PF_H2);
 }
 
 static void read_residual_ahead(int layer, const int *keep, int nkeep, const int *first, int nfirst, int inflight) {
+#ifdef MYDS4_VERIFY_PREFETCH_ROWS
+  int rows = forecast_rows(nkeep / KEEP);
+  if (nfirst > rows * AHEAD) nfirst = rows * AHEAD;
+  if (inflight > rows * INFLIGHT) inflight = rows * INFLIGHT;
+#endif
   cache_refine(layer, keep, nkeep);
   cache_prefetch_from(layer, first, nfirst, nfirst, inflight, PF_PC);
 }
@@ -1300,6 +1385,9 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
   predictor_lab_routes(l, m, rt, (const float *)GL.ptr, (const float *)L[l].gate_bias.ptr);
 #endif
   char used[EXPERTS] = {0}, ready[EXPERTS] = {0};
+#ifdef MYDS4_VERIFY_ROW_CREDIT
+  uint8_t uses[EXPERTS] = {0};
+#endif
   CacheObservation observed;
   cache_observe_snapshot(l, &observed);
   cache_observe_routes(&observed, rt, m, 16, 0);
@@ -1317,6 +1405,9 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
     for (int k = 0; k < TOPK; k++) { // each row's selections, by where their experts are now
       int e = rt[r * 16 + k];
       used[e] = 1;
+#ifdef MYDS4_VERIFY_ROW_CREDIT
+      uses[e]++;
+#endif
       (*tally[approx && e != chosen[r * TOPK + k] ? 4 : cache_where(l, e)])++;
     }
   for (int e = 0; e < EXPERTS; e++)
@@ -1324,6 +1415,10 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
   cache_stats.row_unique += nn;
   double t0 = now();
   int reading = cache_request(l, need, nn);  // this layer's reads first, then the predicted ones
+#ifdef MYDS4_VERIFY_ROW_CREDIT
+  if (verifying && opt.substitute <= 0)
+    for (int i = 0; i < nn; i++) if (uses[need[i]] > 1) cache_repeat_credit(l, need[i], uses[need[i]] - 1);
+#endif
   cache_demote(l);
   if (reading) gpu_keep_clock(reading * 1e-3); // the GPU idles until they are in
   if (opt.online_predictor) {
@@ -1345,39 +1440,35 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
 #endif
   for (int i = 0; i < nn; i++) nready += ready[need[i]] = cache_ready(l, need[i]);
   int split = rest && nready > 0 && nready < nn;
-#ifdef MYDS4_EXPERT_BATCH
-  if (split && m > 1 && (!gk[l].up || gk[l].up_rows)) {
+  if (opt.expert_batch && split && m > 1 && (!gk[l].up || gk[l].up_rows)) {
     size_t eo = (size_t)l * FEW * 256;
     for (int r = 0; r < m; r++) fill_entries(l, eo + r * 256, rt + r * 16, rw + r * 16 + 8, ready, 1);
     if (!experts_rows(l, m, eo, 0))
       for (int r = 0; r < m; r++)
-        experts_go(l, r, eo + r * 256, mf_off(b) + (size_t)r * MIX * 4, hs_off(b) + (size_t)r * HC * DIM * 4, 1);
+        experts_go(l, r, eo + r * 256, mf_off(b) + (size_t)r * MIX * 4, hs_off(b) + (size_t)r * HC * DIM * STREAM_BYTES, 1);
   } else
-#endif
   for (int r = 0; split && r < m; r++) {
     size_t eo = (size_t)(l * FEW + r) * 256;
     fill_entries(l, eo, rt + r * 16, rw + r * 16 + 8, ready, 1);
-    experts_go(l, r, eo, mf_off(b) + (size_t)r * MIX * 4, hs_off(b) + (size_t)r * HC * DIM * 4, 1);
+    experts_go(l, r, eo, mf_off(b) + (size_t)r * MIX * 4, hs_off(b) + (size_t)r * HC * DIM * STREAM_BYTES, 1);
   }
   if (split) gpu_commit(), gpu_encode(rest);
   double t1 = now();
   cache_wait(l, need, nn);
   phase_s[3] += t1 - t0, phase_s[2] += now() - t1, phase_s[4] -= now() - t0;
-#ifdef MYDS4_EXPERT_BATCH
-  if (m > 1 && (!gk[l].up || gk[l].up_rows)) {
+  if (opt.expert_batch && m > 1 && (!gk[l].up || gk[l].up_rows)) {
     size_t eo = split ? late_entries(l, 0) : (size_t)l * FEW * 256;
     for (int r = 0; r < m; r++) fill_entries(l, eo + r * 256, rt + r * 16, rw + r * 16 + 8, split ? ready : NULL, 0);
     int grouped = experts_rows(l, m, eo, split);
     for (int r = 0; r < m; r++) {
-      size_t mf = mf_off(b) + (size_t)r * MIX * 4, hs = hs_off(b) + (size_t)r * HC * DIM * 4;
+      size_t mf = mf_off(b) + (size_t)r * MIX * 4, hs = hs_off(b) + (size_t)r * HC * DIM * STREAM_BYTES;
       if (!grouped) experts_go(l, r, eo + r * 256, mf, hs, split);
       if (split || grouped) experts_sum(r, mf, hs);
     }
     return split;
   }
-#endif
   for (int r = 0; r < m; r++) {
-    size_t mf = mf_off(b) + (size_t)r * MIX * 4, hs = hs_off(b) + (size_t)r * HC * DIM * 4;
+    size_t mf = mf_off(b) + (size_t)r * MIX * 4, hs = hs_off(b) + (size_t)r * HC * DIM * STREAM_BYTES;
     if (!split) {
       encode_experts(l, r, rt + r * 16, rw + r * 16 + 8, mf, hs);
       continue;
@@ -1395,7 +1486,7 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
 // read ahead (see read_ahead_rows), while fewer than `inflight` prefetches
 // are reading.
 static void routed_batch(const Batch *b, int l, int ahead, int inflight, int approx) {
-  if (b->m <= FEW) {  // a short prompt: each row as decoding runs it
+  if (small_rows(b->m)) {  // a short prompt: each row as decoding runs it
     routed_rows(b, l, ahead, inflight, approx, 0);
     return;
   }
@@ -1454,7 +1545,7 @@ static void routed_batch(const Batch *b, int l, int ahead, int inflight, int app
       tiles[nt++] = (MoeTile){{slot->gpu + at[0], slot->gpu + at[1], slot->gpu + at[2]}, (uint32_t)(start[e] + c),
                               (uint32_t)(count[e] - c < per ? count[e] - c : per)};
   }
-  // the pairs' rows as half; tiles of 64 columns of w1 and w3, 128 of w2
+  // Native MXFP4 scales by 128 for exact FP16 storage of small activations.
   uint32_t np = m * TOPK;
   gpu_kern(gg ? K_gg_gather : K_gather_mxfp4);
   gpu_buf(0, &XQ, 0), gpu_buf(1, &PTOK, 0), gpu_buf(2, &XH, 0);
@@ -1485,7 +1576,7 @@ static void capture(const Batch *b, int l, int end, int keep) {
   if (!opt.draft || l < TARGET || r1 <= r0) return;
   uint32_t part = l - TARGET;
   gpu_kern(K_hc_mean);
-  gpu_buf(0, &HS, (size_t)r0 * HC * DIM * 4), gpu_buf(1, &MAINH, (size_t)(r0 - first) * 3 * DIM * 4);
+  gpu_buf(0, &HS, (size_t)r0 * HC * DIM * STREAM_BYTES), gpu_buf(1, &MAINH, (size_t)(r0 - first) * 3 * DIM * 4);
   gpu_bytes(2, &part, 4);
   gpu_go(DIM / 256, r1 - r0, 1, 256, 1, 1);
 }
@@ -1494,6 +1585,7 @@ static void capture(const Batch *b, int l, int end, int keep) {
 // main_x = main_norm(main_proj(main_hidden)), then the stage's wkv, kv_norm,
 // RoPE and FP8.
 static void draft_keys(int rows, int p0) {
+  work_capacity(rows);
   gpu_begin();
   quant(&MAINH, &MAINH, (size_t)rows * 3 * DIM);
   linear(&main_proj, rows, &MAINH, 0, 3 * DIM, &MXA, 0, DIM, 1);
@@ -1533,7 +1625,7 @@ static void embed_read(const int *tokens, int m, int row, int pos) {
 
 static void embed_encode(int m, int row) {
   gpu_kern(K_embed);
-  gpu_buf(0, &EROW, 0), gpu_buf(1, &HS, (size_t)row * HC * DIM * 4);
+  gpu_buf(0, &EROW, 0), gpu_buf(1, &HS, (size_t)row * HC * DIM * STREAM_BYTES);
   gpu_go(DIM / 256, m, 1, 256, 1, 1);
 }
 
@@ -1564,7 +1656,7 @@ static uint64_t layer_front(const Batch *b, int l) {
     if (opt.dump_fd >= 0) {  // the streams after the Engram lookup
       gpu_commit();
       gpu_sync();
-      if (write(opt.dump_fd, HS.ptr, HC * DIM * 4) < 0) die("dump failed");
+      if (write(opt.dump_fd, stream_floats(&HS, 0, HC * DIM), HC * DIM * 4) < 0) die("dump failed");
       gpu_begin();
     }
   }
@@ -1598,7 +1690,7 @@ static uint64_t layer_spec(const Batch *b, int l) {
   uint64_t v = gpu_signal();
   shared_expert(b->m, &L[l]);
   for (int r = 0; r < b->m; r++)
-    experts_go(l, r, spec_entries(l, r), mf_off(b) + (size_t)r * MIX * 4, hs_off(b) + (size_t)r * HC * DIM * 4, 0);
+    experts_go(l, r, spec_entries(l, r), mf_off(b) + (size_t)r * MIX * 4, hs_off(b) + (size_t)r * HC * DIM * STREAM_BYTES, 0);
   return v;
 }
 
@@ -1689,7 +1781,7 @@ static void step_rows(const int *tokens, int m, int pos) {
   if (!nrows) reserve(pos + m, pos);
   request_capacity(m);
   double ts = now();
-  int64_t rows[BLOCK + 1][2][ENGRAM_ROWS];
+  int64_t rows[FEW][2][ENGRAM_ROWS];
   for (int i = 0; i < m; i++) {  // rows of several sequences hash with their own histories
     if (nrows) memcpy(history, row_state[i]->history, sizeof history);
     engram_hash(tokens[i], nrows ? row_pos[i] : pos + i, rows[i]);
@@ -1797,7 +1889,8 @@ static void step_rows(const int *tokens, int m, int pos) {
     if (!ahead) {
       gpu_sync();  // the streams after attention and after the FFN, then the routing
       if (opt.dump_fd >= 0 &&
-          (write(opt.dump_fd, H1.ptr, HC * DIM * 4) < 0 || write(opt.dump_fd, HS.ptr, HC * DIM * 4) < 0 ||
+          (write(opt.dump_fd, stream_floats(&H1, 0, HC * DIM), HC * DIM * 4) < 0 ||
+           write(opt.dump_fd, stream_floats(&HS, 0, HC * DIM), HC * DIM * 4) < 0 ||
            write(opt.dump_fd, RT.ptr, 48) < 0))
         die("dump failed");
       if (l + 1 < LAYERS) next = layer_front(&b, l + 1);
@@ -1858,6 +1951,13 @@ static void step(const int *tokens, int m, int pos) {
 
 uint64_t model_dense_bytes(void) { return dense_bytes; }
 
+uint64_t model_workspace_bytes(void) {
+  uint64_t bytes = HS.size + MF.size + SEL.size + CAND.size + IMG.size;
+  for (int e = 0; e < 2; e++) bytes += EC[e].size + ES[e].size;
+  for (size_t i = 0; i < sizeof work_buffers / sizeof *work_buffers; i++) bytes += work_buffers[i]->size;
+  return bytes;
+}
+
 static int prefix_batch(const Batch *b, int l) {
   return prefix_capture.at > b->pos && prefix_capture.at <= b->pos + b->m &&
          (!prefix_capture.encoder_only || l <= 20);
@@ -1903,7 +2003,7 @@ static void prefix_inputs(const Batch *b, int l) {
   if (first >= end) return;
   uint32_t part = l - TARGET;
   gpu_kern(K_hc_mean);
-  gpu_buf(0, &HS, (size_t)(b->row + first - b->pos) * HC * DIM * 4);
+  gpu_buf(0, &HS, (size_t)(b->row + first - b->pos) * HC * DIM * STREAM_BYTES);
   gpu_buf(1, &prefix_taps, (size_t)(first - prefix_capture.tap_first) * 3 * DIM * 4);
   gpu_bytes(2, &part, sizeof part);
   gpu_go(DIM / 256, end - first, 1, 256, 1, 1);
@@ -1963,7 +2063,13 @@ static void prefill(const int *tokens, int n, int pos0) {
   if (pos0 + n > opt.ctx) die("context full (%d tokens)", opt.ctx);
   ced_active = ced_first != 0;
   int retained = n - decoder_begin(n, pos0);
-  forward_info.chunks++, forward_info.decoder_tokens += retained;
+  PrefillPrune plan = {.kept = n, .suffix_rows = n};
+  if (prefill_prune_active) {
+    plan = prefill_prune_plan(pos0, n, prefill_prune_end, prefix_capture.at,
+                             LAYERS - 21, WINDOW, replay_margin(), MB);
+    retained = plan.suffix_rows;
+  }
+  forward_info.chunks++, forward_info.decoder_tokens += prefill_prune_active ? plan.kept : retained;
   cache_metrics_begin(PF_PREFILL, n);
   CacheStats c0 = cache_stats;
   prefill_n = n, prefill_layer = 0;
@@ -1994,8 +2100,16 @@ static void prefill(const int *tokens, int n, int pos0) {
       // Layer 20 produces full-context global KV; later layers only consume it.
       if (l > 20) begin = first;
       if (l + 1 > 20) next_rows = n - first;
+    } else if (prefill_prune_active && l + 1 > 20) {
+      next_rows = plan.kept;
     }
+    int first_batch = 1;
     for (int s = begin; s < n; s += MB) {
+      if (prefill_prune_active && l > 20) {
+        if (s < plan.prefix_begin) s = plan.prefix_begin;
+        if (s >= plan.prefix_end && s < plan.tail_begin) s = plan.tail_begin;
+        if (s >= n) break;
+      }
       Batch b = {n - s < MB ? n - s : MB, pos0 + s, s};
       prefix_before(&b, l);
       gpu_begin();
@@ -2006,7 +2120,8 @@ static void prefill(const int *tokens, int n, int pos0) {
       ffn_front(&b, l);
       shared_expert(b.m, &L[l]);
       gpu_commit();
-      if (s == begin) cache_adapt_pass(l);  // layer l - 1's experts may still be in use
+      if (first_batch) cache_adapt_pass(l);  // layer l - 1's experts may still be in use
+      first_batch = 0;
       gpu_sync();
       prefix_after(&b, l);
 #ifdef MYDS4_CED_CHECK
@@ -2017,8 +2132,9 @@ static void prefill(const int *tokens, int n, int pos0) {
 #endif
 
       gpu_begin();
-      routed_batch(&b, l, opt.substitute > 0 ? SUB_KEEP : next_rows > 2 * MB ? EXPERTS : 8,
-                   2 * EXPERTS, opt.substitute > 0);
+      int ahead = opt.substitute > 0 ? SUB_KEEP : next_rows > 2 * MB ? EXPERTS : 8;
+      if (prefill_prune_active && !next_rows) ahead = 0;
+      routed_batch(&b, l, ahead, 2 * EXPERTS, opt.substitute > 0);
       gpu_commit();
     }
     if (!opt.quiet) fprintf(stderr, "\rprefill: layer %d/%d", l + 1, LAYERS);
@@ -2028,7 +2144,7 @@ static void prefill(const int *tokens, int n, int pos0) {
   if (!opt.quiet) fprintf(stderr, "\r                         \r");
   if (retained) {
     gpu_begin();
-    hc_pre_norm(1, &HS, (size_t)(n - 1) * HC * DIM * 4, &MF, (size_t)(n - 1) * MIX * 4, &final_norm);
+    hc_pre_norm(1, &HS, (size_t)(n - 1) * HC * DIM * STREAM_BYTES, &MF, (size_t)(n - 1) * MIX * 4, &final_norm);
     head_out(1, &logits);
     gpu_commit();
   }
@@ -2036,7 +2152,7 @@ static void prefill(const int *tokens, int n, int pos0) {
   if (all_logits) {  // every row's logits, for checks
     for (int r = 0; r < n; r++) {
       gpu_begin();
-      hc_pre_norm(1, &HS, (size_t)r * HC * DIM * 4, &MF, (size_t)r * MIX * 4, &final_norm);
+      hc_pre_norm(1, &HS, (size_t)r * HC * DIM * STREAM_BYTES, &MF, (size_t)r * MIX * 4, &final_norm);
       head_out(1, &logits);
       gpu_commit();
       gpu_sync();
@@ -2059,18 +2175,25 @@ static void prefill(const int *tokens, int n, int pos0) {
 }
 
 
-// A prefill pass keeps every row's streams (88 KB a row with the Engram
-// rows): a longer prompt runs as several passes, each reading the experts.
+// A prefill pass keeps every row's streams, selections and Engram rows
+// (about 56 KB plus candidate masks): longer prompts use several passes.
 #define CHUNK 16384
 
 static const float *forward(const int *tokens, int n, int pos, int prefix_pos) {
   if (n < 1 || pos < 0 || n > opt.ctx - pos) die("invalid forward range");
   if (prefix_pos >= 0 && (prefix_pos <= pos || prefix_pos >= pos + n)) die("invalid prefix snapshot position");
   ced_first = 0, ced_compact = 0, ced_active = 0;
-  if (opt.ced && n > opt.ced + BLOCK) ced_first = pos + n - (opt.ced + BLOCK), ced_compact = 1;
+  if (opt.ced && n > opt.ced + replay_margin())
+    ced_first = pos + n - (opt.ced + replay_margin()), ced_compact = 1;
 #ifdef MYDS4_CED_CHECK
   if (!opt.ced) ced_first = ced_check_first, ced_compact = ced_check_compact;
 #endif
+  prefill_prune_active = opt.prefill_prune && !ced_first && !opt.ced && !all_logits &&
+                         opt.substitute <= 0 && opt.dump_fd < 0 && opt.routes_fd < 0;
+#ifdef MYDS4_PREDICT_PROBE
+  if (predict_probe_enabled()) prefill_prune_active = 0;
+#endif
+  prefill_prune_end = pos + n;
   forward_info = (ModelForwardInfo){.tokens = n, .ced_tokens = opt.ced,
                                    .ced_applied = ced_compact && ced_first > (uint32_t)pos};
   prefix_prepare(prefix_pos, pos);
@@ -2090,6 +2213,8 @@ static const float *forward(const int *tokens, int n, int pos, int prefix_pos) {
     }
   }
   prefix_complete();
+  forward_info.prune_applied = prefill_prune_active && forward_info.decoder_tokens < forward_info.tokens;
+  prefill_prune_active = 0;
   if (opt.dump_fd >= 0 && write(opt.dump_fd, logits.ptr, VOCAB * 4) < 0) die("dump failed");
   return (const float *)logits.ptr;
 }
@@ -2188,6 +2313,7 @@ static void vit_gelu_row(void *ctx, size_t r) {
 }
 
 void model_image(Image *im) {
+  work_capacity(MB);
   uint32_t n = (uint32_t)(im->vh * im->vw), L = (uint32_t)(im->th * im->tw);
   uint32_t np = (n + 63) / 64 * 64, dims[2] = {n, np};  // vit_attn's rows: the patches, padded to its tiles
   Buf px = gpu_alloc((size_t)n * VIT_K * 4), cs = gpu_alloc((size_t)n * 64 * 4);
@@ -2312,7 +2438,7 @@ static void draft_stage(int d, int pos, int m) {
   gpu_commit();
   gpu_sync();
 #ifdef MYDS4_PREDICT_LAB
-  predictor_lab_stage(d, m, (const float *)X.ptr, (const float *)H1.ptr,
+  predictor_lab_stage(d, m, (const float *)X.ptr, stream_floats(&H1, 0, (size_t)m * HC * DIM),
                       (const float *)DMF.ptr, (const float *)GL.ptr,
                       (const float *)Q.ptr, (const float *)AO.ptr, (const uint16_t *)y->ring.ptr);
 #endif
@@ -2321,7 +2447,7 @@ static void draft_stage(int d, int pos, int m) {
     int selected[BLOCK * DRAFT_TOPK];
     for (int r = 0; r < m; r++)
       memcpy(selected + r * DRAFT_TOPK, (const int *)RT.ptr + r * 16, DRAFT_TOPK * sizeof(int));
-    predict_probe_streams(pos, LAYERS + d, m, (const float *)H1.ptr, (const float *)DMF.ptr);
+    predict_probe_streams(pos, LAYERS + d, m, stream_floats(&H1, 0, (size_t)m * HC * DIM), (const float *)DMF.ptr);
     predict_probe_emit(3, pos, d, m, DIM, (const float *)X.ptr,
                        DRAFT_EXPERTS, (const float *)GL.ptr, m * DRAFT_TOPK, selected);
   }
@@ -2368,7 +2494,7 @@ static void draft_stage(int d, int pos, int m) {
     gpu_kern(K_moe_down);
     gpu_buf(0, &ETAB, (size_t)(LAYERS * FEW + d * BLOCK + r) * 256), gpu_buf(1, &MH, (size_t)r * DRAFT_TOPK * INTER * 4);
     gpu_buf(2, &SHO, (size_t)r * DIM * 4), gpu_buf(3, &DMF, (size_t)r * MIX * 4);
-    gpu_buf(4, &H1, (size_t)r * HC * DIM * 4), gpu_buf(5, &DHS, (size_t)r * HC * DIM * 4), gpu_bytes(6, &n, 4);
+    gpu_buf(4, &H1, (size_t)r * HC * DIM * STREAM_BYTES), gpu_buf(5, &DHS, (size_t)r * HC * DIM * STREAM_BYTES), gpu_bytes(6, &n, 4);
     uint32_t pm = 0;
     gpu_bytes(7, &pm, 4), gpu_buf(8, &PARTS, 0);
     gpu_go(DIM / 4, 1, 1, 32 * DRAFT_TOPK, 1, 1);
@@ -2381,9 +2507,10 @@ static void draft_stage(int d, int pos, int m) {
 // stages retain all BLOCK keys, which every query sees. With draft_trim,
 // only the final stage's query/output/FFN work uses the first n rows. The
 // head and bias always use those n rows, whose drafts are wanted.
-void model_draft(int token, int pos, int *drafts, int n) {
+static void draft_generate(int token, int pos, int *drafts, int n, const Sampler *sampler) {
   if (token < 0) die("a draft after an image's token (position %d)", pos);
   if (n < 1 || n > BLOCK) die("model_draft needs 1 to %d draft rows", BLOCK);
+  work_capacity(BLOCK);
   double t0 = now();
   int64_t t = token;
   io_rows(embed_t.fd, embed_t.off, DIM * 2, &t, 1, DEROW.ptr);
@@ -2414,31 +2541,54 @@ void model_draft(int token, int pos, int *drafts, int n) {
   hc_pre_norm(n, &DHS, 0, &DMF, 0, &draft_norm);
   head_out(n, &DLOG);
   uint32_t v = VOCAB;
+  int coupled = sampler && sampler->temp > 0;
+  Sampler proposal;
+  if (coupled) {
+    proposal = *sampler;
+    gpu_commit(), gpu_sync();
+  }
   for (int r = 0; r < n; r++) {
+    if (coupled) gpu_begin();
     gpu_kern(K_markov);
     gpu_buf(0, &markov_embed, 0), gpu_buf(1, &markov_head, 0), gpu_buf(2, &DTOK, r * 4);
     gpu_buf(3, &DLOG, (size_t)r * VOCAB * 4);
     gpu_go(VOCAB / 8, 1, 1, 256, 1, 1);
-    gpu_kern(K_argmax);
-    gpu_buf(0, &DLOG, (size_t)r * VOCAB * 4), gpu_buf(1, &DTOK, (r + 1) * 4), gpu_bytes(2, &v, 4);
-    gpu_go(1, 1, 1, 1024, 1, 1);
+    if (coupled) {
+      gpu_commit(), gpu_sync();
+      ((int *)DTOK.ptr)[r + 1] = sample_token((const float *)DLOG.ptr + (size_t)r * VOCAB, VOCAB, &proposal);
+    } else {
+      gpu_kern(K_argmax);
+      gpu_buf(0, &DLOG, (size_t)r * VOCAB * 4), gpu_buf(1, &DTOK, (r + 1) * 4), gpu_bytes(2, &v, 4);
+      gpu_go(1, 1, 1, 1024, 1, 1);
+    }
   }
-  gpu_commit(), gpu_sync();
+  if (!coupled) gpu_commit(), gpu_sync();
   memcpy(drafts, (int *)DTOK.ptr + 1, n * sizeof *drafts);
 #ifdef MYDS4_PREDICT_LAB
-  predictor_lab_final(n, (const float *)DHS.ptr, (const float *)X.ptr);
+  predictor_lab_final(n, stream_floats(&DHS, 0, (size_t)n * HC * DIM), (const float *)X.ptr);
 #endif
 #ifdef MYDS4_PREDICT_PROBE
   if (predict_probe_streams_enabled()) {
     // This snapshot is after the head, at the synchronization above. X
     // contains only n head inputs. Uncomputed final-stage rows are omitted.
     predict_probe_streams(pos, CACHE_LAYERS, opt.draft_trim ? n : BLOCK,
-                          (const float *)DHS.ptr, (const float *)DMF.ptr);
+                          stream_floats(&DHS, 0, (size_t)(opt.draft_trim ? n : BLOCK) * HC * DIM),
+                          (const float *)DMF.ptr);
     predict_probe_emit(10, pos, CACHE_LAYERS, n, DIM, (const float *)X.ptr, 0, 0, 0, 0);
   }
   predict_probe_emit(5, pos, -1, n + 1, 0, 0, 0, 0, n + 1, (const int *)DTOK.ptr);
 #endif
   phase_s[6] += now() - t0;
+}
+
+void model_draft(int token, int pos, int *drafts, int n) {
+  draft_generate(token, pos, drafts, n, NULL);
+}
+
+// Drafting peeks at future uniforms on a copy. Verification consumes the
+// original sampler and therefore keeps ordinary decoding's token sequence.
+void model_draft_coupled(int token, int pos, int *drafts, int n, const Sampler *sampler) {
+  draft_generate(token, pos, drafts, n, sampler);
 }
 
 // A pass of the token at pos and its drafts. Rows after the accepted ones
@@ -2448,8 +2598,11 @@ void model_draft(int token, int pos, int *drafts, int n) {
 static int32_t verify_history[3];
 
 const float *model_verify(const int *tokens, int m, int pos) {
+  if (m < 1 || m > replay_margin() + 1 || m > FEW) die("invalid target verification row count");
   memcpy(verify_history, history, sizeof history);
+  verifying = 1;
   step(tokens, m, pos);
+  verifying = 0;
   return (const float *)logits.ptr;
 }
 
@@ -2462,7 +2615,11 @@ void model_accept(const int *tokens, int n, int pos) {
 #endif
   memcpy(history, verify_history, sizeof history);
   for (int i = 0; i < n; i++) history[2] = history[1], history[1] = history[0], history[0] = engram_map[tokens[i]];
-  draft_keys(n, pos);
+  if (opt.draft) {
+    verifying = 1;
+    draft_keys(n, pos);
+    verifying = 0;
+  }
 }
 
 // Clears the request's state: window rings, compressed rows, compressor
@@ -2533,6 +2690,7 @@ static void bench_attend(int r) {
 }
 
 void model_bench(void) {
+  work_capacity(MB);
 #define OFF(f) offsetof(Layer, f)
   struct { const char *name; size_t field; const Buf *in; } mats[] = {
       {"wq_a  1280x5120 fp8", OFF(wq_a), &XQ}, {"wq_b  32768x1280 fp8", OFF(wq_b), &QRQ},
@@ -2782,22 +2940,33 @@ void model_state_free(State *s) {
   free(s);
 }
 
-void model_state_copy(State *dst, const State *src) {
-  if (dst == active) die("the attention state in use cannot be overwritten");
-  if (dst->cap != src->cap) resize(dst, src->cap, 0);
+void model_state_fork(State *dst, const State *src, int positions) {
+  if (dst == active || dst == src) die("the attention state in use cannot be overwritten");
+  if (positions < 0 || positions > src->cap || !src->saved[1]) die("invalid saved-prefix fork");
   gpu_sync();
-#define COPY(f) memcpy(dst->f.ptr, src->f.ptr, src->f.size)
+  int cap = grown(start_cap(), positions);
+  if (dst->cap != cap) resize(dst, cap, 0);
+  // Global rows are immutable before the saved prefix. Include the guard
+  // row used by each compressed layout; later rows will be overwritten.
   for (int l = 0; l < LAYERS; l++) {
-    COPY(ring[l]);
-    if (L[l].kv_source) COPY(comp[l]), COPY(keys[l]), COPY(cstate[l]);
+    if (!L[l].kv_source) continue;
+    memcpy(dst->comp[l].ptr, src->comp[l].ptr, rows_bytes(l, positions, 0));
+    memcpy(dst->keys[l].ptr, src->keys[l].ptr, rows_bytes(l, positions, 1));
   }
-  for (int d = 0; opt.draft && d < DRAFTS; d++) COPY(dring[d]);
-#undef COPY
-  memcpy(dst->history, src == active ? history : src->history, sizeof history);
-  for (int k = 0; k < 2; k++) {
-    if (src->saved[k] && !dst->saved[k]) dst->saved[k] = xmalloc(saved_bytes());
-    if (src->saved[k]) memcpy(dst->saved[k], src->saved[k], saved_bytes());
+  // The source can have advanced far beyond this prefix. Restore local
+  // state directly from slot 1, rather than copying its current state first.
+  const char *p = src->saved[1];
+#define COPY_SAVED(f) (memcpy(dst->f.ptr, p, dst->f.size), p += dst->f.size)
+  for (int l = 0; l < LAYERS; l++) {
+    COPY_SAVED(ring[l]);
+    if (L[l].kv_source) COPY_SAVED(cstate[l]);
   }
+  for (int d = 0; opt.draft && d < DRAFTS; d++) COPY_SAVED(dring[d]);
+#undef COPY_SAVED
+  memcpy(dst->history, p, sizeof dst->history);
+  free(dst->saved[0]), dst->saved[0] = NULL;
+  if (!dst->saved[1]) dst->saved[1] = xmalloc(saved_bytes());
+  memcpy(dst->saved[1], src->saved[1], saved_bytes());
 }
 
 static void bind(const State *s) {  // the layers' state buffers: s's, for the dispatches encoded next
@@ -2817,7 +2986,7 @@ void model_state_use(State *s) {
 }
 
 const float *model_forward_rows(State **st, const int *tokens, const int *pos, int m) {
-  if (m < 1 || m > FEW) die("%d rows of sequences at once: 1 to %d", m, FEW);
+  if (m < 1 || m > BLOCK + 1) die("%d rows of sequences at once: 1 to %d", m, BLOCK + 1);
   for (int r = 0; r < m; r++) {
     if (pos[r] >= opt.ctx) die("context full (%d tokens)", opt.ctx);
     if (pos[r] + 1 > st[r]->cap) resize(st[r], grown(st[r]->cap, pos[r] + 1), pos[r]);

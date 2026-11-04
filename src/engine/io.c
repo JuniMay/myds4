@@ -1042,13 +1042,28 @@ int cache_request(int layer, const int *experts, int n) {
     }
     slots[i].prefetched = 0;
     slots[i].used = token;
-    score[i] = escore[layer * EXPERTS + e] += weight;
+    double *history = &escore[layer * EXPERTS + e];
+#ifdef MYDS4_DECODE_ONLY_SCORE
+    if (pass_layer < 0 || layer >= LAYERS) *history += weight;
+#else
+    *history += weight;
+#endif
+    score[i] = *history;
     reading += pending;
   }
   return reading;
 }
 
 int cache_slot(int layer, int e) { return where[layer][e] >= 0; }
+
+void cache_repeat_credit(int layer, int expert, int repeats) {
+  if (layer < 0 || layer >= LAYERS || expert < 0 || expert >= EXPERTS || repeats < 0 || repeats > VERIFY_DRAFTS)
+    die("invalid repeated expert usage");
+  if (!repeats) return;
+  int i = where[layer][expert];
+  if (i < 0 || slots[i].used != token) die("repeated usage requires a current expert request");
+  score[i] = escore[layer * EXPERTS + expert] += weight * repeats;
+}
 
 int cache_ready(int layer, int e) {
   int i = where[layer][e];

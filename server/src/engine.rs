@@ -7,7 +7,7 @@ use std::ptr;
 use deepseek_recipe::stream::StreamTokenizer;
 use tokio::sync::mpsc;
 
-const ABI: c_int = 4;
+const ABI: c_int = 5;
 const STARTED: c_int = 0;
 const TOKENS: c_int = 1;
 const DONE: c_int = 2;
@@ -34,6 +34,9 @@ struct RawConfig {
     kv_gb: f64,
     batch: c_int,
     ced: c_int,
+    lookup: c_int,
+    expert_batch: c_int,
+    prefill_prune: c_int,
     on_log: Option<extern "C" fn(*const c_char)>,
     on_die: Option<extern "C" fn()>,
 }
@@ -114,6 +117,9 @@ pub struct Config {
     pub kv_gb: f64,
     pub batch: i32,
     pub ced: i32,
+    pub lookup: i32,
+    pub expert_batch: bool,
+    pub prefill_prune: bool,
     /// Receives the log's lines (with their time) instead of stderr; it runs
     /// under the log's lock and must not call [`log`].
     pub on_log: Option<extern "C" fn(*const c_char)>,
@@ -150,6 +156,9 @@ pub fn start(c: &Config) -> bool {
         kv_gb: c.kv_gb,
         batch: c.batch,
         ced: c.ced,
+        lookup: c.lookup,
+        expert_batch: c.expert_batch.into(),
+        prefill_prune: c.prefill_prune.into(),
         on_log: c.on_log,
         on_die: c.on_die,
     };

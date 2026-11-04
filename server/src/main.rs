@@ -42,7 +42,8 @@ const USAGE: &str = "usage: myds4-server -m MODEL --serve PORT [options]
   --seed N        the seed of requests that set none (default: random for each)
   --think N       thinking effort 1-100 of requests that set none; 0 turns thinking off (default 75)
   --ctx N         context capacity in tokens, at most 1048576 (default 1048576)
-  --ced off|N     approximate prefill: replay N decoder tokens, 128-1048576 (default off), plus five rewind rows
+  --ced off|N     approximate prefill: replay N decoder tokens, 128-1048576 (default off), plus the verification rewind margin
+  --prefill-prune  skip decoder batches outside required history; CED and substitution must be off (default off)
   --cache GB      expert cache budget (default: from available memory)
   --reserve GB    memory the expert cache leaves to other programs, 2-1024 (default 10)
   --cache-half-life N  score half-life in forward passes, 1-1000000 (default 50)
@@ -51,6 +52,8 @@ const USAGE: &str = "usage: myds4-server -m MODEL --serve PORT [options]
   --substitute D  approximate: replace selected experts not in memory (see build/myds4)
   --gpu-route     decoding: the GPU looks up each layer's experts itself
   --draft N       verify up to N (1-5) DSpark drafts per pass
+  --lookup off|N  verify up to N (1-15) context-copy drafts; --draft supplies fallback
+  --expert-batch  share repeated expert weight loads across verification rows
   --draft-cache N  with --draft: expert slots per stage, 15-128
   --draft-trim    with --draft: compute only requested final-stage rows
   --online-predictor  CPU prefetch correction learned online
@@ -98,7 +101,7 @@ struct Args {
     tui: bool,
 }
 
-fn parse() -> Args {
+fn parse(args: &[String]) -> Args {
     let mut a = Args {
         engine: engine::Config { ctx: 1 << 20, kv_gb: 8.0, batch: 4, ..Default::default() },
         port: None,
@@ -108,7 +111,6 @@ fn parse() -> Args {
         render: None,
         tui: false,
     };
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -122,6 +124,8 @@ fn parse() -> Args {
             "--cache-read-cost" => e.cache_read_cost = true,
             "--gpu-route" => e.gpu_route = true,
             "--draft-trim" => e.draft_trim = true,
+            "--expert-batch" => e.expert_batch = true,
+            "--prefill-prune" => e.prefill_prune = true,
             "--online-predictor" => e.online_predictor = true,
             _ => {
                 let Some(v) = args.get(i + 1) else { usage() };
@@ -136,6 +140,7 @@ fn parse() -> Args {
                     "--cache-half-life" => e.cache_half_life = value(flag, v),
                     "--substitute" => e.substitute = value(flag, v),
                     "--draft" => e.draft = value(flag, v),
+                    "--lookup" => e.lookup = if v == "off" { 0 } else { value(flag, v) },
                     "--draft-cache" => e.draft_cache = value(flag, v),
                     "--predictor-state" => {
                         if v.is_empty() {
@@ -176,6 +181,24 @@ fn parse() -> Args {
         i += 1;
     }
     a
+}
+
+#[test]
+fn prefill_and_draft_options_keep_the_sampling_defaults() {
+    let defaults = parse(&[]);
+    assert!(!defaults.engine.prefill_prune);
+    assert_eq!(defaults.engine.ced, 0);
+    assert_eq!(defaults.engine.lookup, 0);
+    assert!(!defaults.engine.expert_batch);
+    let args = ["--prefill-prune", "--lookup", "15", "--expert-batch", "--draft", "2"];
+    let enabled = parse(&args.map(String::from));
+    assert!(enabled.engine.prefill_prune);
+    assert_eq!(enabled.engine.ced, 0);
+    assert_eq!(enabled.engine.lookup, 15);
+    assert!(enabled.engine.expert_batch);
+    assert_eq!(enabled.engine.draft, 2);
+    assert_eq!(enabled.defaults.temperature, 1.0);
+    assert_eq!(enabled.defaults.top_p, 1.0);
 }
 
 /// What the handlers share.
@@ -300,7 +323,7 @@ async fn use_post() -> Response {
 }
 
 fn main() {
-    let a = parse();
+    let a = parse(&std::env::args().skip(1).collect::<Vec<_>>());
     if let Some(file) = &a.render {
         exit(chat::render_file(file));
     }
