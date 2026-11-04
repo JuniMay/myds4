@@ -101,7 +101,11 @@ static int unbyte[324];
 // A byte-level token string to its raw bytes; returns the length.
 static int raw(const char *s, int n, char *out) {
   int m = 0;
-  for (int i = 0, k; i < n; i += k) out[m++] = unbyte[utf8_next((const unsigned char *)s + i, &k)];
+  for (int i = 0, k; i < n; i += k) {
+    int cp = utf8_next((const unsigned char *)s + i, &k);
+    if ((unsigned)cp >= sizeof unbyte / sizeof *unbyte) die("tokenizer: invalid byte-alphabet token");
+    out[m++] = unbyte[cp];
+  }
   return m;
 }
 
@@ -119,10 +123,23 @@ void tok_load(const char *dir) {
   nvocab = VOCAB;
   pieces = xmalloc(nvocab * sizeof *pieces);
   piece_len = xmalloc(nvocab * sizeof *piece_len);
+  // Added tokens use literal UTF-8. Some also occur in model.vocab, where
+  // converting them through the byte-level alphabet would read out of bounds.
+  for (int i = 0; i < add->n && nadded < 2048; i++) {
+    Json *t = &add->kid[i];
+    Json *c = json_get(t, "content");
+    int id = (int)json_get(t, "id")->num;
+    added[nadded].s = c->s;
+    added[nadded].n = c->n;
+    added[nadded++].id = id;
+    if (id >= 0 && id < nvocab) pieces[id] = (char *)c->s, piece_len[id] = c->n;
+  }
   for (vcap = 1; vcap < 2ull * v->n; vcap *= 2) {}
   vocab = xmalloc(vcap * sizeof *vocab);
   for (int i = 0; i < v->n; i++) {
     int id = (int)v->kid[i].num, len = strlen(v->kid[i].key);
+    if (id < 0 || id >= nvocab) die("tokenizer: vocabulary id out of range");
+    if (pieces[id]) continue;
     char *r = xmalloc(len + 1);
     int n = raw(v->kid[i].key, len, r);
     insert(r, n, id);
@@ -144,15 +161,6 @@ void tok_load(const char *dir) {
     merges[j].pair = key + 1;
     merges[j].rank = i;
     merges[j].id = id;
-  }
-  for (int i = 0; i < add->n && nadded < 2048; i++) {
-    Json *t = &add->kid[i];
-    Json *c = json_get(t, "content");
-    int id = (int)json_get(t, "id")->num;
-    added[nadded].s = c->s;
-    added[nadded].n = c->n;
-    added[nadded++].id = id;
-    if (id < nvocab) pieces[id] = (char *)c->s, piece_len[id] = c->n;
   }
 }
 

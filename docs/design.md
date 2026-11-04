@@ -1638,6 +1638,11 @@ then content, then the DSML tool calls, each with its arguments as JSON. The
 engine's tokenizer gives it each token's bytes; a character whose UTF-8
 bytes are not all there yet waits for the next token.
 
+The tokenizer loads added tokens as literal UTF-8 before converting the
+byte-level BPE vocabulary. An added token that also appears in that
+vocabulary keeps its literal spelling. Byte-alphabet decoding validates
+the code point before indexing its table.
+
 ### Sessions
 
 Each conversation keeps its attention state in a session: the layers'

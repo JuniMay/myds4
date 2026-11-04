@@ -134,6 +134,10 @@ build/myds4-staged-draft: $(SRC) $(MODEL_HEADERS) src/experimental/draft_queue.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -DMYDS4_STAGED_DRAFT=2 -o $@ $(SRC) $(LDLIBS)
 
+build/tokenizer-added-check: tools/checks/tokenizer_added_check.c src/engine/tok.c src/engine/util.c $(MODEL_HEADERS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ tools/checks/tokenizer_added_check.c src/engine/tok.c src/engine/util.c $(shell pkg-config --libs yyjson)
+
 build/myds4-staged-coupled-draft: $(SRC) $(MODEL_HEADERS) src/experimental/draft_queue.h $(KERNELS) data/engram.bin data/unicode.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -DMYDS4_STAGED_DRAFT=2 -DMYDS4_COUPLED_DRAFT -o $@ $(SRC) $(LDLIBS)
