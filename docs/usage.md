@@ -13,6 +13,9 @@ The checks and the tools that regenerate `data/` need Python 3 with `torch`,
 environment in `.venv`; the vision check also needs `pillow`. The program
 itself needs no Python.
 
+The tools that read compressed Harness sessions require Python 3.14 or
+later for the standard-library `compression.zstd` module.
+
 `build/myds4` embeds the kernels and two tables from `data/`, which
 `tools/data/gen_data.py` generates from the checkpoint:
 
@@ -44,7 +47,7 @@ it, saying so on stderr. `lockf(1)` takes the same lock.
 | `--top-p P` | Nucleus probability from 0 to 1; default 1 samples the full distribution. Zero retains only the highest-probability token. |
 | `--seed N` | Nonnegative integer seed for repeatable sampling. Omit it to initialize each run from system randomness. |
 | `--ctx N` | Context capacity in tokens, up to 1,048,576, the model's own (default 16,384). The attention state of a conversation takes about 3.1 KB per token and grows with it. |
-| `--prefill-prune` | Skip decoder batches outside the dependencies of the final state and saved prefix. Off by default; available in the CLI and server. Encoder/global KV work remains complete. Applies with CED and substitution off and without full-row diagnostics. The dependency-preserving plan matched full prefill in the tested MXFP4 and IQ2 cases. It can change cache residency and decode speed; see [measurements](performance.md#dependency-pruned-prefill-checks). |
+| `--prefill-prune` | Skip decoder batches outside the dependencies of the final state and of a fork's branch-point capture. Off by default; available in the CLI and server. Encoder/global KV work remains complete. Applies with CED and substitution off and without full-row diagnostics. The dependency-preserving plan matched full prefill in the tested MXFP4 and IQ2 cases. It can change cache residency and decode speed; see [measurements](performance.md#dependency-pruned-prefill-checks). |
 | `--ced off\|N` | Approximate prefill, default `off`. A depth from 128 to 1,048,576 retains N decoder tokens plus `max(5, lookup_depth)` rewind rows. All new tokens run through the encoder and global KV projections; only the retained suffix runs through later decoder layers. Shorter inputs use full prefill. Decoding still uses all layers. Local KV and generated output can differ from full prefill. Available in the CLI and the server. |
 | `--cache GB` | Upper bound on expert memory, including reserved draft pools. After reserving those pools, the budget must hold two backbone layers' experts. The cache adapts to available memory and keeps a reserve for other programs (`--reserve`); the requested budget is not a guaranteed allocation. Slots outside the GPU's mapping limit remain in memory and are mapped when needed. See [Design](design.md#the-expert-cache-and-memory). |
 | `--reserve GB` | The memory the expert cache leaves to other programs, 2 to 1,024 GiB (default 10). The cache starts within available memory (free pages plus reclaimable file pages) less the reserve, gives slots back when the available memory falls below it, and grows only while the available memory exceeds it by 4 GiB. A smaller reserve keeps more experts in memory and leaves less to other applications; the cache still gives slots back on memory pressure, swapping or insufficient available memory. In-memory compression has no separate limit. |
@@ -103,12 +106,13 @@ The [README](../README.md#run) shows how to create a key file and start the serv
 | `--serve PORT` | Serve on this port. `--experts`, cache settings, draft settings, `--substitute`, `--gpu-route` and `--ctx` apply to every request. |
 | `--host ADDR` | The IPv4 address to listen on (default `127.0.0.1`, this machine only). The server speaks plain HTTP: on another address, keys and conversations cross the network unencrypted. |
 | `--api-key-file FILE` | The key clients must send. |
-| `--kv-cache GB` | The memory the conversations' attention state may take (default 8 GiB, apart from `--cache`): a conversation takes 66 MiB at first and up to 3.1 GiB at 1,048,576 tokens. The least recently used conversations are dropped to make room; a request whose conversation alone needs more is refused. |
+| `--kv-cache GB` | The memory the KV prefix cache may take (default 8 GiB, apart from `--cache`): the attention states it keeps (55 MiB at first, up to 3.1 GiB at 1,048,576 tokens) and their snapshots (5.3 MiB each, 5.8 MiB with a prompt end's logits; more with `--draft`). Spare snapshots and then the least recently used states are dropped to make room; a request that does not fit even then is refused before anything is dropped. A decoding request whose state needs more room (past 16,384 positions, then each doubling) makes room the same way before its state grows; when only decoding states are left, the state grows past the limit and the server logs it. |
 | `-t T`, `--temperature T` | The temperature of requests that set none (default 1, the checkpoint's recommendation; 0 is greedy). |
 | `--top-p P` | The nucleus probability of requests that set none (default 1). |
 | `--seed N` | The sampling seed of requests that set none. Without this option, each request receives a random seed. |
 | `--think N` | The thinking default: 1–100 enables thinking at that effort; 0 disables it. Without this option, the server enables thinking at effort 75. Request fields take precedence. |
-| `--batch N` | Requests decoded together at most, 1 to 6 (default 4). Requests that overlap then share each forward pass: more tokens per second in all, fewer for each request (see [Performance](performance.md#concurrent-requests)). A request alone runs the same at any N. |
+| `--batch N` | Requests decoded together at most, 1 to 6 (default 4). Overlapping requests share forward passes. Aggregate throughput depends on expert-cache contention and the workload (see [Performance](performance.md#concurrent-requests)). A request alone runs the same at any N. |
+| `--runahead` | Let ready concurrent requests advance while other requests' expert reads run. Groups ready requests at the same layer and enables `--expert-batch`. Applies with two or more decoding requests; off by default. Requires no `--draft`, `--online-predictor`, `--gpu-route` or `--substitute`. Context lookup remains available for a request running alone. |
 | `--tui` | A live view on the terminal in place of the log (see below); the `q` key stops the server as Ctrl-C does. |
 | `--render FILE` | Print the prompt of a JSON test case of the checkpoint's `encoding/tests` (or a request's messages, tools, thinking mode and effort) as the server renders it, and exit; for `tools/reference/check.py encoding`. |
 
@@ -118,7 +122,7 @@ Endpoints:
 | --- | --- |
 | `POST /v1/chat/completions` | A chat completion: streamed as server-sent events (`"stream": true`, with usage when `stream_options.include_usage` is set) or as one JSON response. Reasoning arrives in `reasoning_content`, tool calls in `tool_calls`. |
 | `GET /v1/models` | The model `deepseek-v4.1-flash`, its context (`context_length`) and output cap (`max_output_tokens`). |
-| `GET /v1/status` | What the server is doing: the phase (idle, prefill, decode) and its request, the waiting requests, the sessions, the KV and expert caches, memory, and totals. |
+| `GET /v1/status` | What the server is doing: the phase (idle, prefill, decode) and its request, the waiting requests, the KV prefix cache's states (`sessions`), the KV and expert caches, memory, and totals. |
 | `GET /health` | `{"status": "ok"}`, without a key. |
 
 A request may set `messages` (roles `system`, `developer`, `user`,
@@ -164,8 +168,9 @@ Images come only from image parts: the placeholder's text
 `<｜deepseek_image｜>` in a message or a tool result (a file that mentions
 it, say) is read as text. An image takes up to 1,024 prompt tokens. The
 vision encoder runs for the images
-of the part of the prompt that is prefilled; images in a conversation's
-earlier turns, whose rows the session holds, are not encoded again. For the
+of the part of the prompt that is prefilled (for a replay, from its first
+recomputed position); images in the part reused from the KV prefix
+cache are not encoded again. For the
 DeepSeek Harness, the model's entry needs `image` among its inputs
 (`input: [text, image]`).
 
@@ -177,18 +182,23 @@ each per step; each is computed exactly as it would be alone, so a greedy
 request's text does not depend on what else runs. With the GGUF experts and
 exact decoding, two or four requests together decode at about the speed of
 one in all (each row reads its own experts, and the SSD binds; see
-[Performance](performance.md#concurrent-requests)). A request that
-repeats a conversation's last prompt (a retry) continues from that prompt's
-saved state and logits, so a greedy retry gives the same text.
+[Performance](performance.md#concurrent-requests)).
 
 Each request's system, user, tool and context messages form one prompt. The
-server saves the system prefix during that prompt's prefill, without a
-second pass at the first user turn. Prompts longer than 16,384 new tokens
-still use bounded chunks. Separate requests keep separate attention states.
-With CED enabled, a system-prefix snapshot may contain only encoder state.
-The server forks that snapshot only when the new suffix exceeds the replay
-depth plus `max(5, lookup_depth)` rows; otherwise it chooses a complete cached state or
-prefills anew.
+server's KV prefix cache resumes it at the longest token prefix it shares
+with any conversation the server holds, also one still decoding, at any
+position: a conversation's next turn continues its state, a retry of a
+prompt continues from that prompt's saved state and logits (so a greedy
+retry gives the same text), and a prompt that branches off another (an
+edited turn, a subagent with the same instructions) gets a copy of the
+shared part. Without `--ced`, where the shared part came from prompts, the
+result is the same, byte for byte, as prefilling the whole prompt; where it
+holds a decoded reply, it is the conversation's own continuation. With
+`--ced`, a resume recomputes up to the last ring of shared positions (133
+with the default `--lookup`) with their windows stopping there, so it is
+approximate, as CED's prefill is. Prompts longer
+than 16,384 new tokens still use bounded chunks. See
+[The KV prefix cache](design.md#the-kv-prefix-cache).
 
 While no request runs, the server keeps experts in memory for later
 requests. Every second it checks memory as it does between tokens. It gives
@@ -200,22 +210,23 @@ footprint; mapped slots are wired, and macOS may compress other slots.
 
 The log on stderr has a line per event: each HTTP request's arrival, its body
 size, message and tool counts, queue admission, and waiting-request count.
-Prefill logs show new and reused tokens, configured CED depth, actual chunk
-count, encoder and decoder token counts, saved prefix, speed and expert reads.
+Prefill logs show how the prompt resumed (`new`, `kept`, `saved` or
+`forked`), new and reused tokens, configured CED depth, actual chunk count,
+encoder and decoder token counts, the capture position, speed and expert reads.
 Queue admission also reports requests taken together for subsequent prefills.
 `GET /v1/status` includes `ced_depth` (0 means off) and `last_prefill` with the
 last completed plan. These fields distinguish separate HTTP requests from
 chunks inside one prompt. The log also shows the
 decoding's progress every 10 s, and its end (tokens, speed, expert hits,
-SSD reads, KV sessions, memory), expert slots given back while idle, and
+SSD reads, the KV prefix cache's states, memory), expert slots given back while idle, and
 refused or unauthorized requests. It never shows keys or conversation text.
 
 ### Live view
 
 With `--tui`, when stderr is a terminal, the server shows a live view there
 in place of the log, redrawn twice a second on the terminal's alternate
-screen (ratatui on its crossterm backend, from the engine's snapshot,
-`myds4_view`). The lines logged while the model loads stay on the normal
+screen (ratatui on its crossterm backend, from the worker's snapshot,
+`worker::view`). The lines logged while the model loads stay on the normal
 screen; the view starts once the model is loaded. It writes nothing to
 files. Ctrl-C, SIGTERM or the `q` key stops the server after its current
 step, about a second when idle; the terminal comes back with the last 30 log
@@ -228,7 +239,7 @@ computes: a request's next token, or a draft being verified. The view has
 five parts:
 
 - **Now:** idle, prefilling (a gauge of the layers done), or decoding. For
-  each request: its session, prompt and reused tokens, generated tokens and
+  each request: its state's number, prompt and reused tokens, generated tokens and
   speed. A sparkline shows the total speed over the last 10 s (20 s on
   terminals wider than 100 columns).
 - **Experts per token**, over the last 10 s (since start when nothing
@@ -257,13 +268,13 @@ five parts:
   (including file cache),
   pressure, file cache, wired memory and swap; below it the compressor, the
   kernel's file-cache target (diagnostic only) and swap-outs since the view started.
-- **KV cache:** the sessions and their memory, the share of the finished
-  requests' prompt tokens that sessions supplied, the requests by how they
-  found their session (new, continued, saved rows, forked), and the
-  sessions' prefix tree. A node is a run of positions that all its sessions
-  share. `●` marks where a session ends, with its number, decoding or idle
-  time, saved position and memory. A node's hits count the requests whose
-  reused rows reach into it.
+- **KV cache:** the states the KV prefix cache keeps and their memory, the
+  share of the finished requests' prompt tokens that it supplied, the
+  requests by how they resumed (new, continued in place, from a saved prompt
+  end, forked), and the states' prefix tree. A node is a run of positions
+  that all its states share. `●` marks where a state ends, with its number,
+  decoding or idle time, last prompt end and memory. A node's hits count the
+  requests whose reused rows reach into it.
 - **Log:** the latest log lines.
 
 ### DeepSeek Harness
@@ -287,20 +298,26 @@ The app stores the key in its own credential file (`~/.dsh/.credentials.yaml`).
 | --- | --- |
 | `make activation-format-check` | 21 CPU checks of BF16 and packed FP8 reference codecs, rounding, scales and scaled-half activation staging. No model or GPU. |
 | `make workspace-check` | 21 CPU checks of request and layer-buffer growth, release before decoding, verification capacity, synchronization, allocation guards and cache-clock preservation. Uses host buffers, not Metal. |
-| `make state-fork-check` | 78 CPU checks of prefix-limited global-cache copies, restored local state, history and source independence. Uses host buffers, not Metal. |
+| `make state-fork-check` | 92 CPU checks of a fork as the KV prefix cache makes it: prefix-limited copies of the global rows, the rolling rows and history restored from a snapshot taken before the source went on, the destination's old rewind point dropped, and source independence; and that the bytes the cache charges a state (`myds4_state_bytes`) are those its buffers and rewind copy take, also for a new state. Uses host buffers, not Metal. |
 | `make context-lookup-check` | 33 CPU checks of the history matcher, including direct-scan comparisons over 32,768 prefixes, long matches behind frequent short endings and the experimental consensus fallback. |
 | `make verification-schedule-check` | 8 CPU checks of wide verification's bounded matrix-vector dispatches and retained local-history sizes. |
 | `make build/verification-prefetch-check`, then `build/verification-prefetch-check` | 8 CPU checks separating experimental prefetch admission limits from retention and verifying the two-layer forecast offsets. |
 | `make build/draft-queue-check`, then `build/draft-queue-check` | 11 CPU checks of staged draft reuse, rejection, bonus tokens and output limits. |
-| `make build/prefill-prune-check`, then `build/prefill-prune-check` | Dependency planning on 109,440 small causal graphs. This does not validate model numerics. |
+| `make build/prefill-prune-check`, then `build/prefill-prune-check` | Dependency planning on 218,880 small causal graphs across fixed and layer-dependent intervals. This does not validate model numerics. |
 | `python3 -B tools/checks/rendered_prompt_check.py CHECKPOINT` | 7 CPU checks of CLI input modes, literal image-marker text and flag order with tokenization and perplexity. Loads only the tokenizer. |
 | `make build/packed-activation-check`, then `build/packed-activation-check` | Synthetic MXFP4 kernel comparison of packed FP8 activation reads against expanded FP32 reads. Reports numerical differences and GPU-only timings; the prototype is not part of inference. |
 | `make build/expert-stream-probe`, then `build/expert-stream-probe CHECKPOINT` | Compare full expert reads with gate/up computation overlapped with down-weight reads, in an isolated favorable case. Uses the GPU and existing weight files. |
 | `make build/verification-model-check`, then `build/verification-model-check CHECKPOINT` | All sixteen verification rows against sequential decoding and rollback after partial acceptance. `--draft`, `--online`, `--gpu-route`, `--long` and `--experts GGUF` select additional cases. Uses the GPU and model. |
 | `.venv/bin/python tools/reference/check.py tok CHECKPOINT` | The tokenizer against the `tokenizers` library on 17 texts. |
 | `make build/tokenizer-added-check`, then `ASAN_OPTIONS=detect_leaks=0 build/tokenizer-added-check CHECKPOINT` | Loads the checkpoint under address and undefined-behavior sanitizers. Checks literal added tokens that also appear in the BPE vocabulary and ordinary text round trips. |
+| `make build/speculative-sample-check`, then `build/speculative-sample-check` | Checks the research rejection sampler's probability conservation, conditional two-token distribution, nucleus filtering, EOS and bonus tokens. |
+| `make build/cache-hold-check`, then `build/cache-hold-check` | 13 CPU checks of shared cache reservations, eviction protection and pending fetch ownership. |
+| `make build/batch-prefetch-check`, then run `build/batch-prefetch-check` | CPU checks of concurrent admission limits and shared-use credits. |
+| `build/runahead-model-check CHECKPOINT --signal --long --requests 2` | Event-based scheduling against ordinary concurrent decoding: all logits, local state, global KV and the caller's active-state identity. Add `--experts GGUF` for a quantized expert pack. |
+| `build/causal-signal-check CHECKPOINT --draft --long` | All 16 verification rows and five rollback lengths against serial decoding, including the next DSpark drafts. |
 | `.venv/bin/python tools/reference/check.py encoding CHECKPOINT` | The server's prompts (`build/myds4-server --render`; `MYDS4_RENDER` names another renderer) of the checkpoint's `encoding/tests` cases 1, 2, 3 and 5, and of 1,200 generated conversations (tools, tool calls and results, reasoning, system messages at the start and mid-conversation, content parts, escapes, both thinking modes, every effort form) and 600 with image parts in user turns and tool results (the placeholders' places and the images' order), against `encoding/encoding.py`, byte for byte. The server's renderer differs from `encoding.py` in known places ([Prompts compared with encoding.py](server.md#prompts-compared-with-encodingpy)), so the check reports the equal counts and exits with status 1. |
-| `make server-check` | The server's tests without a model: the compatibility steps, a numeric effort in the prompt, the live view's frames on a test terminal (the title first, every line within the terminal's width, the log below the sessions' tree, the quit keys), the connections' limits (503, 431, a late head, 408, 413, a client that leaves or stops reading), and, with `MYDS4_CHECKPOINT=CHECKPOINT`, its output path through deepseek-recipe's stream processor with the checkpoint's tokenizer. |
+| `make server-check` | The server's tests without a model: the compatibility steps, a numeric effort in the prompt, the KV prefix cache's decisions, the live view's frames on a test terminal (the title first, every line within the terminal's width, the log below the states' tree, the quit keys), the connections' limits (503, 431, a late head, 408, 413, a client that leaves or stops reading), and, with `MYDS4_CHECKPOINT=CHECKPOINT`, its output path through deepseek-recipe's stream processor with the checkpoint's tokenizer. With `MYDS4_EXPERTS=GGUF` set too, the fork tests through HTTP run as well (about 12 minutes; see [The server](server.md#checks)). |
+| `build/prefix-fork-check CHECKPOINT --text FILE [--rendered] [--limit N] [--experts GGUF] [--ced N] --fork [--random N]` | The fork test in the engine: a conversation forked at many positions, each resume method against a cold prefill and the conversation itself, and each fork's branch-point snapshot against the fork; with `--ced N`, the bounded replay's kept rows and its distance from the cold prefill (see [The server](server.md#checks)). About half an hour with a model. |
 | `.venv/bin/python tools/reference/check.py vision CHECKPOINT IMAGE [BINARY...]` | The image's feature rows (`--vision-fd`) against `inference/image_processor.py` and `vision.py` (ViT and Aligner in BF16 on the CPU): their SNR, overall and per row. With BINARY, each of those builds instead of `build/myds4`, against one reference. Needs `pillow`. |
 | `.venv/bin/python tools/reference/check.py model CHECKPOINT [CACHE]` | Every layer's streams, the routing and the logits of 20 decoded positions against DeepSeek's `inference/model.py` on the CPU (about 12 minutes, up to 55 GB of memory; `CACHE` keeps the reference's results in a file for reruns). The reference reads the checkpoint through the page cache, which then holds tens of GB of it: myds4 counts reclaimable file pages as available, and its expert reads may come from the page cache instead of the SSD. |
 | `build/myds4 -m CHECKPOINT -p TEXT --check-prefill` | The prompt as two batches (the first of odd length) against one: the final logits must be equal. The batched prefill's logits at every position against token-by-token decoding. |
@@ -309,8 +326,14 @@ The app stores the key in its own credential file (`~/.dsh/.credentials.yaml`).
 | `make cache-ready-check` | Cache readiness and prefetch accounting with completed, pending and released dispatch groups. Runs 45 checks without a model, expert reads or GPU execution. |
 | `make draft-cache-check` | Runs 49 CPU checks of stage-pool bounds, native expert admission, least-recently-used replacement, protected requests and completion-group ownership. No model, expert reads or GPU execution. |
 | `make prefetch-metrics-check` | Runs 56 CPU checks of fixed-snapshot route attribution, first-use accounting, origin preservation, completed/cancelled bytes, I/O timing and unsupported GPU-route coverage. Prints bounded JSON summaries; no model or GPU execution. |
-| `make cache-policy-check` | Runs 48 CPU checks of score aging, victim eligibility, read-cost weighting, repeated-row priority, persistent history, rescaling and pending-read ownership. No model or GPU execution. |
-| `make prefetch-queue-check` | Runs 10 CPU checks of immediate prefetch admission release, including completion and cancellation while notifications are delayed. Reads `/dev/zero`; no model, SSD files or GPU execution. |
+| `make cache-policy-check` | Runs 59 CPU checks of score aging, victim eligibility, read-cost weighting, repeated-row priority, history, pending ownership and reuse of refined empty slots. No model or GPU execution. |
+| `make prefetch-queue-check` | Runs 14 CPU checks of admission release and pending ownership, including completion and cancellation while notifications are delayed. Reads `/dev/zero`; no model, SSD files or GPU execution. |
+| `make prefetch-admission-check` | Runs 19 CPU checks of admission limits, promotion, repeated forecasts and preservation of required data. Reads `/dev/zero`; no model or GPU execution. |
+| `make prefetch-demote-check` | Runs 40 CPU checks of experimental cancellation after actual routing, queue compaction, protected buffers, refinement keep lists and prefill exclusion. No model or GPU execution. |
+| `make prefetch-refine-race-check` | Runs 8 CPU checks of a reader winning ownership during refinement. Holds a real `/dev/zero` read and requires refinement to return without waiting. No model or GPU execution. |
+| `make expert-ready-check` | Runs 10 CPU checks of completion notification and waiting for any selected expert. No model or GPU execution. |
+| `make prefetch-pool-check` | Runs 42 CPU checks of the four- and eight-slot experimental forecast segment, including promotion, buffer identity, protection and release. No model or GPU execution. |
+| `make build/expert-waves-model-check`, then `build/expert-waves-model-check CHECKPOINT [EXPERT_GGUF] [--long]` | Uses the GPU and a 20 GiB cache to compare all logits and retained state over eight forced continuation positions. Forces one expert per group; `--long` uses a 16,521-token prompt instead of 257. Run with no other model process and sufficient runtime memory. |
 | `make memory-available-check` | Runs 11 CPU checks of reclaimable file pages and speculative-page accounting. No model or GPU execution. |
 | `make cache-memory-check` | Runs 8 CPU checks of initial capacity, growth with compression, and responses to pressure and swapping. No model or GPU execution. |
 | `make gpu-clock-check` | Checks the GPU clock-keeper calibration with injected host scheduling delay. Uses a tiny Metal kernel and no model weights. |
@@ -382,7 +405,7 @@ Multirow substitution computes only the next-layer forecast, so that path
 trains and uses only the available horizon.
 
 Learned corrections belong to the engine and remain in memory across requests,
-KV-state resets and session switches. The server's single model worker shares
+KV-state resets and switches between attention states. The server's single model worker shares
 one learner across its requests; each row trains against its own native router
 result. Without a state path, starting the engine initializes a new learner
 and all learned state remains in RAM. Tensor state uses about 23 MiB and
@@ -463,7 +486,8 @@ ownership and report semantics. Performance results are documented separately.
   the context, and a prompt over 16,384 tokens runs as several passes that
   each read the experts again. A 41,000-token prompt took about 80 s with
   the GGUF experts; a 1,048,576-token prompt would take hours. The
-  server's sessions spare a conversation's earlier tokens this work.
+  server's KV prefix cache spares a prompt the work on the tokens it shares
+  with a conversation the server holds.
 - The server decodes up to 6 requests together and prefills one at a time;
   up to 16 more wait (more are refused with 429). Drafts (`--draft`) serve
   a request only while it decodes alone.

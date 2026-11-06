@@ -19,35 +19,41 @@ serves `POST /v1/chat/completions`, streamed or as one response,
 | Prompts: recipe's V4.1 rendering | Rust | `server/src/chat.rs` |
 | Output: recipe's stream processor (reasoning, content, tool calls, usage) and its Chat Completions chunks | Rust | `server/src/chat.rs` |
 | The live view (`--tui`): the terminal, the statistics windows, the frame, on ratatui | Rust | `server/src/view.rs` |
-| The engine's ABI in Rust: declarations, events as messages, cancellation | Rust | `server/src/engine.rs` |
-| The engine: the queue, sessions, batching, sampling, drafts, the status, the live view's snapshot, the log | C | `src/engine/engine.c` |
+| The worker: the queue, scheduling and batching, drafts, events, cancellation, the status and the live view's snapshot | Rust | `server/src/worker.rs` |
+| The KV prefix cache: which attention states and snapshots to keep, and how a prompt resumes from them | Rust | `server/src/kv.rs` |
+| The engine's ABI in Rust: declarations and thin wrappers | Rust | `server/src/engine.rs` |
+| The engine: loading, attention states and snapshots, prefill (with a replay, exact or bounded under `--ced`, and a capture position), decoding, drafts, sampling, context-copy drafts, images, statistics, the tokenizer, the log | C | `src/engine/engine.c` |
 | The model, the expert cache, the vision encoder, the tokenizer, signals | C, Metal | `src/engine/model.c`, `src/engine/io.c`, `src/engine/gpu.c`, `src/engine/vision.c`, `src/engine/tok.c`, `src/engine/util.c` |
 
 ## Threads
 
-- **The engine's thread** (`myds4_start` creates it, with a 16 MB stack and
-  the user-interactive QoS class). It loads the model and then runs the
-  worker loop: it admits waiting requests while fewer than `--batch` decode,
-  prefills each, advances every decoding request by a step and ends finished
-  ones. All model work stays on this thread, because `gpu.c` keeps an
-  autorelease pool per thread. While no request runs, it resizes the expert
-  cache every second (`cache_idle`).
-- **The live view's thread** (`--tui`): twice a second it takes the engine's
-  snapshot (`myds4_view`), draws the frame on stderr's alternate screen and
+- **The worker's thread** (`worker::start` creates it with a 16 MiB stack;
+  `myds4_load` gives it the user-interactive QoS class). It loads the model
+  and then runs the worker loop: it admits waiting requests while fewer than
+  `--batch` decode, resumes each from the KV prefix cache and prefills the
+  rest, advances every decoding request by a step and ends finished ones.
+  Every engine call that runs the model happens on this thread, because
+  `gpu.c` keeps an autorelease pool per thread, the model's work buffers are
+  shared and one attention state is in use at a time. While no request runs,
+  it lets the expert cache resize every second (`myds4_idle`).
+- **The live view's thread** (`--tui`): twice a second it takes the worker's
+  snapshot (`worker::view`), draws the frame on stderr's alternate screen and
   reads the keys.
-- **Tokio's threads** run HTTP: reading requests, converting and rendering
-  them, submitting them to the engine, and turning the engine's events into
-  response chunks.
+- **Tokio's threads** run HTTP: reading requests, converting, rendering and
+  tokenizing them, submitting them to the worker, and turning the worker's
+  events into response chunks.
 
 Signals belong to the engine: SIGINT and SIGTERM request the stop, and the
 live view's `q` (or Ctrl-C, which the terminal's raw mode delivers as a key)
-requests it through `myds4_request_stop`. The server checks
-`myds4_stopping()` several times a second, stops accepting connections,
-waits for the open responses to end (the engine ends every request), and
-calls `myds4_stop()`, which saves the predictor state (`--predictor-state`)
-and returns. The live view then gives the terminal back with the last log
-lines. It also does so before a fatal error's message, the engine's
-(`on_die`) or the server's, and after a panic.
+requests it through `worker::request_stop`, which also wakes the worker.
+The server checks `myds4_stopping()` several times a second, stops accepting
+connections, waits for the open responses to end (the worker ends every
+request), and calls `worker::stop`, which waits for the worker's thread to
+save the predictor state (`--predictor-state`, `myds4_finish`) and end. The
+live view then gives the terminal back with the last log lines. It also does
+so before a fatal error's message, the engine's (`on_die`) or the server's,
+and after a panic; a panic on the worker's thread ends the process, since
+its requests could not end otherwise.
 
 ## A request's path
 
@@ -58,19 +64,22 @@ lines. It also does so before a fatal error's message, the engine's
    reads the sampling settings itself, and converts the rest with recipe's
    `ChatCompletionRequest::convert`.
 3. recipe's `DeepseekV41Encoding` renders the conversation. Each image
-   place becomes the byte 0xFF (`IMAGE_MARK`) in the prompt sent to the
-   engine.
+   place becomes the byte 0xFF (`IMAGE_MARK`) in the rendered prompt.
 4. The images of `data:` URLs are decoded to their files' bytes.
-5. `myds4_submit` queues the prompt, its images, sampling settings, token
-   limit and an event callback. Invalid input (a 400) and a full queue (a
-   429) are answered before the response starts.
+5. `worker::submit` tokenizes the prompt (`myds4_tokenize`, as a rendered
+   prompt) and queues it with its images, sampling settings and token
+   limit. Invalid input (a 400) and a full queue (a 429, at 16 waiting) are
+   answered before the response starts.
 6. The response starts: server-sent events for `"stream": true`, else one
-   JSON body at the end. Each engine event becomes an input of recipe's
+   JSON body at the end. Each of the worker's events (the prefill's end, each
+   step's tokens, the end, or a refusal) becomes an input of recipe's
    `StreamProcessor`, whose Chat Completions chunks are written as they
-   come.
+   come. Every request gets exactly one last event, also one cancelled or
+   stopped before its prefill.
 7. When the client closes its connection or stops reading for 60 s, or the
-   processor stops early (a stop sequence), the server cancels the request
-   (`myds4_cancel`).
+   processor stops early (a stop sequence), the server cancels the request:
+   dropping its guard (`worker::Cancel`) sets its flag, which the worker reads
+   before each step and when it admits requests.
 
 ## Connections
 
@@ -96,67 +105,78 @@ it keeps reading the connection meanwhile; reads have no deadline then.
 ## The C ABI
 
 [`src/engine/engine.h`](../src/engine/engine.h) is the whole interface. Its
-version is `MYDS4_ABI = 5`. Callers must use the matching `myds4_config`
-layout, including the `lookup`, `expert_batch` and `prefill_prune` fields
-before the log callbacks, and rebuild with the engine. Its parts:
+version is `MYDS4_ABI = 6`. Callers must use the matching `myds4_config`
+layout and rebuild with the engine. The engine runs the model; everything
+about requests (their queue, scheduling, the KV prefix cache, the status
+and the live view's data) is the server's. Every function that runs the
+model or touches states, snapshots, samplers, lookups or images runs on
+one thread, the worker's; the log, the stop, the statistics and the
+tokenizer may be called from any thread. Its parts:
 
-- **Start and stop.** `myds4_start(config)` takes the model and engine
+- **Loading and the stop.** `myds4_load(config)` takes the model and engine
   options (`myds4_config`: the checkpoint, `--experts`, `--ctx`, the cache
   settings, `--substitute`, `--gpu-route`, the draft settings, the online
-  predictor, `--ced`, `--prefill-prune`, `--lookup`, `--expert-batch`,
-  `--kv-cache` and `--batch`) and two hooks: `on_log`,
-  which receives the log's lines instead of stderr (the live view's pane),
-  and `on_die`, which runs before a fatal error's message (the live view
-  gives the terminal back). It waits for the model lock (`myds4.lock` beside
-  the executable, or `$MYDS4_LOCK`), loads the model on the engine's thread
-  and returns once requests are taken. `myds4_stopping()` reports a
-  requested stop, `myds4_request_stop()` requests one and returns, and
-  `myds4_stop()` requests one and waits for the engine's thread.
-- **Requests.** `myds4_submit(request, &id, message, cap)` queues one request
-  and returns at once: `MYDS4_QUEUED` with the request's id (also its number
-  in the log), `MYDS4_BUSY` when 16 requests wait, or `MYDS4_INVALID` with a
-  message. A request holds:
-  - its whole prompt, as token ids or as rendered text that the engine
-    tokenizes as a chat prompt (a special token's spelling is that token;
-    the byte 0xFF is an image's place);
-  - its images, as the bytes of image files, in the order of their places;
-  - sampling: temperature (0 is greedy), top_p and an optional seed;
-  - `max_tokens`, at least 1 (the context's end also stops a request);
-  - the event callback and a pointer for it;
-  - a note for the log, which the engine writes as `req ID NOTE` when it
-    queues the request, before any line of its prefill.
-- **Events.** The engine calls the request's callback on its own thread:
-  `MYDS4_STARTED` after the prefill (prompt tokens with the images' spans,
-  and the tokens a session held), `MYDS4_TOKENS` after each decoding step
-  with the tokens that step kept (several when drafts are accepted; never
-  the end token), and one `MYDS4_DONE` with the finish (`MYDS4_STOP` at the
-  end token, `MYDS4_LENGTH` at `max_tokens` or the context's end,
-  `MYDS4_CANCELLED`, `MYDS4_SHUTDOWN`) and the counts. A request refused
-  before its prefill (the context or `--kv-cache` cannot hold it, or an image
-  cannot be read) gets one `MYDS4_REFUSED` with a message instead. After
-  `MYDS4_DONE` or `MYDS4_REFUSED` the engine never calls back for that
-  request again. A callback must return quickly; it may call only
-  `myds4_cancel` and `myds4_log`.
-- **Cancel.** `myds4_cancel(id)` drops a waiting request, without running
-  it, when the worker next admits requests, and stops a running one before
-  its next step. Ids of finished requests are ignored, so the caller may
-  cancel whenever its response ends.
-- **State.** `myds4_status()` returns the JSON of `GET /v1/status` (the
-  phase, the requests, the sessions, the caches, memory and totals);
-  `myds4_view()` returns the live view's snapshot as JSON (the phase and the
-  requests decoding, the statistics of decoded rows and of prompt rows, the
-  expert cache, memory and the sessions' prefix tree); and `myds4_log(line)`
-  writes a line to the log with the time: on stderr, or to `on_log`.
+  predictor, `--ced`, `--lookup`, `--expert-batch` and `--prefill-prune`) and
+  two hooks: `on_log`, which receives the log's lines instead of stderr (the
+  live view's pane), and `on_die`, which runs before a fatal error's message
+  (the live view gives the terminal back). It waits for the model lock
+  (`myds4.lock` beside the executable, or `$MYDS4_LOCK`) and loads the model
+  on the calling thread, which from then on is the engine's.
+  `myds4_finish()` saves the predictor state, `myds4_stopping()` reports a
+  requested stop, `myds4_request_stop()` requests one, `myds4_idle()` lets
+  the expert cache give memory back while no request runs, and
+  `myds4_log(line)` writes a line to the log with the time.
+- **Limits.** The rows of different states one step takes (6), DSpark's
+  drafts per pass (`--draft`), the rows of one verify pass (16), the
+  positions a state can continue before its end (`max(5, lookup_depth)`) and
+  the vocabulary.
+- **States and snapshots.** `myds4_state_new`, `myds4_state_free`,
+  `myds4_state_bytes`, `myds4_state_use`, `myds4_reset`;
+  `myds4_state_copy(dst, src, positions)` copies a state's compressed rows
+  and index keys before a position into another state, also while a request
+  decodes in the source. `myds4_snapshot_take(state, pos, with_logits)` keeps
+  a state's rolling rows (window rings, compressor rows, draft rings, Engram
+  history) and optionally the last logits; `myds4_snapshot_restore` puts them
+  back into a state that holds the snapshot state's rows before `pos`.
+- **Running the model**, in the state in use.
+  `myds4_prefill(tokens, n, from, replay, capture, &captured, &info)`
+  prefills positions `from` to `n - 1` and returns the last one's logits.
+  With `replay`, the state holds only the copied rows before `from`, and the
+  prefill starts earlier to rebuild the rolling rows at `from`. Without
+  `--ced` the replay is exact: each layer starts where its window needs.
+  With `--ced` it is bounded: every layer starts a ring before `from` (133
+  positions with the default `--lookup`), the windows of the rows it
+  computes stop there, and the
+  copied compressed rows and index keys stay as they are. A `capture`
+  position after the prefill's first position and before `n` returns the
+  rolling rows there as a snapshot (a fork's branch point), or none when
+  they would hold the encoder layers only (under `--ced`, before the
+  retained decoder suffix). `myds4_replay_rows(k)` and
+  `myds4_replay_start(k)` give a replay's cost and first position, for
+  either kind. `myds4_step`, `myds4_rows` (one token for each of up
+  to 6 states), `myds4_draft`, `myds4_verify` and `myds4_accept` decode;
+  `myds4_seek` sets the Engram history. Calls with invalid arguments return
+  null instead of logits.
+- **Sampling, context-copy drafts and images.** Samplers with the request's
+  temperature, top_p and seed (`myds4_sample`, `myds4_sample_verify` for a
+  verify pass); `--lookup`'s history matcher; a prompt's images
+  (`myds4_images_open`, `myds4_images_expand` to write each image's span of
+  keys in place of its mark, `myds4_images_encode` for the images that a
+  prefill reaches).
+- **Statistics.** `myds4_stats_get` fills the expert cache's counters, the
+  decoded and prompt rows' statistics, the running prefill's progress and
+  memory, which the status and the live view show.
 - **Tokenizer.** `myds4_tokenizer(dir)` loads the checkpoint's tokenizer
-  without the model; `myds4_tokenize`, `myds4_piece` (a token's bytes) and
-  `myds4_added` (whether a token is one of the tokenizer's added tokens)
-  serve the prompt checks and the output decoding below. The tokenizer keeps
-  its work buffers in static memory, so the engine serializes its calls.
+  without the model; `myds4_tokenize`, `myds4_piece` (a token's bytes),
+  `myds4_added` (whether a token is one of the tokenizer's added tokens) and
+  `myds4_special` (a special token's id) serve the prompts and the output
+  decoding below. The tokenizer keeps its work buffers in static memory, so
+  the engine serializes its calls.
 
 A request's system, user, tool and context messages arrive as one prompt.
-The engine passes all its new tokens to the model together. It saves the
-state before the first user turn during the same pass, for later forks
-(see [Sessions](design.md#sessions)). The model divides more than 16,384
+The worker resumes it from the KV prefix cache (see
+[The KV prefix cache](design.md#the-kv-prefix-cache)) and prefills the
+rest in one call. The model divides more than 16,384
 new tokens into chunks to bound working memory. The scheduler prefills
 separate requests in queue order while other requests wait to decode.
 Rendering and tokenization precede enqueueing, so HTTP arrival order and
@@ -167,15 +187,16 @@ CLI. `off` is the default. N is 128 to 1,048,576; the engine retains N plus
 `max(5, lookup_depth)` rewind rows. Shorter inputs run full prefill. CED preserves full-context
 encoder/global KV work and changes the later decoder's local state, so it
 can change generated output. It does not shorten decoding's layer stack.
-An encoder-only system-prefix snapshot can be forked only if the new suffix
-exceeds N plus that rewind margin and rebuilds the decoder window. The engine chooses
-a complete cached state or cold prefill otherwise. `myds4_config.ced` is 0
-for off.
+With CED the KV prefix cache's replay is bounded: it computes a ring's
+positions before the resume point again (133 with the default `--lookup`,
+`128 + max(5, lookup_depth)` in general) with their windows stopping there,
+so a cache hit is approximate too ([The KV prefix
+cache](design.md#the-kv-prefix-cache)). `myds4_config.ced` is 0 for off.
 
 `--prefill-prune` enables dependency-preserving decoder prefill, off by
 default. All encoder/global KV work remains complete. The later layers
-retain enough history for the final state and any saved system prefix,
-then skip batches outside those dependencies. CED, substitution and
+retain enough history for the final state and for a fork's branch-point
+capture, then skip batches outside those dependencies. CED, substitution and
 full-row diagnostics disable this plan. Short prompts may have nothing
 to skip. It can improve prefill while changing the cache left for decoding;
 the measured long MXFP4 request finished sooner but decoded more slowly.
@@ -189,15 +210,52 @@ requests, each request uses ordinary one-token decoding and retains its
 own lookup history. `--expert-batch` lets verification rows share repeated
 expert weight loads. Both options are off by default.
 
+`--runahead` changes how two or more active requests share the model. Each
+request can advance to its next layer when its selected experts are ready.
+The scheduler groups ready requests at the same layer and prioritizes
+earlier layers. Reads use actual router selections; the concurrent path
+does not compute or issue the unused native expert forecasts. Cache entries
+remain reserved until every consuming job completes. Per-request sampling
+and selected experts are preserved. A request running alone follows ordinary
+decoding, including context lookup when configured.
+
+Runahead is off by default and enables shared expert loads when selected.
+The server rejects combinations with DSpark, substitution, GPU routing or
+the online predictor. CED retains its configured prefill behavior. The C ABI
+offers `myds4_set_runahead(0|1)` before loading, without changing the config
+structure. `/v1/status` reports `runahead` and cumulative `model_decode`
+counters: computed rows, model wall time, main-queue GPU time, expert-read
+bytes and read-wait time. These times overlap and must not be added together.
+
+The HTTP comparison uses a short off/on/off sequence, not a general
+throughput guarantee. Its [recorded results](performance.md#http-runahead-comparison)
+include the memory budget, prompt reuse and output equality.
+
 Arrival logs carry an HTTP identifier, body size, and message/tool counts.
 Queue logs show waiting requests and how many the scheduler admits for
-prefill. Each completed prefill reports its chunks, encoder/decoder tokens,
-CED application and saved prefix. These are counts, without conversation
+prefill. Each request's start names how it resumed (`new`, `kept`, `saved`
+or `forked`) and the tokens it reused; each completed prefill reports its
+chunks, encoder/decoder tokens, CED application, its capture position
+(`prefix=`, a fork's branch point, or 0) and, after a replay (`an exact
+replay`, or `a bounded replay` with `--ced`), how many earlier rows it
+computed again. These are counts, without conversation
 text or API keys. `GET /v1/status` includes configured `ced_depth`,
 `lookup_depth`, `expert_batch`, `prefill_prune` and the `last_prefill` plan.
 `last_prefill.prune_applied` reports whether that pass actually skipped
 decoder work. A separate title request therefore has its own arrival
 and prefill records rather than appearing as a chunk of the main request.
+
+`expert_cache.slots` counts allocated expert slots. Allocation is lazy, so
+it can be zero after startup and grow during the first prompt.
+`expert_cache.slots_released` counts slots returned because the cache
+shrunk for memory. Benchmark tools use that counter to detect capacity
+changes even when the cache fills again before the next status sample.
+
+`model_decode` reports cumulative model-forward work across active requests:
+computed rows, elapsed seconds, main-queue GPU seconds, requested expert
+gigabytes and read-wait seconds. It excludes prompt prefill and CPU response
+streaming. Compare counter differences over a workload rather than comparing
+the final values from servers with different histories.
 
 ## Requests
 
@@ -216,13 +274,23 @@ case is provided for integration testing; it has not yet been run.
 The tool checks GPU ownership,
 bounds runtime and retains requests, replies and logs only in memory.
 
-CPU regressions in `tools/checks/prefill_schedule_check.c` cover one forward
-call with a saved system prefix, exact retries after short replies, a changed
-last prompt token, prefix-only requests and encoder-only fork eligibility.
+The KV prefix cache's decisions are tested without a model in
+`server/src/kv.rs`: the longest match across busy and idle states, the
+choice between continuing in place, a snapshot and a replay (and the
+replay's cost, exact or bounded), the same prompt again, truncation in
+place, the branch point a fork leaves (after a replay, or past a snapshot
+it resumed from), the refusal before any eviction, the eviction order and
+the state bound; and the budget's other steps: a retry of a saved prompt at
+a full budget, a decoding state charged its growth before it grows (idle
+states and spare snapshots freed first, the limit exceeded only when busy
+states alone hold it), and a generation-end snapshot kept only within the
+limit. `tools/checks/state_fork_check.c` checks a fork's row
+copy and snapshot restore on host buffers, and that the bytes the cache
+charges a state are those its buffers take. With a model, the fork test
+checks exactness: `tools/checks/prefix_fork_check.c` in the engine and
+`server/tests/prefix_fork.rs` through HTTP (see [Checks](#checks)).
 `tools/checks/attention_candidate_check.c` checks candidate-mask offsets after
-decoder compaction and across prompt batches. The real-model
-`tools/checks/prefill_prefix_check.c` compares prefix state and resumed logits
-at 640 and 16,521 tokens in both expert formats with DSpark enabled.
+decoder compaction and across prompt batches.
 
 The server's defaults for requests that do not set a value:
 
@@ -284,18 +352,21 @@ the conversion, the checkpoint's spelling of the image token,
 `<｜deepseek_image｜>` (id 129264); recipe's default spelling `<｜image｜>`
 is not in the checkpoint's tokenizer.
 
-The engine tokenizes the rendered prompt with `src/engine/tok.c`: a special
+The server tokenizes the rendered prompt on the request's thread with the
+engine's tokenizer (`myds4_tokenize`, `src/engine/tok.c`): a special
 token's spelling anywhere in the prompt is that token, and the byte 0xFF is
-an image's place.
+an image's place. The worker writes each image's span of keys at its place
+(`myds4_images_expand`); the keys come from the image file's bytes, so a
+cached prefix matches only the same image.
 
 The model's output tokens go to recipe's `StreamProcessor` as token ids. Its
 tokenizer is the engine's: a token's text is its bytes (`myds4_piece`), and
 the special tokens are the tokenizer's added tokens (`myds4_added`), each of
 which the processor decodes as a piece of its own, so that `</think>` and
-the DSML tags count only as tokens. The end token is not passed on: a
-`MYDS4_DONE` with `MYDS4_STOP` becomes the processor's stop, and the end
-token is counted as one completion token without text, as the engine counts
-it.
+the DSML tags count only as tokens. The end token is not passed on: the
+worker's last event with the finish `Stop` becomes the processor's stop, and
+the end token is counted as one completion token without text, as the
+worker counts it.
 
 ## Responses
 
@@ -306,9 +377,10 @@ its response started gets an `error` event and `[DONE]`; a request ended by
 the server's stop gets an `error` event saying so. A response that is not streamed is recipe's
 accumulated `chat.completion` object.
 
-Usage reports the engine's prompt tokens and the tokens a session held
-(`prompt_cache_hit_tokens`, `cached_tokens`), and recipe's completion and
-reasoning counts.
+Usage reports the prompt tokens (with the images' spans), those whose rows
+came from the KV prefix cache (`prompt_cache_hit_tokens`, `cached_tokens`;
+see [The KV prefix cache](design.md#the-kv-prefix-cache)), and recipe's
+completion and reasoning counts.
 
 ## Prompts compared with encoding.py
 
@@ -377,7 +449,52 @@ not call them: prompts and output use the engine's tokenizer.
 | Command | What it checks |
 | --- | --- |
 | `.venv/bin/python tools/reference/check.py encoding CHECKPOINT` | The server's prompts (`build/myds4-server --render FILE`) against `encoding.py` on the test cases and the generated conversations ([above](#prompts-compared-with-encodingpy)). |
-| `make server-check` (`MYDS4_CHECKPOINT=CHECKPOINT` for the tokenizer test) | The compatibility steps, a numeric effort in the prompt, the engine's events through recipe's processor with the checkpoint's tokenizer (reasoning, content, finish, usage), and the live view's frames on a test terminal: the title first, every line within the terminal's width, the log below the sessions' tree, per-request speeds and the quit keys; and the connections' limits on a local socket, with short timeouts: 503 beyond the connection limit, 431, a late head, 408 and 413, and a client that leaves or stops reading ending its request. No model is loaded; without `MYDS4_CHECKPOINT` the tokenizer test is skipped. |
+| `make server-check` (`MYDS4_CHECKPOINT=CHECKPOINT` for the tokenizer test) | The compatibility steps, a numeric effort in the prompt, the worker's events through recipe's processor with the checkpoint's tokenizer (reasoning, content, finish, usage), the KV prefix cache's decisions (`server/src/kv.rs`), and the live view's frames on a test terminal: the title first, every line within the terminal's width, the log below the states' tree, per-request speeds and the quit keys; and the connections' limits on a local socket, with short timeouts: 503 beyond the connection limit, 431, a late head, 408 and 413, and a client that leaves or stops reading ending its request. No model is loaded; without `MYDS4_CHECKPOINT` the tokenizer test is skipped. With `MYDS4_EXPERTS` (a GGUF file) set too, it also runs the fork tests through HTTP (next row). |
+| `MYDS4_CHECKPOINT=CHECKPOINT MYDS4_EXPERTS=GGUF cargo test --release --manifest-path server/Cargo.toml --target-dir build/cargo --test prefix_fork -- --nocapture` | The fork test through HTTP (`server/tests/prefix_fork.rs`, about 12 minutes, one model process at a time): a conversation with a long system prompt and user turn decodes, and 20 forks of it, cut in the system prompt or the user turn and continued differently, must each reuse at least the prefix they share with it less what an exact replay there computes again, and no more than that prefix, and must give the tokens that a server starting without a cache gives. With `--ced 128` the same forks must each reuse at least the shared prefix less 133 tokens; their tokens are printed. A fork after an image (a 32 x 32 PNG the test builds) must give the cold server's tokens. Two tests check the budget with a tight `--kv-cache` set from what a first server reports: a retry of a saved prompt must fit a cache filled to within 2 MiB of its limit, and a generation that takes its state past 16,384 positions must free an idle state before its state grows and keep the cache within its limit in every status sample. `MYDS4_SERVER` and `MYDS4_CLI` pick the binaries (default `build/myds4-server` and `build/myds4`). |
+| `build/prefix-fork-check CHECKPOINT --text FILE [--rendered] [--limit N] [--experts GGUF] [--draft N] [--cache GB] [--ced N] --fork [--random N] [--at P]... [--prompt-only] [--suffix N]` | The fork test in the engine (`tools/checks/prefix_fork_check.c`): a conversation (the text's prompt, or its first `--limit` tokens, then a decoded reply, a tool-like result and a second decoded reply) forked at 24 position classes and N random positions (default 16). Where the history before a fork came from prompts, the exact replay and the latest snapshot must give a cold prefill's bytes in the logits, every state tensor and the next 16 greedy tokens; where it holds decoded rows, the snapshot resume must give the bytes of the conversation computed again as it ran, and the replay must be about as close to the cold prefill as that conversation is. Each fork's branch-point snapshot, resumed over that fork's rows, must give the fork's own bytes. With `--ced N` the replay is bounded: it must keep the copied compressed rows and index keys byte for byte and give finite logits, and each fork's distance from the cold prefill is printed. `--measure` prints how far decoding a reply and prefilling it differ. |
+
+On 2026-11-04 (the UD-IQ2_XXS experts, `--cache 40`, `--kv-cache 8`) the
+server, with the worker in Rust, reused 0 of a new prompt's 54 tokens, 54 of
+the same prompt again (without a prefill, giving the same reply), 49 for
+another user turn after the same system prompt (an exact replay), and 66 of
+the first conversation's next turn's 75 (continued in place). SIGTERM during
+a streamed request ended it with the `error` event `the server is
+stopping`, and the server exited with status 0.
+
+Later on 2026-11-04, with every fork capturing its branch point and the
+bounded replay under `--ced` (same experts and options), the HTTP fork
+tests passed in 12 minutes. Without `--ced` all 20 forks gave the tokens of
+a server started without a cache. The first user-turn fork replayed at its
+whole shared prefix (4,119 tokens); each later one resumed from the branch
+point that the fork before it captured, for example sharing 4,256 tokens and
+reusing 4,119. The 20 forks reused 4,417 fewer tokens than they shared, at
+most 1,490 for one fork. With `--ced 128` every fork reused its whole
+shared prefix by a bounded replay. The image fork reused 4,303 tokens and
+gave the cold server's tokens. The engine's fork test on the first 5,600
+tokens of `docs/design.md` (`--limit 5600 --fork --random 16`) passed: 40
+forks, 0 failures, and all 47 resumes from a fork's own branch-point
+snapshot gave that fork's bytes. With `--ced 128` it passed as well (40
+forks, 0 failures): every bounded replay kept the copied compressed rows
+and index keys byte for byte. Against the cold prefill (compacted too), the
+bounded replays' logits had an SNR of 12.4 dB at the median (4.8 dB at
+least) over prompt history and 10.9 dB (8.4 dB) over decoded history, with
+the next token the same in 32 of 40 forks. Resumes from a snapshot under
+CED, which the cache also used before, gave 12.7 dB (6.9 dB), the next
+token the same in 13 of 15: CED's own result depends on where a prefill
+starts, so no cache hit under CED gives the cold prefill's bytes.
+
+After the budget fixes (2026-11-04, same experts), the two budget tests
+passed in 57 s. A retry of a saved prompt fitted a cache filled to within
+2 MiB of its limit: the first try took 0.065 GiB of `--kv-cache 0.0670`,
+and the retry reused 15 of 15 tokens. A generation of 16,353 prompt tokens
+and 181 generated tokens under `--kv-cache 0.1544` freed the idle state
+before its own state grew past 16,384 positions: none of the 29 status
+samples taken while it decoded past them still held the idle state, and no
+sample exceeded the limit. The HTTP fork tests passed again (674 s) with
+the same reuse.
+
+The runs below were made with the scheduler in the engine's C code, before
+it moved to `server/src/worker.rs`.
 
 On 2026-11-01 the server (the UD-IQ1_M experts, `--cache 40`) answered eight
 requests at temperature 0: thinking off; thinking at effort `high` and at

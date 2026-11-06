@@ -27,10 +27,11 @@ engine's headers by name.
 | `src/engine/vision.c` | Images: decoding, the reference's grid, Pillow's resize and padding, the vision encoder's patches and RoPE angles, an image's span of tokens. |
 | `src/engine/sample.c` | Shared temperature/top-p sampling and DSpark prefix verification. |
 | `src/engine/expert_batch.h` | Row grouping and GPU descriptors for the experimental shared-expert kernels. |
+| `src/experimental/context_lookup.c`, `src/experimental/context_lookup.h` | Bounded CPU history matching for the CLI and server's context-copy drafts. |
+| `src/experimental/expert_waves.c` | Experimental execution of completed experts while other selected experts are still loading; included by `model.c`. |
 | `src/experimental/expert_compact.h`, `src/experimental/expert_compact.metal` | Compact partial native expert batches while retaining original result indices and reduction order. |
 | `src/experimental/urgent_io_diagnostic.h` | Optional software timestamps for urgent reads, selected-expert arrival and blocked promotion. |
-| `src/experimental/context_lookup.c`, `src/experimental/context_lookup.h` | Bounded CPU history matching for the CLI and server's context-copy drafts. |
-| `src/engine/engine.c`, `src/engine/engine.h` | The engine behind a C ABI for the server: the queue, sessions, batching, the status, the live view's snapshot and the log, without HTTP or JSON (see [The server](server.md)). |
+| `src/engine/engine.c`, `src/engine/engine.h` | The engine behind a C ABI for the server: loading, attention states and their snapshots, prefill (with a replay: exact, or bounded under `--ced`, and a capture position), decoding, drafts, sampling, context-copy drafts, images, statistics, the tokenizer and the log. Requests, their scheduling and the KV prefix cache are the server's (see [The server](server.md)). |
 | `src/kernels/kernels.metal` | The GPU kernels. |
 | `src/kernels/gguf.metal`, `src/kernels/gguf_grids.metal` | The kernels for routed experts in GGUF codes (`--experts`), and their codebook grids, generated from llama.cpp's `ggml-common.h` (MIT License). |
 | `src/kernels/vision.metal` | The vision encoder's kernels. |
@@ -240,10 +241,11 @@ chosen across the whole forward call, including multi-chunk prompts. They
 preserve all encoder/global KV work and prime DSpark only from computed
 decoder inputs. Decoding runs normally after prefill. A compact prefill can
 change local KV, routing and output; it is not an exact-output optimization.
+The server's KV prefix cache resumes a prompt under CED by a bounded replay
+(see The KV prefix cache).
 
-The retained `tools/checks/prefill_prefix_check.c` compares compact execution
-with the same full-shape attention mask, including DSpark state, prefix
-restoration and chunk boundaries. `tools/checks/server_prefill_check.py`
+`tools/checks/ced_check.c --compare-compact N` compares compact execution
+with the same full-shape attention mask. `tools/checks/server_prefill_check.py`
 checks the option and cache reuse through HTTP. Its shared guard in
 `tools/bench/gpu_guard.py` checks GPU-client ownership, available memory, AC power
 and competing processes, and stops its own workload on resource interference.
@@ -388,43 +390,6 @@ remain grounds to reject a comparison. CPU work does not need a separate
 reservation. The default quiet mode retains the broader Python-job
 exclusion. Background-helper observations are retained with the result.
 
-### Experimental partial-batch compaction and read scheduling
-
-The `myds4-expert-compact` build retains the ordinary two-batch schedule.
-For a partial native MXFP4 batch, it puts up to six original expert indices
-in the unused end of the existing 256-byte descriptor. The up kernel
-dispatches only active experts; the down kernel dispatches one SIMD group
-per active expert. Hidden values and partial products retain their original
-indices, and the final ordered reduction is unchanged. The all-ready fused
-and GGUF paths retain their ordinary kernels.
-
-The `myds4-io-window4-diagnostic`, `myds4-io-window8-diagnostic` and
-`myds4-io-window16-diagnostic` builds bound urgent read workers. Queued and
-active urgent pieces both suppress background reads. Each piece retains
-its existing destination and exactly one owner. The ordinary engine keeps
-unrestricted urgent submission. Diagnostic intervals describe software
-callbacks and selected-expert arrival, not hardware queue depth.
-
-`MYDS4_EARLY_DEMAND_PROMOTION` promotes all existing selected pending slots
-after protecting selected residents and before allocating missing slots.
-This lets those reads proceed while reclamation waits for a victim's
-already-started read. Hit attribution stays attached to the original slot;
-late attribution uses its pending status before promotion. The cache budget
-and victim-selection policy are unchanged. The normal build does not
-enable it.
-
-`myds4-late-preencode` encodes ordinary single-row late expert work before
-waiting for its data. Mixed batches use the separate late descriptor
-region. All-missing batches encode their ordinary fused work. Neither
-case submits the pending-data command until the required reads finish.
-Both reserved queue positions remain in place. The normal engine keeps
-the ordinary encoding order. Numerical and performance checks for these
-experiments are described in [Performance](performance.md).
-
-The pipeline-limit fixtures compile separate default and bounded variants
-of the native up/down kernels. Their runtime dispatch sizes stay fixed;
-only the compiler limits differ. Pipeline identities include the limit.
-
 ### CED and DSpark study tools
 
 Build with `make build/ced-check build/dspark-state-check`. The CED tool
@@ -441,8 +406,7 @@ against the corresponding full-shape mask; it does not assert equality to
 full prefill.
 
 `--bench N` measures prefill and up to N generated tokens; zero times only
-prefill. `--prefill-plan split|joint` compares system-prefix scheduling.
-`--ced off|N` uses production replay, including its verification rewind margin.
+prefill. `--ced off|N` uses production replay, including its verification rewind margin.
 The diagnostic `--compact --keep N` instead retains exactly N decoder rows.
 `--dspark N` enables 1–5 native drafts, 32 expert slots per stage and trimming.
 `--cache GIB`, `--reserve GIB` and `--experts GGUF` choose cache bounds and
@@ -488,6 +452,15 @@ not cached, while fewer than 6 read-aheads are reading. A read-ahead is not
 evicted before its layer's routing; after it, one the layer did not select
 keeps the score of its earlier selections (see the cache below).
 
+Refinement first filters candidate slots without locking, then rechecks
+ownership and claims cancelled pieces under the reader queue's lock. It
+skips the lock when there are no candidates. It removes every queued
+reference before completing cancelled groups and making their buffers
+reusable. Readers claim ownership under the same lock. A read that has
+started stays resident, so refinement does
+not wait for its I/O. Kept forecasts, held buffers and published GPU entries
+remain protected.
+
 The online CPU learner below corrects the one- and two-layer router
 forecasts when enabled. Cache-retention settings operate independently of
 the learner.
@@ -505,6 +478,105 @@ still being read, the cache declines that admission. It leaves the victim
 and the higher-scoring residents in place. A demand may wait for its victim's
 read to finish before reusing the buffer.
 
+
+### Experimental expert completion groups
+
+The `myds4-expert-waves` research build runs complete selected experts as
+their reads finish during ordinary single-row decoding. It waits for any
+remaining expert to complete, collects all currently ready experts, and
+submits their computation while other reads continue. Each group writes
+the experts' original partial-output positions. One final reduction sums
+them in the normal expert order.
+
+The next layer's front is encoded early but submitted after every expert
+group. Its deferred submission allows intermediate groups to enter the
+command queue first. Each layer has six separate descriptor regions, so
+the CPU does not overwrite descriptors used by an earlier group. This
+adds 60 KiB of scratch descriptors. Request batches, verification,
+substitution and profiling keep their existing execution paths. The
+normal engine does not enable this experiment.
+
+### Experimental partial-batch compaction and read scheduling
+
+The `myds4-expert-compact` build retains the ordinary two-batch schedule.
+For a partial native MXFP4 batch, it puts up to six original expert indices
+in the unused end of the existing 256-byte descriptor. The up kernel
+dispatches only active experts; the down kernel dispatches one SIMD group
+per active expert. Hidden values and partial products retain their original
+indices, and the final ordered reduction is unchanged. The all-ready fused
+and GGUF paths retain their ordinary kernels.
+
+The `myds4-io-window4-diagnostic`, `myds4-io-window8-diagnostic` and
+`myds4-io-window16-diagnostic` builds bound urgent read workers. Queued and
+active urgent pieces both suppress background reads. Each piece retains
+its existing destination and exactly one owner. The ordinary engine keeps
+unrestricted urgent submission. Diagnostic intervals describe software
+callbacks and selected-expert arrival, not hardware queue depth.
+
+`MYDS4_EARLY_DEMAND_PROMOTION` promotes all existing selected pending slots
+after protecting selected residents and before allocating missing slots.
+This lets those reads proceed while reclamation waits for a victim's
+already-started read. Hit attribution stays attached to the original slot;
+late attribution uses its pending status before promotion. The cache budget
+and victim-selection policy are unchanged. The normal build does not
+enable it.
+
+`myds4-late-preencode` encodes ordinary single-row late expert work before
+waiting for its data. Mixed batches use the separate late descriptor
+region. All-missing batches encode their ordinary fused work. Neither
+case submits the pending-data command until the required reads finish.
+Both reserved queue positions remain in place. The normal engine keeps
+the ordinary encoding order. Numerical and performance checks for these
+experiments are described in [Performance](performance.md).
+
+### Combined expert scheduling experiments
+
+Three research builds combine the single-session changes:
+
+| Build | Enabled changes |
+| --- | --- |
+| `myds4-combined` | Compact partial batches, earlier promotion of selected pending reads, and late pre-encoding. |
+| `myds4-combined-all` | The three changes above, a 16-reader urgent window, and 256/192 compiler thread limits for the ordinary native up/down pipelines. |
+| `myds4-combined-waves` | Progressive complete-expert groups, compact partial batches, and earlier promotion. |
+
+The ordinary engine already computes its initial ready experts while other
+selected experts are being read. Progressive groups additionally compute
+experts that become ready during that wait. Late pre-encoding overlaps CPU
+command preparation with reads; it does not execute a GPU command before
+its data is ready. The wave path returns before ordinary late pre-encoding,
+so the wave combination leaves that option out. Compiler limits in the
+all-five build apply to the ordinary pipelines; compact partial kernels
+retain their existing compiler settings.
+
+`combined-all-model-check` checks mixed and all-missing cases against the
+ordinary kernels and default compiler limits. `combined-waves-model-check`
+forces one expert per group to check the combined scheduling and compact
+kernels. Both retain the original expert slots and final summation order.
+
+### Experimental forecast segment
+
+The `myds4-prefetch-pool4` and `myds4-prefetch-pool8` research builds limit
+decode-mode forecasts to a probationary segment of up to four or eight
+existing expert-cache slots. Establishing the segment can displace that
+many main-cache entries; subsequent forecasts replace eligible entries
+inside the segment. The total expert-cache allocation is unchanged.
+
+Actual routing promotes a probationary expert by changing its membership
+and demoting an eligible main-cache entry. No weights or buffer addresses
+move. A demoted resident remains usable until its slot is replaced.
+Promotion does not wait for I/O. If no main victim is eligible, promotion
+is deferred; required reads can reclaim a segment slot when necessary.
+Current selections, held entries, published GPU data and protected
+forecasts keep their existing protections. Prompt-pass requests reclaim
+membership, and memory-pressure release removes freed slots from the
+segment count. Small batches using decode-mode eviction can also use the
+segment during prefill.
+
+The `prefetch_pool` record reports the limit, current and peak membership,
+admissions, declined forecasts, promotions, deferred promotions and main
+entries displaced while establishing the segment. Promotions include
+previously demoted residents and are not a measure of useful prefetches.
+The normal engine retains its existing policy.
 
 ### Online CPU predictor
 
@@ -1146,7 +1218,7 @@ Draft-history projection can temporarily require up to 128 rows, and image
 encoding reserves the full matrix staging capacity. Resizing waits for GPU
 completion and updates cache residency. Router tables retain separate slots
 for queued layers when GPU routing is enabled. FP32 logits, persistent KV,
-draft history and saved prefix state have independent lifetimes.
+draft history and snapshots have independent lifetimes.
 
 The index scores of a batch (a row of scores per row, as long as the
 context) are computed in tiles of as many rows as 256 MB hold: the whole
@@ -1210,8 +1282,8 @@ carry information between token positions only through their causal
 per layer. Token-local operations do not extend that distance.
 
 The plan conservatively retains `2668 + max(5, lookup_depth)` positions
-before the final state and before the saved prefix checkpoint. It rounds
-the starts down and the checkpoint end up to the original 2,048-row matrix
+before the final state and before a capture's position (a fork's branch
+point). It rounds the starts down and the capture's end up to the original 2,048-row matrix
 batch boundaries, merges overlapping regions, and skips whole batches
 outside them in layers 21 through 39. Those skipped rows cannot affect the
 retained local state. Global attention still has the complete encoder KV.
@@ -1220,12 +1292,10 @@ The attention masks and numerical kernels remain unchanged.
 The CLI and server expose the plan through `--prefill-prune`, off by
 default. The engine's `myds4_config.prefill_prune` field selects the same
 path. `build/myds4-prefill-prune` enables it for diagnostic comparisons.
-The paired benchmark builds
-`build/myds4-prefix-prefill` and `build/myds4-prefix-prune` both save the
-first-user prefix checkpoint.
 The plan applies only with substitution and CED off and without full-row
-logits or activation/route dumps. Validation compares
-logits, global and local state, prefix restore and DSpark history, as well
+logits or activation/route dumps. Validation
+(`tools/checks/prefill_prune_model_check.c`) compares logits, global and
+local state, a capture at a prefix, a resume from it and DSpark history, as well
 as checking the dependency plan on small causal graphs. See
 [validation records](../data/benchmarks/prefill_prune_results.json).
 
@@ -1235,6 +1305,14 @@ The option therefore does not promise a decode-throughput improvement.
 The server reports the configured `prefill_prune` flag and the last
 prefill's `prune_applied` flag separately; short prompts or incompatible
 diagnostics can leave pruning unused.
+
+The research builds `myds4-layer-prune` and `myds4-chunk32` respectively
+shrink the retained dependency interval with decoder depth and increase
+the outer chunk to 32,768 tokens. Both keep the original 2,048-row matrix
+batches. The normal build retains the fixed dependency interval and
+16,384-token outer chunks. The CLI's `decoder_row_layers` counter adds the
+rows actually executed across layers 21 through 39; `decoder_tokens`
+counts positions retained for the first of those layers.
 
 ## Images
 
@@ -1310,7 +1388,7 @@ an `--image` image. `--render` writes the placeholder's text, as
 
 Every position of an image's span carries a negative token derived from the
 image file's bytes (FNV-1a, mixed with the position in the span), so that a
-session matches only the same image (see Sessions). The model takes such a
+cache entry matches only the same image (see The KV prefix cache). The model takes such a
 position as part of an image span, as `model.py` does: its embedding row is
 the span's (the learned `image_start`, `image_end` and `image_newline` at
 the delimiters, the Aligner's rows in reading order at the IMAGE slots); the
@@ -1318,7 +1396,7 @@ router selects with each layer's `bias_vl`; Engram leaves its stream
 untouched (the gate is shut) and n-grams stop at it (the reference's DEAD
 tokens). The server decodes a request's images when it renders the prompt,
 and runs the vision encoder only for the images whose spans reach the part
-of the prompt being prefilled; the others are in the session's rows.
+of the prompt being prefilled; the others are in the rows the prompt resumes from.
 
 Checked on 2026-10-31, besides the preprocessing (above): the placeholders'
 places and the images' order in prompts (`tools/reference/check.py encoding`:
@@ -1389,6 +1467,13 @@ several tokens. These are forward-pass units, not emitted-token units. The
 growth ratio is computed at setup; occasional common rescaling keeps the
 stored history and resident scores within range.
 
+Two research builds change only the credits from large prompt batches.
+`myds4-prefill-frequency` credits an expert by its selection frequency over
+the batch; `myds4-prefill-tail-frequency` measures that frequency over the
+last 256 rows. Total credit per batch is six, independent of its row count.
+Both retain existing history and leave decoded-row credit, slot protection,
+reads and model arithmetic unchanged. They are not normal-engine settings.
+
 Decode eviction chooses the lowest score by default. With
 `--cache-read-cost`, off by default, the victim priority is the raw score
 times the expert's aligned read bytes divided by the fixed backbone slot
@@ -1398,7 +1483,9 @@ raw score history and request increments remain unweighted. This policy
 does not change prefill eviction, least-recently-used release under memory
 pressure, GPU unmapping priorities or the draft pools' replacement rule.
 
-Slots emptied by cancelled read-aheads go first. Experts requested by the
+Slots emptied by cancelled read-aheads go first. An empty entry is exempt
+from current-layer usage protection, even if it retains that layer's usage
+stamp. Held references still prevent reuse. Experts requested by the
 layer being served in the current pass, protected read-aheads, and experts
 whose addresses are still published for GPU routing cannot be victims.
 A recency list orders the slots for prompt passes and for giving slots back.
@@ -1492,15 +1579,21 @@ the markers on its unselected experts, so later reuse of those experts is
 counted as an ordinary hit by these legacy counters. Separate opt-in
 attribution preserves the original read metadata, as described below.
 
-The cache checks run without model weights, expert reads or GPU execution:
+The cache checks run without model weights or GPU execution. Controlled
+read fixtures use `/dev/zero`:
 
 | Command | Checks | Scope |
 | --- | ---: | --- |
 | `make cache-ready-check` | 45 | Completed/pending groups, readiness, late counts and consumer release. |
 | `make draft-cache-check` | 49 | Separate stage pools, native demand admission, replacement and protected groups. |
 | `make prefetch-metrics-check` | 56 | Fixed snapshots, first use, read origin, byte accounting, I/O timing and unsupported coverage. |
-| `make cache-policy-check` | 37 | Aging ratios, victim rules, aligned read costs, uniform costs, history and rescaling. |
-| `make prefetch-queue-check` | 10 | Immediate admission release on completion or cancellation, with a delayed notification queue and reads from `/dev/zero`. |
+| `make cache-policy-check` | 59 | Aging ratios, victim rules, aligned read costs, history, rescaling and reuse of refined empty slots. |
+| `make prefetch-queue-check` | 14 | Admission release on completion or cancellation, pending ownership and delayed notifications. |
+| `make prefetch-admission-check` | 19 | In-flight admission limits, promotion, repeated candidates and preservation of required data. |
+| `make prefetch-demote-check` | 40 | Unstarted cancellation, keep lists, queue compaction, protected buffers and prefill exclusion. |
+| `make prefetch-refine-race-check` | 8 | An actual reader winning ownership while refinement decides whether to cancel. |
+| `make expert-ready-check` | 10 | Waiting for any selected expert to finish, immediate readiness and consumer ownership of completed groups. |
+| `make prefetch-pool-check` | 42 | Four- and eight-slot segment bounds, promotion without moving buffers, protection, refinement and release. |
 | `make memory-available-check` | 11 | Reclaimable file pages, speculative-page accounting and independence from kernel cache targets. |
 | `make cache-memory-check` | 8 | Initial capacity, calm growth with compression, and responses to pressure and swapping. |
 
@@ -1617,21 +1710,23 @@ disk reads.
 
 ## Server
 
-The server (`build/myds4-server`, see [The server](server.md)) handles HTTP,
-request conversion, prompts and output in Rust with DeepSeek's
-`deepseek-recipe`; the scheduler below runs in `src/engine/engine.c`, behind
-a C ABI.
+The server (`build/myds4-server`, see [The server](server.md)) is written in
+Rust with DeepSeek's `deepseek-recipe`: HTTP, request conversion, prompts,
+output, the scheduler below (`server/src/worker.rs`) and the KV prefix
+cache (`server/src/kv.rs`). The model runs behind the engine's C ABI
+(`src/engine/engine.h`).
 
-A chat completion waits in a queue (at most 16) for the model, which the
-engine's thread runs. A streamed request gets its headers at once and a
-comment every 15 s while it waits. Between tokens the worker admits waiting
-requests while fewer than `--batch` decode: it tokenizes one's rendered
-prompt, prefills it (the others wait) and samples its first token. Then
+A chat completion is tokenized on its handler's thread and waits in a queue
+(at most 16) for the model, which the worker's thread runs. A streamed
+request gets its headers at once and a comment every 15 s while it waits.
+Between tokens the worker admits waiting requests while fewer than
+`--batch` decode: it resumes one's prompt from the KV prefix cache,
+prefills the rest (the others wait) and samples its first token. Then
 every request decoding advances by a token: alone, with drafts when
-`--draft` is set; else in one step of `model_forward_rows`, one row per
-request. The engine hands each step's tokens to the server, which writes
-them to the request's client; when a client closes its end, the server
-cancels its request.
+`--draft` is set; else in one step of `myds4_rows`, one row per request.
+The worker sends each step's tokens to the request's handler, which writes
+them to its client; when a client closes its end, the handler cancels its
+request.
 
 While no request runs, the experts stay in memory as the last request left
 them. The worker wakes every second and resizes the cache as between tokens
@@ -1649,6 +1744,73 @@ and a verify pass's first row, with a token decoded alone (0 of 129,280
 logits differed, with the GGUF experts and two drafts). A sequence decoded
 beside others does not update the draft's windows, so drafting it alone
 later keeps fewer drafts until they refill.
+
+### Concurrent scheduling experiments
+
+The normal server exposes `--runahead` for grouped scheduling with two or
+more active requests. It uses mode 3 below and omits unused forecast
+projections during concurrent execution. It is off by default. Its startup
+validation excludes DSpark, substitution, GPU routing and online prediction;
+single-request decoding and context lookup retain their ordinary paths.
+
+The separate `myds4-server-prefetch-study` build supports bounded scheduling
+experiments through environment variables. Without `--runahead`, the ordinary
+server uses its configured batch size and simultaneous rows.
+
+The HTTP mode of `tools/bench/session_bench.py` selects the public runahead
+option with schedule 0 or 3. Its direct-model mode supports schedules 0
+through 5 through `session-probe-runahead`.
+
+- `MYDS4_BATCH_PREFETCH_LIMIT=0..4` caps fresh admissions across concurrent
+  requests. One unit allows three new predictions with six reads in flight.
+  Prediction refinement still considers every row. Single-request decoding
+  and speculative verification keep their existing policy.
+- `MYDS4_BATCH_USAGE_CREDIT=1` counts each request's actual expert use in the
+  retention score. A shared expert already receives one credit from the
+  deduplicated demand request; this adds one for each additional consuming
+  row. It does not create extra reads or credit speculative rows.
+- `MYDS4_RUNAHEAD=1..5` allows requests to progress at different model layers.
+  Each request keeps the activations, router output, candidate mask, index
+  selection and Engram rows needed across a scheduling pause. Mode 1 waits
+  for each GPU job to finish. Mode 2 waits for routing events and retires
+  command buffers once per step. CPU-written descriptors and embedding
+  rows belong to each job; shared GPU scratch follows command-queue order.
+  A ready request runs its routed experts and the next layer's front while
+  other requests' reads continue. Mode 3 groups ready requests at the same
+  layer. Mode 4 also checks for such a group after a blocking read finishes,
+  so requests that became ready during that wait can run together. Mode 5
+  uses mode 3's grouping and batches the output head after all requests finish
+  their final experts. It retains each row's final streams and mixing weights
+  until that head pass, preserving output order.
+
+Runahead cache reservations include both resident experts and pending reads.
+Requests share an existing fetch when they need the same expert. Each job
+releases its references only after its GPU work finishes. Held entries are
+ineligible for eviction, and cache resizing requires that every job has
+finished. The scheduler prefers ready jobs at earlier layers; if none are
+ready, it waits for a job at the earliest layer, breaking ties by remaining
+misses. Modes 1 and 2 dispatch jobs individually; modes 3 through 5 use the
+existing batch kernels for ready groups. These modes fetch known experts
+without native speculative admission during the concurrent step.
+`session-probe-runahead` also omits the unused native forecast projections.
+The
+[Bevy paper](https://arxiv.org/html/2611.04794v1) describes the broader
+approach, including grouping ready requests at the same layer.
+
+The concurrent runahead experiment requires DSpark, substitution, GPU
+routing and online prediction to be off. The separate causal-verification
+CLI builds schedule speculative rows within one session. Each row's next
+layer front waits for the preceding row to reach that layer; routed expert
+products can finish earlier and wait in a private residual buffer. The
+draft-input captures are assembled in token order for normal rollback and
+DSpark continuation. These builds still compute every proposed row before
+sampling decides which prefix to accept.
+
+`tools/bench/session_bench.py` streams reconstructed Harness requests and
+compares returned text, reasoning and tool arguments. It records prefill,
+client latency, model execution counters, cache capacity and expert reads.
+It never executes generated tools. These are workload replays rather than
+an autonomous agent quality benchmark.
 
 ### Prompts
 
@@ -1673,27 +1835,27 @@ byte-level BPE vocabulary. An added token that also appears in that
 vocabulary keeps its literal spelling. Byte-alphabet decoding validates
 the code point before indexing its table.
 
-### Sessions
+### The KV prefix cache
 
-Each conversation keeps its attention state in a session: the layers'
+Each conversation's attention state lives in an engine state: the layers'
 window rings, compressed rows, index keys and compressor rows, the draft's
 windows and the Engram history. The compressed rows and index keys take
 3,200 bytes per position (3.125 KiB) in BF16; a state starts with room for 16,384 positions
-(66 MiB with its saved rows) and doubles its room when a forward pass
-needs more, up to `--ctx` (3.14 GiB at 1,048,576), keeping the rows it
-holds; a reset gives the room back. The layers use one session's state at a
+(55 MiB with its rolling rows, without `--draft`) and doubles its room when
+a forward pass needs more, up to `--ctx` (3.13 GiB at 1,048,576), keeping
+the rows it holds; a reset gives the room back. The KV prefix cache charges
+a state these bytes (`myds4_state_bytes`), its snapshots apart. The layers use one state at a
 time. A ring holds its layer's last `128 + max(5, lookup_depth)` positions.
-The compressor keeps 8 rows normally and 32 for wider lookup. Server prefix
-reuse can continue at any of the last 5 positions (BLOCK).
-After each prompt's prefill the session saves those rows (slot 0, about 6
-MB). A new conversation also saves the state before its first user turn
-(slot 1), during the same prefill. Each layer copies the prefix's last ring
-rows from its completed attention batch and preserves its compressor rows.
-DSpark captures the prefix's final input rows separately, so saving the
-prefix does not overwrite the current request's draft state. The compressed
-rows and index keys of earlier
-positions are never rewritten, so a saved slot and the state's later rows
-together give the state at the saved position.
+The compressor keeps 8 rows normally and 32 for wider lookup, so a state
+can continue at its position or up to `max(5, lookup_depth)` positions
+before it. The compressed rows and index keys of a position are never
+rewritten once later positions ran, so another state can copy a state's
+rows before its position (`myds4_state_copy`), also while a request still
+decodes in it. The rows that later positions overwrite (the rings, the
+compressor rows, the draft rings and the Engram history) are kept apart as
+snapshots of 5.3 MiB each without `--draft` (5,578,764 bytes), plus 0.5 MB
+of logits at a prompt's end (`myds4_snapshot_take`). A snapshot and its own state's rows before its
+position together give the state at that position.
 
 The storage rate follows the three ratio-2 KV sources and one ratio-1
 source: `(3/2 + 1) * (512 + 128) * 2 = 3200` bytes per input token,
@@ -1721,83 +1883,131 @@ would need numerical and performance validation. See
 [FlashMLA's format](https://github.com/deepseek-ai/FlashMLA/blob/main/csrc/cuda_kernels/kv_cache_format.h)
 and [DeepInfer's cache layouts](https://github.com/deepseek-ai/DeepInfer/blob/main/deepinfer/model_executor/layers/tilelang_ops/cache_common.py).
 
-A request runs only the tokens a session does not hold:
+The server's KV prefix cache (`server/src/kv.rs`) keeps the states and their
+snapshots between requests. Snapshots are taken at every prompt's end (with
+its logits), at every generation's end, and at every fork's branch point:
+where the prompt parts from every state, when that lies after the resume
+point and before the prompt's end. The fork's prefill captures the rolling
+rows there as it passes (`myds4_prefill` with a capture position), so a
+later fork at the same point resumes there with nothing to replay. For a
+prompt, the cache finds, among all states, idle or decoding, the longest
+token prefix `k` that one of them shares with it, at any position and
+whatever roles its tokens belong to, and picks the cheapest way to resume
+there, counted in prefilled tokens. Without `--ced` every way is exact:
 
-- kept: a session whose tokens the prompt starts with, up to its last 5
-  positions, continues (a tool loop's next request, a conversation's next
-  turn);
-- saved: a session whose saved prompt end the prompt shares restores slot
-  0 and continues from there or up to 5 positions before it (a retry, or
-  the next turn of a chat without tools, whose earlier reasoning is
-  dropped);
-- forked: a prompt that shares a session's first system part (another
-  conversation with the same instructions and tools, such as an agent's
-  subagent) gets a copy of that session from its slot 1, which leaves the
-  session unchanged;
-- new: else a free session, or the least recently used one emptied.
+- **In place** (logged `kept`): an idle state that the prompt extends,
+  whole or from up to `max(5, lookup_depth)` positions before its end,
+  continues without a copy; its rows past the resume point and the
+  snapshots past it are dropped. A state that a request decodes in is
+  never continued in place.
+- **Snapshot** (`saved` for the same prompt again, else `forked`): a new
+  state copies the source's rows before one of its snapshots at `b <= k`,
+  restores the snapshot and prefills from `b`. When `b` is the prompt's
+  length, the snapshot's logits are the prompt's and nothing is prefilled,
+  so a retry decodes as the first try did.
+- **Replay** (`forked`): a new state copies the source's rows before `k` and
+  prefills from `k` with an exact replay (`myds4_prefill` with replay set).
+  Layer 39 starts its window 133 positions before `k` (128 plus the rewind
+  margin), and each layer below starts 127 positions earlier, about 5,100
+  positions before `k` at layer 0: a layer's window keys come from the layer
+  below's output there, which is right only a window after that layer's
+  first row. So each layer rebuilds its rolling rows at `k` from the copied
+  rows with the arithmetic of a cold prefill; the replay captures them as
+  the new state's branch-point snapshot. It costs about 2,610 rows per layer
+  beyond the prompt's new tokens for long prefixes, and never more than
+  `k` (`myds4_replay_rows`).
+- **Cold** (`new`): nothing is shared; a new state prefills from position 0.
 
-A fork sizes its destination from the saved prefix length, with the usual
-initial capacity and growth rule. It copies the prefix's compressed global
-rows and index keys, including each layout's guard row. The window rings,
-compressor state, draft rings and Engram history come directly from slot 1.
-The fork retains its own copy of that prefix snapshot. Its next completed
-prompt creates a new slot-0 checkpoint. CPU host-buffer checks cover odd
-and even prefix lengths, both compression ratios, draft state, capacity
-reduction and source independence. Real-model resume validation has passed
-the 257-token MXFP4 model check at a 128-token
-prefix, with unchanged resumed logits and source state.
+Ties go to the plan earlier in the list. A response's usage reports as
+`prompt_cache_hit_tokens` (and `cached_tokens`) the prompt tokens whose rows
+came from the cache: `k` for a replay, `b` for a snapshot, the resume point
+in place. When a snapshot lies less than the replay's cost below `k`,
+resuming there is cheaper, and the report is `b`; that fork captures its
+branch point at `k` on the way.
 
-With CED, slot 1 holds encoder state through layer 20. Such a fork needs
-more than the configured replay depth plus `max(5, lookup_depth)` new tokens, so replay
-excludes missing decoder-prefix keys and rebuilds all rewind rows. Other
-requests reuse a complete state or prefill from the beginning. A fork must
-leave at least one new token to compute logits. Prefill retains the local
-rows required by its configured verification margin and the five rows
-needed before a saved server position.
+With `--ced`, prefill is approximate already (CED prefill), and the replay
+is bounded instead: every layer starts a ring before `k` (133 positions,
+more with a wider `--lookup`), and the attention windows of the rows it
+computes stop there. The compressed rows and index keys before `k` stay the
+ones the new state copied; only the rolling rows at `k` are computed again,
+from the copied global rows and the window that the replay covers, so they
+differ from a cold prefill's. The replay costs at most a ring's rows
+(`myds4_replay_rows`), so a snapshot wins only within a ring below `k`. A
+branch point's capture holds the encoder layers only (layers 0 through 20)
+when layers 21 through 39 have not computed a ring before it in that
+prefill: unless it lies at least a ring inside the retained decoder suffix.
+The engine returns no snapshot then, and a later fork there replays again.
 
-A session in which a request decodes is never emptied, rewound or freed;
-another request may fork from it. The prompt's last token always runs, for its logits, except when the prompt
-is the session's saved prompt again: then the saved rows and the logits kept
-with them (0.5 MB) continue the request, so that a retry decodes exactly as
-the first try did; the prompt's last token in a decoding step would round
-differently from the prefill's. Reuse checks every token, including the last,
-and restores the saved window even if a short reply leaves the current
-window within rewind range. `--kv-cache` bounds the sessions' memory,
-which is apart from the expert cache's budget: before a
-request runs, the least recently used other sessions are freed until the
-chosen one fits with room for its prompt, and a request whose session alone
-does not fit is refused; a session that grew while decoding pushes others
-out after its request. Under memory pressure the least recently used
-session other than the current one is freed too. The usage of a response reports the tokens a session supplied as
-`cached_tokens`.
+Every prefill batch runs the prefill (matrix) kernels, whatever its size,
+so a row's bytes do not depend on where the prefill that computes it
+starts: a resume over rows that came from prompts gives the same bytes as a
+cold prefill of the whole prompt, in the logits, every state tensor and the
+generated tokens. Prefill calls of 1 to 6 tokens therefore take 175-218 ms
+instead of the 66-125 ms of the decode kernels (UD-IQ2_XXS). Decoded rows
+are reused as they are: a resume over them gives what the conversation
+itself continued there gives, which differs from a cold prefill of the same
+tokens because decoding and prefilling round differently (on the fork
+test's conversation, logits SNR 9.5-16.5 dB, the next token the same).
 
-In a tool loop with the GGUF experts, the second request ran 26 of its 399
-prompt tokens: the re-rendered tool call matched the model's own tokens,
-so the state of the whole first turn was kept.
+`--kv-cache` bounds what the states and snapshots take, apart from the
+expert cache's budget. Before a request runs, the cache checks that the
+room its prompt needs fits: its state at the prompt's end, the prompt end's
+snapshot when it prefills (a retry of a saved prompt uses the snapshot
+there and takes none), and its branch point's. It refuses the request
+before anything is freed if that does not fit. Then it frees what is
+needed: the spare snapshots first (all but each state's last prompt end and
+last branch point), of the least recently used states first, then whole
+idle states, least recently used first. A resume's source and every state a
+request decodes in are kept, and a fork marks its source used. At most 256
+states are kept.
+
+A state that decodes past its room (16,384 positions at first, then each
+doubling) is charged its new size before the pass that grows it, counting
+the pass's draft and lookup rows (`kv::Cache::grow`), and the cache frees
+room first in the same order. When only states that requests decode in are
+left, the state grows past the limit, and the server logs by how much; new
+requests are then refused until room is back. A generation's end snapshot
+is taken only if it fits in the same way. `server/tests/prefix_fork.rs`
+checks a retry at a full budget and a growing generation through HTTP.
+
+The fork test checks this. `tools/checks/prefix_fork_check.c` forks a
+conversation (a prompt, a decoded reply, a tool-like result, a second
+decoded reply) at 24 position classes and 16 random positions, resumes each
+fork by replay and from the latest snapshot, and compares the results with
+a cold prefill and with the conversation continued at the fork. Each fork
+also resumes once more from the branch-point snapshot it captured, which
+must give its own bytes. With `--ced N` it checks that a bounded replay
+keeps the copied compressed rows and index keys byte for byte and gives
+finite logits, and prints how far each fork lies from the cold prefill.
+`server/tests/prefix_fork.rs` forks a conversation through HTTP while it
+still decodes. Each fork must reuse at least its shared prefix less a
+replay's cost, and no more than the prefix, and must give the tokens of a
+server that starts without a cache; with `--ced 128` the reuse must be at
+least the shared prefix less 133 ([Checks](usage.md#checks)).
 
 ### The live view
 
 `--tui` gives stderr's alternate screen to a thread of the server
 (`server/src/view.rs`, on ratatui and its crossterm backend) that every
-0.5 s takes the engine's snapshot (`myds4_view`, as JSON) and draws the frame
-from it. The engine writes the log's lines to the server's `on_log`, which
-keeps the last 256 in a ring that the frame shows; the lines logged before
-the view is on the screen (while the model loads) also go to stderr. The
-snapshot takes the queue's lock for the number of waiting requests and the
-status lock for the requests, the totals and the sessions. Sessions are
-freed and reassigned under the status lock, so the snapshot never reads a
-freed session; a session's tokens may change while the snapshot reads them,
-which at worst places a node wrongly for one frame.
+0.5 s takes the worker's snapshot (`worker::view`, as JSON) and draws the
+frame from it. The engine writes the log's lines to the server's `on_log`,
+which keeps the last 256 in a ring that the frame shows; the lines logged
+before the view is on the screen (while the model loads) also go to
+stderr. The snapshot takes the queue's lock for the number of waiting
+requests and the status lock for the requests, the totals and the cache's
+states and tree, which the worker publishes there after each prefill and
+request end and once a second while it decodes; it reads the engine's
+counters directly (`myds4_stats_get`), so a long prefill's progress shows
+while it runs.
 
-The prefix tree covers the 24 most recently used sessions. Depth first, a
-node is the run of positions, from its parent's end, that all sessions of
-its group share (compared 1,024 tokens at a time with `memcmp`), and the
-sessions that go on past it form groups by their token at its end. The
-frame shows at most 40 nodes. Each session keeps the positions up to which
-its last 32 reuses ran (requests that continued it, rewound to its saved
-rows, or forked from it); a node counts those that reach past its start, so
-a system prompt that many conversations share collects the hits of all of
-them.
+The prefix tree covers the 24 most recently used states. Depth first, a
+node is the run of positions, from its parent's end, that all states of
+its group share (compared 1,024 tokens at a time), and the states that go
+on past it form groups by their token at its end. The frame shows at most
+40 nodes. Each state keeps the positions up to which its last 32 reuses ran
+(requests that continued it or resumed from a copy of it); a node counts
+those that reach past its start, so a system prompt that many
+conversations share collects the hits of all of them.
 
 The counters cost a few hundred additions per decoded token. A decoding
 step adds the cache's statistics during the step to `decode_stats`, with its
@@ -1983,8 +2193,9 @@ instead of 157.6), and 8,912 tokens 14.76 and 14.68 s against 14.67 and
 
 The window keys, compressed rows and index keys were FP32, although each
 value is an FP8 or FP4 code times a scale, which BF16 holds exactly (see
-Numerics). As BF16, a session's state takes 66 MiB at first instead of 132,
-and 3.14 GiB at 1,048,576 positions instead of 6.28. The 8,912-token
+Numerics). As BF16, a session's state, which then also held two saved
+copies of its rolling rows, took 66 MiB at first instead of 132, and
+3.14 GiB at 1,048,576 positions instead of 6.28. The 8,912-token
 prefill took 17.61 and 14.52 s against 18.48 and 15.48 s (`attend_m` in the
 prefill profile 2,312 against 2,558 ms); decoding did not change.
 

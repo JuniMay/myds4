@@ -92,12 +92,18 @@ during prefill, with `off` as the default. For example, `--ced 128` retains
 128 decoder tokens plus `max(5, lookup_depth)` rewind rows. This can change output; see the
 [option and cache behavior](docs/usage.md) and the
 [measured comparisons](docs/performance.md#joint-prefill-and-server-ced).
-Each new conversation's system prefix is saved within the same prefill as
-its remaining messages. Arrival and prefill logs show request counts,
-queue depth and actual chunks without logging conversation text.
+The server's KV prefix cache resumes each prompt at the longest prefix it
+shares with any conversation the server holds, at any position. Without
+`--ced` it is exact: over rows that came from prompts, the result is byte
+for byte that of prefilling the whole prompt. With `--ced` it recomputes
+the last shared ring of positions (133 with the default `--lookup`) with
+their windows stopping there, which is approximate, as CED is
+([design](docs/design.md#the-kv-prefix-cache)).
+Arrival and prefill logs show request counts, queue depth and actual chunks
+without logging conversation text.
 
 `--prefill-prune` skips decoder prefill batches outside the dependencies
-of the final state and saved system prefix. It is off by default and
+of the final state and of a fork's branch-point capture. It is off by default and
 applies with CED and substitution off. The tested MXFP4 and IQ2 outputs
 match full prefill. Long-prompt prefill improved, while subsequent decode
 slowed in the measured MXFP4 case; see
@@ -110,6 +116,14 @@ Without `--draft`, these options do not load DSpark weights. Both are off
 by default. Context copy speeds repeated text in the measured copy task,
 but slows the measured long DSH continuation; see
 [context-copy measurements](docs/performance.md#context-copy-drafting).
+
+The server's `--runahead` option lets ready requests advance while other
+requests wait for expert reads. It groups ready requests at the same layer
+and enables shared expert loads. It applies when at least two requests are
+decoding; a request alone keeps ordinary decoding. Omit DSpark, substitution,
+GPU routing and the online predictor when using it. The option is off by
+default. See the [server comparison](docs/performance.md#http-runahead-comparison)
+for measured throughput and its limits.
 
 ## Performance
 
