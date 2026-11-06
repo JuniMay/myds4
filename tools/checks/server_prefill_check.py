@@ -75,9 +75,9 @@ def main():
             try:
                 mem = memory_snapshot()
                 foreign = process_snapshot(child=process.pid, preflight=False, allow_cpu_helpers=True)
-                if not foreign and mem["compressions"] <= baseline["compressions"] and mem["swapouts"] <= baseline["swapouts"]:
+                if not foreign and mem["swapouts"] <= baseline["swapouts"]:
                     continue
-                failures.append("another compute job or memory compression appeared")
+                failures.append("another compute job or swapping appeared")
             except Exception as error:
                 failures.append(type(error).__name__)
             stop(process)

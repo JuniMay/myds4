@@ -2,8 +2,8 @@
 
 wait_for_gpu waits until no competing compute process, GPU load or memory
 shortage is visible and the machine is on AC power; guarded_process runs one
-bounded process and discards the run if another workload or memory
-compression appears. Neither is an exclusive lease.
+bounded process and discards the run if another workload or swapping
+appears. In-memory compression is recorded and allowed. Neither is an exclusive lease.
 """
 import json
 import os
@@ -99,8 +99,18 @@ def memory_snapshot():
     page_size = int(re.search(r"page size of (\d+) bytes", output)[1])
     def pages(name):
         return int(re.search(r"^" + re.escape(name) + r":\s+(\d+)", output, re.M)[1])
-    return {"free_gib": pages("Pages free") * page_size / 1024**3,
-            "compressions": pages("Compressions"), "swapouts": pages("Swapouts")}
+    free = pages("Pages free")
+    # macOS can reclaim file-backed pages for an explicit allocation.
+    # Speculative pages already belong to free_count; do not count them twice.
+    file_cache = max(0, pages("File-backed pages") - pages("Pages speculative"))
+    return {"free_gib": free * page_size / 1024**3,
+            "file_cache_gib": file_cache * page_size / 1024**3,
+            "available_gib": (free + file_cache) * page_size / 1024**3,
+            "page_bytes": page_size, "compressions": pages("Compressions"),
+            "decompressions": pages("Decompressions"),
+            "compressor_gib": pages("Pages occupied by compressor") * page_size / 1024**3,
+            "compressed_logical_gib": pages("Pages stored in compressor") * page_size / 1024**3,
+            "swapouts": pages("Swapouts")}
 
 
 def gpu_activity():
@@ -151,14 +161,14 @@ def gpu_snapshot(cache_gib, reserve_gib=10, desktop=False, quiet_cpu=False):
         reasons.append("another workload retains more than 8 GiB of GPU memory")
     # Dense weights, DSpark and working buffers have stayed below 14 GiB in
     # the bounded checks. Keep the requested engine reserve in addition.
-    required_free = cache_gib + 14 + reserve_gib
-    if memory["free_gib"] < required_free:
-        reasons.append("insufficient free memory for cache, runtime and reserve")
+    required_available = cache_gib + 14 + reserve_gib
+    if memory["available_gib"] < required_available:
+        reasons.append("insufficient available memory for cache, runtime and reserve")
     if not on_ac:
         reasons.append("large model tests require AC power")
     return {"device_percent": device, "renderer_percent": renderer, "gpu_resident_gib": round(resident, 2),
             "desktop_load": desktop,
-            "reserve_gib": reserve_gib, "required_free_gib": required_free,
+            "reserve_gib": reserve_gib, "required_available_gib": required_available,
             "memory": memory, "ac_power": on_ac, "competing_processes": busy,
             "background_cpu_helpers": background, "reasons": reasons}
 
@@ -181,7 +191,8 @@ def wait_for_gpu(cache_gib, timeout, reserve_gib=10, desktop=False, quiet_cpu=Fa
             quiet.append(state)
             if len(quiet) == 3:
                 print("GPU_READY " + json.dumps({"free_gib": quiet[-1]["memory"]["free_gib"],
-                      "required_free_gib": quiet[-1]["required_free_gib"], "device_percent": quiet[-1]["device_percent"],
+                      "available_gib": quiet[-1]["memory"]["available_gib"],
+                      "required_available_gib": quiet[-1]["required_available_gib"], "device_percent": quiet[-1]["device_percent"],
                       "desktop_load": desktop, "samples": len(quiet)}), flush=True)
                 return {"method": "process scan and three GPU/memory samples; not an exclusive reservation", "samples": quiet}
         if time.monotonic() >= until:
@@ -193,11 +204,13 @@ def guarded_process(command, env, timeout, baseline, observe_graphics=False, all
                     input_data=None, abort_cpu_contention=False):
     process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    print("GPU_PROCESS " + json.dumps({"runner_pid": os.getpid(), "model_pid": process.pid}), flush=True)
     stop = threading.Event()
     interference = []
     activity_samples = []
     helper_samples = []
     helper_peak = 0.0
+    memory_samples = [baseline]
     started = time.monotonic()
     def monitor():
         nonlocal helper_peak
@@ -211,6 +224,7 @@ def guarded_process(command, env, timeout, baseline, observe_graphics=False, all
                 busy = process_snapshot(child=process.pid, preflight=False,
                                         allow_cpu_helpers=allow_cpu_helpers, background=background)
                 memory = memory_snapshot()
+                memory_samples.append(memory)
                 cpu_total = sum(row["cpu_percent"] for row in background)
                 helper_peak = max(helper_peak, cpu_total)
                 if background and len(helper_samples) < 32:
@@ -227,8 +241,8 @@ def guarded_process(command, env, timeout, baseline, observe_graphics=False, all
                     next_progress = time.monotonic() + 60
                 if process.poll() is not None:
                     return  # snapshots after the child ended are not interference with its run
-                if (busy or memory["compressions"] > baseline["compressions"] or
-                        memory["swapouts"] > baseline["swapouts"] or (abort_cpu_contention and cpu_total > 100)):
+                if (busy or memory["swapouts"] > baseline["swapouts"] or
+                        (abort_cpu_contention and cpu_total > 100)):
                     interference.append({"competing_processes": busy, "memory": memory,
                                          "background_cpu_percent": cpu_total})
                 else:
@@ -260,11 +274,26 @@ def guarded_process(command, env, timeout, baseline, observe_graphics=False, all
     finally:
         stop.set()
         watcher.join(timeout=6)
+    final_memory = memory_snapshot()
+    memory_samples.append(final_memory)
+    if final_memory["swapouts"] > baseline["swapouts"]:
+        interference.append({"swapping_at_completion": final_memory})
     if interference:
         print("GPU_RUN_DISCARDED " + json.dumps(interference), flush=True)
-        raise GPUUnavailable("another workload appeared or memory was compressed; this run is not a performance result")
+        raise GPUUnavailable("another workload appeared, swapping occurred or monitoring failed; this run is not a performance result")
     result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
     result.gpu_activity_samples = activity_samples
     result.background_cpu_helpers = helper_samples
     result.background_cpu_peak = helper_peak
+    result.memory_activity = {
+        "compression_policy": "allowed without a compression-specific limit; swap-outs invalidate the run",
+        "scope": "system-wide counters, sampled about every two seconds; not per-process attribution",
+        "before": baseline, "after": final_memory,
+        "observed_peak_compressor_gib": max(m.get("compressor_gib", 0) for m in memory_samples),
+        "observed_peak_compressed_logical_gib": max(m.get("compressed_logical_gib", 0) for m in memory_samples),
+        "observed_min_available_gib": min(m["available_gib"] for m in memory_samples),
+        "compressed_input_gib": (final_memory["compressions"] - baseline["compressions"]) * final_memory["page_bytes"] / 1024**3,
+        "decompressed_output_gib": (final_memory["decompressions"] - baseline.get("decompressions", final_memory["decompressions"])) * final_memory["page_bytes"] / 1024**3,
+        "sample_count": len(memory_samples),
+    }
     return result

@@ -157,7 +157,7 @@ void io_rows(int fd, uint64_t base, uint32_t rowbytes, const int64_t *rows, int 
 uint64_t mem_available(void);
 int mem_pressure(void);  // 1 normal, 2 warn, 4 critical
 typedef struct {
-  uint64_t total, free, file, file_kept;  // bytes: RAM, free pages, file cache, the file cache macOS keeps
+  uint64_t total, free, file, file_kept;  // bytes: RAM, free pages, reclaimable files, diagnostic kernel cache target
   uint64_t wired, compressor, compressed;  // wired pages; the compressor's pages and the memory they hold
   uint64_t swap_used;                     // bytes in swap files
   uint64_t swapouts, compressions;        // pages since boot
@@ -198,7 +198,7 @@ enum { CACHE_HALF_LIFE_DEFAULT = 50, CACHE_HALF_LIFE_MAX = 1000000 };
 void cache_retention(int half_life, int read_cost);
 enum { CACHE_RESERVE_DEFAULT = 10, CACHE_RESERVE_MIN = 2, CACHE_RESERVE_MAX = 1024 };
 // Before cache_init: the memory in GiB that the cache leaves available to
-// other programs, 0 for the default. The cache starts within the free memory
+// other programs, 0 for the default. The cache starts within available memory
 // less the reserve, gives slots back when the available memory falls below
 // it and grows only while 4 GiB more than it is available.
 void cache_reserve(double gib);

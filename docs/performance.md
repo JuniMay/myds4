@@ -1250,18 +1250,18 @@ visible when testing longer sessions.
 
 ## Runtime checks after restart
 
-On 2026-11-01, bounded tests reproduced three implementation defects before
-their fixes. The retained checks then passed on the rebuilt engine:
+Bounded tests reproduced the following implementation defects before
+their fixes. The checks cover independent behaviors:
 
 | Check | Reproduced behavior | Checked result |
 | --- | --- | --- |
 | Prefetch admission release | A completed or cancelled read retained its admission while its dispatch notification was delayed; 8/10 checks passed. | The final piece releases the admission immediately; 10/10 checks passed. |
-| Available-memory estimate | A zero kernel file-cache floor was retained as unavailable, even after a later successful query; 3/7 checks passed. | Each estimate reads the current floor, with a conservative fallback on failure; 7/7 checks passed. |
+| Available-memory accounting | Reclaimable file pages were excluded when the kernel cache target was zero and partially excluded otherwise; 3/11 checks passed. Initial capacity used free pages alone; 4/7 allocation/pressure checks passed. | All reclaimable file pages count once; 11/11 accounting and 8/8 allocation/pressure checks pass. |
 | GPU clock calibration | Injecting 10 ms of host scheduling delay made a requested 2 ms spin last 0.469 ms. | GPU timestamp calibration produced a 1.650 ms median in the final check, within the test's 1.5–3 ms tolerance. |
 
 These checks establish the corrected behavior. Repeated live comparisons did
 not establish a material throughput gain from the admission or calibration
-fixes. The memory check validates recovery when the kernel value changes; it
+fixes. The memory checks validate reclaimable-page accounting and pressure responses; it
 does not prove that this defect caused an earlier slow user session. Energy
 use was not measured.
 
@@ -1475,8 +1475,30 @@ of 12.2 MB).
 
 ## Memory and the file cache
 
-On the development machine (2026-10-31) the kernel keeps 23.9 GiB of file
-cache (`vm.vm_page_filecache_min`: 1,565,484 pages of 16 KiB) and starts
+Current accounting includes free pages and all reclaimable file pages,
+counting speculative pages only once. The initial expert capacity uses
+that total minus the reserve and draft pools. The TUI reports total minus
+available as used memory and shows file cache separately. Memory pressure, swapping and GPU-residency limits still trigger their
+protective responses. Compression in RAM alone does not reduce capacity
+or prevent growth.
+
+The regression fixtures reproduce the accounting and allocation defects
+before the change. Accounting passes 11/11 checks, allocation and pressure
+handling pass 8/8, and the server passes 40 unit tests including the TUI
+case. With 58 GiB free and 36 GiB cached on a 128 GiB machine, the display
+reports 34 GiB used and 94 GiB available. In the controlled allocation
+fixture, the requested 56 GiB budget admits 3,185 slots instead of 2,503.
+
+A live 56 GiB MXFP4 attempt after this correction caused 50,073 pages of
+system compression (about 0.76 GiB) and no swapping. The then-active no-compression benchmark guard stopped it. This attempt establishes no throughput result or stable
+56 GiB allocation. Current comparisons permit and record in-memory compression, but reject
+new swap-outs and any change in allocated expert-cache bytes. The
+[memory-policy records](../data/benchmarks/memory_policy_validation.json)
+separate the regression checks from the stopped live attempt.
+
+The measurements below used the cache-target-based policy on 2026-10-31;
+they do not measure the current full-file-cache accounting policy. On that
+date, the development machine reported a target of 23.9 GiB of file cache (`vm.vm_page_filecache_min`: 1,565,484 pages of 16 KiB) and starts
 reclaiming memory only when fewer than 62.5 MiB of pages are free
 (`vm.vm_page_free_target`: 4,000 pages). Since boot it had compressed 1.91
 billion pages and dropped 221 million file pages
@@ -1895,15 +1917,12 @@ stayed normal.
   Of the GPU's work, the one-row dense products take 15.5 ms per token, at
   370 to 570 GB/s of their weights (`--bench`); the routed experts take 6.4
   ms and the head 1 ms.
-- Memory: the cache keeps 10 GiB available (the default `--reserve`),
-  counting the file cache only
-  beyond the kernel's 23.9 GiB share, and backs off as soon as the kernel
-  compresses anything while the free memory is below the reserve (see
-  [Memory and the file cache](#memory-and-the-file-cache)). With about 45
-  GiB used by other applications and the system and less file cache than
-  that share, `--cache 64` settles where the free memory meets the reserve,
-  at 42 to 53 GiB on 2026-10-31; 44 to 53 GiB decoded 1 to 11% faster than
-  40 GiB exactly (see [Expert formats compared](#expert-formats-compared)).
+- Memory: the cache leaves the selected reserve available, counting free
+  pages and reclaimable file pages once. The default reserve is 10 GiB.
+  Real pressure and swapping can still reduce expert capacity; compression alone does not.
+  Historical cache-size measurements appear in
+  [Memory and the file cache](#memory-and-the-file-cache); they do not
+  establish the performance of the current accounting policy.
 - Approximate decoding (`--substitute 0.5`) adds 32 to 39% on these experts
   (26 to 28 tokens/s, a mean KL of 0.027 and 0.080 nats from exact decoding
   on the two short texts), and with `--draft 3` the Python prompt decodes at

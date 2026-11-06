@@ -16,11 +16,10 @@
 // stalls (mem_gpu_room): a slot whose expert a layer needs is mapped before
 // the GPU uses it, and between tokens (in a prompt, for the layers done) the
 // mapped slots with the lowest scores leave the set until the rest fit. The
-// cache counts as available the free pages and the file cache beyond the
-// share the kernel keeps, and keeps 10 GiB of that free for other programs.
+// cache counts free pages and reclaimable file pages as available, and
+// leaves a configurable reserve for other programs.
 // It gives slots back when the kernel reports pressure, when anything was
-// swapped out, when the available memory falls below the reserve, and when
-// the kernel compresses memory because the cache took file cache, waiting a
+// swapped out or the available memory falls below the reserve, waiting a
 // second between steps for the memory given back to show; it grows again
 // only after a calm period. It checks after every token, after every layer
 // of a prompt and every second while the server idles.
@@ -159,19 +158,15 @@ static uint64_t sysctl_u64(const char *name) {  // 0 if there is no such value
   return sysctlbyname(name, &v, &n, 0, 0) ? 0 : v;
 }
 
-// Memory available to the cache: the free pages and the file cache beyond
-// the share the kernel keeps (vm.vm_page_filecache_min, 23.9 GiB with 128
-// GiB). While the file cache is below that share the kernel compresses
-// applications' memory rather than drop cached files; on the machine
-// measured it had compressed 8.6 pages for every file page it dropped
-// since boot.
-static uint64_t avail_of(vm_statistics64_data_t s) {
-  // The kernel initializes this to zero and recalculates it during pageout.
-  // Remain conservative while unavailable, but do not cache that state forever.
-  uint64_t keep = sysctl_u64("vm.vm_page_filecache_min");
-  if (!keep) keep = UINT64_MAX;
+// Free pages already include speculative file pages. The remaining file
+// pages are reclaimable too; the kernel's cache target is not used memory.
+static uint64_t file_of(vm_statistics64_data_t s) {
   uint64_t file = s.external_page_count > s.speculative_count ? s.external_page_count - s.speculative_count : 0;
-  return ((uint64_t)s.free_count + (file > keep ? file - keep : 0)) * vm_page_size;
+  return file * vm_page_size;
+}
+
+static uint64_t avail_of(vm_statistics64_data_t s) {
+  return (uint64_t)s.free_count * vm_page_size + file_of(s);
 }
 
 uint64_t mem_available(void) { return avail_of(vm()); }
@@ -252,7 +247,7 @@ void mem_info(MemInfo *m) {
   size_t n = sizeof sw;
   sysctlbyname("vm.swapusage", &sw, &n, 0, 0);
   *m = (MemInfo){.total = sysctl_u64("hw.memsize"), .free = s.free_count * p,
-                 .file = (s.external_page_count > s.speculative_count ? s.external_page_count - s.speculative_count : 0) * p,
+                 .file = file_of(s),
                  .file_kept = keep * p, .wired = s.wire_count * p, .compressor = s.compressor_page_count * p,
                  .compressed = s.total_uncompressed_pages_in_compressor * p, .swap_used = sw.xsu_used,
                  .swapouts = s.swapouts, .compressions = s.compressions, .pressure = mem_pressure()};
@@ -620,8 +615,8 @@ void cache_init(uint64_t budget, int layers) {
   if (max_slots < 2 * EXPERTS) max_slots = 2 * EXPERTS;
   if (budget < 2 * EXPERTS * SLOT_SIZE)
     die("an expert cache of %.1f GiB is too small: a prompt needs %.1f GiB", budget / GiB, 2.0 * EXPERTS * SLOT_SIZE / GiB);
-  // it starts within the free pages and takes file cache only in resize's steps
-  uint64_t within = free > reserve + pinned_bytes ? free - reserve - pinned_bytes : 0;
+  // File-cache reclamation is handled by macOS as slots are populated.
+  uint64_t within = avail > reserve + pinned_bytes ? avail - reserve - pinned_bytes : 0;
   cap = (int)((budget < within ? budget : within) / SLOT_SIZE);
   if (cap > max_slots) cap = max_slots;
   if (cap < 2 * EXPERTS) cap = 2 * EXPERTS;
@@ -655,7 +650,7 @@ void cache_init(uint64_t budget, int layers) {
   for (int i = max_slots; i < max_slots + npinned; i++) finish(i);
   int64_t gpu_room = mem_gpu_room();
   fprintf(stderr, "expert cache: %d slots (%.1f GiB) to start, up to %d mapped for the GPU, %.1f GiB free and %.1f GiB "
-          "of file cache beyond the kernel's share, %.1f GiB kept for other programs, GPU resident memory %.1f GiB",
+          "of reclaimable file cache, %.1f GiB kept for other programs, GPU resident memory %.1f GiB",
           cap, cap * (double)SLOT_SIZE / GiB, mcap, free / GiB, (avail > free ? avail - free : 0) / GiB, reserve / GiB,
           mem_gpu() / GiB);
   if (gpu_room < INT64_MAX) fprintf(stderr, " (%.1f GiB below the GPU's limit)", gpu_room / GiB);
@@ -1197,33 +1192,28 @@ void cache_refine(int layer, const int *keep, int n) {
 // Resizes the cache. It gives slots back, the least recently used of the
 // layers below `below` first, on memory pressure, when anything was swapped
 // out or the swapper woke, when the available memory falls below the
-// reserve, and down to the free pages' reserve when this process's memory is
-// being compressed or the kernel compresses anything while the free pages
-// are below the reserve. It grows again only after 32 calm calls, by a
-// quarter of the headroom, and into the file cache only after five minutes
-// without any of those.
+// reserve. Compression in RAM has no separate limit. It grows again after
+// 32 calm calls by a quarter of the headroom; after swapping, growth uses
+// only free pages for five minutes.
 static void resize(int below) {
-  static uint64_t swapouts, wakeups, compressions, own;
+  static uint64_t swapouts, wakeups;
   static int calm, init;
   static double gave;  // when slots were last given back: their memory shows as free only later
-  static double bad = -1e9;  // when the kernel last compressed or swapped in a way the cache could have caused
+  static double bad = -1e9;  // last observed swap-out or swapper wakeup
   vm_statistics64_data_t s = vm();
   uint64_t free = (uint64_t)s.free_count * vm_page_size, avail = avail_of(s), slot = SLOT_SIZE, margin = 4 * (uint64_t)GiB;
-  uint64_t woke = sysctl_u64("vm.compressor.swapper.wakeups.total"), comp = mem_compressed(0);
-  if (!init) swapouts = s.swapouts, wakeups = woke, compressions = s.compressions, own = comp, init = 1;
+  uint64_t woke = sysctl_u64("vm.compressor.swapper.wakeups.total");
+  if (!init) swapouts = s.swapouts, wakeups = woke, init = 1;
   int64_t room = mem_gpu_room();
   int level = mem_pressure(), swapped = s.swapouts > swapouts || woke > wakeups;
-  int compressing = s.compressions > compressions;
-  int squeezed = (compressing && free < reserve) || comp > own + (64 << 20);
-  int low = level >= 2 || swapped || squeezed || avail < reserve;
+  int low = level >= 2 || swapped || avail < reserve;
   static int calm_map;
   static double unmapped;  // when the GPU's excess was last unmapped: the driver shows it about a second later
-  if (swapped || squeezed || comp > own) bad = now();
-  if (compressing || comp > own) calm = 0;  // the kernel is reclaiming memory: no growth
-  swapouts = s.swapouts, wakeups = woke, compressions = s.compressions, own = comp;
+  if (swapped) bad = now();
+  swapouts = s.swapouts, wakeups = woke;
   uint64_t headroom = now() - bad > 300 ? avail : free;
   if (low && (level >= 4 || swapped || now() - gave > 1)) {
-    uint64_t to = squeezed ? free : avail;
+    uint64_t to = avail;
     int64_t give = level >= 4 ? nslots / 4 : nslots / 16 + 1;
     if (to < reserve && (int64_t)((reserve - to) / slot) + 1 > give) give = (reserve - to) / slot + 1;
     cap = nslots - (int)give > 2 * EXPERTS ? nslots - (int)give : 2 * EXPERTS;

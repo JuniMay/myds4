@@ -1,4 +1,4 @@
-// CPU-only cache-budget regression: kernel file-cache limits may change.
+// Available memory includes reclaimable file pages without counting them twice.
 #include <sys/sysctl.h>
 #include <errno.h>
 #include <stdint.h>
@@ -30,18 +30,26 @@ static void expect(const char *name, uint64_t actual, uint64_t wanted) {
 int main(void) {
   vm_statistics64_data_t pages = {.free_count = 100, .external_page_count = 500, .speculative_count = 20};
   reported_floor = 0;
-  expect("zero floor remains conservative", avail_of(pages), 100 * vm_page_size);
+  expect("zero floor includes reclaimable files", avail_of(pages), 580 * vm_page_size);
   reported_floor = 200;
-  expect("later published floor is observed", avail_of(pages), 380 * vm_page_size);
+  expect("kernel floor does not mark cached files as used", avail_of(pages), 580 * vm_page_size);
   reported_floor = 450;
-  expect("increased floor reduces reclaimable cache", avail_of(pages), 130 * vm_page_size);
+  expect("changing floor does not change available bytes", avail_of(pages), 580 * vm_page_size);
   reported_floor = 600;
-  expect("file cache below its floor contributes nothing", avail_of(pages), 100 * vm_page_size);
+  expect("all cached files remain reclaimable", avail_of(pages), 580 * vm_page_size);
   query_failed = 1;
-  expect("query failure falls back to free pages", avail_of(pages), 100 * vm_page_size);
+  expect("unavailable floor does not discard cached files", avail_of(pages), 580 * vm_page_size);
   query_failed = 0, reported_floor = 200;
-  expect("query failure is retried", avail_of(pages), 380 * vm_page_size);
-  expect("each budget calculation observes current kernel policy", queries, 6);
+  expect("query recovery preserves available bytes", avail_of(pages), 580 * vm_page_size);
+  pages.external_page_count = 10;
+  expect("speculative pages cannot underflow file count", avail_of(pages), 100 * vm_page_size);
+  pages.external_page_count = 20;
+  expect("speculative pages are counted only in free pages", avail_of(pages), 100 * vm_page_size);
+  pages.external_page_count = 0, pages.speculative_count = 0;
+  expect("no file cache leaves only free pages", avail_of(pages), 100 * vm_page_size);
+  pages.free_count = 0, pages.external_page_count = 500;
+  expect("cached pages remain available with no free pages", avail_of(pages), 500 * vm_page_size);
+  expect("available memory does not query the cache floor", queries, 0);
   fprintf(stderr, "available memory: %d/%d CPU checks passed\n", checks - failures, checks);
   return failures != 0;
 }

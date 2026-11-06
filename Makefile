@@ -318,6 +318,15 @@ build/memory-available-check: tools/checks/memory_available_check.c src/engine/i
 memory-available-check: build/memory-available-check
 	./build/memory-available-check
 
+build/cache-memory-check: tools/checks/cache_memory_check.c src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/myds4.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/cache_memory_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
+
+cache-memory-check: build/cache-memory-check
+	./build/cache-memory-check
+
+.PHONY: cache-memory-check
+
 clean:
 	rm -rf build
 

@@ -47,7 +47,7 @@ it, saying so on stderr. `lockf(1)` takes the same lock.
 | `--prefill-prune` | Skip decoder batches outside the dependencies of the final state and saved prefix. Off by default; available in the CLI and server. Encoder/global KV work remains complete. Applies with CED and substitution off and without full-row diagnostics. The dependency-preserving plan matched full prefill in the tested MXFP4 and IQ2 cases. It can change cache residency and decode speed; see [measurements](performance.md#dependency-pruned-prefill-checks). |
 | `--ced off\|N` | Approximate prefill, default `off`. A depth from 128 to 1,048,576 retains N decoder tokens plus `max(5, lookup_depth)` rewind rows. All new tokens run through the encoder and global KV projections; only the retained suffix runs through later decoder layers. Shorter inputs use full prefill. Decoding still uses all layers. Local KV and generated output can differ from full prefill. Available in the CLI and the server. |
 | `--cache GB` | Upper bound on expert memory, including reserved draft pools. After reserving those pools, the budget must hold two backbone layers' experts. The cache adapts to available memory and keeps a reserve for other programs (`--reserve`); the requested budget is not a guaranteed allocation. Slots outside the GPU's mapping limit remain in memory and are mapped when needed. See [Design](design.md#the-expert-cache-and-memory). |
-| `--reserve GB` | The memory the expert cache leaves to other programs, 2 to 1,024 GiB (default 10). The cache starts within the free memory less the reserve, gives slots back when the available memory falls below it, and grows only while the available memory exceeds it by 4 GiB. A smaller reserve keeps more experts in memory and leaves less to other applications; the cache still gives slots back when the kernel reports pressure, swaps or compresses memory while the free memory is below the reserve. |
+| `--reserve GB` | The memory the expert cache leaves to other programs, 2 to 1,024 GiB (default 10). The cache starts within available memory (free pages plus reclaimable file pages) less the reserve, gives slots back when the available memory falls below it, and grows only while the available memory exceeds it by 4 GiB. A smaller reserve keeps more experts in memory and leaves less to other applications; the cache still gives slots back on memory pressure, swapping or insufficient available memory. In-memory compression has no separate limit. |
 | `--cache-half-life N` | Retention-score half-life, 1 to 1,000,000 forward-pass advances; default 50. A decode or verification pass advances once, and prefill advances once at its end. A DSpark pass can emit several tokens, so these are not emitted-token units. |
 | `--cache-read-cost` | Off by default. Multiply backbone decode eviction priority by the expert's aligned read bytes divided by the fixed slot size. Raw score history, prefill eviction, memory-pressure release and GPU unmapping retain their existing rules. |
 | `--online-predictor` | Learn a CPU correction to available one- and two-layer prefetch forecasts during inference. Included in the normal engine, off by default. Works with substitution, DSpark, GPU routing and serving. See [online CPU predictor](#online-cpu-prefetch-predictor) for learning and measurement scope. |
@@ -190,19 +190,13 @@ The server forks that snapshot only when the new suffix exceeds the replay
 depth plus `max(5, lookup_depth)` rows; otherwise it chooses a complete cached state or
 prefills anew.
 
-While no request runs, the server keeps its experts in memory, so the next
-request finds them as the last one left them. Every second it checks memory
-as it does between tokens: when other programs take memory (the kernel
-reports pressure, the system swaps, the kernel compresses memory while the
-free memory is below the reserve, 10 GiB unless `--reserve` sets it, or
-the available memory falls
-below the reserve), it gives expert slots back, as it does when the memory
-that all processes keep resident for the GPU passes the GPU's limit. The
-whole cache counts as the server's memory, for example in Activity Monitor.
-The slots mapped for the GPU are wired; the kernel could compress or swap
-the others like any program's memory, which is why the server gives slots
-back as soon as the kernel compresses anything while the free memory is
-below the reserve.
+While no request runs, the server keeps experts in memory for later
+requests. Every second it checks memory as it does between tokens. It gives
+expert slots back on memory pressure, swap-outs or insufficient available
+memory for the selected reserve. GPU-resident slots also obey the separate
+GPU mapping limit. In-memory compression alone does not evict experts or
+prevent cache growth. The whole cache contributes to the server's memory
+footprint; mapped slots are wired, and macOS may compress other slots.
 
 The log on stderr has a line per event: each HTTP request's arrival, its body
 size, message and tool counts, queue admission, and waiting-request count.
@@ -259,9 +253,10 @@ five parts:
   its experts and the rest, and the expert slots against the cache's
   current limit and its largest. **SSD:** the experts only on the SSD (their
   bytes and count), evictions and slots given back for memory. **Mac:**
-  memory in use against the total (the file cache dim), free memory,
+  memory in use against the total (excluding file cache), available memory
+  (including file cache),
   pressure, file cache, wired memory and swap; below it the compressor, the
-  kernel's minimum for the file cache and swap-outs since the view started.
+  kernel's file-cache target (diagnostic only) and swap-outs since the view started.
 - **KV cache:** the sessions and their memory, the share of the finished
   requests' prompt tokens that sessions supplied, the requests by how they
   found their session (new, continued, saved rows, forked), and the
@@ -307,7 +302,7 @@ The app stores the key in its own credential file (`~/.dsh/.credentials.yaml`).
 | `.venv/bin/python tools/reference/check.py encoding CHECKPOINT` | The server's prompts (`build/myds4-server --render`; `MYDS4_RENDER` names another renderer) of the checkpoint's `encoding/tests` cases 1, 2, 3 and 5, and of 1,200 generated conversations (tools, tool calls and results, reasoning, system messages at the start and mid-conversation, content parts, escapes, both thinking modes, every effort form) and 600 with image parts in user turns and tool results (the placeholders' places and the images' order), against `encoding/encoding.py`, byte for byte. The server's renderer differs from `encoding.py` in known places ([Prompts compared with encoding.py](server.md#prompts-compared-with-encodingpy)), so the check reports the equal counts and exits with status 1. |
 | `make server-check` | The server's tests without a model: the compatibility steps, a numeric effort in the prompt, the live view's frames on a test terminal (the title first, every line within the terminal's width, the log below the sessions' tree, the quit keys), the connections' limits (503, 431, a late head, 408, 413, a client that leaves or stops reading), and, with `MYDS4_CHECKPOINT=CHECKPOINT`, its output path through deepseek-recipe's stream processor with the checkpoint's tokenizer. |
 | `.venv/bin/python tools/reference/check.py vision CHECKPOINT IMAGE [BINARY...]` | The image's feature rows (`--vision-fd`) against `inference/image_processor.py` and `vision.py` (ViT and Aligner in BF16 on the CPU): their SNR, overall and per row. With BINARY, each of those builds instead of `build/myds4`, against one reference. Needs `pillow`. |
-| `.venv/bin/python tools/reference/check.py model CHECKPOINT [CACHE]` | Every layer's streams, the routing and the logits of 20 decoded positions against DeepSeek's `inference/model.py` on the CPU (about 12 minutes, up to 55 GB of memory; `CACHE` keeps the reference's results in a file for reruns). The reference reads the checkpoint through the page cache, which then holds tens of GB of it: until those pages are reclaimed, myds4 finds less free memory, and its expert reads may come from the page cache instead of the SSD. |
+| `.venv/bin/python tools/reference/check.py model CHECKPOINT [CACHE]` | Every layer's streams, the routing and the logits of 20 decoded positions against DeepSeek's `inference/model.py` on the CPU (about 12 minutes, up to 55 GB of memory; `CACHE` keeps the reference's results in a file for reruns). The reference reads the checkpoint through the page cache, which then holds tens of GB of it: myds4 counts reclaimable file pages as available, and its expert reads may come from the page cache instead of the SSD. |
 | `build/myds4 -m CHECKPOINT -p TEXT --check-prefill` | The prompt as two batches (the first of odd length) against one: the final logits must be equal. The batched prefill's logits at every position against token-by-token decoding. |
 | `build/myds4 -m CHECKPOINT -p TEXT --check-batch` | The prompt's next token decoded alone and beside another sequence (`model_forward_rows`), and with `--draft N` in a verify pass: the logits must be equal. With `--gpu-route`, the token decoded alone takes the GPU-routed path and the others do not, so the check compares the two paths. |
 | `make gguf-decode-check [GGUF=FILE]` | IQ1_M expert decoding on the GPU against llama.cpp's `dequantize_row_iq1_m`, value by value: 8,192 random blocks and, with `GGUF`, 768 blocks of each IQ1_M expert tensor of the file (any shard of a split set). No model is loaded. |
@@ -316,7 +311,8 @@ The app stores the key in its own credential file (`~/.dsh/.credentials.yaml`).
 | `make prefetch-metrics-check` | Runs 56 CPU checks of fixed-snapshot route attribution, first-use accounting, origin preservation, completed/cancelled bytes, I/O timing and unsupported GPU-route coverage. Prints bounded JSON summaries; no model or GPU execution. |
 | `make cache-policy-check` | Runs 48 CPU checks of score aging, victim eligibility, read-cost weighting, repeated-row priority, persistent history, rescaling and pending-read ownership. No model or GPU execution. |
 | `make prefetch-queue-check` | Runs 10 CPU checks of immediate prefetch admission release, including completion and cancellation while notifications are delayed. Reads `/dev/zero`; no model, SSD files or GPU execution. |
-| `make memory-available-check` | Runs 7 CPU checks of changing kernel file-cache floors and query recovery. No model or GPU execution. |
+| `make memory-available-check` | Runs 11 CPU checks of reclaimable file pages and speculative-page accounting. No model or GPU execution. |
+| `make cache-memory-check` | Runs 8 CPU checks of initial capacity, growth with compression, and responses to pressure and swapping. No model or GPU execution. |
 | `make gpu-clock-check` | Checks the GPU clock-keeper calibration with injected host scheduling delay. Uses a tiny Metal kernel and no model weights. |
 | `make build/myds4-predict-lab` | Builds the optional live feature-ablation and cache-action experiment. The ordinary executable does not link its predictor. See [experiment design](design.md#live-predictor-experiment-build). |
 | `make build/predictor-lab-check build/cache-action-check`, then run those two executables | Checks causal learning, signal wiring, victim eligibility and admission ownership without loading the model or running the GPU. |

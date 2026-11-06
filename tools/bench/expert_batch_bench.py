@@ -198,6 +198,7 @@ def run(args, role, prompt, settings, expected, env):
         "output_shape": output_shape,
         "copy_exact": copy_exact,
         "metrics": metrics, "grouping": grouping, "guard": guard,
+        "memory_activity": p.memory_activity,
         "gpu_activity_during_run": p.gpu_activity_samples,
         "background_cpu_helpers": p.background_cpu_helpers,
         "background_cpu_peak": p.background_cpu_peak,

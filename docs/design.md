@@ -243,7 +243,7 @@ The retained `tools/checks/prefill_prefix_check.c` compares compact execution
 with the same full-shape attention mask, including DSpark state, prefix
 restoration and chunk boundaries. `tools/checks/server_prefill_check.py`
 checks the option and cache reuse through HTTP. Its shared guard in
-`tools/bench/gpu_guard.py` checks GPU-client ownership, free memory, AC power
+`tools/bench/gpu_guard.py` checks GPU-client ownership, available memory, AC power
 and competing processes, and stops its own workload on resource interference.
 Requests, replies and diagnostic logs remain in memory.
 
@@ -365,9 +365,9 @@ Generated code is not executed. These workloads measure inference on
 agentic-style histories; they do not measure autonomous task completion.
 Before loading, the runner requires the requested expert-cache budget,
 14 GiB for weights and working buffers, and the explicit engine reserve to
-be free. The reserve defaults to 10 GiB; `--reserve` sets it for every
+be available. The reserve defaults to 10 GiB; `--reserve` sets it for every
 comparison arm and for the guard. The native memory-pressure policy remains
-active, and a run with cache shrinkage or new compression/swap is rejected.
+active, and a run with cache shrinkage or new swap-outs is rejected. In-memory compression is recorded and allowed.
 The all-row model check requests a 20 GiB cache and a 4 GiB reserve; it
 compares logits and makes no throughput claim.
 The default timing admission limit is 20% device activity. Explicit
@@ -381,7 +381,7 @@ logged as background CPU work when the driver exposes GPU-client
 ownership and neither they nor their descendants own a GPU client. During
 inference the model's own GPU client must also be visible for that exception
 to apply. GPU clients, named model/probe jobs and the model lock
-still block a run; memory bounds, cache shrinkage and new compression/swap
+still block a run; memory bounds, cache shrinkage and new swap-outs
 remain grounds to reject a comparison. CPU work does not need a separate
 reservation. The default quiet mode retains the broader Python-job
 exclusion. Background-helper observations are retained with the result.
@@ -656,18 +656,17 @@ from model runs belongs in [Performance](performance.md).
 module. `tools/experimental/predictor_lab.py` runs serial CLI controls and
 experiments with bounded output held in RAM. It does not save traces, model
 output or learned weights. The runner stops on changed output, process failure,
-cache shrinkage, compression or swap. A repeat control measures timing drift
+cache shrinkage or swap. Compression is recorded without a compression-specific limit. A repeat control measures timing drift
 across a trial.
 
 Before every run, the runner requires three quiet GPU/memory samples. It
 checks process names for other model, IREE, kernel-probe and substantial Python
 workloads, requires GPU device activity at most 20%, resident GPU memory at
-most 8 GiB, and free memory at least the requested cache plus 24 GiB for
-runtime allocations and reserve. Large model runs require AC power. It waits
+most 8 GiB, and available memory at least the requested cache plus 14 GiB
+for runtime allocations and the selected reserve. Large model runs require AC power. It waits
 up to `--gpu-wait` seconds, default
 900, without loading the model. The existing inference lock remains in use.
-During inference it checks for other compute processes and new compression
-or swap. On interference it sends SIGINT only to its own child and discards
+During inference it checks for other compute processes and new swap-outs. On interference it sends SIGINT only to its own child and discards
 that run. It never stops another agent's job. These checks are conservative
 observations, not an exclusive GPU reservation; short activity between polls
 can escape detection. Guard snapshots accompany new trial records.
@@ -1300,21 +1299,18 @@ without encoding it again.
 A slot is a Metal buffer holding one expert (18.9 MB with alignment slack).
 The cache's budget is the available memory less a reserve for other
 programs: 10 GiB, or 2 to 1,024 GiB with `--reserve`. The
-available memory is the free memory (the kernel's free pages, which include
-the file pages read ahead) and the file cache beyond the share that the
-kernel keeps (`vm.vm_page_filecache_min`, 23.9 GiB with 128 GiB). While the
-file cache is below that share, the kernel compresses applications' memory
-rather than drop cached files: on the development machine it had
-compressed 8.6 pages for every file page it dropped since boot. Beyond the
-share it drops cached files first but may still compress some memory, so
-the cache starts within the free memory less the reserve and takes more
-only in its growth steps, which stop as soon as the kernel compresses
-anything (see below).
+available memory is the kernel's free pages plus reclaimable file-backed
+pages. Speculative file pages are already in the free count and are not
+counted twice. The kernel's file-cache target does not reduce availability,
+including when that target is zero or unavailable. Cached files are not
+reported as used memory in the TUI.
 
-Each available-memory calculation reads the current kernel file-cache floor.
-When that query fails or returns zero, only free pages count toward available
-memory. Later calculations retry the query, including after startup when the
-kernel may not yet have published a nonzero floor.
+Initial expert capacity uses this available total minus the reserve and
+reserved draft pools, bounded by the requested cache budget. macOS reclaims
+file pages as slots are populated; no manual file-cache purge is required.
+The cache responds to actual memory pressure and swapping. Compression
+in RAM has no separate limit. A requested budget remains an upper bound, because later pressure
+can shrink the allocation.
 
 The GPU also limits it. The GPU driver reports how much memory all
 processes keep resident for the GPU ("In use system memory" in the
@@ -1368,25 +1364,19 @@ layer being served in the current pass, protected read-aheads, and experts
 whose addresses are still published for GPU routing cannot be victims.
 A recency list orders the slots for prompt passes and for giving slots back.
 
-Every slot is in the memory the process accounts for (its footprint). The
-slots mapped for the GPU are wired; the kernel could compress or swap the
-others like any program's memory, so the cache gives memory back as soon
-as the kernel starts compressing memory to make room. It checks memory at
-each decode or verification pass, during each prompt layer and every second
-while the server idles. It shrinks, least recently used slots first, when the kernel reports memory
-pressure, when anything was swapped out or the swapper woke
-(`vm.compressor.swapper.wakeups.total`), or when the available memory falls
-below the reserve. It shrinks to the free memory less the reserve when the
-kernel compresses anything while the free memory is below the reserve, or
-when 64 MiB more of the process's own memory is compressed than at the
-check before. Memory given back shows as free only after a while, so it
-waits a second before shrinking again, unless the pressure is critical or
-the system swaps. It grows again, by a quarter of the headroom, only after
-32 checks in which the kernel compressed nothing and while the available
-memory exceeds the reserve by 4 GiB, up to `--cache` when one
-is given. For five minutes after a compression or swap that the cache could
-have caused, the headroom is the free memory alone, without the file
-cache.
+Every slot contributes to the process's memory footprint. Mapped slots
+are wired for the GPU; macOS may compress other slots in RAM. Compression
+alone does not shrink the cache or prevent growth. The engine checks memory
+at each decode or verification pass, during each prompt layer and every
+second while the server idles. It shrinks when macOS reports pressure,
+when swap-outs or swapper wakeups increase, or when available memory falls
+below the reserve. It waits one second between releases unless pressure
+is critical or swapping occurs.
+
+After 32 calm checks, the cache can grow by a quarter of the headroom when
+availability exceeds the reserve by 4 GiB, up to the requested budget.
+For five minutes after swapping, growth uses free pages alone. In-memory
+compression does not start that cooldown.
 Within a prompt pass at layer l it releases and unmaps only slots of layers
 before l - 1, which no GPU work in flight uses.
 
@@ -1472,7 +1462,8 @@ The cache checks run without model weights, expert reads or GPU execution:
 | `make prefetch-metrics-check` | 56 | Fixed snapshots, first use, read origin, byte accounting, I/O timing and unsupported coverage. |
 | `make cache-policy-check` | 37 | Aging ratios, victim rules, aligned read costs, uniform costs, history and rescaling. |
 | `make prefetch-queue-check` | 10 | Immediate admission release on completion or cancellation, with a delayed notification queue and reads from `/dev/zero`. |
-| `make memory-available-check` | 7 | Changing kernel file-cache floors, conservative query failure and recovery. |
+| `make memory-available-check` | 11 | Reclaimable file pages, speculative-page accounting and independence from kernel cache targets. |
+| `make cache-memory-check` | 8 | Initial capacity, calm growth with compression, and responses to pressure and swapping. |
 
 ### Prefetch attribution
 
@@ -2074,56 +2065,16 @@ the MXFP4 experts and 1 to 7% faster with the GGUF ones, exactly (see
 
 ### The file cache as available memory
 
-At `--cache 64` the cache settled where the free memory met the 10 GiB
-reserve, at 42 to 53 GiB, while macOS showed another 16 to 30 GiB as cached
-files. The build of 2026-10-31 10:03 counted only free memory: the kernel's
-free pages plus its read-ahead pages, which the free pages already include,
-so those counted twice (1.1 to 1.2 GiB that day). It also started at the
-full `--cache` size and shrank only after its first checks.
+The engine and benchmark preflight count free pages plus reclaimable file
+pages. For example, 58 GiB free and 36 GiB of file cache provide 94 GiB
+available on a 128 GiB machine, so the TUI reports 34 GiB used. File cache
+remains visible as a separate dim segment of the memory bar.
 
-Counting the whole file cache was not tried. The kernel keeps a share of
-the file cache (`vm.vm_page_filecache_min`, 23.9 GiB with 128 GiB) and,
-while the file cache is below it, compresses applications' memory instead
-of dropping cached files: since boot it had compressed 1.91 billion pages
-and dropped 221 million file pages. The cache's unmapped slots are the
-process's oldest untouched pages, which the kernel would compress first,
-and quantized weights do not compress, so the compressor would fill and
-then swap. The cache therefore counts only the file cache beyond the share,
-starts within the free memory less the reserve, and stops growing, or gives
-memory back, when the kernel compresses anything (see The expert cache and
-memory).
-
-Measured on 2026-10-31 with `--cache 64`, the story prompt, exact
-decoding, the GGUF experts unless noted, each run a fresh process,
-alternated, one run per row and rule (other applications used 0 to 22% of
-the GPU). No run swapped anything out:
-
-| State before the run | Cache, 10:03 rule | Cache, this rule | Tokens/s, 10:03 rule | Tokens/s, this rule |
-| --- | ---: | ---: | ---: | ---: |
-| 15.9 GiB of file cache, 300 tokens | 43.8 and 43.4 GiB | 44.4 and 42.7 GiB | 23.70 and 23.54 | 23.79 and 23.38 |
-| The same, MXFP4 experts | 44.9 and 44.4 GiB | 43.7 and 42.3 GiB | 13.16 and 12.64 | 13.04 and 12.59 |
-| 39.0 GiB of file cache, 600 tokens | 24.8 GiB | 34.1 GiB | 18.88 | 21.23 |
-| Right after reading 30 GiB of other files, 600 tokens | 23.9 GiB | 20.2 GiB | 18.31 | 16.66 |
-
-Below the share both rules held about the same cache, this one keeping
-about 1 GiB more free since it counts the read-ahead pages once. With 39.0
-GiB of file cache this rule took the free memory below the reserve (a
-footprint of 43.7 GiB against 45.3 GiB free before the run), the file cache
-beyond the share standing in for it, and the kernel dropped and compressed
-nothing. Right after the 30 GiB had been read, the kernel compressed 40 MiB
-during this rule's run and the cache stopped at 20.2 GiB. During the 10:03
-rule's run, which came second (41.9 GiB of file cache against 46.1), the
-kernel dropped 3.0 GiB of file pages and compressed 1.2 GiB, likely because
-that rule started at the full 64 GiB and its first prompt took more than
-the free memory.
-
-The cost: with file cache beyond the share, the free memory can fall to 1
-to 2 GiB, and a program that then takes memory gets it from the kernel's
-reclaim, which drops cached files and may compress some memory, before the
-cache gives slots back. The rule backs off at the first compression and
-stays within the free memory for five minutes, which kept the cache at 20.2
-GiB in the run right after the reads. Each state was measured once per
-rule.
+The CPU checks cover zero and changing kernel cache targets, failed target
+queries, speculative-page accounting, initial allocation from file-cache
+headroom and calm growth. They also verify that actual pressure, new
+swapping still reduce expert capacity, while compression alone does not. The TUI regression
+checks the displayed used and available totals.
 
 ### Eviction and read-ahead predictors
 

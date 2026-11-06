@@ -658,10 +658,9 @@ pub fn frame(s: &Snapshot, f: &mut Frames, now: f64, title: &str, log: &[String]
     {
         // the Mac's memory in use: without the file cache, then the file cache
         let swap0 = *f.swapouts.get_or_insert(m.swapouts);
-        let spare = m.free as f64 / GIB;
+        let spare = (m.free.saturating_add(m.file).min(m.total)) as f64 / GIB;
         let file = m.file as f64 / GIB;
         let used = ram - spare;
-        let held = (used - file).max(0.0);
         let level = if m.pressure >= 4 {
             Span::styled("critical", color(Color::Red))
         } else if m.pressure >= 2 {
@@ -670,17 +669,17 @@ pub fn frame(s: &Snapshot, f: &mut Frames, now: f64, title: &str, log: &[String]
             Span::styled("normal", color(Color::Green))
         };
         let mut line = vec![text(" "), strong("Mac"), text("  ")];
-        line.extend(bar(gw, &[(share(held, ram), Style::new()), (share(file, ram), dim())]));
+        line.extend(bar(gw, &[(share(used, ram), Style::new()), (share(file, ram), dim())]));
         line.push(text("  "));
         line.extend(pad(vec![strong(format!("{used:.1}")), text(format!(" / {ram:.0} GiB"))], fw));
-        line.extend([label("free"), text(" "), strong(format!("{spare:.1}")), text("   "), label("pressure"), text(" "), level]);
+        line.extend([label("available"), text(" "), strong(format!("{spare:.1}")), text("   "), label("pressure"), text(" "), level]);
         line.extend([text("   "), label("file cache"), text(format!(" {file:.1}   ")), label("wired")]);
         line.extend([text(format!(" {:.1}   ", m.wired as f64 / GIB)), label("swap"), text(format!(" {:.1}", m.swap_used as f64 / GIB))]);
         l.push(Line::from(line));
         l.push(Line::from(vec![
             text("      "),
             label(format!(
-                "compressor {:.1} GiB holding {:.1} · file cache minimum {:.1} · {} swap-outs since start",
+                "compressor {:.1} GiB holding {:.1} · kernel cache target {:.1} · {} swap-outs since start",
                 m.compressor as f64 / GIB,
                 m.compressed as f64 / GIB,
                 m.file_kept as f64 / GIB,
@@ -889,6 +888,21 @@ mod tests {
 
     fn snapshot() -> Snapshot {
         serde_json::from_str(SNAPSHOT).expect("myds4_view's form")
+    }
+
+    #[test]
+    fn mac_memory_counts_file_cache_as_available() {
+        let mut s = snapshot();
+        s.memory.total = 128 * 1024u64.pow(3);
+        s.memory.free = 58 * 1024u64.pow(3);
+        s.memory.file = 36 * 1024u64.pow(3);
+        let mut f = Frames::new();
+        let lines = frame(&s, &mut f, 1.0, "myds4", &[], 240, 60);
+        let mac = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .find(|l| l.starts_with(" Mac ")).expect("Mac memory row");
+        assert!(mac.contains("34.0 / 128 GiB"), "{mac}");
+        assert!(mac.contains("available 94.0"), "{mac}");
+        assert!(mac.contains("file cache 36.0"), "{mac}");
     }
 
     fn log(n: usize) -> Vec<String> {
