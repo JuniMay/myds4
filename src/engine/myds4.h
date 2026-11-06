@@ -136,6 +136,8 @@ void gpu_kern(int k);
 void gpu_buf(int idx, const Buf *b, size_t off);
 void gpu_bytes(int idx, const void *p, size_t n);
 void gpu_use(const Buf *b);
+typedef struct { const Buf *from, *to; size_t from_offset, to_offset, bytes; } GpuCopy;
+void gpu_copies(const GpuCopy *copies, int count);
 void gpu_go(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t tx, uint32_t ty, uint32_t tz);
 uint64_t gpu_signal(void);  // ends the encoder, signals the returned value
 void gpu_keep_clock(double seconds);  // keeps the GPU's clock up for about that long
@@ -222,9 +224,28 @@ void cache_load(int layer, const int *experts, int n);  // makes them resident
 // Starts making the experts resident. Returns how many had pending reads
 // when each was checked; prefetch lateness uses that same completion check.
 int cache_request(int layer, const int *experts, int n);
+#ifdef MYDS4_PREFILL_CREDIT_ROWS
+void cache_prefill_credit(int layer, const int *experts, int n, const int *routes, int rows, int tail_rows);
+#endif
 void cache_repeat_credit(int layer, int expert, int repeats); // extra row uses after one deduplicated request
 void cache_wait(int layer, const int *experts, int n);     // waits for their reads
+#ifdef MYDS4_EXPERT_WAVES
+void cache_wait_any(int layer, const int *experts, int n); // returns when any requested expert is complete
+#endif
+#ifdef MYDS4_EXPERT_PHASED
+void cache_phase_reads(int enabled);
+void cache_wait_up(int layer, const int *experts, int n);
+#endif
 int cache_slot(int layer, int expert);   // it has a slot: resident, or being read
+#ifdef MYDS4_RUNAHEAD
+int cache_hold(int layer, const int *experts, int n);
+void cache_unhold(int layer, const int *experts, int n);
+#ifdef MYDS4_CAUSAL_PRIORITY_READS
+int cache_hold_speculative(int layer, const int *experts, int n);
+void cache_promote_selected(int layer, const int *experts, int n);
+#endif
+uint64_t model_ready_groups(void);
+#endif
 int cache_ready(int layer, int expert);  // resident and read
 int cache_where(int layer, int expert);  // 0 only on the SSD, 1 in memory, 2 read ahead, 3 read ahead and still being read
 // Starts reading up to `admit` of n predicted experts that are not resident,
@@ -293,7 +314,8 @@ int tok_encode_chat(const char *text, int *out, int max);
 #define IMAGE_MARK "\xff"  // no valid UTF-8 text holds this byte
 const char *tok_piece(int id, int *len);
 int tok_added(int id);  // one of tokenizer.json's added tokens (the special tokens among them)
-int tok_find(const char *special);
+int tok_find(const char *special);              // its id; a spelling that is none ends the process
+int tok_special(const char *text, size_t len);  // the id of an added token's spelling, -1 for none
 // Engram hashing (data/engram.bin): multipliers [2][4], primes [2][3][8],
 // offsets [2][24], the compressed pad id and token map.
 extern const int32_t *engram_map;
@@ -351,6 +373,7 @@ typedef struct {
   int online_predictor;        // rank64 online prefetch corrector; 0 disables it
   int ced;                    // 0: no approximate replay; otherwise decoder replay tokens (at least WINDOW)
   int prefill_prune;          // skip decoder batches outside the final and saved-prefix dependencies
+  int runahead;               // exact concurrent requests: group ready jobs while other expert reads run
 } Options;
 void online_predictor_init(int rank, const float *const biases[LAYERS]);
 void online_predictor_reset(void);
@@ -368,12 +391,9 @@ void model_save_predictor(void);
 void model_load(const char *dir, const Options *o);
 // Runs the tokens at positions pos.. and returns the logits of the last one.
 const float *model_forward(const int *tokens, int n, int pos);
-// Run one prompt traversal while saving the state at prefix_pos in slot 1.
-// An encoder-only CED snapshot requires more than ced + max(BLOCK, lookup)
-// new tokens on reuse, so verification can rewind safely.
-const float *model_forward_prefix(const int *tokens, int n, int pos, int prefix_pos, int *encoder_only);
 typedef struct {
   int tokens, chunks, decoder_tokens, ced_tokens, ced_applied, prune_applied;
+  int decoder_row_layers; // token rows actually processed across layers 21 through 39
   int prefix_tokens, prefix_encoder_only;
 } ModelForwardInfo;
 ModelForwardInfo model_forward_info(void);
@@ -381,9 +401,24 @@ ModelForwardInfo model_forward_info(void);
 // having run (with Options.draft): the tokens it drafts for pos + 1 .. pos + BLOCK.
 void model_draft(int token, int pos, int *drafts, int n); // the first n of BLOCK drafts
 void model_draft_coupled(int token, int pos, int *drafts, int n, const Sampler *sampler); // experimental shared uniforms
+#ifdef MYDS4_REJECTION_DRAFT
+void model_draft_sampled(int token, int pos, int *drafts, int n, Sampler *sampler, double *probabilities);
+#endif
 // Speculative decoding: runs the token at pos and its drafts (m rows) and
 // returns each row's logits; model_accept keeps the first n of the rows.
 const float *model_verify(const int *tokens, int m, int pos);
+#ifdef MYDS4_CAUSAL_EARLY_STOP
+typedef struct {
+  uint64_t calls, attempted_rows, finished_rows, sampled_rows, cancelled_rows;
+  uint64_t requested_row_layers, skipped_expert_row_layers;
+  uint64_t background_row_layers, promoted_row_layers;
+} EarlyVerifyStats;
+EarlyVerifyStats model_early_stats(void);
+// Samples completed rows in order and stops after a rejection or EOS. Only
+// accepted + 1 leading logits rows are promised; model_accept follows.
+const float *model_verify_early(const int *tokens, int m, int pos, int eos,
+                                Sampler *sampler, int *next, int *accepted);
+#endif
 void model_accept(const int *tokens, int n, int pos);
 void model_bench(void);
 void model_reset(void);
@@ -393,16 +428,51 @@ void model_reset(void);
 typedef struct State State;
 State *model_state_new(void);    // zeroed; the first takes over the state model_load made
 void model_state_free(State *s);  // not the one in use
-// Fork slot 1 at its saved token count into an inactive destination. Copy
-// only the prefix's global rows and restore its local state and history.
-void model_state_fork(State *dst, const State *src, int positions);
 size_t model_state_bytes(const State *s, int positions);  // s (null: a new state) holding that many
 void model_state_use(State *s);
-// The rows of the state in use that later positions overwrite, saved in
-// slot k (0 or 1) and restored; a restored state continues at the saved
-// position or up to BLOCK positions before it.
-void model_state_save(int k);
-void model_state_restore(int k);
+// The rows of the state in use that later positions overwrite, saved in the
+// state and restored (a rewind point, for the CLI's checks); a restored state
+// continues at the saved position or up to BLOCK positions before it.
+void model_state_save(void);
+void model_state_restore(void);
+// For the server's KV prefix cache. A snapshot holds a state's rolling part
+// at one position: the window rings, compressor rows and draft rings that
+// later positions overwrite, and the Engram history.
+typedef struct Snapshot Snapshot;
+Snapshot *model_snapshot(State *s, int pos, int with_logits);  // s's rolling rows now, as at pos; and the last logits
+void model_snapshot_restore(State *s, const Snapshot *x);
+void model_snapshot_free(Snapshot *x);
+size_t model_snapshot_bytes(int with_logits);
+int model_snapshot_pos(const Snapshot *x);
+int model_snapshot_extent(const Snapshot *x);  // the last layer it holds: LAYERS - 1, or 20 (CED)
+const float *model_snapshot_logits(const Snapshot *x);  // null without
+// The global rows (compressed rows, index keys) of src before positions, into
+// dst, which is not in use (its rewind point is dropped). A running src is
+// fine: no later step changes them.
+void model_state_copy(State *dst, const State *src, int positions);
+// Prefills positions from .. n - 1 of a prompt (tokens: all n of them) in the
+// state in use, and returns the last one's logits. Without replay, the state
+// holds every position before from (its own, or a copy and a restored
+// snapshot at from). With replay it holds only the global rows before from
+// and the prefill rebuilds the rolling rows at from. With --ced off the
+// replay is exact: the prefill starts earlier, each layer where its window
+// needs. With --ced it is bounded and approximate (as DeepInfer's encoder
+// SWA bounded replay): every layer computes again the ring's positions before
+// from, with windows cut off at the first of them, and the copied global
+// rows of groups completed before from stay. With capture >= 0, *captured
+// gets the rolling rows at that position as a snapshot, taken during the
+// prefill: after where it starts (from, or a replay's first row) and before
+// n; a replay's branch point is from. Under CED compaction, unless the
+// decoder layers start a ring or more before it, the capture holds layers
+// 0-20 only (extent 20).
+const float *model_prefill(const int *tokens, int n, int from, int replay, int capture, Snapshot **captured);
+// What a replay at k computes again before k, per layer on average (rounded
+// up): with --ced off at most k, about 2,610 for long prefixes; with --ced
+// the ring (133 positions, at most k).
+int model_replay_rows(int k);
+// The first position a replay at k computes again (layer 0's), from which its
+// prompt's images must be encoded.
+int model_replay_start(int k);
 // One token for each of m sequences at once (m <= BLOCK + 1, no drafts):
 // row r is tokens[r] at position pos[r] of state st[r], every position before
 // it having run. Each row is computed as model_forward computes a token

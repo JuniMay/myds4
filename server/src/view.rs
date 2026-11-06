@@ -1,8 +1,8 @@
 //! The live view (--tui): the terminal's alternate screen on stderr, redrawn
-//! twice a second from the engine's snapshot ([`engine::view`]). It shows the
+//! twice a second from the worker's snapshot ([`crate::worker::view`]). It shows the
 //! requests and their decoding speed, the experts per decoded row (with what
-//! substitution adds), memory on the GPU, in RAM and on the SSD, the
-//! sessions' prefix tree and the latest log lines. Nothing is written to
+//! substitution adds), memory on the GPU, in RAM and on the SSD, the KV
+//! prefix cache's tree of states and the latest log lines. Nothing is written to
 //! files: on exit the normal screen comes back with the last log lines. The
 //! q key, or Ctrl-C, stops the server as SIGINT does.
 //!
@@ -38,7 +38,7 @@ const FRAMES: usize = 21; // statistics kept: 10 s at two frames a second
 const SPEEDS: usize = 60; // the requests' tokens/s, the last 30 s
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
-// ---- the engine's snapshot (myds4_view) ----
+// ---- the worker's snapshot (worker::view) ----
 
 #[derive(Deserialize, Default)]
 pub struct Snapshot {
@@ -806,7 +806,7 @@ fn run(screen: &mut Terminal<CrosstermBackend<Stderr>>, title: &str, keys: bool,
     while !stop.load(Ordering::Acquire) {
         // The snapshot before the screen's lock: an engine failing while it
         // holds what the snapshot needs can still restore the terminal.
-        let snapshot = serde_json::from_str::<Snapshot>(&engine::view());
+        let snapshot = serde_json::from_str::<Snapshot>(&crate::worker::view());
         let log: Vec<String> = ring().lines.iter().cloned().collect();
         if let Ok(s) = snapshot {
             let _draw = DRAW.lock().unwrap_or_else(|e| e.into_inner());
@@ -840,7 +840,7 @@ fn wait(keys: bool, time: Duration) -> bool {
                     if !engine::stopping() {
                         engine::log("q: stopping after the current step");
                     }
-                    engine::request_stop();
+                    crate::worker::request_stop();
                 }
                 Ok(_) => {}
                 Err(_) => {
@@ -862,7 +862,7 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
 
-    // A snapshot in the form engine.c's myds4_view writes, decoding two requests.
+    // A snapshot in the form worker::view writes, decoding two requests.
     const SNAPSHOT: &str = r#"{"uptime_seconds": 3725, "phase": "decode", "phase_seconds": 2.5, "waiting": 1,
         "requests": [{"number": 12, "session": 3, "prompt": 41234, "reused": 40000, "generated": 77},
                      {"number": 13, "session": 4, "prompt": 900, "reused": 0, "generated": 5}],
@@ -887,7 +887,7 @@ mod tests {
                    "pressure": 1}}"#;
 
     fn snapshot() -> Snapshot {
-        serde_json::from_str(SNAPSHOT).expect("myds4_view's form")
+        serde_json::from_str(SNAPSHOT).expect("worker::view's form")
     }
 
     #[test]

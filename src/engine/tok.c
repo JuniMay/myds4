@@ -309,8 +309,14 @@ int tok_added(int id) {
   return 0;
 }
 
-int tok_find(const char *special) {
+int tok_special(const char *text, size_t len) {
   for (int k = 0; k < nadded; k++)
-    if (!strcmp(added[k].s, special)) return added[k].id;
-  die("no special token %s", special);
+    if (strlen(added[k].s) == len && !memcmp(added[k].s, text, len)) return added[k].id;
+  return -1;
+}
+
+int tok_find(const char *special) {
+  int id = tok_special(special, strlen(special));
+  if (id < 0) die("no special token %s", special);
+  return id;
 }

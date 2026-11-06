@@ -231,6 +231,10 @@ int64_t mem_gpu_limit(void) {
     n = sizeof ram;
     sysctlbyname("hw.memsize", &ram, &n, 0, 0);
     limit = off ? INT64_MAX : lwm > 0 ? (int64_t)lwm << 20 : (int64_t)(ram / 100 * 41);
+#ifdef MYDS4_GPU_LIMIT_GIB
+    int64_t experimental = (int64_t)MYDS4_GPU_LIMIT_GIB << 30;
+    if (experimental < limit) limit = experimental;
+#endif
   }
   return limit;
 }
@@ -261,11 +265,24 @@ typedef struct {
   int16_t layer, expert;
   int prev, next;  // links in the recency list, head = most recent
   int prefetched;  // loaded on a prediction, not yet requested
+#ifdef MYDS4_PREFETCH_POOL
+  int probation;  // forecast segment; membership does not move the buffer
+#endif
   int pinned;      // a DSpark pool buffer, exempt from backbone eviction/unmapping
   int fresh;       // joined the residency set this token: needs gpu_use until it is committed
   int mapped;      // in the residency set (or joining it: fresh)
   uint64_t used;   // token of the last use
+#ifdef MYDS4_RUNAHEAD
+  unsigned holds; // jobs awaiting or using this expert; released after GPU completion
+#endif
+#ifdef MYDS4_STALE_PRIORITY
+  uint64_t demanded; // last pass that actually selected this slot's expert
+#endif
   dispatch_group_t loading;  // owned until finish(), including after its reads complete
+#ifdef MYDS4_EXPERT_PHASED
+  dispatch_group_t up_loading; // gate/up code pieces and all scales; released with loading
+  int up_pieces;
+#endif
   Piece piece[16];
   int npiece;
   int background_load; // this load originally occupied a prefetch admission
@@ -292,11 +309,36 @@ static int16_t where[CACHE_LAYERS][EXPERTS];
 static int nslots, cap, max_slots, *free_list, nfree, npinned;
 static int nmapped, mcap;  // slots mapped for the GPU, and how many may be
 static uint64_t reserve, pinned_bytes;
+#ifdef MYDS4_PREFETCH_POOL
+static int pool_limit = MYDS4_PREFETCH_POOL, pool_members, pool_peak;
+static uint64_t pool_admissions, pool_declined, pool_promotions, pool_deferred, pool_setup_evictions;
+static void pool_member(int i, int member) {
+  pool_members += member - slots[i].probation;
+  slots[i].probation = member;
+  if (pool_members < 0 || pool_members > pool_limit) die("invalid forecast pool membership");
+  if (pool_members > pool_peak) pool_peak = pool_members;
+}
+#endif
 
 void cache_reserve(double gib) { reserve = (uint64_t)((gib > 0 ? gib : CACHE_RESERVE_DEFAULT) * GiB); }
 static int draft_capacity = DRAFT_EXPERTS;
 static uint64_t draft_clock, draft_touch_clock;
 static uint64_t draft_age[DRAFTS * DRAFT_EXPERTS];  // recency within the separate pools
+#ifdef MYDS4_DRAFT_CACHE_METRICS
+static uint64_t draft_hits[DRAFTS], draft_misses[DRAFTS];
+static void report_draft_cache(void) {
+  if (!slots) return;
+  int held[DRAFTS] = {0};
+  for (int i = max_slots; i < max_slots + npinned; i++)
+    if (slots[i].expert >= 0 && slots[i].layer >= LAYERS && slots[i].layer < CACHE_LAYERS)
+      held[slots[i].layer - LAYERS]++;
+  fprintf(stderr, "{\"draft_cache_stages\":[");
+  for (int d = 0; d < DRAFTS; d++)
+    fprintf(stderr, "%s{\"stage\":%d,\"hits\":%llu,\"misses\":%llu,\"resident\":%d}", d ? "," : "", d,
+            (unsigned long long)draft_hits[d], (unsigned long long)draft_misses[d], held[d]);
+  fprintf(stderr, "]}\n");
+}
+#endif
 
 // Observation metadata is separate from the eviction policy's prefetched flag.
 // The model thread owns it until a read group finishes; readers update only
@@ -571,12 +613,18 @@ static void push_front(int i) {
 static void cancel(int i), start_readers(void), start(int i, int urgent), finish(int i);
 
 static void release(int i) {
+#ifdef MYDS4_RUNAHEAD
+  if (slots[i].holds) die("cannot release an expert held by a runahead job");
+#endif
   cancel(i);
   metrics_retire(i, 0);
   unlink_slot(i);
   if (slots[i].expert >= 0) where[slots[i].layer][slots[i].expert] = -1;
   if (slots[i].mapped) nmapped--, slots[i].mapped = 0;
   gpu_free(&slots[i].b);
+#ifdef MYDS4_PREFETCH_POOL
+  pool_member(i, 0);
+#endif
   score[i] = INFINITY;
   free_list[nfree++] = i;
   nslots--;
@@ -584,6 +632,10 @@ static void release(int i) {
 }
 
 void cache_init(uint64_t budget, int layers) {
+#ifdef MYDS4_PREFETCH_POOL
+  if (pool_limit < 1 || pool_limit > 8) die("invalid forecast pool size");
+  pool_members = pool_peak = 0;
+#endif
   if (!retention_growth) cache_retention(0, 0);
   const char *observe = getenv("MYDS4_PREFETCH_METRICS");
   pf_enabled = observe && *observe && strcmp(observe, "0");
@@ -610,6 +662,9 @@ void cache_init(uint64_t budget, int layers) {
   prepare_reload_cost(layers);
   npinned = draft_pool_count(layers);
   pinned_bytes = npinned * pin_size;
+#ifdef MYDS4_DRAFT_CACHE_METRICS
+  atexit(report_draft_cache);
+#endif
   draft_clock = draft_touch_clock = 0;
   memset(draft_age, 0, sizeof draft_age);
   uint64_t free = mem_free(), avail = mem_available(), limit = gpu_working_set();
@@ -670,8 +725,13 @@ void cache_init(uint64_t budget, int layers) {
     if (draft_capacity == DRAFT_EXPERTS)
       fprintf(stderr, "the DSpark stages' %d experts: %.1f GiB, resident\n", npinned, pinned_bytes / GiB);
     else
+#ifdef MYDS4_DRAFT_SHARED_POOL
+      fprintf(stderr, "DSpark cache: %d slots shared by %d stages, %.1f GiB reserved, native experts read on demand\n",
+              npinned, DRAFTS, pinned_bytes / GiB);
+#else
       fprintf(stderr, "DSpark cache: %d slots per stage, %.1f GiB reserved, native experts read on demand\n",
               draft_capacity, pinned_bytes / GiB);
+#endif
   }
 }
 
@@ -684,7 +744,7 @@ const Buf *cache_get(int layer, int expert, uint32_t at[3], int *fresh) {
 }
 
 // Prefetch reads: a prefetch's pieces wait in a queue for READERS threads,
-// which start a piece only while no demand piece is in flight. A demand read
+// which start a piece only while no demand piece is queued or running. A demand read
 // so shares the SSD with at most READERS pieces, and a demand request for an
 // expert still being prefetched claims the pieces no reader has started.
 // The threads and the demand reads run above the utility QoS class, whose
@@ -703,8 +763,16 @@ static uint32_t urgent_queue[QUEUE], urgent_head, urgent_tail;
 static unsigned urgent_workers, urgent_peak_workers, urgent_peak_pending;
 static uint64_t urgent_submissions, urgent_worker_launches;
 #endif
+#ifdef MYDS4_EXPERT_WAVES
+static pthread_mutex_t ready_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t ready_cond = PTHREAD_COND_INITIALIZER;
+static _Atomic int ready_waiting;
+#endif
 
 static void piece_finished(Slot *s, int piece) {
+#ifdef MYDS4_EXPERT_PHASED
+  if (s->up_loading && piece < s->up_pieces) dispatch_group_leave(s->up_loading);
+#endif
   // Release the admission when the last I/O/cancellation finishes. Deferring
   // this to a dispatch notification can block a newer forecast after data is ready.
   int last_piece = atomic_fetch_sub_explicit(&s->unfinished, 1, memory_order_acq_rel) == 1;
@@ -716,6 +784,15 @@ static void piece_finished(Slot *s, int piece) {
     if (s->background_load) atomic_fetch_sub_explicit(&prefetching, 1, memory_order_relaxed);
   }
   dispatch_group_leave(s->loading);
+#ifdef MYDS4_EXPERT_WAVES
+  // Publish group completion before notifying the model thread. A waiter
+  // registers under ready_lock and checks readiness again before sleeping.
+  if (last_piece && atomic_load(&ready_waiting)) {
+    pthread_mutex_lock(&ready_lock);
+    pthread_cond_signal(&ready_cond);
+    pthread_mutex_unlock(&ready_lock);
+  }
+#endif
 }
 
 static void *reader(void *arg) {
@@ -724,9 +801,12 @@ static void *reader(void *arg) {
     while (qhead == qtail || demand) pthread_cond_wait(&qcond, &qlock);
     if (qtail - qhead == QUEUE) pthread_cond_broadcast(&qcond);  // room for start()
     uint32_t q = queue[qhead++ % QUEUE];
+    // Cancellation examines taken under this lock. Announce ownership
+    // before a popped piece can become invisible to the queue scan.
+    int owned = !atomic_exchange(&slots[q >> 4].taken[q & 15], 1);
     pthread_mutex_unlock(&qlock);
     Slot *s = &slots[q >> 4];
-    if (!atomic_exchange(&s->taken[q & 15], 1)) {
+    if (owned) {
       uint64_t began = metrics_io_begin(s, 0);
       read_piece(&s->piece[q & 15], 0);
       metrics_io_end(s, 0, began);
@@ -765,7 +845,6 @@ static void read_demand(void *ctx) {
   if (--demand == 0) pthread_mutex_lock(&qlock), pthread_cond_broadcast(&qcond), pthread_mutex_unlock(&qlock);
 }
 
-// Promotes unclaimed pieces to the urgent read path.
 #ifdef MYDS4_URGENT_WINDOW
 static void urgent_worker(void *unused) {
   for (;;) {
@@ -805,6 +884,7 @@ static void submit_demand(uint32_t q) {
   dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), (void *)(uintptr_t)q, read_demand);
 }
 
+// Promotes slot i's pieces that no reader has started to the urgent path.
 static void claim(int i) {
   for (int k = 0; k < slots[i].npiece; k++)
     if (!atomic_exchange(&slots[i].taken[k], 1)) {
@@ -835,6 +915,11 @@ static void finish(int i) {
 #ifdef MYDS4_IO_DIAGNOSTICS
   if (reclaim_began) diagnostic_reclaim_ns += metrics_ns() - reclaim_began;
 #endif
+#ifdef MYDS4_EXPERT_PHASED
+  if (slots[i].up_loading) dispatch_release(slots[i].up_loading);
+  slots[i].up_loading = 0;
+  slots[i].up_pieces = 0;
+#endif
   dispatch_release(slots[i].loading);
   slots[i].loading = 0;
 }
@@ -862,15 +947,41 @@ void cache_pass(int layer) { pass_layer = layer; }
 static int serving = -1;  // the layer cache_request makes resident: its experts used this token stay
 
 static int published = -1;  // --gpu-route: the layer whose table entries a committed buffer may still read
+#ifdef MYDS4_RUNAHEAD
+static unsigned held_references;
+#endif
 
+#ifdef MYDS4_PREFETCH_POOL
+static int victim_segment(int segment, int complete) {
+#else
 static int victim(void) {
+#endif
   if (pass_layer < 0) {
     int best = -1;
     double lowest = INFINITY;
+#ifdef MYDS4_STALE_PRIORITY
+    int best_group = 3;
+#endif
     for (int j = 0; j < max_slots; j++)
-      if (score[j] < INFINITY && !slots[j].prefetched && !(slots[j].layer == serving && slots[j].used == token) &&
+      if (score[j] < INFINITY && !slots[j].prefetched &&
+#ifdef MYDS4_PREFETCH_POOL
+          (segment < 0 || slots[j].probation == segment) && (!complete || !slot_reading(j)) &&
+#endif
+          !(slots[j].expert >= 0 && slots[j].layer == serving && slots[j].used == token) &&
+#ifdef MYDS4_RUNAHEAD
+          !slots[j].holds &&
+#endif
           (slots[j].layer != published || slots[j].expert < 0)) {
         double priority = eviction_priority(j);
+#ifdef MYDS4_STALE_PRIORITY
+        // Prefer stale past layers, then stale future layers, then already
+        // used experts. Frequency orders each class; live GPU work and
+        // protected prefetches remain ineligible above.
+        int group = slots[j].expert < 0 ? -1 : token && slots[j].demanded == token ? 2
+                    : slots[j].layer < serving ? 0 : 1;
+        if (group > best_group) continue;
+        if (group < best_group) best_group = group, lowest = INFINITY;
+#endif
         if (priority < lowest) best = j, lowest = priority;
       }
     return best;
@@ -881,6 +992,26 @@ static int victim(void) {
     if (slots[j].layer > pass_layer + 1) return j;
   return -1;
 }
+
+#ifdef MYDS4_PREFETCH_POOL
+static int victim(void) {
+  if (pass_layer >= 0) return victim_segment(-1, 0);
+  int i = victim_segment(0, 0);
+  return i >= 0 ? i : victim_segment(1, 0); // required work can reclaim the segment if necessary
+}
+
+static void pool_promote(int i) {
+  if (!slots[i].probation) return;
+  if (pass_layer >= 0) { pool_member(i, 0); return; }
+  int other = victim_segment(0, 0);
+  if (other < 0) { pool_deferred++; return; }
+  // Only membership changes. A demoted resident remains usable until a
+  // forecast needs its slot; pending I/O and GPU buffer addresses stay valid.
+  pool_member(i, 0);
+  pool_member(other, 1);
+  pool_promotions++;
+}
+#endif
 
 // Maps slot i for the GPU; until the set is committed (between tokens) the
 // GPU reaches it through gpu_use (fresh).
@@ -927,14 +1058,30 @@ static int action_victims(LabVictim *list) {
 
 static int take(int layer, int e, int optional) {
   int i;
+#ifdef MYDS4_PREFETCH_POOL
+  int use_pool = optional && pass_layer < 0 && layer < LAYERS;
+#endif
 #ifdef MYDS4_PREDICT_LAB
   int lab_policy = predictor_lab_cache_policy();
   int policy = optional && pass_layer < 0 && lab_policy &&
       (lab_policy >= 3 ? pf_issuer == PF_PC || pf_issuer == PF_H1 || pf_issuer == PF_H2 ||
                         pf_issuer == PF_H4 || pf_issuer == PF_H8 : pf_issuer == PF_DRAFT);
   uint64_t action_id = 0;
+#ifdef MYDS4_PREFETCH_POOL
+  policy &= !use_pool;
 #endif
-  if (nslots >= cap || !nfree) {
+#endif
+  int reuse = nslots >= cap || !nfree;
+#ifdef MYDS4_PREFETCH_POOL
+  if (use_pool && pool_members >= pool_limit) reuse = 1;
+#endif
+  if (reuse) {
+#ifdef MYDS4_PREFETCH_POOL
+    if (use_pool) {
+      i = victim_segment(1, 1);
+      if (i < 0 && pool_members < pool_limit) i = victim_segment(0, 1);
+    } else
+#endif
 #ifdef MYDS4_PREDICT_LAB
     i = policy ? -1 : victim();
 #else
@@ -953,12 +1100,18 @@ static int take(int layer, int e, int optional) {
     }
 #endif
     if (i < 0) {
+#ifdef MYDS4_PREFETCH_POOL
+      if (use_pool) pool_declined++;
+#endif
       if (optional) return -1;
       die("the expert cache (%d slots) cannot hold the experts of two layers", nslots);
     }
     // Routing can demote a prefetch while its read is still running. Do not
     // stall the model for optional work or evict a higher-scoring resident.
     if (optional && slot_reading(i)) return -1;
+#ifdef MYDS4_PREFETCH_POOL
+    if (use_pool && !slots[i].probation && slots[i].expert >= 0) pool_setup_evictions++;
+#endif
     cancel(i);
     metrics_retire(i, optional);
     unlink_slot(i);
@@ -971,6 +1124,9 @@ static int take(int layer, int e, int optional) {
                                       NULL, 0, &action_id) == -2) return -1;
 #endif
     i = free_list[--nfree];
+#ifdef MYDS4_PREFETCH_POOL
+    slots[i].probation = 0;
+#endif
     slots[i].b = gpu_new(SLOT_SIZE);
     gpu_resident(&slots[i].b, 1), slots[i].fresh = 1;  // committed with the token's other changes
     slots[i].mapped = 1, nmapped++;
@@ -980,16 +1136,59 @@ static int take(int layer, int e, int optional) {
   slots[i].action_id = action_id;
 #endif
   slots[i].prefetched = 0;
+#ifdef MYDS4_PREFETCH_POOL
+  pool_member(i, use_pool);
+  if (use_pool) pool_admissions++;
+#endif
   slots[i].layer = layer, slots[i].expert = e;
+#ifdef MYDS4_STALE_PRIORITY
+  slots[i].demanded = 0;
+#endif
   where[layer][e] = i;
   score[i] = escore[layer * EXPERTS + e];
   push_front(i);
   return i;
 }
 
-// Reads slot i's expert in the background: on demand (urgent) at once, else
-// through the prefetch queue.
-static void start(int i, int urgent) {
+#ifdef MYDS4_EXPERT_PHASED
+static int phase_reads_enabled;
+void cache_phase_reads(int enabled) { phase_reads_enabled = enabled; }
+
+// Existing aligned pieces are partitioned without changing their ranges.
+// A late piece lies wholly inside w2. It cannot write gate/up bytes or
+// scales while the GPU uses those parts of the same cache slot.
+static int phase_pieces(Slot *s, int n) {
+  if (n < 0 || n > 16) die("invalid phased expert piece count");
+  if (!phase_reads_enabled || s->layer >= LAYERS || expert_spans[s->layer] != 2) return 0;
+  const FileSpan *w = &expert_span[s->layer][s->expert][0];
+  const FileSpan *scale = &expert_span[s->layer][s->expert][1];
+  if (w->len != EXPERT_W || scale->len != EXPERT_S) return 0;
+  Piece ordered[16];
+  int early = 0, late = 0;
+  uint64_t down_first = w->off + EXPERT_W / 3, down_end = w->off + 2 * (EXPERT_W / 3);
+  // Destination regions distinguish scales even when they share w's file.
+  for (int k = 0; k < n; k++) {
+    Piece p = s->piece[k];
+    int down_only = p.dst < s->b.ptr + REGION(EXPERT_W) && p.fd == w->fd &&
+                    p.off >= down_first && p.off + p.len <= down_end;
+    if (!down_only) ordered[early++] = p;
+  }
+  for (int k = 0; k < n; k++) {
+    Piece p = s->piece[k];
+    if (p.dst < s->b.ptr + REGION(EXPERT_W) && p.fd == w->fd &&
+        p.off >= down_first && p.off + p.len <= down_end) ordered[early + late++] = p;
+  }
+  if (early + late != n) die("invalid phased expert pieces");
+  memcpy(s->piece, ordered, n * sizeof *ordered);
+  return late ? early : 0;
+}
+#endif
+
+// Read mode: 0 is a forecast, 1 is a demand, and 2 is a router-selected
+// speculative row. Modes 0 and 2 use the background queue, but only mode 0
+// is attributed to a predictor by the prefetch metrics.
+static void start(int i, int mode) {
+  int urgent = mode == 1;
   Slot *s = &slots[i];
   int n = 0;
   uint64_t region = 0;
@@ -1000,21 +1199,29 @@ static void start(int i, int urgent) {
     region += REGION(p->len);
   }
   s->npiece = n;
-  s->background_load = !urgent;
-  atomic_store_explicit(&s->unfinished, n, memory_order_relaxed);
 #ifdef MYDS4_IO_DIAGNOSTICS
   atomic_store_explicit(&s->diagnostic_ready, 0, memory_order_relaxed);
   atomic_store_explicit(&s->diagnostic_ready_urgent, 0, memory_order_relaxed);
   memset(s->diagnostic_queued, 0, sizeof s->diagnostic_queued);
 #endif
-  metrics_start(i, urgent);
+#ifdef MYDS4_EXPERT_PHASED
+  s->up_pieces = phase_pieces(s, n);
+  s->up_loading = s->up_pieces ? dispatch_group_create() : 0;
+  for (int k = 0; k < s->up_pieces; k++) dispatch_group_enter(s->up_loading);
+#endif
+  s->background_load = !urgent;
+  atomic_store_explicit(&s->unfinished, n, memory_order_relaxed);
+  metrics_start(i, mode != 0);
   s->loading = dispatch_group_create();
-  for (int k = 0; k < n; k++) dispatch_group_enter(s->loading), s->taken[k] = 0;
+  // A stale queue entry may claim a newly reused slot as soon as taken is
+  // reset. Publish all group entries and the admission before that reset.
+  for (int k = 0; k < n; k++) dispatch_group_enter(s->loading);
+  if (!urgent) atomic_fetch_add_explicit(&prefetching, 1, memory_order_relaxed);
+  for (int k = 0; k < n; k++) atomic_store_explicit(&s->taken[k], 0, memory_order_release);
   if (urgent) {
     claim(i);
     return;
   }
-  prefetching++;
   pthread_mutex_lock(&qlock);
   for (int k = 0; k < n; k++) {
     while (qtail - qhead == QUEUE) pthread_cond_wait(&qcond, &qlock);
@@ -1034,7 +1241,13 @@ static int draft_victim(int layer, uint64_t stamp) {
   int first = max_slots + (layer - LAYERS) * draft_capacity, best = -1;
   if (layer < LAYERS || layer >= CACHE_LAYERS || first + draft_capacity > max_slots + npinned)
     die("draft cache layer %d has no pool", layer);
-  for (int i = first; i < first + draft_capacity; i++) {
+  int end = first + draft_capacity;
+#ifdef MYDS4_DRAFT_SHARED_POOL
+  // Every draft slot stores the same native format. The caller has finished
+  // prior stage work before loading this stage's experts.
+  first = max_slots, end = max_slots + npinned;
+#endif
+  for (int i = first; i < end; i++) {
     Slot *s = &slots[i];
     if ((s->expert >= 0 && s->used == stamp) || slot_reading(i)) continue;
     if (s->expert < 0) return i;
@@ -1065,16 +1278,22 @@ static int draft_request(int layer, const int *experts, int n) {
     if (i >= 0) {
       if (slot_reading(i)) claim(i);
       cache_stats.hits++;
+#ifdef MYDS4_DRAFT_CACHE_METRICS
+      draft_hits[layer - LAYERS]++;
+#endif
     } else {
       i = draft_victim(layer, stamp);
       if (i < 0) die("draft stage %d has no reusable slot: its slots are needed or still being read", layer - LAYERS);
       finish(i);  // reap a completed handle before assigning a new expert
       Slot *s = &slots[i];
-      if (s->expert >= 0) where[layer][s->expert] = -1, cache_stats.evictions++;
-      s->expert = e;
+      if (s->expert >= 0) where[s->layer][s->expert] = -1, cache_stats.evictions++;
+      s->layer = layer, s->expert = e;
       s->prefetched = 0;
       where[layer][e] = i;
       cache_stats.misses++;
+#ifdef MYDS4_DRAFT_CACHE_METRICS
+      draft_misses[layer - LAYERS]++;
+#endif
       start(i, 1);  // draft misses always use the demand-priority path
     }
     slots[i].used = stamp;
@@ -1085,9 +1304,9 @@ static int draft_request(int layer, const int *experts, int n) {
   return reading;
 }
 
-int cache_request(int layer, const int *experts, int n) {
+static int cache_request_priority(int layer, const int *experts, int n, int urgent) {
 #ifdef MYDS4_IO_DIAGNOSTICS
-  diagnostic_request_begin(layer, experts, n, 1);
+  diagnostic_request_begin(layer, experts, n, urgent);
 #endif
   if (layer >= LAYERS && draft_capacity < DRAFT_EXPERTS) return draft_request(layer, experts, n);
   int reading = 0;
@@ -1096,7 +1315,7 @@ int cache_request(int layer, const int *experts, int n) {
     if (where[layer][experts[k]] >= 0) slots[where[layer][experts[k]]].used = token;
 #ifdef MYDS4_EARLY_DEMAND_PROMOTION
   char pending_at_request[EXPERTS] = {0};
-  for (int k = 0; k < n; k++) {
+  for (int k = 0; urgent && k < n; k++) {
     int i = where[layer][experts[k]];
     if (i >= 0 && slot_reading(i)) pending_at_request[k] = 1, claim(i);
   }
@@ -1109,13 +1328,13 @@ int cache_request(int layer, const int *experts, int n) {
       // A forecast can outlive its predicted pass and lose its protection.
       // Any later demand must promote its queued pieces, protected or not.
 #ifdef MYDS4_IO_DIAGNOSTICS
-      if (pending) diagnostic_promote(&slots[i]);
+      if (pending && urgent) diagnostic_promote(&slots[i]);
 #endif
-      if (pending) claim(i);
+      if (pending && urgent) claim(i);
       if (slots[i].prefetched) {
         cache_stats.prefetch_hits++;
 #ifdef MYDS4_EARLY_DEMAND_PROMOTION
-        if (pending_at_request[k]) cache_stats.late++;
+        if (urgent ? pending_at_request[k] : pending) cache_stats.late++;
 #else
         if (pending) cache_stats.late++;
 #endif
@@ -1125,7 +1344,7 @@ int cache_request(int layer, const int *experts, int n) {
     } else {
       i = take(layer, e, 0);
       cache_stats.misses++;
-      start(i, 1);
+      start(i, urgent ? 1 : 2);
       pending = slot_reading(i);
     }
     // This is an actual served request even when GPU-route timeliness is not
@@ -1139,6 +1358,9 @@ int cache_request(int layer, const int *experts, int n) {
     }
     slots[i].prefetched = 0;
     slots[i].used = token;
+#ifdef MYDS4_STALE_PRIORITY
+    slots[i].demanded = token;
+#endif
     double *history = &escore[layer * EXPERTS + e];
 #ifdef MYDS4_DECODE_ONLY_SCORE
     if (pass_layer < 0 || layer >= LAYERS) *history += weight;
@@ -1146,6 +1368,9 @@ int cache_request(int layer, const int *experts, int n) {
     *history += weight;
 #endif
     score[i] = *history;
+#ifdef MYDS4_PREFETCH_POOL
+    if (i < max_slots) pool_promote(i);
+#endif
     reading += pending;
   }
 #ifdef MYDS4_IO_DIAGNOSTICS
@@ -1154,7 +1379,83 @@ int cache_request(int layer, const int *experts, int n) {
   return reading;
 }
 
+int cache_request(int layer, const int *experts, int n) {
+  return cache_request_priority(layer, experts, n, 1);
+}
+
+#ifdef MYDS4_PREFILL_CREDIT_ROWS
+// Replace the deduplicated request's unit credit with observed frequency.
+// One prompt batch contributes TOPK uses in total, as one decode row does.
+// The tail window selects recent rows; earlier requested experts get zero.
+void cache_prefill_credit(int layer, const int *experts, int n, const int *routes, int rows, int tail_rows) {
+  if (layer < 0 || layer >= LAYERS || pass_layer != layer || rows < 1 || tail_rows < 0)
+    die("invalid prefill usage credit");
+  int uses[EXPERTS] = {0}, first = tail_rows && rows > tail_rows ? rows - tail_rows : 0;
+  for (int r = first; r < rows; r++)
+    for (int k = 0; k < TOPK; k++) {
+      int e = routes[r * 16 + k];
+      if (e < 0 || e >= EXPERTS) die("invalid prefill route");
+      uses[e]++;
+    }
+  for (int k = 0; k < n; k++) {
+    int e = experts[k];
+    if (e < 0 || e >= EXPERTS) die("invalid prefill expert");
+    int i = where[layer][e];
+    if (i < 0 || slots[i].used != token) die("prefill credit requires a current expert request");
+    score[i] = escore[layer * EXPERTS + e] += weight * ((double)uses[e] / (rows - first) - 1);
+  }
+}
+#endif
+
 int cache_slot(int layer, int e) { return where[layer][e] >= 0; }
+
+#ifdef MYDS4_RUNAHEAD
+static int hold_priority(int layer, const int *experts, int n, int urgent) {
+  if (layer < 0 || layer >= LAYERS || n < 1 || n > TOPK) die("invalid runahead expert set");
+  unsigned char resident[TOPK];
+  // Protect resident entries before allocating missing ones. Jobs share
+  // the reservation and pending fetch when they need the same expert.
+  for (int k = 0; k < n; k++) {
+    int e = experts[k];
+    if (e < 0 || e >= EXPERTS) die("invalid runahead expert");
+    int i = where[layer][e];
+    resident[k] = i >= 0;
+    if (i >= 0) slots[i].holds++;
+  }
+  int pending = cache_request_priority(layer, experts, n, urgent);
+  for (int k = 0; k < n; k++) if (!resident[k]) slots[where[layer][experts[k]]].holds++;
+  held_references += n;
+  return pending;
+}
+
+int cache_hold(int layer, const int *experts, int n) { return hold_priority(layer, experts, n, 1); }
+
+#ifdef MYDS4_CAUSAL_PRIORITY_READS
+int cache_hold_speculative(int layer, const int *experts, int n) { return hold_priority(layer, experts, n, 0); }
+
+// A selected row has become necessary for the next target decision. Promote
+// its pending pieces without counting another request or reservation.
+void cache_promote_selected(int layer, const int *experts, int n) {
+  if (layer < 0 || layer >= LAYERS || n < 1 || n > TOPK) die("invalid selected-read promotion");
+  for (int k = 0; k < n; k++) {
+    if (experts[k] < 0 || experts[k] >= EXPERTS) die("invalid selected expert");
+    int i = where[layer][experts[k]];
+    if (i < 0 || !slots[i].holds) die("selected-read promotion needs a reservation");
+    if (slot_reading(i)) claim(i);
+  }
+}
+#endif
+
+void cache_unhold(int layer, const int *experts, int n) {
+  for (int k = 0; k < n; k++) {
+    int i = where[layer][experts[k]];
+    if (i < 0 || !slots[i].holds) die("runahead expert lost its reservation");
+    slots[i].holds--;
+  }
+  if (held_references < (unsigned)n) die("invalid runahead reference count");
+  held_references -= n;
+}
+#endif
 
 void cache_repeat_credit(int layer, int expert, int repeats) {
   if (layer < 0 || layer >= LAYERS || expert < 0 || expert >= EXPERTS || repeats < 0 || repeats > VERIFY_DRAFTS)
@@ -1184,15 +1485,46 @@ int cache_where(int layer, int e) {  // as cache_request will count it
 
 void cache_wait(int layer, const int *experts, int n) {
   double t = now();
-#ifdef MYDS4_IO_DIAGNOSTICS
-  uint64_t diagnostic_wait = metrics_ns();
-#endif
   for (int k = 0; k < n; k++) finish(where[layer][experts[k]]);
   cache_stats.read_s += now() - t;
 #ifdef MYDS4_IO_DIAGNOSTICS
-  diagnostic_request_end(layer, experts, n, diagnostic_wait);
+  diagnostic_request_end(layer, experts, n, (uint64_t)(t * 1e9));
 #endif
 }
+
+#ifdef MYDS4_EXPERT_WAVES
+void cache_wait_any(int layer, const int *experts, int n) {
+  if (n < 1 || n > TOPK) die("invalid expert completion wait");
+  double began = now();
+  pthread_mutex_lock(&ready_lock);
+  atomic_store(&ready_waiting, 1);
+  for (;;) {
+    int ready = 0;
+    for (int k = 0; k < n; k++) {
+      if (where[layer][experts[k]] < 0) die("completion wait needs a resident slot");
+      ready |= cache_ready(layer, experts[k]);
+    }
+    if (ready) break;
+    pthread_cond_wait(&ready_cond, &ready_lock);
+  }
+  atomic_store(&ready_waiting, 0);
+  pthread_mutex_unlock(&ready_lock);
+  cache_stats.read_s += now() - began;
+}
+#endif
+
+#ifdef MYDS4_EXPERT_PHASED
+void cache_wait_up(int layer, const int *experts, int n) {
+  double t = now();
+  for (int k = 0; k < n; k++) {
+    int i = where[layer][experts[k]];
+    if (i < 0) die("phased read needs a selected expert");
+    if (slots[i].up_loading) dispatch_group_wait(slots[i].up_loading, DISPATCH_TIME_FOREVER);
+    else finish(i);
+  }
+  cache_stats.read_s += now() - t;
+}
+#endif
 
 void cache_load(int layer, const int *experts, int n) {
   cache_request(layer, experts, n);
@@ -1269,9 +1601,78 @@ int cache_publish(int layer) {
 
 void cache_unpublish(void) { published = -1; }
 
+#ifdef MYDS4_PREFETCH_DEMOTE_CANCEL
+static uint64_t demote_cancellations;
+#endif
+
+// The model thread cancels only pieces that no reader owns. Check and
+// claim under the reader's lock so optional cancellation never waits for I/O.
+static int discard_unstarted(int layer, const int *keep, int n) {
+  if (layer == published || !atomic_load(&prefetching)) return 0;
+  int retired[EXPERTS], nc = 0;
+  // Only the model thread changes slot metadata. Readers can change taken,
+  // so this scan is a filter; ownership is rechecked under qlock below.
+  for (int e = 0; e < EXPERTS; e++) {
+    int i = where[layer][e];
+    if (i < 0 || !slots[i].prefetched || !slots[i].loading || !slots[i].npiece) continue;
+    int k = 0;
+    while (k < n && keep[k] != e) k++;
+    if (k < n) continue;
+#ifdef MYDS4_RUNAHEAD
+    if (slots[i].holds) continue;
+#endif
+    int started = 0;
+    for (int p = 0; p < slots[i].npiece; p++) started |= atomic_load(&slots[i].taken[p]);
+    if (!started) retired[nc++] = i;
+  }
+  if (!nc) return 0;
+  unsigned char discard[EXPERTS] = {0};
+  int nr = 0;
+  pthread_mutex_lock(&qlock);
+  for (int k = 0; k < nc; k++) {
+    int i = retired[k], started = 0;
+    for (int p = 0; p < slots[i].npiece; p++) started |= atomic_load(&slots[i].taken[p]);
+    if (started) continue;
+    // Reader claims use qlock too. The model thread is the only demand
+    // claimant, so every piece is now owned by this cancellation.
+    for (int p = 0; p < slots[i].npiece; p++) atomic_store(&slots[i].taken[p], 1);
+    discard[slots[i].expert] = 1, retired[nr++] = i;
+  }
+  if (nr) {
+    uint32_t end = qtail, write = qhead;
+    for (uint32_t read = qhead; read != end; read++) {
+      uint32_t q = queue[read % QUEUE];
+      Slot *s = &slots[q >> 4];
+      if (s->layer == layer && s->expert >= 0 && discard[s->expert]) continue;
+      queue[write++ % QUEUE] = q;
+    }
+    qtail = write;
+    pthread_cond_broadcast(&qcond);
+  }
+  pthread_mutex_unlock(&qlock);
+  // All old queue references are gone, and no reader owns a retired piece.
+  // Complete the groups before making these buffers available for reuse.
+  for (int k = 0; k < nr; k++) {
+    int i = retired[k], expert = slots[i].expert;
+    for (int p = 0; p < slots[i].npiece; p++) piece_finished(&slots[i], p);
+    finish(i);
+    metrics_retire(i, 0);
+    where[layer][expert] = -1;
+    slots[i].expert = -1, slots[i].prefetched = 0;
+    slots[i].used = token - 1; // an empty slot is not part of the selected union
+    score[i] = -INFINITY;
+    unlink_slot(i), push_back(i);
+    cache_stats.cancelled++;
+  }
+  return nr;
+}
+
 // After a decoded layer's routing: its read-ahead experts that it did not
 // select may be evicted again, by the score earlier selections gave them.
 void cache_demote(int layer) {
+#ifdef MYDS4_PREFETCH_DEMOTE_CANCEL
+  if (pass_layer < 0) demote_cancellations += discard_unstarted(layer, NULL, 0);
+#endif
   for (int e = 0; e < EXPERTS; e++) {
     int i = where[layer][e];
     if (i >= 0) slots[i].prefetched = 0;
@@ -1282,22 +1683,7 @@ void cache_demote(int layer) {
 // their expert is among keep[0..n): a newer prediction for the layer rules
 // them out. Their slots hold no expert (expert -1) and are taken first.
 void cache_refine(int layer, const int *keep, int n) {
-  for (int e = 0; e < EXPERTS; e++) {
-    int i = where[layer][e], k = 0, started = 0;
-    if (i < 0 || !slots[i].prefetched || !slots[i].loading) continue;
-    while (k < n && keep[k] != e) k++;
-    for (int p = 0; p < slots[i].npiece; p++) started |= slots[i].taken[p];
-    if (k < n || started) continue;
-    cancel(i);  // a reader that started a piece meanwhile is waited for
-    metrics_retire(i, 0);
-    cache_stats.cancelled++;
-    where[layer][e] = -1;
-    slots[i].expert = -1;
-    slots[i].prefetched = 0;
-    score[i] = -INFINITY;
-    unlink_slot(i);
-    push_back(i);
-  }
+  discard_unstarted(layer, keep, n);
 }
 
 // Resizes the cache. It gives slots back, the least recently used of the
@@ -1365,6 +1751,9 @@ static void resize(int below) {
 // released. Within a prompt pass at layer `pass` the GPU may still use the
 // slots of the layer before, so only those of earlier layers are released.
 void cache_adapt_pass(int pass) {
+#ifdef MYDS4_RUNAHEAD
+  if (held_references) die("cannot resize the cache during a runahead job");
+#endif
   if (pass < 0) {
     advance_score_clock();
   }
@@ -1403,6 +1792,17 @@ void cache_metrics_report(FILE *out) {
 #endif
 #ifdef MYDS4_IO_DIAGNOSTICS
   diagnostic_report(out);
+#endif
+#ifdef MYDS4_PREFETCH_POOL
+  fprintf(out, "{\"prefetch_pool\":{\"limit\":%d,\"members\":%d,\"peak_members\":%d,"
+          "\"admissions\":%llu,\"declined\":%llu,\"promotions\":%llu,\"deferred_promotions\":%llu,"
+          "\"setup_evictions\":%llu}}\n", pool_limit, pool_members, pool_peak,
+          (unsigned long long)pool_admissions, (unsigned long long)pool_declined,
+          (unsigned long long)pool_promotions, (unsigned long long)pool_deferred,
+          (unsigned long long)pool_setup_evictions);
+#endif
+#ifdef MYDS4_PREFETCH_DEMOTE_CANCEL
+  fprintf(out, "{\"prefetch_demote\":{\"unstarted_cancelled\":%llu}}\n", (unsigned long long)demote_cancellations);
 #endif
   if (!pf_enabled) return;
   const char *const phase[] = {"prefill", "decode"};

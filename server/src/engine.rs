@@ -1,18 +1,14 @@
-//! The engine's C ABI (src/engine/engine.h) and a safe interface over it: a request
-//! becomes a channel of events, and dropping a [`Cancel`] cancels it.
+//! The engine's C ABI (src/engine/engine.h) and thin safe wrappers over it.
+//! The model's functions (states, snapshots, prefill, decoding, sampling,
+//! lookups, images, statistics) run on the worker's thread only
+//! (worker.rs); the log, the stop and the tokenizer on any thread.
 
-use std::ffi::{CStr, CString, c_char, c_int, c_long, c_void};
+use std::ffi::{CString, c_char, c_int};
 use std::ptr;
 
 use deepseek_recipe::stream::StreamTokenizer;
-use tokio::sync::mpsc;
 
-const ABI: c_int = 5;
-const STARTED: c_int = 0;
-const TOKENS: c_int = 1;
-const DONE: c_int = 2;
-const QUEUED: c_int = 0;
-const BUSY: c_int = 1;
+const ABI: c_int = 6;
 
 #[repr(C)]
 struct RawConfig {
@@ -31,8 +27,6 @@ struct RawConfig {
     draft_trim: c_int,
     online_predictor: c_int,
     predictor_state: *const c_char,
-    kv_gb: f64,
-    batch: c_int,
     ced: c_int,
     lookup: c_int,
     expert_batch: c_int,
@@ -41,64 +35,173 @@ struct RawConfig {
     on_die: Option<extern "C" fn()>,
 }
 
+/// An engine attention state (myds4_state).
 #[repr(C)]
-struct RawImage {
-    data: *const u8,
-    len: usize,
+pub struct RawState {
+    _opaque: [u8; 0],
+}
+
+/// A snapshot of a state's rolling rows (myds4_snapshot).
+#[repr(C)]
+pub struct RawSnapshot {
+    _opaque: [u8; 0],
 }
 
 #[repr(C)]
-struct RawEvent {
-    kind: c_int,
-    id: u64,
-    tokens: *const i32,
-    ntokens: c_int,
-    prompt: c_int,
-    reused: c_int,
-    generated: c_int,
-    reasoning: c_int,
-    finish: c_int,
-    message: *const c_char,
+struct RawSampler {
+    _opaque: [u8; 0],
 }
 
 #[repr(C)]
-struct RawRequest {
-    tokens: *const i32,
-    ntokens: c_int,
-    text: *const c_char,
-    len: usize,
-    images: *const RawImage,
-    nimages: c_int,
-    temperature: f64,
-    top_p: f64,
-    seed: u64,
-    seed_set: c_int,
-    max_tokens: c_long,
-    on_event: extern "C" fn(*mut c_void, *const RawEvent),
-    user: *mut c_void,
-    note: *const c_char,
+struct RawLookup {
+    _opaque: [u8; 0],
+}
+
+#[repr(C)]
+struct RawImages {
+    _opaque: [u8; 0],
+}
+
+/// A prefill's plan (myds4_prefill_info).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PrefillInfo {
+    pub chunks: c_int,
+    pub tokens: c_int,
+    pub decoder_tokens: c_int,
+    pub ced_applied: c_int,
+    pub prune_applied: c_int,
+    pub prefix_tokens: c_int,
+}
+
+/// The expert cache's counters (myds4_cache_counts).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CacheCounts {
+    pub hits: u64,
+    pub misses: u64,
+    pub prefetch_hits: u64,
+    pub prefetches: u64,
+    pub bytes: u64,
+    pub evictions: u64,
+    pub late: u64,
+    pub cancelled: u64,
+    pub substituted: u64,
+    pub remaps: u64,
+    pub given_back: u64,
+    pub row_own: u64,
+    pub row_ahead: u64,
+    pub row_late: u64,
+    pub row_sub: u64,
+    pub row_ssd: u64,
+    pub read_s: f64,
+}
+
+/// The engine's statistics (myds4_stats).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stats {
+    pub cache: CacheCounts,
+    pub decode: CacheCounts,
+    pub prefill: CacheCounts,
+    pub decode_rows: u64,
+    pub prefill_rows: u64,
+    pub decode_seconds: f64,
+    pub decode_gpu_seconds: f64,
+    pub prefill_layer: c_int,
+    pub prefill_rows_now: c_int,
+    pub slots: c_int,
+    pub mapped: c_int,
+    pub cap: c_int,
+    pub max_slots: c_int,
+    pub experts: c_int,
+    pub uncached: c_int,
+    pub slot_bytes: u64,
+    pub uncached_bytes: u64,
+    pub cache_bytes: u64,
+    pub dense_bytes: u64,
+    pub footprint: u64,
+    pub gpu_in_use: u64,
+    pub available: u64,
+    pub gpu_limit: i64,
+    pub total: u64,
+    pub free: u64,
+    pub file: u64,
+    pub file_kept: u64,
+    pub wired: u64,
+    pub compressor: u64,
+    pub compressed: u64,
+    pub swap_used: u64,
+    pub swapouts: u64,
+    pub pressure: c_int,
+    pub layers: c_int,
+    pub experts_per_row: c_int,
 }
 
 unsafe extern "C" {
-    fn myds4_start(c: *const RawConfig) -> c_int;
+    fn myds4_load(c: *const RawConfig) -> c_int;
+    fn myds4_set_runahead(enabled: c_int) -> c_int;
+    fn myds4_finish();
     fn myds4_stopping() -> c_int;
     fn myds4_request_stop();
-    fn myds4_stop();
-    fn myds4_submit(r: *const RawRequest, id: *mut u64, message: *mut c_char, cap: usize) -> c_int;
-    fn myds4_cancel(id: u64);
-    fn myds4_status() -> *mut c_char;
-    fn myds4_view() -> *mut c_char;
-    fn myds4_free(p: *mut c_void);
+    fn myds4_idle() -> c_int;
     fn myds4_log(line: *const c_char);
+    fn myds4_max_rows() -> c_int;
+    fn myds4_draft_block() -> c_int;
+    fn myds4_rewind() -> c_int;
+    fn myds4_vocab() -> c_int;
+    fn myds4_state_new() -> *mut RawState;
+    fn myds4_state_free(s: *mut RawState);
+    fn myds4_state_bytes(s: *const RawState, positions: c_int) -> usize;
+    fn myds4_state_copy(dst: *mut RawState, src: *const RawState, positions: c_int);
+    fn myds4_state_use(s: *mut RawState);
+    fn myds4_reset();
+    fn myds4_snapshot_take(s: *mut RawState, pos: c_int, with_logits: c_int) -> *mut RawSnapshot;
+    fn myds4_snapshot_restore(s: *mut RawState, x: *const RawSnapshot);
+    fn myds4_snapshot_free(x: *mut RawSnapshot);
+    fn myds4_snapshot_bytes(with_logits: c_int) -> usize;
+    fn myds4_snapshot_logits(x: *const RawSnapshot) -> *const f32;
+    fn myds4_prefill(
+        tokens: *const i32,
+        n: c_int,
+        from: c_int,
+        replay: c_int,
+        capture: c_int,
+        captured: *mut *mut RawSnapshot,
+        info: *mut PrefillInfo,
+    ) -> *const f32;
+    fn myds4_replay_rows(k: c_int) -> c_int;
+    fn myds4_replay_start(k: c_int) -> c_int;
+    fn myds4_step(token: i32, pos: c_int) -> *const f32;
+    fn myds4_rows(states: *mut *mut RawState, tokens: *const i32, pos: *const i32, m: c_int) -> *const f32;
+    fn myds4_draft(token: i32, pos: c_int, drafts: *mut i32, n: c_int);
+    fn myds4_verify(rows: *const i32, m: c_int, pos: c_int) -> *const f32;
+    fn myds4_accept(rows: *const i32, n: c_int, pos: c_int);
+    fn myds4_seek(tokens: *const i32, pos: c_int);
+    fn myds4_sampler_new(temperature: f64, top_p: f64, seed: u64, seed_set: c_int) -> *mut RawSampler;
+    fn myds4_sampler_free(s: *mut RawSampler);
+    fn myds4_sample(logits: *const f32, s: *mut RawSampler) -> i32;
+    fn myds4_sample_verify(logits: *const f32, drafts: *const i32, n: c_int, eos: i32, s: *mut RawSampler, accepted: *mut c_int) -> i32;
+    fn myds4_lookup_new(capacity: c_int) -> *mut RawLookup;
+    fn myds4_lookup_free(x: *mut RawLookup);
+    fn myds4_lookup_append(x: *mut RawLookup, tokens: *const i32, n: c_int) -> c_int;
+    fn myds4_lookup_propose(x: *const RawLookup, max: c_int, drafts: *mut i32) -> c_int;
+    fn myds4_lookup_feedback(x: *mut RawLookup, offered: c_int, accepted: c_int);
+    fn myds4_images_open(data: *const *const u8, len: *const usize, n: c_int, message: *mut c_char, cap: usize) -> *mut RawImages;
+    fn myds4_images_expand(x: *mut RawImages, input: *const i32, n: c_int, out: *mut i32, max: c_int) -> c_int;
+    fn myds4_images_encode(x: *mut RawImages, from: c_int) -> c_int;
+    fn myds4_images_close(x: *mut RawImages);
+    fn myds4_stats_get(s: *mut Stats);
     #[cfg(test)]
     fn myds4_tokenizer(dir: *const c_char) -> c_int;
     fn myds4_tokenize(text: *const c_char, len: usize, chat: c_int, out: *mut i32, max: c_int) -> c_int;
     fn myds4_piece(id: i32, len: *mut usize) -> *const c_char;
     fn myds4_added(id: i32) -> c_int;
+    fn myds4_special(text: *const c_char, len: usize) -> i32;
 }
 
-/// The engine's settings: the server's model and engine options.
-#[derive(Default)]
+/// The engine's settings and the server's: the model, engine and cache options.
+#[derive(Default, Clone)]
 pub struct Config {
     pub model: String,
     pub experts: Option<String>,
@@ -114,12 +217,15 @@ pub struct Config {
     pub draft_trim: bool,
     pub online_predictor: bool,
     pub predictor_state: Option<String>,
+    /// --kv-cache: what the attention states and snapshots may take, GiB (the worker's).
     pub kv_gb: f64,
+    /// --batch: requests decoding together at most (the worker's).
     pub batch: i32,
     pub ced: i32,
     pub lookup: i32,
     pub expert_batch: bool,
     pub prefill_prune: bool,
+    pub runahead: bool,
     /// Receives the log's lines (with their time) instead of stderr; it runs
     /// under the log's lock and must not call [`log`].
     pub on_log: Option<extern "C" fn(*const c_char)>,
@@ -131,9 +237,9 @@ fn c_string(s: &str) -> CString {
     CString::new(s.replace('\0', "")).expect("no NUL bytes left")
 }
 
-/// Waits for the model lock, loads the model and starts the engine's
-/// thread; false for invalid settings (the engine says why on stderr).
-pub fn start(c: &Config) -> bool {
+/// Loads the model on this thread, which from then on is the engine's (it
+/// needs a 16 MiB stack); false for invalid settings (the engine says why).
+pub fn load(c: &Config) -> bool {
     let model = c_string(&c.model);
     let experts = c.experts.as_deref().map(c_string);
     let state = c.predictor_state.as_deref().map(c_string);
@@ -153,8 +259,6 @@ pub fn start(c: &Config) -> bool {
         draft_trim: c.draft_trim.into(),
         online_predictor: c.online_predictor.into(),
         predictor_state: state.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
-        kv_gb: c.kv_gb,
-        batch: c.batch,
         ced: c.ced,
         lookup: c.lookup,
         expert_batch: c.expert_batch.into(),
@@ -162,22 +266,29 @@ pub fn start(c: &Config) -> bool {
         on_log: c.on_log,
         on_die: c.on_die,
     };
-    unsafe { myds4_start(&raw) == 0 }
+    unsafe { myds4_set_runahead(c.runahead.into()) == 0 && myds4_load(&raw) == 0 }
 }
 
-/// Whether a stop was requested: SIGINT, SIGTERM or the live view's q.
+/// After the last request: saves --predictor-state and reports the predictor.
+pub fn finish() {
+    unsafe { myds4_finish() }
+}
+
+/// Whether a stop was requested: SIGINT, SIGTERM or [`request_stop`].
 pub fn stopping() -> bool {
     unsafe { myds4_stopping() != 0 }
 }
 
-/// Requests the stop as SIGINT does and returns at once.
+/// Requests the stop as SIGINT does (the worker notices it within a second,
+/// or at once through worker::request_stop).
 pub fn request_stop() {
     unsafe { myds4_request_stop() }
 }
 
-/// Ends every request, saves the predictor state and waits for the engine.
-pub fn stop() {
-    unsafe { myds4_stop() }
+/// While no request runs: the expert cache gives slots back if other
+/// programs need the memory; the slots it keeps.
+pub fn idle() -> i32 {
+    unsafe { myds4_idle() }
 }
 
 /// A line for the log, with the time: on stderr, or to the live view's pane.
@@ -186,26 +297,215 @@ pub fn log(line: &str) {
     unsafe { myds4_log(line.as_ptr()) }
 }
 
-/// GET /v1/status's JSON.
-pub fn status() -> String {
-    unsafe {
-        let p = myds4_status();
-        let s = CStr::from_ptr(p).to_string_lossy().into_owned();
-        myds4_free(p.cast());
-        s
+/// The model's limits: rows of different states one step takes, DSpark's
+/// drafts per pass, the rows of one verify pass, and the positions a state
+/// can continue before its end.
+pub fn max_rows() -> usize {
+    unsafe { myds4_max_rows() as usize }
+}
+pub fn draft_block() -> usize {
+    unsafe { myds4_draft_block() as usize }
+}
+pub fn rewind() -> usize {
+    unsafe { myds4_rewind() as usize }
+}
+/// The vocabulary: the floats in one row of logits.
+pub fn vocab() -> usize {
+    unsafe { myds4_vocab() as usize }
+}
+
+// ---- states and snapshots (the worker's thread) ----
+
+pub fn state_new() -> *mut RawState {
+    unsafe { myds4_state_new() }
+}
+/// Not the state in use.
+pub fn state_free(s: *mut RawState) {
+    unsafe { myds4_state_free(s) }
+}
+/// The bytes a state (null: a new one) takes holding that many positions.
+pub fn state_bytes(s: *const RawState, positions: usize) -> u64 {
+    unsafe { myds4_state_bytes(s, positions as c_int) as u64 }
+}
+/// src's global rows before `positions` into dst, which is not in use.
+pub fn state_copy(dst: *mut RawState, src: *const RawState, positions: usize) {
+    unsafe { myds4_state_copy(dst, src, positions as c_int) }
+}
+pub fn state_use(s: *mut RawState) {
+    unsafe { myds4_state_use(s) }
+}
+pub fn reset() {
+    unsafe { myds4_reset() }
+}
+pub fn snapshot_take(s: *mut RawState, pos: usize, with_logits: bool) -> *mut RawSnapshot {
+    unsafe { myds4_snapshot_take(s, pos as c_int, with_logits.into()) }
+}
+pub fn snapshot_restore(s: *mut RawState, x: *const RawSnapshot) {
+    unsafe { myds4_snapshot_restore(s, x) }
+}
+pub fn snapshot_free(x: *mut RawSnapshot) {
+    unsafe { myds4_snapshot_free(x) }
+}
+pub fn snapshot_bytes(with_logits: bool) -> u64 {
+    unsafe { myds4_snapshot_bytes(with_logits.into()) as u64 }
+}
+/// The logits a snapshot keeps (null without).
+pub fn snapshot_logits(x: *const RawSnapshot) -> *const f32 {
+    unsafe { myds4_snapshot_logits(x) }
+}
+
+// ---- running the model, in the state in use ----
+
+/// Logits of one row or more, valid until the next call that runs the model.
+pub type Logits = *const f32;
+
+/// Prefills positions `from..` of `tokens` (all of the prompt); with `replay`,
+/// the state holds only the global rows before `from` (exact with --ced off,
+/// bounded and approximate with --ced). With `capture`, the rolling rows at
+/// that position (a replay's `from`, or one after `from`) come back as a
+/// snapshot, or null when it would hold only the encoder layers. None for
+/// invalid arguments.
+pub fn prefill(
+    tokens: &[i32],
+    from: usize,
+    replay: bool,
+    capture: Option<usize>,
+) -> Option<(Logits, *mut RawSnapshot, PrefillInfo)> {
+    let mut captured = ptr::null_mut();
+    let mut info = PrefillInfo::default();
+    let at = capture.map_or(-1, |p| p as c_int);
+    let lg = unsafe {
+        myds4_prefill(tokens.as_ptr(), tokens.len() as c_int, from as c_int, replay.into(), at, &mut captured, &mut info)
+    };
+    (!lg.is_null()).then_some((lg, captured, info))
+}
+/// What a replay at k computes again before k: rows per layer, on average.
+pub fn replay_rows(k: usize) -> usize {
+    unsafe { myds4_replay_rows(k as c_int).max(0) as usize }
+}
+/// The first position an exact replay at k computes again: its images from there are encoded.
+pub fn replay_start(k: usize) -> usize {
+    unsafe { myds4_replay_start(k as c_int).max(0) as usize }
+}
+pub fn step(token: i32, pos: usize) -> Option<Logits> {
+    let lg = unsafe { myds4_step(token, pos as c_int) };
+    (!lg.is_null()).then_some(lg)
+}
+pub fn rows(states: &mut [*mut RawState], tokens: &[i32], pos: &[i32]) -> Option<Logits> {
+    let lg = unsafe { myds4_rows(states.as_mut_ptr(), tokens.as_ptr(), pos.as_ptr(), states.len() as c_int) };
+    (!lg.is_null()).then_some(lg)
+}
+pub fn draft(token: i32, pos: usize, drafts: &mut [i32]) {
+    unsafe { myds4_draft(token, pos as c_int, drafts.as_mut_ptr(), drafts.len() as c_int) }
+}
+pub fn verify(rows: &[i32], pos: usize) -> Option<Logits> {
+    let lg = unsafe { myds4_verify(rows.as_ptr(), rows.len() as c_int, pos as c_int) };
+    (!lg.is_null()).then_some(lg)
+}
+pub fn accept(rows: &[i32], pos: usize) {
+    unsafe { myds4_accept(rows.as_ptr(), rows.len() as c_int, pos as c_int) }
+}
+pub fn seek(tokens: &[i32], pos: usize) {
+    unsafe { myds4_seek(tokens.as_ptr(), pos as c_int) }
+}
+
+// ---- sampling, lookups and images ----
+
+pub struct Sampler(*mut RawSampler);
+
+impl Sampler {
+    /// None for invalid settings.
+    pub fn new(temperature: f64, top_p: f64, seed: Option<u64>) -> Option<Sampler> {
+        let s = unsafe { myds4_sampler_new(temperature, top_p, seed.unwrap_or(0), seed.is_some().into()) };
+        (!s.is_null()).then_some(Sampler(s))
+    }
+    pub fn sample(&mut self, lg: Logits) -> i32 {
+        unsafe { myds4_sample(lg, self.0) }
+    }
+    /// Rows of logits for a token and its drafts: the next token, and how many
+    /// drafts it kept; eos ends the kept ones.
+    pub fn verify(&mut self, lg: Logits, drafts: &[i32], eos: i32) -> (i32, usize) {
+        let mut accepted = 0;
+        let next = unsafe { myds4_sample_verify(lg, drafts.as_ptr(), drafts.len() as c_int, eos, self.0, &mut accepted) };
+        (next, accepted.max(0) as usize)
     }
 }
 
-/// The live view's snapshot (JSON): phase, requests, statistics, memory and
-/// the sessions' prefix tree.
-pub fn view() -> String {
-    unsafe {
-        let p = myds4_view();
-        let s = CStr::from_ptr(p).to_string_lossy().into_owned();
-        myds4_free(p.cast());
-        s
+impl Drop for Sampler {
+    fn drop(&mut self) {
+        unsafe { myds4_sampler_free(self.0) }
     }
 }
+
+pub struct Lookup(*mut RawLookup);
+
+impl Lookup {
+    pub fn new(capacity: usize) -> Option<Lookup> {
+        let x = unsafe { myds4_lookup_new(capacity as c_int) };
+        (!x.is_null()).then_some(Lookup(x))
+    }
+    /// False when full.
+    pub fn append(&mut self, tokens: &[i32]) -> bool {
+        unsafe { myds4_lookup_append(self.0, tokens.as_ptr(), tokens.len() as c_int) != 0 }
+    }
+    pub fn propose(&self, max: usize, drafts: &mut [i32]) -> usize {
+        unsafe { myds4_lookup_propose(self.0, max.min(drafts.len()) as c_int, drafts.as_mut_ptr()).max(0) as usize }
+    }
+    pub fn feedback(&mut self, offered: usize, accepted: usize) {
+        unsafe { myds4_lookup_feedback(self.0, offered as c_int, accepted as c_int) }
+    }
+}
+
+impl Drop for Lookup {
+    fn drop(&mut self) {
+        unsafe { myds4_lookup_free(self.0) }
+    }
+}
+
+/// A prompt's images, decoded; closed (and given back) when dropped.
+pub struct Images(*mut RawImages);
+
+impl Images {
+    pub fn open(images: &[Vec<u8>]) -> Result<Images, String> {
+        let data: Vec<*const u8> = images.iter().map(|i| i.as_ptr()).collect();
+        let len: Vec<usize> = images.iter().map(|i| i.len()).collect();
+        let mut message = [0 as c_char; 256];
+        let x = unsafe { myds4_images_open(data.as_ptr(), len.as_ptr(), images.len() as c_int, message.as_mut_ptr(), message.len()) };
+        if x.is_null() {
+            return Err(unsafe { std::ffi::CStr::from_ptr(message.as_ptr()) }.to_string_lossy().into_owned());
+        }
+        Ok(Images(x))
+    }
+    /// The prompt with each image place replaced by its image's span, or None
+    /// if the places and images differ or it would exceed `max` tokens.
+    pub fn expand(&mut self, prompt: &[i32], max: usize) -> Option<Vec<i32>> {
+        let mut out = vec![0i32; max + 2];
+        let n = unsafe { myds4_images_expand(self.0, prompt.as_ptr(), prompt.len() as c_int, out.as_mut_ptr(), max as c_int) };
+        (n >= 0).then(|| {
+            out.truncate(n as usize);
+            out
+        })
+    }
+    /// Encodes the images that positions from `from` reach, for the next
+    /// prefill; how many.
+    pub fn encode(&mut self, from: usize) -> usize {
+        unsafe { myds4_images_encode(self.0, from as c_int).max(0) as usize }
+    }
+}
+
+impl Drop for Images {
+    fn drop(&mut self) {
+        unsafe { myds4_images_close(self.0) }
+    }
+}
+
+pub fn stats() -> Stats {
+    let mut s = Stats::default();
+    unsafe { myds4_stats_get(&mut s) };
+    s
+}
+
+// ---- the tokenizer, from any thread ----
 
 /// Loads the checkpoint's tokenizer without the model.
 #[cfg(test)]
@@ -214,141 +514,28 @@ pub fn load_tokenizer(dir: &str) {
     unsafe { myds4_tokenizer(dir.as_ptr()) };
 }
 
-/// The token ids of plain text, without special tokens.
-pub fn tokenize(text: &str) -> Vec<i32> {
+fn tokenize_as(text: &[u8], chat: bool) -> Vec<i32> {
     let mut out = vec![0i32; text.len() + 2];
-    let n = unsafe { myds4_tokenize(text.as_ptr().cast(), text.len(), 0, out.as_mut_ptr(), out.len() as c_int) };
+    let n = unsafe { myds4_tokenize(text.as_ptr().cast(), text.len(), chat.into(), out.as_mut_ptr(), out.len() as c_int) };
     out.truncate(n.max(0) as usize);
     out
 }
 
-/// How a request ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Finish {
-    /// The end token.
-    Stop,
-    /// `max_tokens`, or the context's end.
-    Length,
-    Cancelled,
-    /// The server's stop.
-    Shutdown,
+/// The token ids of plain text, without special tokens.
+pub fn tokenize(text: &str) -> Vec<i32> {
+    tokenize_as(text.as_bytes(), false)
 }
 
-/// What the engine reports about a request.
-#[derive(Debug)]
-pub enum Event {
-    /// Its prefill ran: prompt tokens (images expanded), and those a session held.
-    Started { prompt: usize, reused: usize },
-    /// The tokens one decoding step kept; never the end token.
-    Tokens(Vec<u32>),
-    /// Its end; the last event. (The engine logs its counts.)
-    Done { finish: Finish },
-    /// Refused before its prefill; the last event.
-    Refused(String),
+/// The token ids of a rendered prompt: a special token's spelling is that
+/// token, the byte 0xFF an image's place.
+pub fn tokenize_prompt(prompt: &[u8]) -> Vec<i32> {
+    tokenize_as(prompt, true)
 }
 
-/// A request for the engine: the rendered prompt (the byte 0xFF at each
-/// image's place), its images' file bytes, sampling and its token limit.
-pub struct Request<'a> {
-    pub prompt: &'a [u8],
-    pub images: &'a [Vec<u8>],
-    pub temperature: f64,
-    pub top_p: f64,
-    pub seed: Option<u64>,
-    pub max_tokens: i64,
-    /// Logged as "req ID NOTE" when the request is queued.
-    pub note: &'a str,
-}
-
-pub enum SubmitError {
-    /// Too many requests wait, or the server stops.
-    Busy(String),
-    Invalid(String),
-}
-
-type Sender = mpsc::UnboundedSender<Event>;
-
-extern "C" fn on_event(user: *mut c_void, e: *const RawEvent) {
-    // Safety: user is the Sender that submit boxed; e is valid during the call.
-    let (tx, e) = unsafe { (&*(user as *const Sender), &*e) };
-    let event = match e.kind {
-        STARTED => Event::Started { prompt: e.prompt.max(0) as usize, reused: e.reused.max(0) as usize },
-        TOKENS => {
-            let ids = unsafe { std::slice::from_raw_parts(e.tokens, e.ntokens.max(0) as usize) };
-            Event::Tokens(ids.iter().map(|&t| t as u32).collect())
-        }
-        DONE => Event::Done {
-            finish: match e.finish {
-                0 => Finish::Stop,
-                1 => Finish::Length,
-                2 => Finish::Cancelled,
-                _ => Finish::Shutdown,
-            },
-        },
-        _ => Event::Refused(if e.message.is_null() {
-            String::new()
-        } else {
-            unsafe { CStr::from_ptr(e.message) }.to_string_lossy().into_owned()
-        }),
-    };
-    let last = matches!(event, Event::Done { .. } | Event::Refused(_));
-    let _ = tx.send(event);
-    if last {
-        // The engine calls back no more for this request.
-        drop(unsafe { Box::from_raw(user as *mut Sender) });
-    }
-}
-
-/// Queues a request: the guard that cancels it when dropped (and holds its
-/// id), and its events.
-pub fn submit(r: &Request) -> Result<(Cancel, mpsc::UnboundedReceiver<Event>), SubmitError> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    let user = Box::into_raw(Box::new(tx)) as *mut c_void;
-    let images: Vec<RawImage> = r.images.iter().map(|i| RawImage { data: i.as_ptr(), len: i.len() }).collect();
-    let note = c_string(r.note);
-    let raw = RawRequest {
-        tokens: ptr::null(),
-        ntokens: 0,
-        text: r.prompt.as_ptr().cast(),
-        len: r.prompt.len(),
-        images: images.as_ptr(),
-        nimages: images.len() as c_int,
-        temperature: r.temperature,
-        top_p: r.top_p,
-        seed: r.seed.unwrap_or(0),
-        seed_set: r.seed.is_some().into(),
-        max_tokens: r.max_tokens as c_long,
-        on_event,
-        user,
-        note: note.as_ptr(),
-    };
-    let mut id = 0u64;
-    let mut message = [0 as c_char; 256];
-    let result = unsafe { myds4_submit(&raw, &mut id, message.as_mut_ptr(), message.len()) };
-    if result == QUEUED {
-        return Ok((Cancel(id), rx));
-    }
-    drop(unsafe { Box::from_raw(user as *mut Sender) });
-    let message = unsafe { CStr::from_ptr(message.as_ptr()) }.to_string_lossy().into_owned();
-    Err(if result == BUSY { SubmitError::Busy(message) } else { SubmitError::Invalid(message) })
-}
-
-/// Cancels its request when dropped: when the response ends, whether it was
-/// finished, cut by its client before or after it started, or ended early by
-/// a stop sequence. The engine ignores the ids of requests that ended.
-pub struct Cancel(u64);
-
-impl Cancel {
-    /// The request's id, its number in the log.
-    pub fn id(&self) -> u64 {
-        self.0
-    }
-}
-
-impl Drop for Cancel {
-    fn drop(&mut self) {
-        unsafe { myds4_cancel(self.0) }
-    }
+/// The id of a special token's spelling.
+pub fn special(text: &str) -> Option<i32> {
+    let id = unsafe { myds4_special(text.as_ptr().cast(), text.len()) };
+    (id >= 0).then_some(id)
 }
 
 /// The engine's tokenizer for recipe's stream processor: a token's text is

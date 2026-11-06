@@ -27,7 +27,8 @@ use serde_json::{Map, Value, json};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_stream::{Stream, StreamExt};
 
-use crate::engine::{self, Event, Finish};
+use crate::engine;
+use crate::worker::{self, Event, Finish};
 
 /// The model's name in responses and in GET /v1/models.
 pub const MODEL_ID: &str = "deepseek-v4.1-flash";
@@ -296,8 +297,8 @@ pub struct Prepared {
 }
 
 impl Prepared {
-    pub fn engine_request<'a>(&'a self, note: &'a str) -> engine::Request<'a> {
-        engine::Request {
+    pub fn engine_request<'a>(&'a self, note: &'a str) -> worker::Request<'a> {
+        worker::Request {
             note,
             prompt: &self.prompt,
             images: &self.images,
@@ -452,7 +453,7 @@ fn tool_calls(chunk: &ChatCompletionChunk) -> usize {
 
 /// A streamed response: server-sent events from recipe's chunks, a comment
 /// every 15 s while the request waits for the engine.
-pub fn stream(p: Prepared, cancel: engine::Cancel, mut rx: UnboundedReceiver<Event>) -> Response {
+pub fn stream(p: Prepared, cancel: worker::Cancel, mut rx: UnboundedReceiver<Event>) -> Response {
     let id = cancel.id();
     let body = async_stream::stream! {
         let _cancel = cancel;  // dropped with the stream, polled or not
@@ -505,7 +506,7 @@ pub fn stream(p: Prepared, cancel: engine::Cancel, mut rx: UnboundedReceiver<Eve
 }
 
 /// A response that is not streamed: recipe's accumulated chat.completion.
-pub async fn whole(p: Prepared, cancel: engine::Cancel, mut rx: UnboundedReceiver<Event>) -> Response {
+pub async fn whole(p: Prepared, cancel: worker::Cancel, mut rx: UnboundedReceiver<Event>) -> Response {
     let id = cancel.id();
     let first = match rx.recv().await {
         Some(Event::Refused(message)) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", &message),

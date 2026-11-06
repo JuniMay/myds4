@@ -1,13 +1,17 @@
 //! myds4-server: the OpenAI Chat Completions API over myds4's engine, with
 //! DeepSeek's deepseek-recipe for requests, prompts and output
 //! (docs/server.md). The engine (src/engine/engine.c behind
-//! src/engine/engine.h) owns the model, the sessions, the queue, the batching
-//! and the stop on SIGINT or SIGTERM; the live view (--tui) is view.rs.
+//! src/engine/engine.h, engine.rs) runs the model and owns the stop on SIGINT
+//! or SIGTERM; the worker (worker.rs) owns the queue, the batching and the
+//! requests' events, the KV prefix cache (kv.rs) the states kept between
+//! requests; the live view (--tui) is view.rs.
 
 mod chat;
 mod engine;
 mod http;
+mod kv;
 mod view;
+mod worker;
 
 use std::io::IsTerminal;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -33,9 +37,9 @@ const USAGE: &str = "usage: myds4-server -m MODEL --serve PORT [options]
   --serve PORT    serve OpenAI Chat Completions at http://HOST:PORT/v1 (needs MYDS4_API_KEY or --api-key-file)
   --host ADDR     the IPv4 address to serve on (default 127.0.0.1)
   --api-key-file FILE  the API key clients must send (16 to 256 characters)
-  --kv-cache GB   bound of the conversations' attention state kept between requests (default 8)
+  --kv-cache GB   bound of the KV prefix cache: attention states and snapshots kept between requests (default 8)
   --batch N       requests decoding together at most, 1 to 6 (default 4)
-  --tui           a live view in the terminal (requests, speed, experts, memory, sessions) instead of the
+  --tui           a live view in the terminal (requests, speed, experts, memory, the KV cache) instead of the
                   log on stderr; q stops the server, and the last log lines print on exit
   -t T, --temperature T  the temperature of requests that set none (default 1; 0 is greedy)
   --top-p P       the top_p of requests that set none, 0 to 1 (default 1)
@@ -54,6 +58,7 @@ const USAGE: &str = "usage: myds4-server -m MODEL --serve PORT [options]
   --draft N       verify up to N (1-5) DSpark drafts per pass
   --lookup off|N  verify up to N (1-15) context-copy drafts; --draft supplies fallback
   --expert-batch  share repeated expert weight loads across verification rows
+  --runahead     overlap exact concurrent requests with expert reads; enables expert sharing
   --draft-cache N  with --draft: expert slots per stage, 15-128
   --draft-trim    with --draft: compute only requested final-stage rows
   --online-predictor  CPU prefetch correction learned online
@@ -125,6 +130,7 @@ fn parse(args: &[String]) -> Args {
             "--gpu-route" => e.gpu_route = true,
             "--draft-trim" => e.draft_trim = true,
             "--expert-batch" => e.expert_batch = true,
+            "--runahead" => { e.runahead = true; e.expert_batch = true; },
             "--prefill-prune" => e.prefill_prune = true,
             "--online-predictor" => e.online_predictor = true,
             _ => {
@@ -201,6 +207,17 @@ fn prefill_and_draft_options_keep_the_sampling_defaults() {
     assert_eq!(enabled.defaults.top_p, 1.0);
 }
 
+#[test]
+fn runahead_is_explicit_and_preserves_sampling_defaults() {
+    assert!(!parse(&[]).engine.runahead);
+    let a = parse(&["--runahead".into(), "--batch".into(), "4".into()]);
+    assert!(a.engine.runahead && a.engine.expert_batch);
+    assert_eq!(a.engine.batch, 4);
+    assert_eq!((a.defaults.temperature, a.defaults.top_p), (1.0, 1.0));
+    assert_eq!(a.engine.draft, 0);
+    assert_eq!(a.engine.substitute, 0.0);
+}
+
 /// What the handlers share.
 struct Shared {
     key: [u8; 32],  // the API key's SHA-256
@@ -261,7 +278,7 @@ async fn models(State(s): App) -> Response {
 }
 
 async fn status() -> Response {
-    json(engine::status())
+    json(worker::status())
 }
 
 /// An error answered before the response starts, and its line in the log.
@@ -295,10 +312,10 @@ async fn completions(State(s): App, ConnectInfo(peer): ConnectInfo<SocketAddr>, 
             if p.stream { "streamed" } else { "one response" },
             p.thinking()
         );
-        match engine::submit(&p.engine_request(&note)) {
+        match worker::submit(&p.engine_request(&note)) {
             Ok((cancel, rx)) => Ok((p, cancel, rx)),
-            Err(engine::SubmitError::Busy(m)) => Err(chat::Error { status: StatusCode::TOO_MANY_REQUESTS, message: m }),
-            Err(engine::SubmitError::Invalid(m)) => Err(chat::Error { status: StatusCode::BAD_REQUEST, message: m }),
+            Err(worker::SubmitError::Busy(m)) => Err(chat::Error { status: StatusCode::TOO_MANY_REQUESTS, message: m }),
+            Err(worker::SubmitError::Invalid(m)) => Err(chat::Error { status: StatusCode::BAD_REQUEST, message: m }),
         }
     })
     .await;
@@ -354,7 +371,7 @@ fn main() {
         config.on_log = Some(view::on_log);
         config.on_die = Some(view::on_die);
     }
-    if !engine::start(&config) {
+    if !worker::start(&config) {
         exit(2);
     }
     let mut title = format!(
@@ -425,7 +442,7 @@ fn main() {
         };
         http::serve(listener, app, stopped, http::LIMITS).await;
     });
-    engine::stop();
+    worker::stop();
     if let Some(live) = live {
         live.finish();
     }

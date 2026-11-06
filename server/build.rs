@@ -6,16 +6,26 @@ use std::process::Command;
 fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
     let root = Path::new(&manifest).parent().expect("server/ is inside the repository");
+    let variant = std::env::var("MYDS4_ENGINE_VARIANT").unwrap_or_default();
+    let library = match variant.as_str() {
+        "" => "myds4",
+        "prefetch-study" => "myds4-prefetch-study",
+        "prefetch-demote" => "myds4-prefetch-demote",
+        "expert-waves" => "myds4-expert-waves",
+        _ => panic!("unknown MYDS4_ENGINE_VARIANT"),
+    };
+    let target = format!("build/lib{library}.a");
     let status = Command::new("make")
         .arg("-C")
         .arg(root)
-        .arg("build/libmyds4.a")
+        .arg(&target)
         .status()
         .expect("make runs");
-    assert!(status.success(), "make build/libmyds4.a failed");
+    assert!(status.success(), "make {target} failed");
 
     println!("cargo:rustc-link-search=native={}", root.join("build").display());
-    println!("cargo:rustc-link-lib=static=myds4");
+    println!("cargo:rustc-link-lib=static={library}");
+    println!("cargo:rerun-if-env-changed=MYDS4_ENGINE_VARIANT");
     for framework in ["Metal", "Foundation", "IOKit", "ImageIO", "CoreGraphics", "Accelerate"] {
         println!("cargo:rustc-link-lib=framework={framework}");
     }

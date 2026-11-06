@@ -271,6 +271,24 @@ void gpu_use(const Buf *b) {
   if (nused < (int)(sizeof used / sizeof *used)) used[nused++] = b->obj;
 }
 
+void gpu_copies(const GpuCopy *copies, int count) {
+  if (!count) return;
+  MSG(void (*)(id, SEL), enc, S("endEncoding"));
+  id blit = MSG(id (*)(id, SEL), cb, S("blitCommandEncoder"));
+  for (int i = 0; i < count; i++) {
+    const GpuCopy *c = copies + i;
+    if (c->from_offset > c->from->size || c->to_offset > c->to->size ||
+        c->bytes > c->from->size - c->from_offset || c->bytes > c->to->size - c->to_offset)
+      die("GPU copy exceeds a buffer");
+    MSG(void (*)(id, SEL, id, unsigned long, id, unsigned long, unsigned long), blit,
+        S("copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:"), (id)c->from->obj,
+        c->from->off + c->from_offset, (id)c->to->obj, c->to->off + c->to_offset, c->bytes);
+  }
+  MSG(void (*)(id, SEL), blit, S("endEncoding"));
+  enc = MSG(id (*)(id, SEL), cb, S("computeCommandEncoder"));
+  nused = 0;
+}
+
 void gpu_go(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t tx, uint32_t ty, uint32_t tz) {
   Size3 g = {gx, gy, gz}, t = {tx, ty, tz};
   MSG(void (*)(id, SEL, Size3, Size3), enc, s_dispatch, g, t);

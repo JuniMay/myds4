@@ -8,6 +8,12 @@
 
 #include "myds4.h"
 #include "../experimental/context_lookup.h"
+#ifdef MYDS4_PROTOCOL_DRAFT
+#include "../experimental/protocol_draft.h"
+#endif
+#ifdef MYDS4_REJECTION_DRAFT
+#include "../experimental/speculative_sample.h"
+#endif
 #ifdef MYDS4_STAGED_DRAFT
 #include "../experimental/draft_queue.h"
 static_assert(DRAFT_QUEUE_MAX == BLOCK, "draft queue matches DSpark's width");
@@ -339,9 +345,9 @@ int main(int argc, char **argv) {
       if (shutdown_requested()) return complete();
       model_state_use(st[s]);
       next[s] = sample_argmax(model_forward(tokens, len[s], 0), VOCAB);
-      model_state_save(0);
+      model_state_save();
       memcpy(alone + (size_t)s * VOCAB, model_forward(&next[s], 1, len[s]), VOCAB * 4);
-      model_state_restore(0);
+      model_state_restore();
     }
     if (shutdown_requested()) return complete();
     const float *both = model_forward_rows(st, next, len, 2);
@@ -352,7 +358,7 @@ int main(int argc, char **argv) {
     if (o.draft) { // a verify pass's first row is the token alone
       if (shutdown_requested()) return complete();
       model_state_use(st[0]);
-      model_state_restore(0);
+      model_state_restore();
       int rows[BLOCK + 1] = {next[0]}, d = 0;
       model_draft(next[0], n, rows + 1, o.draft);
       const float *v = model_verify(rows, o.draft + 1, n);
@@ -400,25 +406,18 @@ int main(int argc, char **argv) {
   uint64_t swap0 = mem_swapouts(), comp0 = mem_compressions();
   extern double phase_s[7];
   double g0 = gpu_busy, t0 = now(), p1[7];
-  const float *logits;
-#ifdef MYDS4_PREFILL_PREFIX
-  int prefix = 0, user_token = tok_find("<｜User｜>");
-  while (prefix < n && tokens[prefix] != user_token) prefix++;
-  logits = prefix > 1 && prefix < n ? model_forward_prefix(tokens, n, 0, prefix, NULL) : model_forward(tokens, n, 0);
-#else
-  logits = model_forward(tokens, n, 0);
-#endif
+  const float *logits = model_forward(tokens, n, 0);
   uint64_t prefill_workspace = model_workspace_bytes();
   ModelForwardInfo prune_info = model_forward_info();
-  fprintf(stderr, "{\"prefill_prune\":{\"applied\":%s,\"tokens\":%d,\"decoder_tokens\":%d,\"chunks\":%d,\"prefix_tokens\":%d}}\n",
+  fprintf(stderr, "{\"prefill_prune\":{\"applied\":%s,\"tokens\":%d,\"decoder_tokens\":%d,\"decoder_row_layers\":%d,\"chunks\":%d,\"prefix_tokens\":%d}}\n",
           prune_info.prune_applied ? "true" : "false", prune_info.tokens, prune_info.decoder_tokens,
-          prune_info.chunks, prune_info.prefix_tokens);
+          prune_info.decoder_row_layers, prune_info.chunks, prune_info.prefix_tokens);
   double t1 = now();
   CacheStats c1 = cache_stats;
+  uint64_t rows_before_decode = decode_rows;
 #ifdef MYDS4_IO_DIAGNOSTICS
   cache_io_diagnostic_decode();
 #endif
-  uint64_t rows_before_decode = decode_rows;
   const char *prof = getenv("MYDS4_PROFILE");
   if (!prof || strcmp(prof, "prefill")) gpu_profile_reset(); // a profile covers decoding, or the prefill
   memcpy(p1, phase_s, sizeof p1);
@@ -426,8 +425,18 @@ int main(int argc, char **argv) {
   long gaps1 = gpu_gaps;
   uint64_t fix1 = spec_fixups;
   int pos = n, gen = 0, passes = 0, accepted = 0, t = sample_token(logits, VOCAB, &sampler), len;
-  ContextLookup *lookup = o.lookup ? context_lookup_new(o.ctx) : NULL;
+  ContextLookup *lookup = NULL;
+#ifdef MYDS4_REJECTION_DRAFT
+  double *draft_probability = o.draft ? xmalloc((size_t)o.draft * VOCAB * sizeof(double)) : NULL;
+  int rejection_passes = 0, accepted_prefix[BLOCK + 1] = {0};
+#endif
+#ifdef MYDS4_PROTOCOL_DRAFT
+  ProtocolDraft protocol = {0};
+  if (o.lookup) protocol_draft_init(&protocol);
+#else
+  lookup = o.lookup ? context_lookup_new(o.ctx) : NULL;
   if (o.lookup && (!lookup || !context_lookup_append(lookup, tokens, n))) die("cannot initialize context lookup");
+#endif
   int lookup_attempts = 0, lookup_passes = 0, lookup_offered = 0, lookup_kept = 0;
 #ifdef MYDS4_STAGED_DRAFT
   DraftQueue pending_draft = {0};
@@ -442,6 +451,13 @@ int main(int argc, char **argv) {
     int room = ntokens - gen - 1;
     if (room > o.ctx - pos - 1) room = o.ctx - pos - 1;
     ContextDraft proposal = {0};
+#ifdef MYDS4_PROTOCOL_DRAFT
+    if (o.lookup) {
+      protocol_draft_push(&protocol, &t, 1);
+      proposal = protocol_draft_propose(&protocol, o.lookup < room ? o.lookup : room);
+      lookup_attempts++;
+    }
+#endif
     if (lookup) {
       if (!context_lookup_append(lookup, &t, 1)) die("context lookup exceeds the configured context");
 #ifdef MYDS4_CONSENSUS_LOOKUP
@@ -475,7 +491,9 @@ int main(int argc, char **argv) {
 #else
       k = o.draft < room ? o.draft : room;
       if (k) {
-#ifdef MYDS4_COUPLED_DRAFT
+#ifdef MYDS4_REJECTION_DRAFT
+        model_draft_sampled(t, pos, rows + 1, k, &sampler, draft_probability);
+#elif defined(MYDS4_COUPLED_DRAFT)
         model_draft_coupled(t, pos, rows + 1, k, &sampler);
 #else
         model_draft(t, pos, rows + 1, k);
@@ -484,8 +502,18 @@ int main(int argc, char **argv) {
 #endif
     }
     if (k > 0) {
+#ifdef MYDS4_CAUSAL_EARLY_STOP
+      logits = model_verify_early(rows, k + 1, pos, eos, &sampler, &next, &a);
+#else
       logits = model_verify(rows, k + 1, pos);
+#ifdef MYDS4_REJECTION_DRAFT
+      if (!proposal.count) {
+        next = speculative_verify(logits, VOCAB, rows + 1, k, draft_probability, eos, &sampler, &a);
+        rejection_passes++, accepted_prefix[a]++;
+      } else
+#endif
       next = sample_verify(logits, VOCAB, rows + 1, k, eos, &sampler, &a);
+#endif
       model_accept(rows, a + 1, pos);
       logits += (size_t)a * VOCAB;
       passes++, accepted += a;
@@ -499,8 +527,14 @@ int main(int argc, char **argv) {
     if (next == eos) pending_draft.count = 0;
 #endif
     if (lookup && a && !context_lookup_append(lookup, rows + 1, a)) die("context lookup exceeds the configured context");
+#ifdef MYDS4_PROTOCOL_DRAFT
+    if (o.lookup && a) protocol_draft_push(&protocol, rows + 1, a);
+#endif
     if (proposal.count) {
-      context_lookup_feedback(lookup, k, a);
+      if (lookup) context_lookup_feedback(lookup, k, a);
+#ifdef MYDS4_PROTOCOL_DRAFT
+      protocol_draft_feedback(&protocol, proposal.source, a);
+#endif
       lookup_kept += a;
     }
     uint64_t current_cache = cache_bytes();
@@ -531,17 +565,38 @@ int main(int argc, char **argv) {
     fprintf(stderr, "speculative: %d passes, %.2f of up to %d drafts kept per pass\n", passes,
             (double)accepted / passes, verify_limit);
   if (o.lookup)
+#ifdef MYDS4_PROTOCOL_DRAFT
+    fprintf(stderr, "{\"protocol_draft\":{\"attempts\":%d,\"passes\":%d,\"offered\":%d,\"accepted\":%d}}\n",
+#else
     fprintf(stderr, "{\"context_lookup\":{\"attempts\":%d,\"passes\":%d,\"offered\":%d,\"accepted\":%d}}\n",
+#endif
             lookup_attempts, lookup_passes, lookup_offered, lookup_kept);
 #ifdef MYDS4_STAGED_DRAFT
   fprintf(stderr, "{\"staged_draft\":{\"generated_drafts\":%d,\"chunk_drafts\":%d,\"generations\":%d,\"reused_passes\":%d}}\n",
           o.draft, MYDS4_STAGED_DRAFT, draft_generations, draft_reuses);
 #endif
   CacheStats c2 = cache_stats;
+#ifdef MYDS4_REJECTION_DRAFT
+  fprintf(stderr, "{\"rejection_sampling\":{\"enabled\":true,\"drafts\":%d,\"same_seed_output\":false,\"passes\":%d,\"accepted_prefix_counts\":[",
+          o.draft, rejection_passes);
+  for (int r = 0; r <= BLOCK; r++) fprintf(stderr, "%s%d", r ? "," : "", accepted_prefix[r]);
+  fprintf(stderr, "]}}\n");
+  free(draft_probability);
+#endif
   uint64_t computed_rows = decode_rows - rows_before_decode;
+#ifdef MYDS4_CAUSAL_EARLY_STOP
+  EarlyVerifyStats early = model_early_stats();
+  uint64_t scheduled_rows = computed_rows;
+  uint64_t selected = ((scheduled_rows - early.attempted_rows) * LAYERS + early.requested_row_layers) * TOPK;
+  computed_rows -= early.cancelled_rows;
+  fprintf(stderr, "{\"decode_experts\":{\"computed_rows\":%llu,\"scheduled_rows\":%llu,\"selected\":%llu,\"unique_layer_requests\":%llu}}\n",
+          (unsigned long long)computed_rows, (unsigned long long)scheduled_rows, (unsigned long long)selected,
+          (unsigned long long)(c2.row_unique - c1.row_unique));
+#else
   fprintf(stderr, "{\"decode_experts\":{\"computed_rows\":%llu,\"selected\":%llu,\"unique_layer_requests\":%llu}}\n",
           (unsigned long long)computed_rows, (unsigned long long)(computed_rows * LAYERS * TOPK),
           (unsigned long long)(c2.row_unique - c1.row_unique));
+#endif
   fprintf(stderr, "{\"decode_cache\":{\"bytes_at_start\":%llu,\"min_bytes\":%llu,\"max_bytes\":%llu,\"slots_released\":%llu}}\n",
           (unsigned long long)cache_start, (unsigned long long)cache_min, (unsigned long long)cache_max,
           (unsigned long long)(c2.given_back - c1.given_back));
