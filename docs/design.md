@@ -27,6 +27,8 @@ engine's headers by name.
 | `src/engine/vision.c` | Images: decoding, the reference's grid, Pillow's resize and padding, the vision encoder's patches and RoPE angles, an image's span of tokens. |
 | `src/engine/sample.c` | Shared temperature/top-p sampling and DSpark prefix verification. |
 | `src/engine/expert_batch.h` | Row grouping and GPU descriptors for the experimental shared-expert kernels. |
+| `src/experimental/expert_compact.h`, `src/experimental/expert_compact.metal` | Compact partial native expert batches while retaining original result indices and reduction order. |
+| `src/experimental/urgent_io_diagnostic.h` | Optional software timestamps for urgent reads, selected-expert arrival and blocked promotion. |
 | `src/experimental/context_lookup.c`, `src/experimental/context_lookup.h` | Bounded CPU history matching for the CLI and server's context-copy drafts. |
 | `src/engine/engine.c`, `src/engine/engine.h` | The engine behind a C ABI for the server: the queue, sessions, batching, the status, the live view's snapshot and the log, without HTTP or JSON (see [The server](server.md)). |
 | `src/kernels/kernels.metal` | The GPU kernels. |
@@ -385,6 +387,43 @@ still block a run; memory bounds, cache shrinkage and new swap-outs
 remain grounds to reject a comparison. CPU work does not need a separate
 reservation. The default quiet mode retains the broader Python-job
 exclusion. Background-helper observations are retained with the result.
+
+### Experimental partial-batch compaction and read scheduling
+
+The `myds4-expert-compact` build retains the ordinary two-batch schedule.
+For a partial native MXFP4 batch, it puts up to six original expert indices
+in the unused end of the existing 256-byte descriptor. The up kernel
+dispatches only active experts; the down kernel dispatches one SIMD group
+per active expert. Hidden values and partial products retain their original
+indices, and the final ordered reduction is unchanged. The all-ready fused
+and GGUF paths retain their ordinary kernels.
+
+The `myds4-io-window4-diagnostic`, `myds4-io-window8-diagnostic` and
+`myds4-io-window16-diagnostic` builds bound urgent read workers. Queued and
+active urgent pieces both suppress background reads. Each piece retains
+its existing destination and exactly one owner. The ordinary engine keeps
+unrestricted urgent submission. Diagnostic intervals describe software
+callbacks and selected-expert arrival, not hardware queue depth.
+
+`MYDS4_EARLY_DEMAND_PROMOTION` promotes all existing selected pending slots
+after protecting selected residents and before allocating missing slots.
+This lets those reads proceed while reclamation waits for a victim's
+already-started read. Hit attribution stays attached to the original slot;
+late attribution uses its pending status before promotion. The cache budget
+and victim-selection policy are unchanged. The normal build does not
+enable it.
+
+`myds4-late-preencode` encodes ordinary single-row late expert work before
+waiting for its data. Mixed batches use the separate late descriptor
+region. All-missing batches encode their ordinary fused work. Neither
+case submits the pending-data command until the required reads finish.
+Both reserved queue positions remain in place. The normal engine keeps
+the ordinary encoding order. Numerical and performance checks for these
+experiments are described in [Performance](performance.md).
+
+The pipeline-limit fixtures compile separate default and bounded variants
+of the native up/down kernels. Their runtime dispatch sizes stay fixed;
+only the compiler limits differ. Pipeline identities include the limit.
 
 ### CED and DSpark study tools
 

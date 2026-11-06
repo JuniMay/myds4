@@ -415,6 +415,9 @@ int main(int argc, char **argv) {
           prune_info.chunks, prune_info.prefix_tokens);
   double t1 = now();
   CacheStats c1 = cache_stats;
+#ifdef MYDS4_IO_DIAGNOSTICS
+  cache_io_diagnostic_decode();
+#endif
   uint64_t rows_before_decode = decode_rows;
   const char *prof = getenv("MYDS4_PROFILE");
   if (!prof || strcmp(prof, "prefill")) gpu_profile_reset(); // a profile covers decoding, or the prefill

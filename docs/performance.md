@@ -2586,3 +2586,239 @@ routing and I/O. These aggregate measurements do not separate those effects
 and do not establish an intrinsic decoding penalty from CED. A controlled
 continuation replay would remove token-stream differences; routing and cache
 residency would still need separate accounting.
+
+### Urgent read concurrency
+
+The `myds4-io-diagnostic` build measures urgent read callbacks and the
+completion of each decoded layer's selected experts. It records queue delay,
+read service time, active callbacks and the interval from demand to the last
+selected expert's completion. These are software timestamps, not physical
+SSD queue-depth or bandwidth counters. Histogram percentiles are upper
+bounds in 50-microsecond bins. Diagnostic throughput is not used as ordinary
+decode throughput.
+
+The `myds4-io-window4-diagnostic`, `myds4-io-window8-diagnostic` and
+`myds4-io-window16-diagnostic` builds limit urgent workers to 4, 8 and 16.
+Pending and active urgent pieces both suppress background readers. Pieces
+keep their 2 MiB size, destination buffers and atomic ownership. The limit
+also applies during prefill. Ordinary builds retain unrestricted GCD
+submission. The CPU ownership fixture passes 144 checks, including repeated
+promotion, queue-counter wrap, completion accounting and exact destination
+bytes.
+
+A live MXFP4 comparison uses a reconstructed 13,772-token Harness request,
+128 generated tokens, a fixed 16 GiB cache and a 4 GiB reserve. Temperature
+and top-p are 1, with seed 12345. Dependency pruning and shared expert rows
+are enabled; CED, substitution, DSpark and online prediction are disabled.
+All five outputs match, and each run retains 17,175,674,880 cache bytes.
+
+| Urgent window | Peak active read callbacks during decode | Mean last-selected-expert arrival | Mean urgent queue delay | Mean urgent read service |
+| --- | ---: | ---: | ---: | ---: |
+| Unrestricted, first control | 60 | 3.561 ms | 0.123 ms | 2.816 ms |
+| 8 | 8 | 3.548 ms | 1.739 ms | 1.119 ms |
+| 4 | 4 | 3.551 ms | 2.164 ms | 0.591 ms |
+| 16 | 16 | 3.553 ms | 0.998 ms | 1.891 ms |
+| Unrestricted, closing control | 60 | 3.585 ms | 0.126 ms | 2.834 ms |
+
+The shorter service intervals are offset by longer queue waits. The
+last-required arrival changes by less than one percent relative to the
+controls. This screen establishes no material reduction in exposed read
+latency. It does not justify a long throughput test or a default change.
+The [diagnostic records](../data/benchmarks/urgent_window_diagnostic_results.json)
+include resource observations and completion-counter checks.
+
+### Compact partial expert batches
+
+The experimental `myds4-expert-compact` build keeps the ordinary ready/late
+schedule and compacts each partial native MXFP4 batch. Six original expert
+indices fit after the six expert records in each 256-byte descriptor. The
+up kernel dispatches only active expert grids. The down kernel uses one
+SIMD group per active expert. Both kernels write the original hidden and
+partial-result indices; the final expert-ordered sum is unchanged. The
+all-ready fused path and GGUF paths retain their ordinary kernels.
+
+The resident fixture passes 768 checks across all 64 masks, including the
+empty mask. It compares hidden values and partial results byte-for-byte,
+checks that inactive slots retain sentinels, and compares complementary
+partial batches with the fused result. Eight forced continuation steps at
+257-token and 16,521-token prefixes each compare 640 compact batches and
+1,920 expert contributions. Both model checks have zero differing logit,
+rolling-state and global-cache bytes.
+
+Resident timings rotate eight weight sets. Complete partial sequences read
+from a 902,430,720-byte allocated weight set; this is not a measurement of
+physical memory traffic. Each median uses seven alternated samples of 64
+iterations and includes both partial batches and the final sum.
+
+| Active experts in first/second batch | Ordinary GPU sequence | Compact GPU sequence |
+| --- | ---: | ---: |
+| 1 / 5 | 0.2840 ms | 0.2536 ms |
+| 2 / 4 | 0.2877 ms | 0.2683 ms |
+| 3 / 3 | 0.3052 ms | 0.2780 ms |
+
+These are kernel measurements, not model-throughput gains. The
+[numerical checks and resident timings](../data/benchmarks/expert_compact_validation.json)
+retain their resource observations. Run `make build/expert-compact-check
+build/expert-compact-model-check` to build the fixtures. The model fixture
+takes a checkpoint path and accepts `--long` for the longer prefix.
+
+The first unprofiled full-model comparison uses the same 13,772-token
+Harness request and fixed 16 GiB cache as the urgent-read study. It requests
+512 tokens; all arms finish after the same 308-token reply. Other settings
+remain temperature/top-p 1, seed 12345, shared expert rows and dependency
+pruning, with CED, substitution, DSpark and online prediction disabled.
+
+| Measurement | First control | Compact partial batches | Closing control |
+| --- | ---: | ---: | ---: |
+| Decode throughput | 5.76 tokens/s | 5.83 tokens/s | 5.83 tokens/s |
+| Decode wall time | 53.45 s | 52.83 s | 52.82 s |
+| Main-queue GPU time | 10.68 s | 10.46 s | 10.65 s |
+| Read-wait time | 42.61 s | 42.25 s | 42.09 s |
+
+The candidate executes 22,090 partial batches. Outputs match and cache
+allocation stays fixed in all arms. GPU time falls about 1.9% relative to
+the mean control, but decode throughput equals the closing control. This
+does not establish an end-to-end gain or justify enabling the option by
+default. Prefill wall time varies from 22.25 to 26.27 seconds, so the screen
+supports no prefill claim. GPU and read-wait intervals can overlap. The
+[full-model screen](../data/benchmarks/expert_compact_speed_results.json)
+records all three arms; an 8K generation and an HTTP throughput comparison
+have not been run for compaction.
+
+### Per-pipeline compiler thread limits
+
+Two resident screens set explicit compiler limits for native `moe_up` and
+`moe_down`: 256/192 threads and 512/256 threads. Runtime dispatch sizes
+remain 256/192. Each fixture keeps separate pipeline identities for the
+default and bounded versions of the same function. Both variants pass
+769 checks across all partial masks and complete reductions. Metal reports
+the requested limits and 128 bytes of static threadgroup memory for each
+kernel. Register occupancy and spill counters were not captured.
+
+Neither setting gives a consistent timing improvement. With 256/192,
+complete 1/5, 2/4 and 3/3 sequences take 0.285, 0.290 and 0.305 ms against
+0.283, 0.289 and 0.303 ms controls. With 512/256, the first two improve by
+less than one percent, while the 3/3 sequence and six-active batch regress.
+These screens support no model-throughput claim or default change. Build
+`expert-limit256-check` and `expert-limit512-check` under `build/` to repeat
+them. The [records](../data/benchmarks/expert_pipeline_limit_results.json)
+contain both configurations and their correctness checks.
+
+### Promoting selected pending reads before reclamation
+
+The controlled CPU fixture requests a missing expert before a selected
+pending prefetch. Reclaiming the missing expert's victim waits for a held
+read. The ordinary path fails to promote the selected prefetch before that
+wait: 11 of 12 checks pass. `MYDS4_EARLY_DEMAND_PROMOTION` first protects
+all selected residents, then promotes existing pending selections before
+allocating misses. The same fixture passes all 12 checks. Piece ownership,
+requested bytes, selection protection, hit attribution and pending-read
+accounting remain checked. Late attribution records whether the original
+prefetch was pending before promotion.
+
+A 128-token MXFP4 diagnostic on the same 13,772-token Harness prompt and
+16 GiB cache finds 245 promotions, covering 2,078 unclaimed pieces, delayed
+behind reclamation in the ordinary path. The revised path records zero.
+Reclamation itself still waits: 167.949 ms total in the control and
+167.127 ms in the candidate. Mean last-required-expert arrival is 3.561 ms
+and 3.558 ms, respectively. Outputs and cache bytes match. This verifies
+the ordering change but establishes no meaningful arrival-time gain.
+Normal builds retain the ordinary policy; no uninstrumented throughput
+claim follows from this pair. The
+[diagnostic records](../data/benchmarks/demand_promotion_diagnostic_results.json)
+contain both arms and the CPU reproduction.
+
+### Encoding late work while reads finish
+
+The `myds4-late-preencode` build encodes the ordinary single-row late
+expert batch before its data wait. Mixed-ready layers use the separate
+late descriptor region and final ordered sum. All-missing layers encode
+their ordinary fused batch. Submission still follows the required-read
+wait, and both reserved command-buffer positions remain intact. The
+arithmetic, selected experts and allocated cache are unchanged.
+
+The numerical fixture compares eight forced continuation steps with the
+ordinary engine. It checks mixed groups at 257-token and 16,521-token
+prefixes and all-missing groups at a 257-token prefix. All three cases
+have zero differing logits, rolling-state bytes and global-cache bytes.
+Across 960 layer checks, the pending-data command remains enqueued but
+unsubmitted at the final data wait. These fixtures finish reads before
+forcing their masks; they do not artificially hold a physical read. The
+submission-state checks and unchanged synchronous wait provide separate
+evidence about command ordering. The
+[numerical records](../data/benchmarks/late_preencode_validation.json)
+retain all three cases.
+
+The unprofiled full-model screen uses the 13,772-token Harness request,
+308-token completed reply, fixed 16 GiB cache, 4 GiB reserve,
+temperature/top-p 1 and seed 12345. Shared expert rows and dependency
+pruning are enabled; CED, substitution, DSpark and online prediction are
+disabled. The candidate pre-encodes 11,054 mixed layers and 346 all-missing
+layers. Every output matches and all arms retain 910 cache slots.
+
+| Measurement | First control | Late pre-encoding | Closing control |
+| --- | ---: | ---: | ---: |
+| Decode throughput | 5.83 tokens/s | 5.84 tokens/s | 5.84 tokens/s |
+| Decode wall time | 52.80 s | 52.78 s | 52.76 s |
+| Main-queue GPU time | 10.65 s | 10.65 s | 10.64 s |
+| Read-wait time | 42.07 s | 42.10 s | 42.05 s |
+
+The candidate's duration equals the mean control duration. This screen
+shows no throughput gain. No separate final-read-to-GPU-start timeline
+capture or long-generation test was performed. Prefill varies from 22.16
+to 25.81 seconds, so these results support no prefill claim. The
+[full-model records](../data/benchmarks/late_preencode_speed_results.json)
+contain all three complete runs. This remains a research build.
+
+
+### Fixed 56 GiB MXFP4 comparison
+
+All five proposals also have short full-model screens with the same
+13,772-token Harness request, 308-token completed reply, context capacity
+32,768, temperature/top-p 1 and seed 12345. Dependency pruning and shared
+expert rows are enabled; CED, substitution, DSpark and online correction
+are disabled. The ordinary engine's memory policy counts reclaimable file
+cache and permits compression in RAM. No cache purge is performed.
+
+Every valid run retains 3,185 expert slots: 60,114,862,080 allocated bytes.
+Every output matches. All 14 completed runs record zero additional
+compression events and zero swap-outs. Desktop graphics activity is
+recorded; no competing compute workload is observed.
+
+| Candidate | Controls before / after (tokens/s) | Candidate (tokens/s) | Change from mean control duration |
+| --- | ---: | ---: | ---: |
+| Compact partial batches | 10.62 / 10.66 | 10.69 | +0.45% |
+| Late pre-encoding | 10.57 / 10.59 | 10.54 | -0.43% |
+| Earlier demand promotion | 10.57 / 10.59 | 10.67 | +0.81% |
+| 8 urgent readers | 10.59 / 10.67 | 10.64 | +0.09% |
+| 4 urgent readers | 10.59 / 10.67 | 10.53 | -0.94% |
+| 16 urgent readers | 10.59 / 10.67 | 10.66 | +0.26% |
+| Pipeline limits 256 / 192 | 10.67 / 10.64 | 10.64 | -0.10% |
+| Pipeline limits 512 / 256 | 10.67 / 10.64 | 10.63 | -0.17% |
+
+Each delta uses controls at the same 56 GiB capacity. The small differences
+do not establish a sustained throughput gain. Prefill durations vary from
+22.24 to 25.37 seconds; this screen supports no prefill-speed claim.
+The measured executables include the engine's KV-cache and runahead
+integration, with runahead inactive for single-row decoding. These are
+timings of the integrated engine configuration, not separate timing runs
+of each isolated source patch. Numerical fixtures evaluate equivalence
+separately. All five options remain experimental.
+
+The [compaction records](../data/benchmarks/expert_compact_56g_speed_results.json)
+and [remaining comparisons](../data/benchmarks/five_proposals_56g_results.json)
+retain settings, executable identities, output digests, actual allocations
+and memory counters. The compaction file also retains one earlier invalid
+run whose actual allocation was below 56 GiB; it is excluded here.
+
+
+The standalone source validation builds both the ordinary CLI and the I/O
+diagnostic CLI. Its CPU checks pass 11/11 for memory accounting, 8/8 for
+allocation policy, 144/144 for urgent read ownership and 12/12 for early
+promotion. The kernel fixture passes all 768 checks. Five model cases
+cover 257- and 16,521-token prefixes with eight forced continuation steps;
+all checked logits, rolling state and global KV bytes match. The three
+pre-encoding cases also pass 960 checks that the pending-data command
+remains unsubmitted at the final wait.
+The [standalone validation records](../data/benchmarks/expert_commit_validation.json)
+identify the source and retain the separate numerical results.

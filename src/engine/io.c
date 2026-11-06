@@ -271,6 +271,12 @@ typedef struct {
   int background_load; // this load originally occupied a prefetch admission
   _Atomic int unfinished; // read or cancelled pieces that have not completed
   _Atomic char taken[16];  // piece k has been started (or dropped)
+#ifdef MYDS4_IO_DIAGNOSTICS
+  uint64_t diagnostic_queued[16];
+  uint8_t diagnostic_phase[16];
+  _Atomic uint64_t diagnostic_ready;
+  _Atomic int diagnostic_ready_urgent;
+#endif
 #ifdef MYDS4_PREDICT_LAB
   uint64_t action_id;
 #endif
@@ -319,6 +325,9 @@ static PrefetchStats pf_stats[PF_PHASES];
 static uint8_t pf_ghost[LAYERS][EXPERTS];
 static int slot_reading(int i);
 static uint64_t metrics_ns(void) { return (uint64_t)(now() * 1e9); }
+#ifdef MYDS4_IO_DIAGNOSTICS
+#include "../experimental/urgent_io_diagnostic.h"
+#endif
 
 void cache_metrics_begin(int phase, int rows) {
   if (!pf_enabled) return;
@@ -686,12 +695,26 @@ static uint32_t queue[QUEUE], qhead, qtail;  // entries: slot << 4 | piece
 static pthread_mutex_t qlock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t qcond = PTHREAD_COND_INITIALIZER;
 static _Atomic int demand, prefetching;  // demand pieces, and prefetched slots, in flight
+#ifdef MYDS4_URGENT_WINDOW
+static int urgent_window = MYDS4_URGENT_WINDOW;
+static pthread_mutex_t urgent_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t urgent_space = PTHREAD_COND_INITIALIZER;
+static uint32_t urgent_queue[QUEUE], urgent_head, urgent_tail;
+static unsigned urgent_workers, urgent_peak_workers, urgent_peak_pending;
+static uint64_t urgent_submissions, urgent_worker_launches;
+#endif
 
-static void piece_finished(Slot *s) {
+static void piece_finished(Slot *s, int piece) {
   // Release the admission when the last I/O/cancellation finishes. Deferring
   // this to a dispatch notification can block a newer forecast after data is ready.
-  if (atomic_fetch_sub_explicit(&s->unfinished, 1, memory_order_acq_rel) == 1 && s->background_load)
-    atomic_fetch_sub_explicit(&prefetching, 1, memory_order_relaxed);
+  int last_piece = atomic_fetch_sub_explicit(&s->unfinished, 1, memory_order_acq_rel) == 1;
+  if (last_piece) {
+#ifdef MYDS4_IO_DIAGNOSTICS
+    atomic_store_explicit(&s->diagnostic_ready_urgent, s->diagnostic_queued[piece] != 0, memory_order_relaxed);
+    atomic_store_explicit(&s->diagnostic_ready, metrics_ns(), memory_order_release);
+#endif
+    if (s->background_load) atomic_fetch_sub_explicit(&prefetching, 1, memory_order_relaxed);
+  }
   dispatch_group_leave(s->loading);
 }
 
@@ -709,7 +732,7 @@ static void *reader(void *arg) {
       metrics_io_end(s, 0, began);
       __atomic_fetch_add(&cache_stats.bytes, s->piece[q & 15].len, __ATOMIC_RELAXED);
       metrics_piece_done(s, s->piece[q & 15].len);
-      piece_finished(s);
+      piece_finished(s, q & 15);
     }
   }
 }
@@ -728,20 +751,71 @@ static void read_demand(void *ctx) {
   uint32_t q = (uint32_t)(uintptr_t)ctx;
   Slot *s = &slots[q >> 4];
   uint64_t began = metrics_io_begin(s, 1);
+#ifdef MYDS4_IO_DIAGNOSTICS
+  uint64_t diagnostic_began = diagnostic_read_begin(s, q & 15, atomic_load(&demand));
+#endif
   read_piece(&s->piece[q & 15], 0);
+#ifdef MYDS4_IO_DIAGNOSTICS
+  diagnostic_read_end(s, q & 15, diagnostic_began);
+#endif
   metrics_io_end(s, 1, began);
   __atomic_fetch_add(&cache_stats.bytes, s->piece[q & 15].len, __ATOMIC_RELAXED);
   metrics_piece_done(s, s->piece[q & 15].len);
-  piece_finished(s);
+  piece_finished(s, q & 15);
   if (--demand == 0) pthread_mutex_lock(&qlock), pthread_cond_broadcast(&qcond), pthread_mutex_unlock(&qlock);
 }
 
-// Reads slot i's pieces that no reader has started, at once.
+// Promotes unclaimed pieces to the urgent read path.
+#ifdef MYDS4_URGENT_WINDOW
+static void urgent_worker(void *unused) {
+  for (;;) {
+    pthread_mutex_lock(&urgent_lock);
+    if (urgent_head == urgent_tail) {
+      urgent_workers--;
+      pthread_mutex_unlock(&urgent_lock);
+      return;
+    }
+    uint32_t q = urgent_queue[urgent_head++ % QUEUE];
+    pthread_cond_signal(&urgent_space);
+    pthread_mutex_unlock(&urgent_lock);
+    read_demand((void *)(uintptr_t)q);
+  }
+}
+#endif
+
+static void submit_demand(uint32_t q) {
+#ifdef MYDS4_URGENT_WINDOW
+  if (urgent_window) {
+    int launch = 0;
+    pthread_mutex_lock(&urgent_lock);
+    while (urgent_tail - urgent_head == QUEUE) pthread_cond_wait(&urgent_space, &urgent_lock);
+    urgent_queue[urgent_tail++ % QUEUE] = q;
+    urgent_submissions++;
+    unsigned pending = urgent_tail - urgent_head;
+    if (pending > urgent_peak_pending) urgent_peak_pending = pending;
+    if (urgent_workers < (unsigned)urgent_window) {
+      urgent_workers++, urgent_worker_launches++, launch = 1;
+      if (urgent_workers > urgent_peak_workers) urgent_peak_workers = urgent_workers;
+    }
+    pthread_mutex_unlock(&urgent_lock);
+    if (launch) dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), NULL, urgent_worker);
+    return;
+  }
+#endif
+  dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), (void *)(uintptr_t)q, read_demand);
+}
+
 static void claim(int i) {
   for (int k = 0; k < slots[i].npiece; k++)
-    if (!atomic_exchange(&slots[i].taken[k], 1))
-      demand++, dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
-                                 (void *)(uintptr_t)(i << 4 | k), read_demand);
+    if (!atomic_exchange(&slots[i].taken[k], 1)) {
+#ifdef MYDS4_IO_DIAGNOSTICS
+      slots[i].diagnostic_queued[k] = metrics_ns();
+      slots[i].diagnostic_phase[k] = diagnostic_phase;
+#endif
+      // demand counts both queued and active pieces. Background readers
+      // therefore stay suppressed even before a bounded worker starts.
+      demand++, submit_demand((uint32_t)(i << 4 | k));
+    }
 }
 
 // The model thread owns each group until finish(). Parallel substitution
@@ -754,7 +828,13 @@ static int slot_reading(int i) {
 
 static void finish(int i) {
   if (!slots[i].loading) return;
+#ifdef MYDS4_IO_DIAGNOSTICS
+  uint64_t reclaim_began = diagnostic_request_active && slot_reading(i) ? metrics_ns() : 0;
+#endif
   dispatch_group_wait(slots[i].loading, DISPATCH_TIME_FOREVER);
+#ifdef MYDS4_IO_DIAGNOSTICS
+  if (reclaim_began) diagnostic_reclaim_ns += metrics_ns() - reclaim_began;
+#endif
   dispatch_release(slots[i].loading);
   slots[i].loading = 0;
 }
@@ -763,7 +843,7 @@ static void finish(int i) {
 static void cancel(int i) {
   if (!slots[i].loading) return;
   for (int k = 0; k < slots[i].npiece; k++)
-    if (!atomic_exchange(&slots[i].taken[k], 1)) piece_finished(&slots[i]);
+    if (!atomic_exchange(&slots[i].taken[k], 1)) piece_finished(&slots[i], k);
   finish(i);
 }
 
@@ -922,6 +1002,11 @@ static void start(int i, int urgent) {
   s->npiece = n;
   s->background_load = !urgent;
   atomic_store_explicit(&s->unfinished, n, memory_order_relaxed);
+#ifdef MYDS4_IO_DIAGNOSTICS
+  atomic_store_explicit(&s->diagnostic_ready, 0, memory_order_relaxed);
+  atomic_store_explicit(&s->diagnostic_ready_urgent, 0, memory_order_relaxed);
+  memset(s->diagnostic_queued, 0, sizeof s->diagnostic_queued);
+#endif
   metrics_start(i, urgent);
   s->loading = dispatch_group_create();
   for (int k = 0; k < n; k++) dispatch_group_enter(s->loading), s->taken[k] = 0;
@@ -1001,11 +1086,21 @@ static int draft_request(int layer, const int *experts, int n) {
 }
 
 int cache_request(int layer, const int *experts, int n) {
+#ifdef MYDS4_IO_DIAGNOSTICS
+  diagnostic_request_begin(layer, experts, n, 1);
+#endif
   if (layer >= LAYERS && draft_capacity < DRAFT_EXPERTS) return draft_request(layer, experts, n);
   int reading = 0;
   serving = layer;
   for (int k = 0; k < n; k++)  // the resident ones first, so that the others' slots are not theirs
     if (where[layer][experts[k]] >= 0) slots[where[layer][experts[k]]].used = token;
+#ifdef MYDS4_EARLY_DEMAND_PROMOTION
+  char pending_at_request[EXPERTS] = {0};
+  for (int k = 0; k < n; k++) {
+    int i = where[layer][experts[k]];
+    if (i >= 0 && slot_reading(i)) pending_at_request[k] = 1, claim(i);
+  }
+#endif
   for (int k = 0; k < n; k++) {
     int e = experts[k], i = where[layer][e], pending;
     if (i >= 0) {
@@ -1013,10 +1108,17 @@ int cache_request(int layer, const int *experts, int n) {
       pending = slot_reading(i);
       // A forecast can outlive its predicted pass and lose its protection.
       // Any later demand must promote its queued pieces, protected or not.
+#ifdef MYDS4_IO_DIAGNOSTICS
+      if (pending) diagnostic_promote(&slots[i]);
+#endif
       if (pending) claim(i);
       if (slots[i].prefetched) {
         cache_stats.prefetch_hits++;
+#ifdef MYDS4_EARLY_DEMAND_PROMOTION
+        if (pending_at_request[k]) cache_stats.late++;
+#else
         if (pending) cache_stats.late++;
+#endif
       } else {
         cache_stats.hits++;
       }
@@ -1046,6 +1148,9 @@ int cache_request(int layer, const int *experts, int n) {
     score[i] = *history;
     reading += pending;
   }
+#ifdef MYDS4_IO_DIAGNOSTICS
+  diagnostic_request_return();
+#endif
   return reading;
 }
 
@@ -1079,8 +1184,14 @@ int cache_where(int layer, int e) {  // as cache_request will count it
 
 void cache_wait(int layer, const int *experts, int n) {
   double t = now();
+#ifdef MYDS4_IO_DIAGNOSTICS
+  uint64_t diagnostic_wait = metrics_ns();
+#endif
   for (int k = 0; k < n; k++) finish(where[layer][experts[k]]);
   cache_stats.read_s += now() - t;
+#ifdef MYDS4_IO_DIAGNOSTICS
+  diagnostic_request_end(layer, experts, n, diagnostic_wait);
+#endif
 }
 
 void cache_load(int layer, const int *experts, int n) {
@@ -1283,6 +1394,16 @@ static void metric_array(FILE *out, const char *const *names, const uint64_t *va
 }
 
 void cache_metrics_report(FILE *out) {
+#ifdef MYDS4_URGENT_WINDOW
+  pthread_mutex_lock(&urgent_lock);
+  fprintf(out, "{\"urgent_window\":{\"limit\":%d,\"peak_workers\":%u,\"peak_pending\":%u,"
+          "\"submissions\":%llu,\"worker_launches\":%llu}}\n", urgent_window, urgent_peak_workers,
+          urgent_peak_pending, (unsigned long long)urgent_submissions, (unsigned long long)urgent_worker_launches);
+  pthread_mutex_unlock(&urgent_lock);
+#endif
+#ifdef MYDS4_IO_DIAGNOSTICS
+  diagnostic_report(out);
+#endif
   if (!pf_enabled) return;
   const char *const phase[] = {"prefill", "decode"};
   const char *const state[] = {"existing_ready", "fresh_timely_prefetch", "pending_prefetch", "pending_demand", "absent"};

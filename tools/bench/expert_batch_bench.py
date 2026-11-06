@@ -183,6 +183,10 @@ def run(args, role, prompt, settings, expected, env):
              cache.get("min_bytes") == cache.get("max_bytes") and (expected is None or digest == expected))
     if args.kind == "expert_batch" and role == "candidate" and not (grouping and grouping.get("calls", 0)):
         valid = False
+    if args.kind == "expert_compact" and role == "candidate":
+        compact = metrics.get("expert_compact", {})
+        if not compact.get("batches") or not 0 < compact.get("active_experts", 0) <= compact["batches"] * 6:
+            valid = False
     if copy_exact is False:
         valid = False
     correctness_valid = valid
@@ -215,7 +219,7 @@ def main():
     ap.add_argument("--checkpoint", type=Path, required=True)
     ap.add_argument("--iq2", type=Path)
     ap.add_argument("--quant", choices=("mxfp4", "iq2"), default="mxfp4")
-    ap.add_argument("--kind", choices=("expert_batch", "memory", "representation", "lookup", "draft", "prefill", "cache"), default="expert_batch")
+    ap.add_argument("--kind", choices=("expert_compact", "expert_batch", "memory", "representation", "lookup", "draft", "prefill", "cache"), default="expert_batch")
     ap.add_argument("--control", type=Path, default=ROOT / "build/myds4")
     ap.add_argument("--candidate", type=Path, default=ROOT / "build/myds4-expert-batch")
     ap.add_argument("--control-args", default="", help="additional engine arguments, parsed without a shell")

@@ -144,6 +144,12 @@ void gpu_wait_signal(uint64_t v);
 void gpu_spin_signal(uint64_t v);  // gpu_wait_signal, spinning
 void gpu_sync(void);
 int gpu_threads(int k);  // max threads per threadgroup of a kernel
+#ifdef MYDS4_PIPELINE_LIMIT
+int gpu_kernel_limited(const char *name, unsigned limit);
+#endif
+#ifdef MYDS4_LATE_PREENCODE_CHECK
+int gpu_command_status(void);
+#endif
 int gpu_profiling(void);       // MYDS4_PROFILE set: dispatches run one at a time, timed
 void gpu_profile_reset(void);
 extern double gpu_busy;  // seconds the GPU spent on committed command buffers
@@ -245,6 +251,9 @@ void cache_observe_snapshot(int layer, CacheObservation *snapshot);
 void cache_observe_routes(const CacheObservation *snapshot, const int *ids, int rows, int stride, int served);
 void cache_prefetch_from(int layer, const int *experts, int n, int admit, int inflight, int issuer);
 void cache_metrics_report(FILE *out);
+#ifdef MYDS4_IO_DIAGNOSTICS
+void cache_io_diagnostic_decode(void);
+#endif
 // Cancels the read-aheads for the layer that no reader has started and that keep[0..n) does not name.
 void cache_refine(int layer, const int *keep, int n);
 void cache_demote(int layer);  // after its routing: the layer's unselected read-aheads are evicted first

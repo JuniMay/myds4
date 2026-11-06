@@ -290,6 +290,26 @@ def parse_metrics(stderr):
     stderr = stderr.replace("\r", "\n")
     metrics = {}
     for line in stderr.splitlines():
+        if line.startswith('{"expert_compact":'):
+            try:
+                metrics["expert_compact"] = json.loads(line)["expert_compact"]
+            except (ValueError, KeyError, TypeError):
+                metrics["expert_compact_parse_error"] = True
+        if line.startswith('{"late_preencode":'):
+            try:
+                metrics["late_preencode"] = json.loads(line)["late_preencode"]
+            except (ValueError, KeyError, TypeError):
+                metrics["late_preencode_parse_error"] = True
+        if line.startswith('{"urgent_window":'):
+            try:
+                metrics["urgent_window"] = json.loads(line)["urgent_window"]
+            except (ValueError, KeyError, TypeError):
+                metrics["urgent_window_parse_error"] = True
+        if line.startswith('{"pipeline_limit":'):
+            try:
+                metrics.setdefault("pipeline_limits", []).append(json.loads(line)["pipeline_limit"])
+            except (ValueError, KeyError, TypeError):
+                metrics["pipeline_limit_parse_error"] = True
         if line.startswith('{"workspace":'):
             try:
                 metrics["workspace"] = json.loads(line)["workspace"]

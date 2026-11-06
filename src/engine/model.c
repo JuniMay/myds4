@@ -140,6 +140,23 @@ static Buf ASC, AMAX, APART;
 static Buf RU, PARTS;  // PARTS: decoded rows' experts' down products, row r's at 8 DIM r, of expert e at 8 i + e
 static Buf EROWS;
 static int K_moe_up_rows, K_moe_down_rows;
+#ifdef MYDS4_LATE_PREENCODE
+static int late_preencode_enabled = 1;
+static uint64_t late_preencode_mixed, late_preencode_missing;
+static void report_late_preencode(void) {
+  fprintf(stderr, "{\"late_preencode\":{\"mixed\":%llu,\"all_missing\":%llu}}\n",
+          (unsigned long long)late_preencode_mixed, (unsigned long long)late_preencode_missing);
+}
+#endif
+#ifdef MYDS4_EXPERT_COMPACT
+#include "../experimental/expert_compact.h"
+static int K_moe_up_active, K_moe_down_active, expert_compact_enabled = 1, expert_compact_force_split;
+static uint64_t expert_compact_calls, expert_compact_active;
+static void report_expert_compact(void) {
+  fprintf(stderr, "{\"expert_compact\":{\"batches\":%llu,\"active_experts\":%llu}}\n",
+          (unsigned long long)expert_compact_calls, (unsigned long long)expert_compact_active);
+}
+#endif
 static uint64_t expert_batch_calls, expert_batch_pairs, expert_batch_groups;
 static void report_expert_batch(void) {
   fprintf(stderr, "{\"expert_batch\":{\"scope\":\"all small backbone batches\",\"calls\":%llu,"
@@ -476,12 +493,23 @@ void model_load(const char *dir, const Options *options) {
 #embed "../kernels/gguf.metal"
       , '\n',
 #embed "../kernels/vision.metal"
+#ifdef MYDS4_EXPERT_COMPACT
+      , '\n',
+#embed "../experimental/expert_compact.metal"
+#endif
   };
   gpu_init(source, sizeof source);
 #define K(name) K_##name = gpu_kernel(#name)
   K(mm_fp8), K(mm_bf16), K(mv_fp8), K(mv_bf16), K(mvm_fp8), K(mvm_bf16), K(mv_fp8_3), K(mv_bf16_3), K(mvm_fp8_3);
   K(mvm_bf16_3), K(moe_up), K(moe_down), K(moe_up_m), K(moe_down_m), K(gg_gather), K(act_quant_h);
   K(gather_mxfp4), K(act_quant_mxfp4);
+#ifdef MYDS4_LATE_PREENCODE
+  atexit(report_late_preencode);
+#endif
+#ifdef MYDS4_EXPERT_COMPACT
+  K(moe_up_active), K(moe_down_active);
+  atexit(report_expert_compact);
+#endif
   K(moe_combine), K(moe_parts), K(act_quant), K(embed), K(rmsnorm), K(hc_mix), K(hc_pre_norm), K(hc_post);
   if (opt.expert_batch) {
     K(moe_up_rows), K(moe_down_rows);
@@ -1241,6 +1269,21 @@ static void substitute_batch(int l, int m, int row) {
 // them; mf and hs: the row's offsets in MF and HS. With pm, only the experts
 // with entries run, and their down products go to PARTS (see moe_parts).
 static void experts_go(int l, int r, size_t eo, size_t mf, size_t hs, uint32_t pm) {
+#ifdef MYDS4_EXPERT_COMPACT
+  if (expert_compact_enabled && pm && !gk[l].up) {
+    int n = expert_active_slots((ExpertRef *)(ETAB.ptr + eo));
+    if (!n) return;
+    expert_compact_calls++, expert_compact_active += n;
+    gpu_kern(K_moe_up_active);
+    gpu_buf(0, &ETAB, eo), gpu_buf(1, &XQ, (size_t)r * DIM * 4), gpu_buf(2, &MH, (size_t)r * TOPK * INTER * 4);
+    gpu_go(INTER / 32, n, 1, 256, 1, 1);
+    gpu_kern(K_moe_down_active);
+    gpu_buf(0, &ETAB, eo), gpu_buf(1, &MH, (size_t)r * TOPK * INTER * 4);
+    gpu_buf(2, &PARTS, (size_t)r * DIM * 8 * 4);
+    gpu_go(DIM / 4, 1, 1, 32 * n, 1, 1);
+    return;
+  }
+#endif
   gpu_kern(gk[l].up ? gk[l].up : K_moe_up);
   gpu_buf(0, &ETAB, eo), gpu_buf(1, &XQ, (size_t)r * DIM * 4), gpu_buf(2, &MH, (size_t)r * TOPK * INTER * 4);
   gpu_go(INTER / 32, TOPK, 1, 256, 1, 1);
@@ -1439,6 +1482,16 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
                                (const float *)LAB_GP.ptr + FEW * EXPERTS, (const float *)GL.ptr);
 #endif
   for (int i = 0; i < nn; i++) nready += ready[need[i]] = cache_ready(l, need[i]);
+#ifdef MYDS4_EXPERT_COMPACT
+  // Numerical fixture only: complete all reads before forcing two disjoint
+  // groups. Ordinary candidate runs retain the observed ready/late groups.
+  if (expert_compact_force_split && rest && m == 1 && !gk[l].up) {
+    cache_wait(l, need, nn);
+    nready = 0;
+    unsigned mask = expert_compact_force_split == 2 ? 0 : 1 + (unsigned)l % 62;
+    for (int k = 0; k < nn; k++) nready += ready[need[k]] = (mask >> k) & 1;
+  }
+#endif
   int split = rest && nready > 0 && nready < nn;
   if (opt.expert_batch && split && m > 1 && (!gk[l].up || gk[l].up_rows)) {
     size_t eo = (size_t)l * FEW * 256;
@@ -1453,6 +1506,26 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
     experts_go(l, r, eo, mf_off(b) + (size_t)r * MIX * 4, hs_off(b) + (size_t)r * HC * DIM * STREAM_BYTES, 1);
   }
   if (split) gpu_commit(), gpu_encode(rest);
+#ifdef MYDS4_LATE_PREENCODE
+  if (late_preencode_enabled && rest && m == 1 && nready < nn) {
+    size_t mf = mf_off(b), hs = hs_off(b);
+    if (split) {
+      fill_entries(l, late_entries(l, 0), rt, rw + 8, ready, 0);
+      experts_go(l, 0, late_entries(l, 0), mf, hs, 1);
+      experts_sum(0, mf, hs);
+      late_preencode_mixed++;
+    } else {
+      encode_experts(l, 0, rt, rw + 8, mf, hs);
+      late_preencode_missing++;
+    }
+    double t1 = now();
+    // Encoding does not submit this command buffer. The caller commits it
+    // only after these reads finish, preserving both reserved queue positions.
+    cache_wait(l, need, nn);
+    phase_s[3] += t1 - t0, phase_s[2] += now() - t1, phase_s[4] -= now() - t0;
+    return split;
+  }
+#endif
   double t1 = now();
   cache_wait(l, need, nn);
   phase_s[3] += t1 - t0, phase_s[2] += now() - t1, phase_s[4] -= now() - t0;

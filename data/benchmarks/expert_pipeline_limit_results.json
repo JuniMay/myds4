@@ -1,0 +1,338 @@
+{
+  "schema_version": 1,
+  "scope": "Per-pipeline compiler thread bounds; same dispatch sizes, separate cached pipeline identities. Resident timings are not model throughput.",
+  "runs": [
+    {
+      "up_bound": 256,
+      "down_bound": 192,
+      "exit": 0,
+      "records": [
+        {
+          "pipeline_bound_checks": {
+            "passed": 769,
+            "total": 769,
+            "masks": 64
+          }
+        },
+        {
+          "pipeline_bound_timing": {
+            "active": 1,
+            "complete_split": false,
+            "sets": 8,
+            "weight_bytes": 150405120,
+            "control_ms": 0.068885,
+            "candidate_ms": 0.068612
+          }
+        },
+        {
+          "pipeline_bound_timing": {
+            "active": 1,
+            "complete_split": true,
+            "sets": 8,
+            "weight_bytes": 902430720,
+            "control_ms": 0.282953,
+            "candidate_ms": 0.284932
+          }
+        },
+        {
+          "pipeline_bound_timing": {
+            "active": 2,
+            "complete_split": false,
+            "sets": 8,
+            "weight_bytes": 300810240,
+            "control_ms": 0.109764,
+            "candidate_ms": 0.110685
+          }
+        },
+        {
+          "pipeline_bound_timing": {
+            "active": 2,
+            "complete_split": true,
+            "sets": 8,
+            "weight_bytes": 902430720,
+            "control_ms": 0.288637,
+            "candidate_ms": 0.289862
+          }
+        },
+        {
+          "pipeline_bound_timing": {
+            "active": 3,
+            "complete_split": false,
+            "sets": 8,
+            "weight_bytes": 451215360,
+            "control_ms": 0.148734,
+            "candidate_ms": 0.149984
+          }
+        },
+        {
+          "pipeline_bound_timing": {
+            "active": 3,
+            "complete_split": true,
+            "sets": 8,
+            "weight_bytes": 902430720,
+            "control_ms": 0.302901,
+            "candidate_ms": 0.304809
+          }
+        },
+        {
+          "pipeline_bound_timing": {
+            "active": 6,
+            "complete_split": false,
+            "sets": 8,
+            "weight_bytes": 902430720,
+            "control_ms": 0.233518,
+            "candidate_ms": 0.23348
+          }
+        },
+        {
+          "pipeline_bound_timing": {
+            "active": 6,
+            "complete_split": true,
+            "sets": 8,
+            "weight_bytes": 902430720,
+            "control_ms": 0.238729,
+            "candidate_ms": 0.238951
+          }
+        },
+        {
+          "pipeline_limit": {
+            "name": "moe_up",
+            "requested": 256,
+            "reported": 256,
+            "static_threadgroup_bytes": 128
+          }
+        },
+        {
+          "pipeline_limit": {
+            "name": "moe_down",
+            "requested": 192,
+            "reported": 192,
+            "static_threadgroup_bytes": 128
+          }
+        }
+      ],
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 6.0,
+            "renderer_percent": 5.0,
+            "gpu_resident_gib": 0.74,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 19,
+            "memory": {
+              "free_gib": 63.33050537109375,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 5.0,
+            "renderer_percent": 5.0,
+            "gpu_resident_gib": 0.58,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 19,
+            "memory": {
+              "free_gib": 63.38175964355469,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 6.0,
+            "renderer_percent": 6.0,
+            "gpu_resident_gib": 0.57,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 19,
+            "memory": {
+              "free_gib": 63.43608093261719,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          }
+        ]
+      }
+    },
+    {
+      "up_bound": 512,
+      "down_bound": 256,
+      "exit": 0,
+      "records": [
+        {
+          "pipeline_bound_checks": {
+            "passed": 769,
+            "total": 769,
+            "masks": 64
+          }
+        },
+        {
+          "pipeline_bound_timing": {
+            "active": 1,
+            "complete_split": false,
+            "sets": 8,
+            "weight_bytes": 150405120,
+            "control_ms": 0.068742,
+            "candidate_ms": 0.068578
+          }
+        },
+        {
+          "pipeline_bound_timing": {
+            "active": 1,
+            "complete_split": true,
+            "sets": 8,
+            "weight_bytes": 902430720,
+            "control_ms": 0.284654,
+            "candidate_ms": 0.281906
+          }
+        },
+        {
+          "pipeline_bound_timing": {
+            "active": 2,
+            "complete_split": false,
+            "sets": 8,
+            "weight_bytes": 300810240,
+            "control_ms": 0.110018,
+            "candidate_ms": 0.11093
+          }
+        },
+        {
+          "pipeline_bound_timing": {
+            "active": 2,
+            "complete_split": true,
+            "sets": 8,
+            "weight_bytes": 902430720,
+            "control_ms": 0.289094,
+            "candidate_ms": 0.288296
+          }
+        },
+        {
+          "pipeline_bound_timing": {
+            "active": 3,
+            "complete_split": false,
+            "sets": 8,
+            "weight_bytes": 451215360,
+            "control_ms": 0.149585,
+            "candidate_ms": 0.150665
+          }
+        },
+        {
+          "pipeline_bound_timing": {
+            "active": 3,
+            "complete_split": true,
+            "sets": 8,
+            "weight_bytes": 902430720,
+            "control_ms": 0.302768,
+            "candidate_ms": 0.305197
+          }
+        },
+        {
+          "pipeline_bound_timing": {
+            "active": 6,
+            "complete_split": false,
+            "sets": 8,
+            "weight_bytes": 902430720,
+            "control_ms": 0.231979,
+            "candidate_ms": 0.235725
+          }
+        },
+        {
+          "pipeline_bound_timing": {
+            "active": 6,
+            "complete_split": true,
+            "sets": 8,
+            "weight_bytes": 902430720,
+            "control_ms": 0.237441,
+            "candidate_ms": 0.241106
+          }
+        },
+        {
+          "pipeline_limit": {
+            "name": "moe_up",
+            "requested": 512,
+            "reported": 512,
+            "static_threadgroup_bytes": 128
+          }
+        },
+        {
+          "pipeline_limit": {
+            "name": "moe_down",
+            "requested": 256,
+            "reported": 256,
+            "static_threadgroup_bytes": 128
+          }
+        }
+      ],
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 97.0,
+            "renderer_percent": 29.0,
+            "gpu_resident_gib": 0.57,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 19,
+            "memory": {
+              "free_gib": 63.48823547363281,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 6.0,
+            "renderer_percent": 6.0,
+            "gpu_resident_gib": 0.57,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 19,
+            "memory": {
+              "free_gib": 63.48155212402344,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 6.0,
+            "renderer_percent": 6.0,
+            "gpu_resident_gib": 0.82,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 19,
+            "memory": {
+              "free_gib": 63.29267883300781,
+              "compressions": 0,
+              "swapouts": 0
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          }
+        ]
+      }
+    }
+  ]
+}

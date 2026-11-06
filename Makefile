@@ -4,7 +4,7 @@ CFLAGS = -std=c23 -O2 -Wall -Wextra -Wno-unused-parameter -Isrc/engine $(shell p
 LDLIBS = -framework Metal -framework Foundation -framework IOKit -framework ImageIO -framework CoreGraphics -framework Accelerate -lobjc \
          $(shell pkg-config --libs yyjson libjpeg)
 SRC = src/cli/main.c src/engine/model.c src/engine/io.c src/engine/gpu.c src/engine/tok.c src/engine/util.c src/engine/vision.c src/experimental/online_predictor.c src/experimental/context_lookup.c src/engine/sample.c
-MODEL_HEADERS = src/engine/myds4.h src/experimental/online_predictor_math.h src/experimental/context_lookup.h src/engine/expert_batch.h src/experimental/prefill_prune.h
+MODEL_HEADERS = src/engine/myds4.h src/experimental/online_predictor_math.h src/experimental/context_lookup.h src/engine/expert_batch.h src/experimental/prefill_prune.h src/experimental/urgent_io_diagnostic.h
 KERNELS = src/kernels/kernels.metal src/kernels/gguf_grids.metal src/kernels/gguf.metal src/kernels/vision.metal
 
 build/activation-format-check: tools/checks/activation_format_check.c tools/reference/activation_format.h
@@ -326,6 +326,74 @@ cache-memory-check: build/cache-memory-check
 	./build/cache-memory-check
 
 .PHONY: cache-memory-check
+
+build/myds4-io-diagnostic: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_IO_DIAGNOSTICS -o $@ $(SRC) $(LDLIBS)
+
+build/myds4-io-window%-diagnostic: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_IO_DIAGNOSTICS -DMYDS4_URGENT_WINDOW=$* -o $@ $(SRC) $(LDLIBS)
+
+build/myds4-early-promotion-diagnostic: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_IO_DIAGNOSTICS -DMYDS4_EARLY_DEMAND_PROMOTION -o $@ $(SRC) $(LDLIBS)
+
+build/myds4-early-promotion: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_EARLY_DEMAND_PROMOTION -o $@ $(SRC) $(LDLIBS)
+
+build/myds4-late-preencode: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_LATE_PREENCODE -o $@ $(SRC) $(LDLIBS)
+
+build/late-preencode-model-check: tools/checks/late_preencode_model_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) src/experimental/expert_compact.h src/experimental/expert_compact.metal data/engram.bin data/unicode.bin tools/checks/model_state_fixture.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_EXPERT_COMPACT -DMYDS4_LATE_PREENCODE -DMYDS4_LATE_PREENCODE_CHECK -o $@ tools/checks/late_preencode_model_check.c $(filter-out src/cli/main.c src/engine/model.c,$(SRC)) $(LDLIBS)
+
+build/myds4-io-window%: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_URGENT_WINDOW=$* -o $@ $(SRC) $(LDLIBS)
+
+build/urgent-window-check: tools/checks/urgent_window_check.c src/engine/io.c src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/urgent_window_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
+
+build/prefetch-promote-check: tools/checks/prefetch_promote_check.c src/engine/io.c src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_EARLY_DEMAND_PROMOTION -o $@ tools/checks/prefetch_promote_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
+
+build/expert-compact-check: tools/checks/expert_compact_check.c src/experimental/expert_compact.h src/experimental/expert_compact.metal src/engine/expert_batch.h tools/reference/activation_format.h src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS) $(KERNELS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/expert_compact_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
+
+build/myds4-expert-compact: $(SRC) $(MODEL_HEADERS) $(KERNELS) src/experimental/expert_compact.h src/experimental/expert_compact.metal data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_EXPERT_COMPACT -o $@ $(SRC) $(LDLIBS)
+
+build/expert-compact-model-check: tools/checks/expert_compact_model_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) src/experimental/expert_compact.h src/experimental/expert_compact.metal data/engram.bin data/unicode.bin tools/checks/model_state_fixture.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_EXPERT_COMPACT -o $@ tools/checks/expert_compact_model_check.c $(filter-out src/cli/main.c src/engine/model.c,$(SRC)) $(LDLIBS)
+
+build/expert-limit256-check: tools/checks/expert_compact_check.c src/experimental/expert_compact.h src/experimental/expert_compact.metal src/engine/expert_batch.h tools/reference/activation_format.h src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS) $(KERNELS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_PIPELINE_LIMIT=256 -DMYDS4_PIPELINE_DOWN_LIMIT=192 -o $@ tools/checks/expert_compact_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
+
+build/expert-limit512-check: tools/checks/expert_compact_check.c src/experimental/expert_compact.h src/experimental/expert_compact.metal src/engine/expert_batch.h tools/reference/activation_format.h src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS) $(KERNELS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_PIPELINE_LIMIT=512 -DMYDS4_PIPELINE_DOWN_LIMIT=256 -o $@ tools/checks/expert_compact_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
+
+build/myds4-limit256: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_PIPELINE_LIMIT=256 -DMYDS4_PIPELINE_DOWN_LIMIT=192 -o $@ $(SRC) $(LDLIBS)
+
+build/myds4-limit512: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_PIPELINE_LIMIT=512 -DMYDS4_PIPELINE_DOWN_LIMIT=256 -o $@ $(SRC) $(LDLIBS)
+
+build/prefetch-queue-diag-check: tools/checks/prefetch_queue_check.c src/engine/io.c src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -DMYDS4_IO_DIAGNOSTICS -o $@ tools/checks/prefetch_queue_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
 
 clean:
 	rm -rf build
