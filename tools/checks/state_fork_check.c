@@ -1,4 +1,5 @@
-// Fork a saved prefix with host buffers. No model weights or GPU are used.
+// Fork a state from a snapshot with host buffers, as the KV prefix cache
+// does. No model weights or GPU are used.
 #include "myds4.h"
 #include <stdlib.h>
 #include <string.h>
@@ -52,11 +53,24 @@ static State *make_state(int cap) {
   return s;
 }
 
-// Exercise the same saved-prefix operation used by the server.
-static void fork_prefix(State *dst, State *src, int positions) {
-  model_state_fork(dst, src, positions);
+// The bytes a state's buffers take, and its rewind copy's, if it has one.
+static size_t owned(const State *s) {
+  size_t n = s->saved ? saved_bytes() : 0;
+  for (int l = 0; l < LAYERS; l++) n += s->ring[l].size + s->cstate[l].size + s->comp[l].size + s->keys[l].size;
+  for (int d = 0; opt.draft && d < DRAFTS; d++) n += s->dring[d].size;
+  return n;
 }
 
+// The source's rolling rows (and history) set to `value`, as at some position.
+static void rolling_fill(State *src, unsigned char value) {
+  for (int l = 0; l < LAYERS; l++) memset(src->ring[l].ptr, value, src->ring[l].size);
+  memset(src->cstate[2].ptr, value, src->cstate[2].size);
+  for (int d = 0; opt.draft && d < DRAFTS; d++) memset(src->dring[d].ptr, value, src->dring[d].size);
+}
+
+// A fork as the server's KV cache makes it: a snapshot of the source at the
+// fork, the source going on past it, then the source's global rows before the
+// fork copied into another state and the snapshot restored there.
 static void run(int ratio, int positions, int large, int draft) {
   memset(L, 0, sizeof L);
   memset(D, 0, sizeof D);
@@ -67,19 +81,26 @@ static void run(int ratio, int positions, int large, int draft) {
   State *src = make_state(opt.ctx), *dst = make_state(start_cap());
   active = src;
   bind(src);
+  // What the server's KV prefix cache charges for a state (myds4_state_bytes).
+  expect("a state is charged the bytes it owns", model_state_bytes(src, src->cap) == owned(src));
+  State *fresh = make_state(grown(start_cap(), positions));
+  expect("a new state is charged what it will own", model_state_bytes(NULL, positions) == owned(fresh));
+  model_state_free(fresh);
+  rolling_fill(src, 0x42);
+  int32_t fork_history[3] = {11, 12, 13};
+  memcpy(history, fork_history, sizeof history);  // the state in use keeps its history in `history`
+  Snapshot *x = model_snapshot(src, positions, 0);
+  rolling_fill(src, 0x39);
   for (int i = 0; i < 3; i++) history[i] = src->history[i] = 70 + i;
-  for (int l = 0; l < LAYERS; l++) memset(src->ring[l].ptr, 0x39, src->ring[l].size);
   memset(src->comp[2].ptr, 0x31, src->comp[2].size);
   memset(src->keys[2].ptr, 0x32, src->keys[2].size);
   size_t saved = saved_bytes();
-  src->saved[0] = xmalloc(saved), src->saved[1] = xmalloc(saved), dst->saved[0] = xmalloc(saved);
-  memset(src->saved[0], 0x53, saved);
-  memset(src->saved[1], 0x42, saved);
-  memset(dst->saved[0], 0x67, saved);
-  int32_t prefix_history[3] = {11, 12, 13};
-  memcpy(src->saved[1] + saved - sizeof prefix_history, prefix_history, sizeof prefix_history);
+  dst->saved = xmalloc(saved);  // a rewind point of the destination's old rows
+  memset(dst->saved, 0x67, saved);
+  expect("a state is charged its rewind copy", model_state_bytes(dst, dst->cap) == owned(dst));
   pending = 1;
-  fork_prefix(dst, src, positions);
+  model_state_copy(dst, src, positions);
+  model_snapshot_restore(dst, x);
   size_t main_used = rows_bytes(2, positions, 0), keys_used = rows_bytes(2, positions, 1);
   expect("capacity follows the prefix, not the source allocation", dst->cap == grown(start_cap(), positions));
   expect("required global KV rows and guard row are copied", !memcmp(src->comp[2].ptr, dst->comp[2].ptr, main_used));
@@ -90,15 +111,15 @@ static void run(int ratio, int positions, int large, int draft) {
   for (int l = 0; l < LAYERS; l++) local &= filled(&dst->ring[l], 0, 0x42);
   local &= filled(&dst->cstate[2], 0, 0x42);
   for (int d = 0; opt.draft && d < DRAFTS; d++) local &= filled(&dst->dring[d], 0, 0x42);
-  expect("local and draft state comes from the saved prefix", local);
-  expect("prefix history is restored", !memcmp(dst->history, prefix_history, sizeof prefix_history));
-  expect("saved prefix remains available for later forks", dst->saved[1] && !memcmp(dst->saved[1], src->saved[1], saved));
-  expect("later prompt checkpoint is not inherited", dst->saved[0] == NULL);
+  expect("local and draft state comes from the snapshot, not the source as it is now", local);
+  expect("the snapshot's history is restored", !memcmp(dst->history, fork_history, sizeof fork_history));
+  expect("the destination's old rewind point is dropped", dst->saved == NULL);
   expect("active source and its state are unchanged", active == src && history[0] == 70 && filled(&src->ring[0], 0, 0x39));
   expect("submitted work completes before replacing buffers", !pending && !unsafe_frees);
   if (large)
     fprintf(stderr, "prefix copy: %zu required global bytes; %zu bytes in source capacity\n",
             main_used + keys_used, src->comp[2].size + src->keys[2].size);
+  model_snapshot_free(x);
   active = NULL;
   model_state_free(dst), model_state_free(src);
 }

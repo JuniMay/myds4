@@ -1,0 +1,379 @@
+{
+  "schema_version": 1,
+  "method": "read-drained alternating resident drafts",
+  "scope": "DSpark generation from a fixed checkpoint state; scalar versus shared expert kernels",
+  "excluded_attempts": [
+    {
+      "quant": "mxfp4",
+      "exit": 1,
+      "checks_and_timings": [
+        {
+          "draft_expert_check": {
+            "depth": 1,
+            "trim": 0,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 28
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 2,
+            "trim": 0,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 28
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 5,
+            "trim": 0,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 28
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 1,
+            "trim": 1,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 2,
+            "row_expert_pairs": 30,
+            "weight_groups": 20
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 2,
+            "trim": 1,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 36,
+            "weight_groups": 24
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 5,
+            "trim": 1,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 28
+          }
+        },
+        {
+          "draft_expert_timing": {
+            "depth": 2,
+            "trim": true,
+            "samples": 7,
+            "repeats": 8,
+            "control_wall_ms": 7.68225,
+            "candidate_wall_ms": 7.096375,
+            "control_gpu_ms": 6.659594,
+            "candidate_gpu_ms": 6.176448,
+            "control_expert_read_bytes": 253165568,
+            "candidate_expert_read_bytes": 0
+          }
+        },
+        {
+          "draft_expert_timing": {
+            "depth": 5,
+            "trim": true,
+            "samples": 7,
+            "repeats": 8,
+            "control_wall_ms": 9.7995,
+            "candidate_wall_ms": 9.19,
+            "control_gpu_ms": 8.840672,
+            "candidate_gpu_ms": 8.180656,
+            "control_expert_read_bytes": 0,
+            "candidate_expert_read_bytes": 0
+          }
+        }
+      ],
+      "background_cpu_peak": 0.0,
+      "gpu_activity": [
+        {
+          "elapsed_seconds": 2.096,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 26.7
+        }
+      ],
+      "timing_valid": false,
+      "timing_exclusion": "The resident timing fixture observed expert I/O after warm-up. Those samples are excluded; the numerical checks passed."
+    }
+  ],
+  "runs": [
+    {
+      "quant": "mxfp4",
+      "exit": 0,
+      "timing_valid": true,
+      "checks_and_timings": [
+        {
+          "draft_expert_check": {
+            "depth": 1,
+            "trim": 0,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 28
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 2,
+            "trim": 0,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 28
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 5,
+            "trim": 0,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 28
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 1,
+            "trim": 1,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 2,
+            "row_expert_pairs": 30,
+            "weight_groups": 20
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 2,
+            "trim": 1,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 36,
+            "weight_groups": 24
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 5,
+            "trim": 1,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 28
+          }
+        },
+        {
+          "draft_expert_timing": {
+            "depth": 2,
+            "trim": true,
+            "samples": 7,
+            "repeats": 8,
+            "control_wall_ms": 7.282125,
+            "candidate_wall_ms": 6.87775,
+            "control_gpu_ms": 6.317781,
+            "candidate_gpu_ms": 5.898172,
+            "control_expert_read_bytes": 0,
+            "candidate_expert_read_bytes": 0
+          }
+        },
+        {
+          "draft_expert_timing": {
+            "depth": 5,
+            "trim": true,
+            "samples": 7,
+            "repeats": 8,
+            "control_wall_ms": 9.63475,
+            "candidate_wall_ms": 9.03175,
+            "control_gpu_ms": 8.635698,
+            "candidate_gpu_ms": 8.031323,
+            "control_expert_read_bytes": 0,
+            "candidate_expert_read_bytes": 0
+          }
+        }
+      ],
+      "background_cpu_peak": 0.0,
+      "gpu_activity": [
+        {
+          "elapsed_seconds": 2.104,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 28.44
+        }
+      ]
+    },
+    {
+      "quant": "iq2",
+      "exit": 0,
+      "timing_valid": true,
+      "checks_and_timings": [
+        {
+          "draft_expert_check": {
+            "depth": 1,
+            "trim": 0,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 26
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 2,
+            "trim": 0,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 26
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 5,
+            "trim": 0,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 26
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 1,
+            "trim": 1,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 2,
+            "row_expert_pairs": 30,
+            "weight_groups": 19
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 2,
+            "trim": 1,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 36,
+            "weight_groups": 24
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 5,
+            "trim": 1,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 26
+          }
+        },
+        {
+          "draft_expert_timing": {
+            "depth": 2,
+            "trim": true,
+            "samples": 7,
+            "repeats": 8,
+            "control_wall_ms": 6.122875,
+            "candidate_wall_ms": 5.7765,
+            "control_gpu_ms": 5.153943,
+            "candidate_gpu_ms": 4.771557,
+            "control_expert_read_bytes": 0,
+            "candidate_expert_read_bytes": 0
+          }
+        },
+        {
+          "draft_expert_timing": {
+            "depth": 5,
+            "trim": true,
+            "samples": 7,
+            "repeats": 8,
+            "control_wall_ms": 8.089125,
+            "candidate_wall_ms": 7.45,
+            "control_gpu_ms": 7.07775,
+            "candidate_gpu_ms": 6.4755,
+            "control_expert_read_bytes": 0,
+            "candidate_expert_read_bytes": 0
+          }
+        }
+      ],
+      "background_cpu_peak": 0.0,
+      "gpu_activity": [
+        {
+          "elapsed_seconds": 2.104,
+          "model_gpu_client_visible": true,
+          "device_percent": 16.0,
+          "renderer_percent": 3.0,
+          "gpu_resident_gib": 30.44
+        }
+      ]
+    }
+  ]
+}

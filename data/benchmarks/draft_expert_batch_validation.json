@@ -1,0 +1,174 @@
+{
+  "schema_version": 1,
+  "scope": "DSpark expert sharing versus scalar experts; all requested logits, final residual streams and draft token ids",
+  "runs": [
+    {
+      "quant": "mxfp4",
+      "exit": 0,
+      "checks": [
+        {
+          "draft_expert_check": {
+            "depth": 1,
+            "trim": 0,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 28
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 2,
+            "trim": 0,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 28
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 5,
+            "trim": 0,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 28
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 1,
+            "trim": 1,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 2,
+            "row_expert_pairs": 30,
+            "weight_groups": 20
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 2,
+            "trim": 1,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 36,
+            "weight_groups": 24
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 5,
+            "trim": 1,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 28
+          }
+        }
+      ]
+    },
+    {
+      "quant": "iq2",
+      "exit": 0,
+      "checks": [
+        {
+          "draft_expert_check": {
+            "depth": 1,
+            "trim": 0,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 26
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 2,
+            "trim": 0,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 26
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 5,
+            "trim": 0,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 26
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 1,
+            "trim": 1,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 2,
+            "row_expert_pairs": 30,
+            "weight_groups": 19
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 2,
+            "trim": 1,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 36,
+            "weight_groups": 24
+          }
+        },
+        {
+          "draft_expert_check": {
+            "depth": 5,
+            "trim": 1,
+            "logit_bytes_different": 0,
+            "stream_bytes_different": 0,
+            "token_bytes_different": 0,
+            "nonfinite": 0,
+            "grouped_stages": 3,
+            "row_expert_pairs": 45,
+            "weight_groups": 26
+          }
+        }
+      ]
+    }
+  ]
+}

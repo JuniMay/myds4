@@ -76,7 +76,7 @@ def main():
     ap.add_argument("--expected-input-tokens", type=int, required=True)
     ap.add_argument("--q2", type=Path)
     ap.add_argument("--quant", choices=("mxfp4", "q2", "both"), default="mxfp4")
-    ap.add_argument("--phase", choices=("validate", "prefill", "joint-prefill", "ced-generation", "dspark", "all"), default="all")
+    ap.add_argument("--phase", choices=("validate", "prefill", "ced-generation", "dspark", "all"), default="all")
     ap.add_argument("--tokens", type=int, default=256)
     ap.add_argument("--cache", type=float, default=20)
     ap.add_argument("--reserve", type=float, default=4)
@@ -129,12 +129,6 @@ def main():
                  ("prefill-128", ["--bench", "0", "--compact", "--keep", "128"]),
                  ("prefill-512", ["--bench", "0", "--compact", "--keep", "512"]),
                  ("prefill-control-b", ["--bench", "0"])]
-    if args.phase == "joint-prefill":
-        plan += [("joint-split-control-a", ["--bench", "0", "--prefill-plan", "split"]),
-                 ("joint-off", ["--bench", "0", "--prefill-plan", "joint"]),
-                 ("joint-ced-128", ["--bench", "0", "--prefill-plan", "joint", "--ced", "128"]),
-                 ("joint-ced-512", ["--bench", "0", "--prefill-plan", "joint", "--ced", "512"]),
-                 ("joint-split-control-b", ["--bench", "0", "--prefill-plan", "split"])]
     if args.phase == "ced-generation":
         plan += [("ced-generation-control-a", ["--bench", str(args.tokens)]),
                  ("ced-generation-128", ["--bench", str(args.tokens), "--compact", "--keep", "128"]),
@@ -178,14 +172,6 @@ def main():
                 valid &= bench["cache_bytes_min"] == bench["cache_bytes_start"] == bench["cache_bytes_max"]
                 valid &= bench["slots_released"] == 0
                 valid &= abs(bench["cache_bytes_start"] / 1024**3 - args.cache) < 0.05
-                if name.startswith("joint-") and name != "joint-split-control-a":
-                    controls = [r["bench"] for r in matching() if r["name"] == "joint-split-control-a"]
-                    if not controls:
-                        raise ValueError("Missing split-prefill control")
-                    equal = bench["prefill_logits_sha256"] == controls[0]["prefill_logits_sha256"]
-                    bench["logits_match_split_prefill"] = equal
-                    if name in ("joint-off", "joint-split-control-b") and not equal:
-                        valid, error = False, "Joint or repeated split prefill changed logits"
                 if name in ("dspark-2", "dspark-control-b"):
                     controls = [r["bench"] for r in matching() if r["name"] == "dspark-control-a"]
                     if not controls:

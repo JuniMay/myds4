@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "busy prompt snapshot fork",
+      "exit": 0,
+      "output": "prefix=128 draft=2: logits=0 final_state=0 saved_prefix=0 resumed_logits=0 fork_logits=0 source_state=0 encoder_only=0\nprompt_snapshot=240 source_advanced=8: logits=0 local_state=0 system_snapshot=0 source_state=0 drafts=0\nprefill-prefix-check: differing_bytes_and_failed_conditions=0\n",
+      "error": null
+    }
+  ]
+}

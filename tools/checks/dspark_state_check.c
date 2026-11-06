@@ -15,7 +15,7 @@ int main(int argc, char **argv) {
   const float *lg = model_forward(tokens, n, 0);
   int rows[BLOCK + 1];
   rows[0] = sample_argmax(lg, VOCAB);
-  model_state_save(0);
+  model_state_save();
   size_t bytes = D[0].ring.size;
   void *expected = xmalloc((size_t)(BLOCK + 1) * DRAFTS * bytes);
   for (int r = 0; r <= BLOCK; r++) {
@@ -26,7 +26,7 @@ int main(int argc, char **argv) {
   }
   int failed = 0;
   for (int kept = 1; kept <= BLOCK + 1; kept++) {
-    model_state_restore(0);
+    model_state_restore();
     model_verify(rows, BLOCK + 1, n);
     model_accept(rows, kept, n);
     uint64_t different = 0;

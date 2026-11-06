@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "scope": "Full-model numerical and state checks; runtime below is diagnostic, not a throughput comparison",
+  "cases": [
+    {
+      "name": "layer-mxfp4",
+      "exit": 0,
+      "elapsed_seconds": 81.68,
+      "records": [
+        {
+          "prefill_prune_check": {
+            "rendered_input": false,
+            "prompt_tokens": 16521,
+            "prefix_tokens": 8192,
+            "decoder_tokens": 8329,
+            "decoder_row_layers": 94763,
+            "chunk_rows": 16384,
+            "chunks": 2,
+            "wide": 15,
+            "draft": 2,
+            "different_logit_bytes": 0,
+            "different_state_bytes": 0,
+            "different_prefix_bytes": 0,
+            "different_global_bytes": 0,
+            "different_continuation_bytes": 0,
+            "different_drafts": 0,
+            "different_resume_bytes": 0,
+            "encoder_only": 0
+          }
+        }
+      ],
+      "context": 65536
+    },
+    {
+      "name": "chunk32-mxfp4",
+      "exit": 0,
+      "elapsed_seconds": 161.29,
+      "records": [
+        {
+          "prefill_prune_check": {
+            "rendered_input": false,
+            "prompt_tokens": 32905,
+            "prefix_tokens": 12453,
+            "decoder_tokens": 10377,
+            "decoder_row_layers": 197163,
+            "chunk_rows": 32768,
+            "chunks": 2,
+            "wide": 15,
+            "draft": 2,
+            "different_logit_bytes": 0,
+            "different_state_bytes": 0,
+            "different_prefix_bytes": 0,
+            "different_global_bytes": 0,
+            "different_continuation_bytes": 0,
+            "different_drafts": 0,
+            "different_resume_bytes": 0,
+            "encoder_only": 0
+          }
+        }
+      ],
+      "context": 65536
+    },
+    {
+      "name": "layer-iq2",
+      "exit": 0,
+      "elapsed_seconds": 72.95,
+      "records": [
+        {
+          "prefill_prune_check": {
+            "rendered_input": false,
+            "prompt_tokens": 16521,
+            "prefix_tokens": 8192,
+            "decoder_tokens": 8329,
+            "decoder_row_layers": 94763,
+            "chunk_rows": 16384,
+            "chunks": 2,
+            "wide": 15,
+            "draft": 2,
+            "different_logit_bytes": 0,
+            "different_state_bytes": 0,
+            "different_prefix_bytes": 0,
+            "different_global_bytes": 0,
+            "different_continuation_bytes": 0,
+            "different_drafts": 0,
+            "different_resume_bytes": 0,
+            "encoder_only": 0
+          }
+        }
+      ],
+      "context": 65536
+    },
+    {
+      "name": "chunk32-iq2",
+      "exit": 0,
+      "elapsed_seconds": 153.03,
+      "records": [
+        {
+          "prefill_prune_check": {
+            "rendered_input": false,
+            "prompt_tokens": 32905,
+            "prefix_tokens": 12453,
+            "decoder_tokens": 10377,
+            "decoder_row_layers": 197163,
+            "chunk_rows": 32768,
+            "chunks": 2,
+            "wide": 15,
+            "draft": 2,
+            "different_logit_bytes": 0,
+            "different_state_bytes": 0,
+            "different_prefix_bytes": 0,
+            "different_global_bytes": 0,
+            "different_continuation_bytes": 0,
+            "different_drafts": 0,
+            "different_resume_bytes": 0,
+            "encoder_only": 0
+          }
+        }
+      ],
+      "context": 65536
+    }
+  ],
+  "notes": [
+    "CPU builds overlapped part of the final IQ2 correctness check; its elapsed time is not a performance measurement.",
+    "All four model checks compare against full prefill with 16K outer chunks."
+  ],
+  "cpu_dependency_check": {
+    "cases": 218880,
+    "pruned_cases": 177672,
+    "schedules": [
+      "fixed interval",
+      "layer-dependent interval"
+    ],
+    "passed": true
+  }
+}

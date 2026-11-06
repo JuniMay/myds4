@@ -9,12 +9,15 @@ static size_t bytes_differ(const void *a, const void *b, size_t count) {
 }
 
 int main(int argc, char **argv) {
-  if (argc < 2) die("usage: prefill-prune-model-check CHECKPOINT [--stdin|--long] [--prefix N] [--wide] [--resume] [--no-draft] [--gpu-route] [--experts GGUF]");
-  Options o = {.ctx = 32768, .budget_gb = 20, .reserve_gb = 4, .draft = 2, .draft_cache = 32,
+  if (argc < 2) die("usage: prefill-prune-model-check CHECKPOINT [--stdin|--long] [--tokens N] [--chunk32] [--index-only] [--prefix N] [--wide] [--resume] [--no-draft] [--gpu-route] [--experts GGUF]");
+  Options o = {.ctx = 131072, .budget_gb = 20, .reserve_gb = 4, .draft = 2, .draft_cache = 32,
                .draft_trim = 1, .expert_batch = 1, .quiet = 1, .dump_fd = -1, .routes_fd = -1};
-  int longer = 0, resume = 0, prefix = 1024, prefix_set = 0, input = 0;
+  int longer = 0, resume = 0, prefix = 1024, prefix_set = 0, input = 0, chunk32 = 0, count = 0, index_only = 0;
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--long")) longer = 1;
+    else if (!strcmp(argv[i], "--chunk32")) chunk32 = 1;
+    else if (!strcmp(argv[i], "--index-only")) index_only = 1;
+    else if (!strcmp(argv[i], "--tokens") && i + 1 < argc) count = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--prefix") && i + 1 < argc) prefix = atoi(argv[++i]), prefix_set = 1;
     else if (!strcmp(argv[i], "--stdin")) input = 1;
     else if (!strcmp(argv[i], "--wide")) o.lookup = 15;
@@ -24,9 +27,13 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--experts") && i + 1 < argc) o.experts = argv[++i];
     else die("invalid pruning check option");
   }
+#ifndef MYDS4_INDEX_PRUNE
+  if (index_only) die("--index-only needs the index-pruning check build");
+#endif
   alarm(600);
   tok_load(argv[1]);
-  int pattern[128], n = longer ? CHUNK + 137 : 8192;
+  int pattern[128], n = count ? count : longer ? 16384 + 137 : 8192;
+  if (n < 2 || n + 8 > o.ctx) die("invalid fixture token count");
   int *tokens = xmalloc((size_t)o.ctx * sizeof *tokens);
   if (input) {
     size_t limit = 512u << 10;
@@ -47,13 +54,19 @@ int main(int argc, char **argv) {
   }
   if (prefix < 1 || prefix >= n || n + 8 > o.ctx) die("invalid prefix or input length");
   model_load(argv[1], &o);
+#ifdef MYDS4_INDEX_PRUNE
+  K_index_score = gpu_kernel("index_score");
+  K_index_topk = gpu_kernel("index_topk");
+#endif
+  prefill_chunk = 16384;
   opt.prefill_prune = 0;
   float *reference = xmalloc(VOCAB * sizeof(float));
-  memcpy(reference, model_forward_prefix(tokens, n, 0, prefix, NULL), VOCAB * sizeof(float));
-  model_state_save(0);
+  Snapshot *captured_reference = 0, *captured = 0;  // the rolling rows at prefix, taken during each prefill
+  memcpy(reference, model_prefill(tokens, n, 0, 0, prefix, &captured_reference), VOCAB * sizeof(float));
+  model_state_save();
   size_t state_size = saved_bytes();
-  uint8_t *state = xmalloc(state_size), *saved = xmalloc(state_size);
-  memcpy(state, active->saved[0], state_size), memcpy(saved, active->saved[1], state_size);
+  uint8_t *state = xmalloc(state_size);
+  memcpy(state, active->saved, state_size);
   uint8_t *globals[LAYERS][2] = {{0}};
   size_t sizes[LAYERS][2] = {{0}};
   for (int l = 0; l < LAYERS; l++) if (L[l].kv_source)
@@ -75,15 +88,31 @@ int main(int argc, char **argv) {
     memcpy(future + (size_t)i * VOCAB, lg, VOCAB * sizeof(float));
   }
   model_reset();
-  opt.prefill_prune = 1;
-  int encoder_only = -1;
-  lg = model_forward_prefix(tokens, n, 0, prefix, &encoder_only);
+  opt.prefill_prune = !index_only;
+#ifdef MYDS4_INDEX_PRUNE
+  K_index_score = gpu_kernel("index_score_pruned");
+#if MYDS4_INDEX_PRUNE >= 2
+  K_index_topk = gpu_kernel("index_topk_masked");
+#endif
+#endif
+  prefill_chunk = chunk32 ? 32768 : 16384;
+  lg = model_prefill(tokens, n, 0, 0, prefix, &captured);
+  int encoder_only = model_snapshot_extent(captured) != LAYERS - 1;
   ModelForwardInfo info = model_forward_info();
+  int candidates = n, index_mode = 0;
+#ifdef MYDS4_INDEX_PRUNE
+  index_mode = MYDS4_INDEX_PRUNE;
+#endif
+  if (n > CAND_TOP * 8) {
+    const uint32_t *bits = (const uint32_t *)CAND.ptr + (size_t)((n - 1) % prefill_chunk) * cand_words;
+    candidates = 0;
+    for (int i = 0; i < n; i++) candidates += (bits[i >> 8] >> ((i >> 3) & 31)) & 1;
+  }
   size_t logit_diff = bytes_differ(reference, lg, VOCAB * sizeof(float));
   for (int i = 0; i < VOCAB; i++) logit_diff += !isfinite(reference[i]) || !isfinite(lg[i]);
-  model_state_save(0);
-  size_t state_diff = bytes_differ(state, active->saved[0], state_size);
-  size_t prefix_diff = bytes_differ(saved, active->saved[1], state_size), global_diff = 0;
+  model_state_save();
+  size_t state_diff = bytes_differ(state, active->saved, state_size);
+  size_t prefix_diff = bytes_differ(captured_reference->rows, captured->rows, state_size), global_diff = 0;
   for (int l = 0; l < LAYERS; l++) if (L[l].kv_source)
     for (int k = 0; k < 2; k++) {
       Buf *b = k ? &L[l].keys : &L[l].comp;
@@ -96,20 +125,35 @@ int main(int argc, char **argv) {
   for (int i = 0; i < STEPS; i++)
     continuation_diff += bytes_differ(future + (size_t)i * VOCAB, model_forward(continuation + i, 1, n + i), VOCAB * sizeof(float));
   size_t resume_diff = 0;
-  if (resume) {
+  if (resume) {  // the state's rows before prefix are the same; its rolling rows come from each capture
     opt.prefill_prune = 0;
-    model_state_restore(1), model_seek(tokens, prefix);
-    memcpy(reference, model_forward(tokens + prefix, n - prefix, prefix), VOCAB * sizeof(float));
-    opt.prefill_prune = 1;
-    model_state_restore(1), model_seek(tokens, prefix);
-    resume_diff = bytes_differ(reference, model_forward(tokens + prefix, n - prefix, prefix), VOCAB * sizeof(float));
+#ifdef MYDS4_INDEX_PRUNE
+    K_index_score = gpu_kernel("index_score");
+    K_index_topk = gpu_kernel("index_topk");
+#endif
+    prefill_chunk = 16384;
+    model_snapshot_restore(active, captured_reference);
+    memcpy(reference, model_prefill(tokens, n, prefix, 0, -1, 0), VOCAB * sizeof(float));
+    opt.prefill_prune = !index_only;
+#ifdef MYDS4_INDEX_PRUNE
+    K_index_score = gpu_kernel("index_score_pruned");
+#if MYDS4_INDEX_PRUNE >= 2
+    K_index_topk = gpu_kernel("index_topk_masked");
+#endif
+#endif
+    prefill_chunk = chunk32 ? 32768 : 16384;
+    model_snapshot_restore(active, captured);
+    resume_diff = bytes_differ(reference, model_prefill(tokens, n, prefix, 0, -1, 0), VOCAB * sizeof(float));
   }
-  printf("{\"prefill_prune_check\":{\"rendered_input\":%s,\"prompt_tokens\":%d,\"prefix_tokens\":%d,\"decoder_tokens\":%d,"
+  model_snapshot_free(captured_reference), model_snapshot_free(captured);
+  printf("{\"prefill_prune_check\":{\"rendered_input\":%s,\"index_only\":%s,\"index_mode\":%d,\"last_query_candidates\":%d,\"context\":%d,\"prompt_tokens\":%d,\"prefix_tokens\":%d,\"decoder_tokens\":%d,\"decoder_row_layers\":%d,\"chunk_rows\":%d,"
          "\"chunks\":%d,\"wide\":%d,\"draft\":%d,\"different_logit_bytes\":%zu,\"different_state_bytes\":%zu,"
          "\"different_prefix_bytes\":%zu,\"different_global_bytes\":%zu,\"different_continuation_bytes\":%zu,"
          "\"different_drafts\":%d,\"different_resume_bytes\":%zu,\"encoder_only\":%d}}\n",
-         input ? "true" : "false", n, prefix, info.decoder_tokens, info.chunks, o.lookup, o.draft, logit_diff, state_diff,
+         input ? "true" : "false", index_only ? "true" : "false", index_mode, candidates, o.ctx, n, prefix,
+         info.decoder_tokens, info.decoder_row_layers, prefill_chunk,
+         info.chunks, o.lookup, o.draft, logit_diff, state_diff,
          prefix_diff, global_diff, continuation_diff, draft_diff, resume_diff, encoder_only);
   return logit_diff || state_diff || prefix_diff || global_diff || continuation_diff || draft_diff || resume_diff ||
-         encoder_only != 0 || !info.prune_applied || info.decoder_tokens >= n;
+         encoder_only != 0 || (!index_only && (!info.prune_applied || info.decoder_tokens >= n));
 }

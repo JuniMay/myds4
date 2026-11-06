@@ -1,0 +1,315 @@
+{
+  "schema_version": 1,
+  "scope": "Real model numerical comparison with one selected expert per wave; no timing claim.",
+  "binary_sha256": "d68b6315ee72ed3479014658dbf61275a24a25b1979908ad672e18eeef7c0561",
+  "runs": [
+    {
+      "date_utc": "2026-11-06T02:03:47.908071+00:00",
+      "quant": "mxfp4",
+      "long": false,
+      "valid": true,
+      "exit": 0,
+      "checks": [
+        {
+          "quant": "mxfp4",
+          "prompt_tokens": 257,
+          "steps": 8,
+          "layers": 320,
+          "batches": 1920,
+          "logit_bytes_differ": 0,
+          "local_bytes_differ": 0,
+          "global_bytes_differ": 0,
+          "nonfinite": 0
+        }
+      ],
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 13.0,
+            "renderer_percent": 5.0,
+            "gpu_resident_gib": 1.38,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 38,
+            "memory": {
+              "free_gib": 41.81944274902344,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 23.0,
+            "renderer_percent": 19.0,
+            "gpu_resident_gib": 1.45,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 38,
+            "memory": {
+              "free_gib": 41.82017517089844,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 35.0,
+            "renderer_percent": 31.0,
+            "gpu_resident_gib": 1.75,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 38,
+            "memory": {
+              "free_gib": 41.69172668457031,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          }
+        ]
+      },
+      "background_cpu_peak": 0.0
+    },
+    {
+      "date_utc": "2026-11-06T02:04:22.686998+00:00",
+      "quant": "mxfp4",
+      "long": true,
+      "valid": true,
+      "exit": 0,
+      "checks": [
+        {
+          "quant": "mxfp4",
+          "prompt_tokens": 16521,
+          "steps": 8,
+          "layers": 320,
+          "batches": 1920,
+          "logit_bytes_differ": 0,
+          "local_bytes_differ": 0,
+          "global_bytes_differ": 0,
+          "nonfinite": 0
+        }
+      ],
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 0.0,
+            "renderer_percent": 0.0,
+            "gpu_resident_gib": 1.46,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 38,
+            "memory": {
+              "free_gib": 41.762969970703125,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 0.0,
+            "renderer_percent": 0.0,
+            "gpu_resident_gib": 1.47,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 38,
+            "memory": {
+              "free_gib": 41.77528381347656,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 12.0,
+            "renderer_percent": 5.0,
+            "gpu_resident_gib": 1.46,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 38,
+            "memory": {
+              "free_gib": 41.78082275390625,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          }
+        ]
+      },
+      "background_cpu_peak": 0.0
+    },
+    {
+      "date_utc": "2026-11-06T02:04:33.566844+00:00",
+      "quant": "iq2",
+      "long": false,
+      "valid": true,
+      "exit": 0,
+      "checks": [
+        {
+          "quant": "iq2",
+          "prompt_tokens": 257,
+          "steps": 8,
+          "layers": 320,
+          "batches": 1920,
+          "logit_bytes_differ": 0,
+          "local_bytes_differ": 0,
+          "global_bytes_differ": 0,
+          "nonfinite": 0
+        }
+      ],
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 95.0,
+            "renderer_percent": 54.0,
+            "gpu_resident_gib": 1.45,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 38,
+            "memory": {
+              "free_gib": 41.942596435546875,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 0.0,
+            "renderer_percent": 0.0,
+            "gpu_resident_gib": 1.45,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 38,
+            "memory": {
+              "free_gib": 41.94108581542969,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 12.0,
+            "renderer_percent": 5.0,
+            "gpu_resident_gib": 1.49,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 38,
+            "memory": {
+              "free_gib": 41.95240783691406,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          }
+        ]
+      },
+      "background_cpu_peak": 0.0
+    },
+    {
+      "date_utc": "2026-11-06T02:05:05.735923+00:00",
+      "quant": "iq2",
+      "long": true,
+      "valid": true,
+      "exit": 0,
+      "checks": [
+        {
+          "quant": "iq2",
+          "prompt_tokens": 16521,
+          "steps": 8,
+          "layers": 320,
+          "batches": 1920,
+          "logit_bytes_differ": 0,
+          "local_bytes_differ": 0,
+          "global_bytes_differ": 0,
+          "nonfinite": 0
+        }
+      ],
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 74.0,
+            "renderer_percent": 6.0,
+            "gpu_resident_gib": 1.45,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 38,
+            "memory": {
+              "free_gib": 41.94499206542969,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 13.0,
+            "renderer_percent": 5.0,
+            "gpu_resident_gib": 1.45,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 38,
+            "memory": {
+              "free_gib": 41.942779541015625,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 14.0,
+            "renderer_percent": 5.0,
+            "gpu_resident_gib": 1.45,
+            "desktop_load": true,
+            "reserve_gib": 4,
+            "required_free_gib": 38,
+            "memory": {
+              "free_gib": 41.94432067871094,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          }
+        ]
+      },
+      "background_cpu_peak": 0.0
+    }
+  ]
+}

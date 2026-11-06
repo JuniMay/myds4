@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "scope": "Spin-waiting causal scheduler; sampling and rollback compared with serial inference",
+  "runs": [
+    {
+      "quant": "mxfp4",
+      "prompt_tokens": 257,
+      "exit": 0,
+      "checks": [
+        {
+          "early_verify_check": {
+            "accepted": 0,
+            "sampling_mismatch": 0,
+            "different_logits": 0,
+            "different_continuation_logits": 0,
+            "different_drafts": 0,
+            "cancelled_rows": 15,
+            "skipped_expert_row_layers": 563
+          }
+        },
+        {
+          "early_verify_check": {
+            "accepted": 1,
+            "sampling_mismatch": 0,
+            "different_logits": 0,
+            "different_continuation_logits": 0,
+            "different_drafts": 0,
+            "cancelled_rows": 14,
+            "skipped_expert_row_layers": 547
+          }
+        },
+        {
+          "early_verify_check": {
+            "accepted": 2,
+            "sampling_mismatch": 0,
+            "different_logits": 0,
+            "different_continuation_logits": 0,
+            "different_drafts": 0,
+            "cancelled_rows": 13,
+            "skipped_expert_row_layers": 508
+          }
+        },
+        {
+          "early_verify_check": {
+            "accepted": 5,
+            "sampling_mismatch": 0,
+            "different_logits": 0,
+            "different_continuation_logits": 0,
+            "different_drafts": 0,
+            "cancelled_rows": 10,
+            "skipped_expert_row_layers": 348
+          }
+        },
+        {
+          "early_verify_check": {
+            "accepted": 14,
+            "sampling_mismatch": 0,
+            "different_logits": 0,
+            "different_continuation_logits": 0,
+            "different_drafts": 0,
+            "cancelled_rows": 1,
+            "skipped_expert_row_layers": 23
+          }
+        },
+        {
+          "early_verify_check": {
+            "accepted": 15,
+            "sampling_mismatch": 0,
+            "different_logits": 0,
+            "different_continuation_logits": 0,
+            "different_drafts": 0,
+            "cancelled_rows": 0,
+            "skipped_expert_row_layers": 0
+          }
+        },
+        {
+          "early_verify_total": {
+            "cancelled_rows": 53,
+            "skipped_expert_row_layers": 1989,
+            "failures": 0
+          }
+        }
+      ]
+    },
+    {
+      "quant": "iq2",
+      "prompt_tokens": 257,
+      "exit": 0,
+      "checks": [
+        {
+          "early_verify_check": {
+            "accepted": 0,
+            "sampling_mismatch": 0,
+            "different_logits": 0,
+            "different_continuation_logits": 0,
+            "different_drafts": 0,
+            "cancelled_rows": 15,
+            "skipped_expert_row_layers": 585
+          }
+        },
+        {
+          "early_verify_check": {
+            "accepted": 1,
+            "sampling_mismatch": 0,
+            "different_logits": 0,
+            "different_continuation_logits": 0,
+            "different_drafts": 0,
+            "cancelled_rows": 14,
+            "skipped_expert_row_layers": 547
+          }
+        },
+        {
+          "early_verify_check": {
+            "accepted": 2,
+            "sampling_mismatch": 0,
+            "different_logits": 0,
+            "different_continuation_logits": 0,
+            "different_drafts": 0,
+            "cancelled_rows": 13,
+            "skipped_expert_row_layers": 507
+          }
+        },
+        {
+          "early_verify_check": {
+            "accepted": 5,
+            "sampling_mismatch": 0,
+            "different_logits": 0,
+            "different_continuation_logits": 0,
+            "different_drafts": 0,
+            "cancelled_rows": 10,
+            "skipped_expert_row_layers": 390
+          }
+        },
+        {
+          "early_verify_check": {
+            "accepted": 14,
+            "sampling_mismatch": 0,
+            "different_logits": 0,
+            "different_continuation_logits": 0,
+            "different_drafts": 0,
+            "cancelled_rows": 1,
+            "skipped_expert_row_layers": 38
+          }
+        },
+        {
+          "early_verify_check": {
+            "accepted": 15,
+            "sampling_mismatch": 0,
+            "different_logits": 0,
+            "different_continuation_logits": 0,
+            "different_drafts": 0,
+            "cancelled_rows": 0,
+            "skipped_expert_row_layers": 0
+          }
+        },
+        {
+          "early_verify_total": {
+            "cancelled_rows": 53,
+            "skipped_expert_row_layers": 2067,
+            "failures": 0
+          }
+        }
+      ]
+    }
+  ]
+}

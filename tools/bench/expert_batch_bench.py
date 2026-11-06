@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import resource
 import shlex
 import subprocess
 import time
@@ -139,6 +140,11 @@ def persist(path, data, record):
         path.write_text(text)
 
 
+def draft_count(args, role):
+    override = getattr(args, role + "_draft", None)
+    return args.draft if override is None else override
+
+
 def run(args, role, prompt, settings, expected, env):
     binary = args.control if role == "control" else args.candidate
     if hashlib.sha256(binary.read_bytes()).hexdigest() != settings[role + "_binary_sha256"]:
@@ -147,17 +153,20 @@ def run(args, role, prompt, settings, expected, env):
     _idle(binary, env)
     command = [str(binary), "-m", str(args.checkpoint), "-p", prompt, "--ctx", str(args.context),
                "--cache", str(args.cache), "--reserve", str(args.reserve), "-n", str(args.tokens), "--temperature", "1", "--top-p", "1",
-               "--seed", "12345"]
+               "--seed", str(getattr(args, "seed", 12345))]
     command += ["--rendered"] if args.harness_session else ["--think", "75"]
-    if args.draft:
-        command += ["--draft", str(args.draft), "--draft-cache", "32", "--draft-trim"]
+    drafts = draft_count(args, role)
+    if drafts:
+        command += ["--draft", str(drafts), "--draft-cache", "32", "--draft-trim"]
     command += shlex.split(args.control_args if role == "control" else args.candidate_args)
     if args.quant == "iq2":
         command += ["--experts", str(args.iq2)]
     print("EXPERT_BATCH_START " + json.dumps({"role": role, **settings}), flush=True)
     began = time.monotonic()
+    cpu_before = resource.getrusage(resource.RUSAGE_CHILDREN)
     p = guarded_process(command, env, args.timeout, guard["samples"][-1]["memory"], observe_graphics=True,
                         allow_cpu_helpers=args.desktop, abort_cpu_contention=True)
+    cpu_after = resource.getrusage(resource.RUSAGE_CHILDREN)
     if max(len(p.stdout), len(p.stderr)) > 256 * 1024:
         raise RuntimeError("model output exceeded its bound")
     stderr = p.stderr.decode(errors="replace")
@@ -183,9 +192,18 @@ def run(args, role, prompt, settings, expected, env):
              cache.get("min_bytes") == cache.get("max_bytes") and (expected is None or digest == expected))
     if args.kind == "expert_batch" and role == "candidate" and not (grouping and grouping.get("calls", 0)):
         valid = False
+    if args.kind == "expert_waves" and role == "candidate":
+        waves = metrics.get("expert_waves", {})
+        if not waves.get("layers") or waves.get("batches", 0) <= waves["layers"]:
+            valid = False
     if args.kind == "expert_compact" and role == "candidate":
         compact = metrics.get("expert_compact", {})
         if not compact.get("batches") or not 0 < compact.get("active_experts", 0) <= compact["batches"] * 6:
+            valid = False
+    if args.kind == "prefetch_pool" and role == "candidate":
+        pool = metrics.get("prefetch_pool", {})
+        if (pool.get("limit") not in (4, 8) or not pool.get("admissions") or not pool.get("promotions") or
+                not 0 <= pool.get("members", -1) <= pool.get("peak_members", -1) <= pool["limit"]):
             valid = False
     if copy_exact is False:
         valid = False
@@ -206,6 +224,11 @@ def run(args, role, prompt, settings, expected, env):
         "gpu_activity_during_run": p.gpu_activity_samples,
         "background_cpu_helpers": p.background_cpu_helpers,
         "background_cpu_peak": p.background_cpu_peak,
+        "child_cpu_seconds": {
+            "user": round(cpu_after.ru_utime - cpu_before.ru_utime, 6),
+            "system": round(cpu_after.ru_stime - cpu_before.ru_stime, 6),
+            "scope": "full model run plus diagnostic helper subprocesses; includes startup and prefill",
+        },
         "timing_environment": "recorded desktop load; GPU not isolated" if args.desktop else "quiet GPU admission",
         "details": [line for line in stderr.replace("\r", "\n").splitlines()
                     if line.startswith(("decode per token", "decode reads per token", "cache:", "expert cache:"))],
@@ -219,7 +242,7 @@ def main():
     ap.add_argument("--checkpoint", type=Path, required=True)
     ap.add_argument("--iq2", type=Path)
     ap.add_argument("--quant", choices=("mxfp4", "iq2"), default="mxfp4")
-    ap.add_argument("--kind", choices=("expert_compact", "expert_batch", "memory", "representation", "lookup", "draft", "prefill", "cache"), default="expert_batch")
+    ap.add_argument("--kind", choices=("expert_batch", "expert_waves", "expert_compact", "prefetch_pool", "memory", "representation", "lookup", "draft", "prefill", "cache"), default="expert_batch")
     ap.add_argument("--control", type=Path, default=ROOT / "build/myds4")
     ap.add_argument("--candidate", type=Path, default=ROOT / "build/myds4-expert-batch")
     ap.add_argument("--control-args", default="", help="additional engine arguments, parsed without a shell")
@@ -236,6 +259,8 @@ def main():
     ap.add_argument("--desktop", action="store_true",
                     help="record ordinary desktop activity; still exclude other model/GPU jobs and large compute jobs")
     ap.add_argument("--draft", type=int, choices=range(6), default=2)
+    ap.add_argument("--control-draft", type=int, choices=range(6), help="override --draft for the control")
+    ap.add_argument("--candidate-draft", type=int, choices=range(6), help="override --draft for the candidate")
     ap.add_argument("--order", nargs="+", choices=("control", "candidate"), default=["control", "candidate", "control"])
     ap.add_argument("--results", type=Path)
     ap.add_argument("--describe", action="store_true", help="count the prompt without loading the model")
@@ -244,7 +269,7 @@ def main():
     args = ap.parse_args()
     SOURCE_REVISION = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     if not (4096 <= args.input_tokens <= 114688 and 256 <= args.tokens <= 8192 and
-            args.input_tokens + args.tokens <= args.context <= 131072 and 20 <= args.cache <= 80 and 4 <= args.reserve <= 16 and
+            args.input_tokens + args.tokens <= args.context <= 131072 and 16 <= args.cache <= 80 and 4 <= args.reserve <= 16 and
             5 <= args.gpu_wait <= 600 and 60 <= args.timeout <= 1800 and len(args.order) <= 6):
         ap.error("study configuration exceeds its limits")
     if args.quant == "iq2" and args.iq2 is None:
@@ -269,6 +294,11 @@ def main():
                 "temperature": 1, "top_p": 1, "seed": 12345,
                 "think": args.harness_think if args.harness_session else 75, "draft": args.draft,
                 "draft_cache": 32 if args.draft else 0, "draft_trim": bool(args.draft), "online_predictor": False, "substitute": False}
+    if args.control_draft is not None or args.candidate_draft is not None:
+        by_role = {role: draft_count(args, role) for role in ("control", "candidate")}
+        settings.update(draft=None, draft_cache=None, draft_trim=None, draft_by_role=by_role,
+                        draft_cache_by_role={role: 32 if n else 0 for role, n in by_role.items()},
+                        draft_trim_by_role={role: bool(n) for role, n in by_role.items()})
     if args.harness_session:
         settings.update(harness_session=args.harness_session.parent.name, before_seq=args.before_seq,
                         prompt_mode="reconstructed Harness request; recorded tool calls are not executed")

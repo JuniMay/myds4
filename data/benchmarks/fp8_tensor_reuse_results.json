@@ -1,0 +1,358 @@
+{
+  "schema_version": 1,
+  "scope": "Synthetic dense GEMM with input conversion included; existing BF16-staged GEMM control, not the SIMD decode path",
+  "runs": [
+    {
+      "mode": "fp8-128",
+      "exit": 1,
+      "records": [
+        {
+          "fp8_tensor": {
+            "variant": "fp8-128",
+            "m": 1,
+            "n": 32768,
+            "k": 1280,
+            "bf16_output": 0,
+            "packing_differences": 0,
+            "output_differences": 28437,
+            "nonfinite": 0,
+            "extra_scale_bytes": 1269760,
+            "maximum_finite_error": 2.67028809e-05,
+            "snr_db": 130.1266,
+            "control_ms": 0.161443,
+            "candidate_ms": 0.191766
+          }
+        },
+        {
+          "fp8_tensor": {
+            "variant": "fp8-128",
+            "m": 1,
+            "n": 32768,
+            "k": 1280,
+            "bf16_output": 1,
+            "packing_differences": 0,
+            "output_differences": 6,
+            "nonfinite": 0,
+            "extra_scale_bytes": 1269760,
+            "maximum_finite_error": 0.0625,
+            "snr_db": 84.0675,
+            "control_ms": 0.161198,
+            "candidate_ms": 0.192156
+          }
+        },
+        {
+          "fp8_tensor": {
+            "variant": "fp8-128",
+            "m": 6,
+            "n": 32768,
+            "k": 1280,
+            "bf16_output": 0,
+            "packing_differences": 0,
+            "output_differences": 170646,
+            "nonfinite": 0,
+            "extra_scale_bytes": 1269760,
+            "maximum_finite_error": 2.86102295e-05,
+            "snr_db": 130.1838,
+            "control_ms": 0.165401,
+            "candidate_ms": 0.192484
+          }
+        },
+        {
+          "fp8_tensor": {
+            "variant": "fp8-128",
+            "m": 6,
+            "n": 32768,
+            "k": 1280,
+            "bf16_output": 1,
+            "packing_differences": 0,
+            "output_differences": 39,
+            "nonfinite": 0,
+            "extra_scale_bytes": 1269760,
+            "maximum_finite_error": 0.0625,
+            "snr_db": 88.049,
+            "control_ms": 0.163766,
+            "candidate_ms": 0.192495
+          }
+        },
+        {
+          "fp8_tensor": {
+            "variant": "fp8-128",
+            "m": 128,
+            "n": 5120,
+            "k": 8192,
+            "bf16_output": 0,
+            "packing_differences": 0,
+            "output_differences": 628217,
+            "nonfinite": 0,
+            "extra_scale_bytes": 1269760,
+            "maximum_finite_error": 0.000179290771,
+            "snr_db": 121.6368,
+            "control_ms": 0.390042,
+            "candidate_ms": 0.554781
+          }
+        },
+        {
+          "fp8_tensor": {
+            "variant": "fp8-128",
+            "m": 128,
+            "n": 5120,
+            "k": 8192,
+            "bf16_output": 1,
+            "packing_differences": 0,
+            "output_differences": 403,
+            "nonfinite": 0,
+            "extra_scale_bytes": 1269760,
+            "maximum_finite_error": 0.25,
+            "snr_db": 84.2588,
+            "control_ms": 0.389266,
+            "candidate_ms": 0.554057
+          }
+        },
+        {
+          "fp8_tensor": {
+            "variant": "fp8-128",
+            "m": 2048,
+            "n": 2304,
+            "k": 5120,
+            "bf16_output": 0,
+            "packing_differences": 0,
+            "output_differences": 4463690,
+            "nonfinite": 0,
+            "extra_scale_bytes": 357120,
+            "maximum_finite_error": 0.000150680542,
+            "snr_db": 123.8285,
+            "control_ms": 1.175542,
+            "candidate_ms": 1.763312
+          }
+        },
+        {
+          "fp8_tensor": {
+            "variant": "fp8-128",
+            "m": 2048,
+            "n": 2304,
+            "k": 5120,
+            "bf16_output": 1,
+            "packing_differences": 0,
+            "output_differences": 2018,
+            "nonfinite": 0,
+            "extra_scale_bytes": 357120,
+            "maximum_finite_error": 0.25,
+            "snr_db": 85.2854,
+            "control_ms": 1.172417,
+            "candidate_ms": 1.769625
+          }
+        },
+        {
+          "fp8_tensor": {
+            "variant": "fp8-128",
+            "m": 2048,
+            "n": 5120,
+            "k": 8192,
+            "bf16_output": 0,
+            "packing_differences": 0,
+            "output_differences": 10046942,
+            "nonfinite": 0,
+            "extra_scale_bytes": 1269760,
+            "maximum_finite_error": 0.000198364258,
+            "snr_db": 121.6619,
+            "control_ms": 3.8195,
+            "candidate_ms": 5.84525
+          }
+        },
+        {
+          "fp8_tensor": {
+            "variant": "fp8-128",
+            "m": 2048,
+            "n": 5120,
+            "k": 8192,
+            "bf16_output": 1,
+            "packing_differences": 0,
+            "output_differences": 5827,
+            "nonfinite": 0,
+            "extra_scale_bytes": 1269760,
+            "maximum_finite_error": 0.25,
+            "snr_db": 84.3111,
+            "control_ms": 3.830562,
+            "candidate_ms": 5.87575
+          }
+        }
+      ]
+    },
+    {
+      "mode": "half-128",
+      "exit": 1,
+      "records": [
+        {
+          "fp8_tensor": {
+            "variant": "half-128",
+            "m": 1,
+            "n": 32768,
+            "k": 1280,
+            "bf16_output": 0,
+            "packing_differences": 0,
+            "output_differences": 28437,
+            "nonfinite": 0,
+            "extra_scale_bytes": 1269760,
+            "maximum_finite_error": 2.67028809e-05,
+            "snr_db": 130.1266,
+            "control_ms": 0.196182,
+            "candidate_ms": 0.158964
+          }
+        },
+        {
+          "fp8_tensor": {
+            "variant": "half-128",
+            "m": 1,
+            "n": 32768,
+            "k": 1280,
+            "bf16_output": 1,
+            "packing_differences": 0,
+            "output_differences": 6,
+            "nonfinite": 0,
+            "extra_scale_bytes": 1269760,
+            "maximum_finite_error": 0.0625,
+            "snr_db": 84.0675,
+            "control_ms": 0.162875,
+            "candidate_ms": 0.159818
+          }
+        },
+        {
+          "fp8_tensor": {
+            "variant": "half-128",
+            "m": 6,
+            "n": 32768,
+            "k": 1280,
+            "bf16_output": 0,
+            "packing_differences": 0,
+            "output_differences": 170646,
+            "nonfinite": 0,
+            "extra_scale_bytes": 1269760,
+            "maximum_finite_error": 2.86102295e-05,
+            "snr_db": 130.1838,
+            "control_ms": 0.164078,
+            "candidate_ms": 0.159776
+          }
+        },
+        {
+          "fp8_tensor": {
+            "variant": "half-128",
+            "m": 6,
+            "n": 32768,
+            "k": 1280,
+            "bf16_output": 1,
+            "packing_differences": 0,
+            "output_differences": 39,
+            "nonfinite": 0,
+            "extra_scale_bytes": 1269760,
+            "maximum_finite_error": 0.0625,
+            "snr_db": 88.049,
+            "control_ms": 0.165016,
+            "candidate_ms": 0.16025
+          }
+        },
+        {
+          "fp8_tensor": {
+            "variant": "half-128",
+            "m": 128,
+            "n": 5120,
+            "k": 8192,
+            "bf16_output": 0,
+            "packing_differences": 0,
+            "output_differences": 628217,
+            "nonfinite": 0,
+            "extra_scale_bytes": 1269760,
+            "maximum_finite_error": 0.000179290771,
+            "snr_db": 121.6368,
+            "control_ms": 0.388786,
+            "candidate_ms": 0.421437
+          }
+        },
+        {
+          "fp8_tensor": {
+            "variant": "half-128",
+            "m": 128,
+            "n": 5120,
+            "k": 8192,
+            "bf16_output": 1,
+            "packing_differences": 0,
+            "output_differences": 403,
+            "nonfinite": 0,
+            "extra_scale_bytes": 1269760,
+            "maximum_finite_error": 0.25,
+            "snr_db": 84.2588,
+            "control_ms": 0.390099,
+            "candidate_ms": 0.422052
+          }
+        },
+        {
+          "fp8_tensor": {
+            "variant": "half-128",
+            "m": 2048,
+            "n": 2304,
+            "k": 5120,
+            "bf16_output": 0,
+            "packing_differences": 0,
+            "output_differences": 4463690,
+            "nonfinite": 0,
+            "extra_scale_bytes": 357120,
+            "maximum_finite_error": 0.000150680542,
+            "snr_db": 123.8285,
+            "control_ms": 1.167708,
+            "candidate_ms": 1.310375
+          }
+        },
+        {
+          "fp8_tensor": {
+            "variant": "half-128",
+            "m": 2048,
+            "n": 2304,
+            "k": 5120,
+            "bf16_output": 1,
+            "packing_differences": 0,
+            "output_differences": 2018,
+            "nonfinite": 0,
+            "extra_scale_bytes": 357120,
+            "maximum_finite_error": 0.25,
+            "snr_db": 85.2854,
+            "control_ms": 1.166438,
+            "candidate_ms": 1.309938
+          }
+        },
+        {
+          "fp8_tensor": {
+            "variant": "half-128",
+            "m": 2048,
+            "n": 5120,
+            "k": 8192,
+            "bf16_output": 0,
+            "packing_differences": 0,
+            "output_differences": 10046942,
+            "nonfinite": 0,
+            "extra_scale_bytes": 1269760,
+            "maximum_finite_error": 0.000198364258,
+            "snr_db": 121.6619,
+            "control_ms": 3.899583,
+            "candidate_ms": 4.430354
+          }
+        },
+        {
+          "fp8_tensor": {
+            "variant": "half-128",
+            "m": 2048,
+            "n": 5120,
+            "k": 8192,
+            "bf16_output": 1,
+            "packing_differences": 0,
+            "output_differences": 5827,
+            "nonfinite": 0,
+            "extra_scale_bytes": 1269760,
+            "maximum_finite_error": 0.25,
+            "snr_db": 84.3111,
+            "control_ms": 3.814938,
+            "candidate_ms": 4.419
+          }
+        }
+      ]
+    }
+  ]
+}

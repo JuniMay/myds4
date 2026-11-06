@@ -7,25 +7,12 @@ typedef struct { uint64_t count, different; double signal, error, max_abs; } Err
 static int prompt_n, observed[LAYERS][WINDOW][TOPK], reference_routes[LAYERS][WINDOW][TOPK];
 static uint16_t reference_ring[LAYERS][(WINDOW + VERIFY_DRAFTS) * HEAD_DIM];
 static uint16_t *reference_global[LAYERS][2];
-static int prefill_plan;  // 0: ordinary forward; 1: split at first user; 2: save prefix inside forward
 
 static void benchmark(int *tokens, int generate, int keep) {
   ced_check_first = keep > 0 && prompt_n > keep ? prompt_n - keep : 0;
   CacheStats c0 = cache_stats;
   double g0 = gpu_busy, t0 = now();
-  int prefix = 0, encoder_only = 0;
-  if (prefill_plan) {
-    int user = tok_find("<｜User｜>");
-    while (prefix < prompt_n && tokens[prefix] != user) prefix++;
-    if (prefix < 2 || prefix >= prompt_n - 1) die("benchmark needs a system prefix and user turn");
-  }
-  const float *lg;
-  if (prefill_plan == 1) {
-    model_forward(tokens, prefix, 0);
-    model_state_save(1);
-    lg = model_forward(tokens + prefix, prompt_n - prefix, prefix);
-  } else if (prefill_plan == 2) lg = model_forward_prefix(tokens, prompt_n, 0, prefix, &encoder_only);
-  else lg = model_forward(tokens, prompt_n, 0);
+  const float *lg = model_forward(tokens, prompt_n, 0);
   unsigned char prefill_digest[CC_SHA256_DIGEST_LENGTH];
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -79,9 +66,9 @@ static void benchmark(int *tokens, int generate, int keep) {
          (unsigned long long)slots0, (unsigned long long)minimum, (unsigned long long)maximum,
          (unsigned long long)(c2.given_back - c1.given_back));
   for (size_t i = 0; i < sizeof digest; i++) printf("%02x", digest[i]);
-  printf("\",\"prefill_plan\":%d,\"prefix_tokens\":%d,\"configured_ced_depth\":%d,"
+  printf("\",\"configured_ced_depth\":%d,"
          "\"last_forward_chunks\":%d,\"last_forward_decoder_tokens\":%d,\"prefill_logits_sha256\":\"",
-         prefill_plan, prefix, opt.ced, plan.chunks, plan.decoder_tokens);
+         opt.ced, plan.chunks, plan.decoder_tokens);
   for (size_t i = 0; i < sizeof prefill_digest; i++) printf("%02x", prefill_digest[i]);
   printf("\",\"proposal_policy\":\"%s\",\"decode_remaps\":%llu}}\n",
          opt.draft ? "dspark" : "none", (unsigned long long)(c2.remaps - c1.remaps));
@@ -215,11 +202,6 @@ int main(int argc, char **argv) {
         die("--ced takes off or 128 to 1048576 replay tokens");
       runtime_ced = depth;
     }
-    else if (!strcmp(argv[i], "--prefill-plan") && i + 1 < argc) {
-      const char *v = argv[++i];
-      prefill_plan = !strcmp(v, "split") ? 1 : !strcmp(v, "joint") ? 2 : 0;
-      if (!prefill_plan) die("--prefill-plan takes split or joint");
-    }
     else if (!strcmp(argv[i], "--describe")) describe_only = 1;
     else if (!strcmp(argv[i], "--compact")) ced_check_compact = 1;
     else if (!strcmp(argv[i], "--dspark") && i + 1 < argc) dspark_depth = atoi(argv[++i]);
@@ -233,9 +215,8 @@ int main(int argc, char **argv) {
     else die("unknown or incomplete option %s", argv[i]);
   }
   if (steps < 1 || steps > 64) die("steps must be 1 to 64");
-  if (prefill_plan && bench_tokens < 0) die("--prefill-plan requires --bench");
-  if (runtime_ced && (bench_tokens < 0 || prefill_plan == 1 || ced_check_compact || keep_setting))
-    die("--ced requires an unsplit benchmark without diagnostic mask settings");
+  if (runtime_ced && (bench_tokens < 0 || ced_check_compact || keep_setting))
+    die("--ced requires a benchmark without diagnostic mask settings");
   if (dspark_depth < 0 || dspark_depth > BLOCK || (dspark_depth && ced_check_compact))
     die("invalid or unsupported DSpark study combination");
   if (bench_tokens < -1 || bench_tokens > 4096 ||

@@ -35,14 +35,14 @@ int main(int argc, char **argv) {
   int rows[VERIFY_DRAFTS + 2];
   rows[0] = sample_argmax(model_forward(tokens, n, 0), VOCAB);
   for (int i = 1; i < VERIFY_DRAFTS + 2; i++) rows[i] = seed[(i * 7) % length];
-  model_state_save(0);
+  model_state_save();
   float *reference = xmalloc((size_t)(VERIFY_DRAFTS + 2) * VOCAB * sizeof(float));
   int draft_reference[VERIFY_DRAFTS + 2][2];
   for (int r = 0; r < VERIFY_DRAFTS + 2; r++) {
     if (o.draft) model_draft(rows[r], n + r, draft_reference[r], 2);
     memcpy(reference + (size_t)r * VOCAB, model_forward(rows + r, 1, n + r), VOCAB * sizeof(float));
   }
-  model_state_restore(0);
+  model_state_restore();
   const float *got = model_verify(rows, VERIFY_DRAFTS + 1, n);
   int failed = 0;
   for (int r = 0; r <= VERIFY_DRAFTS; r++) {
@@ -54,7 +54,7 @@ int main(int argc, char **argv) {
   const int kept_cases[] = {1, 2, 6, 15, 16};
   for (size_t i = 0; i < sizeof kept_cases / sizeof *kept_cases; i++) {
     int kept = kept_cases[i], drafts[2], draft_diff = 0;
-    model_state_restore(0);
+    model_state_restore();
     model_verify(rows, VERIFY_DRAFTS + 1, n);
     model_accept(rows, kept, n);
     if (o.draft) {
@@ -68,5 +68,9 @@ int main(int argc, char **argv) {
     failed |= different != 0 || draft_diff;
   }
   free(reference), free(tokens);
+#ifdef MYDS4_CAUSAL_GROUP
+  printf("{\"ready_groups_checked\":%llu}\n", (unsigned long long)model_ready_groups());
+  failed |= !model_ready_groups();
+#endif
   return failed;
 }

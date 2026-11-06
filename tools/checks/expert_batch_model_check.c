@@ -18,11 +18,11 @@ int main(int argc, char **argv) {
   model_load(argv[1], &opt);
   int rows[BLOCK + 1];
   rows[0] = sample_argmax(model_forward(tokens, n, 0), VOCAB);
-  model_state_save(0);
+  model_state_save();
   model_draft(rows[0], n, rows + 1, BLOCK);
   float *batched = xmalloc((size_t)(BLOCK + 1) * VOCAB * sizeof(float));
   memcpy(batched, model_verify(rows, BLOCK + 1, n), (size_t)(BLOCK + 1) * VOCAB * sizeof(float));
-  model_state_restore(0);
+  model_state_restore();
   int failed = 0;
   for (int r = 0; r <= BLOCK; r++) {
     const float *sequential = model_forward(rows + r, 1, n + r);

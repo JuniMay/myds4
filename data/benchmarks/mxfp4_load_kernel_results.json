@@ -1,0 +1,906 @@
+{
+  "schema_version": 1,
+  "scope": "Synthetic resident-weight GPU kernels; no model throughput or SSD reads. Early/pipeline are bitwise checked but slower. Matrix variant is slower and fails numerical equality; its timings are diagnostic, not a valid optimization result.",
+  "results": [
+    {
+      "variant": "early",
+      "rows": 1,
+      "sharing": 0,
+      "control_ms": 0.233344,
+      "candidate_ms": 0.356516
+    },
+    {
+      "variant": "early",
+      "rows": 2,
+      "sharing": 0,
+      "control_ms": 0.467471,
+      "candidate_ms": 0.736542
+    },
+    {
+      "variant": "early",
+      "rows": 3,
+      "sharing": 0,
+      "control_ms": 0.701271,
+      "candidate_ms": 1.076763
+    },
+    {
+      "variant": "early",
+      "rows": 4,
+      "sharing": 0,
+      "control_ms": 0.967133,
+      "candidate_ms": 1.469786
+    },
+    {
+      "variant": "early",
+      "rows": 5,
+      "sharing": 0,
+      "control_ms": 1.195734,
+      "candidate_ms": 1.838576
+    },
+    {
+      "variant": "early",
+      "rows": 6,
+      "sharing": 0,
+      "control_ms": 1.427617,
+      "candidate_ms": 2.195555
+    },
+    {
+      "variant": "early",
+      "rows": 1,
+      "sharing": 1,
+      "control_ms": 0.237359,
+      "candidate_ms": 0.358339
+    },
+    {
+      "variant": "early",
+      "rows": 2,
+      "sharing": 1,
+      "control_ms": 0.469284,
+      "candidate_ms": 0.73769
+    },
+    {
+      "variant": "early",
+      "rows": 3,
+      "sharing": 1,
+      "control_ms": 0.703867,
+      "candidate_ms": 1.09507
+    },
+    {
+      "variant": "early",
+      "rows": 4,
+      "sharing": 1,
+      "control_ms": 0.940667,
+      "candidate_ms": 1.458935
+    },
+    {
+      "variant": "early",
+      "rows": 5,
+      "sharing": 1,
+      "control_ms": 1.196789,
+      "candidate_ms": 1.810701
+    },
+    {
+      "variant": "early",
+      "rows": 6,
+      "sharing": 1,
+      "control_ms": 1.434406,
+      "candidate_ms": 2.174568
+    },
+    {
+      "variant": "early",
+      "rows": 1,
+      "sharing": 2,
+      "control_ms": 0.236219,
+      "candidate_ms": 0.358362
+    },
+    {
+      "variant": "early",
+      "rows": 2,
+      "sharing": 2,
+      "control_ms": 0.470633,
+      "candidate_ms": 0.722
+    },
+    {
+      "variant": "early",
+      "rows": 3,
+      "sharing": 2,
+      "control_ms": 0.706625,
+      "candidate_ms": 1.083344
+    },
+    {
+      "variant": "early",
+      "rows": 4,
+      "sharing": 2,
+      "control_ms": 0.961078,
+      "candidate_ms": 1.453401
+    },
+    {
+      "variant": "early",
+      "rows": 5,
+      "sharing": 2,
+      "control_ms": 1.202708,
+      "candidate_ms": 1.808016
+    },
+    {
+      "variant": "early",
+      "rows": 6,
+      "sharing": 2,
+      "control_ms": 1.424273,
+      "candidate_ms": 2.173763
+    },
+    {
+      "variant": "pipeline",
+      "rows": 1,
+      "sharing": 0,
+      "control_ms": 0.233273,
+      "candidate_ms": 0.385693
+    },
+    {
+      "variant": "pipeline",
+      "rows": 2,
+      "sharing": 0,
+      "control_ms": 0.489234,
+      "candidate_ms": 0.741688
+    },
+    {
+      "variant": "pipeline",
+      "rows": 3,
+      "sharing": 0,
+      "control_ms": 0.726198,
+      "candidate_ms": 1.119286
+    },
+    {
+      "variant": "pipeline",
+      "rows": 4,
+      "sharing": 0,
+      "control_ms": 0.956734,
+      "candidate_ms": 1.479742
+    },
+    {
+      "variant": "pipeline",
+      "rows": 5,
+      "sharing": 0,
+      "control_ms": 1.192352,
+      "candidate_ms": 1.849555
+    },
+    {
+      "variant": "pipeline",
+      "rows": 6,
+      "sharing": 0,
+      "control_ms": 1.426484,
+      "candidate_ms": 2.215656
+    },
+    {
+      "variant": "pipeline",
+      "rows": 1,
+      "sharing": 1,
+      "control_ms": 0.233862,
+      "candidate_ms": 0.365461
+    },
+    {
+      "variant": "pipeline",
+      "rows": 2,
+      "sharing": 1,
+      "control_ms": 0.46993,
+      "candidate_ms": 0.734182
+    },
+    {
+      "variant": "pipeline",
+      "rows": 3,
+      "sharing": 1,
+      "control_ms": 0.70493,
+      "candidate_ms": 1.098758
+    },
+    {
+      "variant": "pipeline",
+      "rows": 4,
+      "sharing": 1,
+      "control_ms": 0.945529,
+      "candidate_ms": 1.484208
+    },
+    {
+      "variant": "pipeline",
+      "rows": 5,
+      "sharing": 1,
+      "control_ms": 1.182146,
+      "candidate_ms": 1.853096
+    },
+    {
+      "variant": "pipeline",
+      "rows": 6,
+      "sharing": 1,
+      "control_ms": 1.437747,
+      "candidate_ms": 2.219531
+    },
+    {
+      "variant": "pipeline",
+      "rows": 1,
+      "sharing": 2,
+      "control_ms": 0.233562,
+      "candidate_ms": 0.368523
+    },
+    {
+      "variant": "pipeline",
+      "rows": 2,
+      "sharing": 2,
+      "control_ms": 0.470203,
+      "candidate_ms": 0.740419
+    },
+    {
+      "variant": "pipeline",
+      "rows": 3,
+      "sharing": 2,
+      "control_ms": 0.706297,
+      "candidate_ms": 1.126641
+    },
+    {
+      "variant": "pipeline",
+      "rows": 4,
+      "sharing": 2,
+      "control_ms": 0.967049,
+      "candidate_ms": 1.500966
+    },
+    {
+      "variant": "pipeline",
+      "rows": 5,
+      "sharing": 2,
+      "control_ms": 1.205352,
+      "candidate_ms": 1.885688
+    },
+    {
+      "variant": "pipeline",
+      "rows": 6,
+      "sharing": 2,
+      "control_ms": 1.439562,
+      "candidate_ms": 2.261531
+    },
+    {
+      "variant": "matrix",
+      "rows": 1,
+      "sharing": 0,
+      "control_ms": 0.233935,
+      "candidate_ms": 0.494859,
+      "input_domain": "initial generic scalar fixture, including values outside matrix staging range",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 2,
+      "sharing": 0,
+      "control_ms": 0.466154,
+      "candidate_ms": 0.820128,
+      "input_domain": "initial generic scalar fixture, including values outside matrix staging range",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 3,
+      "sharing": 0,
+      "control_ms": 0.705052,
+      "candidate_ms": 1.261456,
+      "input_domain": "initial generic scalar fixture, including values outside matrix staging range",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 4,
+      "sharing": 0,
+      "control_ms": 0.96225,
+      "candidate_ms": 1.578133,
+      "input_domain": "initial generic scalar fixture, including values outside matrix staging range",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 5,
+      "sharing": 0,
+      "control_ms": 1.190008,
+      "candidate_ms": 1.860141,
+      "input_domain": "initial generic scalar fixture, including values outside matrix staging range",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 6,
+      "sharing": 0,
+      "control_ms": 1.428195,
+      "candidate_ms": 2.246641,
+      "input_domain": "initial generic scalar fixture, including values outside matrix staging range",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 1,
+      "sharing": 1,
+      "control_ms": 0.233849,
+      "candidate_ms": 0.487508,
+      "input_domain": "initial generic scalar fixture, including values outside matrix staging range",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 2,
+      "sharing": 1,
+      "control_ms": 0.46937,
+      "candidate_ms": 0.833133,
+      "input_domain": "initial generic scalar fixture, including values outside matrix staging range",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 3,
+      "sharing": 1,
+      "control_ms": 0.711255,
+      "candidate_ms": 1.300578,
+      "input_domain": "initial generic scalar fixture, including values outside matrix staging range",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 4,
+      "sharing": 1,
+      "control_ms": 0.963594,
+      "candidate_ms": 1.620302,
+      "input_domain": "initial generic scalar fixture, including values outside matrix staging range",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 5,
+      "sharing": 1,
+      "control_ms": 1.192583,
+      "candidate_ms": 1.928961,
+      "input_domain": "initial generic scalar fixture, including values outside matrix staging range",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 6,
+      "sharing": 1,
+      "control_ms": 1.455107,
+      "candidate_ms": 2.35057,
+      "input_domain": "initial generic scalar fixture, including values outside matrix staging range",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 1,
+      "sharing": 2,
+      "control_ms": 0.233565,
+      "candidate_ms": 0.50969,
+      "input_domain": "initial generic scalar fixture, including values outside matrix staging range",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 2,
+      "sharing": 2,
+      "control_ms": 0.475117,
+      "candidate_ms": 0.890747,
+      "input_domain": "initial generic scalar fixture, including values outside matrix staging range",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 3,
+      "sharing": 2,
+      "control_ms": 0.729604,
+      "candidate_ms": 1.363359,
+      "input_domain": "initial generic scalar fixture, including values outside matrix staging range",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 4,
+      "sharing": 2,
+      "control_ms": 0.943258,
+      "candidate_ms": 1.705227,
+      "input_domain": "initial generic scalar fixture, including values outside matrix staging range",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 5,
+      "sharing": 2,
+      "control_ms": 1.199414,
+      "candidate_ms": 2.014878,
+      "input_domain": "initial generic scalar fixture, including values outside matrix staging range",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 6,
+      "sharing": 2,
+      "control_ms": 1.433437,
+      "candidate_ms": 2.439586,
+      "input_domain": "initial generic scalar fixture, including values outside matrix staging range",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 1,
+      "sharing": 0,
+      "control_ms": 0.233266,
+      "candidate_ms": 0.493734,
+      "input_domain": "bounded FP8-quantized activations",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 2,
+      "sharing": 0,
+      "control_ms": 0.467305,
+      "candidate_ms": 0.828336,
+      "input_domain": "bounded FP8-quantized activations",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 3,
+      "sharing": 0,
+      "control_ms": 0.706148,
+      "candidate_ms": 1.268141,
+      "input_domain": "bounded FP8-quantized activations",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 4,
+      "sharing": 0,
+      "control_ms": 0.967052,
+      "candidate_ms": 1.582591,
+      "input_domain": "bounded FP8-quantized activations",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 5,
+      "sharing": 0,
+      "control_ms": 1.196047,
+      "candidate_ms": 1.918385,
+      "input_domain": "bounded FP8-quantized activations",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 6,
+      "sharing": 0,
+      "control_ms": 1.430146,
+      "candidate_ms": 2.284521,
+      "input_domain": "bounded FP8-quantized activations",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 1,
+      "sharing": 1,
+      "control_ms": 0.233581,
+      "candidate_ms": 0.489977,
+      "input_domain": "bounded FP8-quantized activations",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 2,
+      "sharing": 1,
+      "control_ms": 0.470737,
+      "candidate_ms": 0.827451,
+      "input_domain": "bounded FP8-quantized activations",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 3,
+      "sharing": 1,
+      "control_ms": 0.729984,
+      "candidate_ms": 1.27026,
+      "input_domain": "bounded FP8-quantized activations",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 4,
+      "sharing": 1,
+      "control_ms": 0.937602,
+      "candidate_ms": 1.609102,
+      "input_domain": "bounded FP8-quantized activations",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 5,
+      "sharing": 1,
+      "control_ms": 1.176333,
+      "candidate_ms": 1.923594,
+      "input_domain": "bounded FP8-quantized activations",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 6,
+      "sharing": 1,
+      "control_ms": 1.428195,
+      "candidate_ms": 2.318654,
+      "input_domain": "bounded FP8-quantized activations",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 1,
+      "sharing": 2,
+      "control_ms": 0.233331,
+      "candidate_ms": 0.494195,
+      "input_domain": "bounded FP8-quantized activations",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 2,
+      "sharing": 2,
+      "control_ms": 0.473466,
+      "candidate_ms": 0.849026,
+      "input_domain": "bounded FP8-quantized activations",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 3,
+      "sharing": 2,
+      "control_ms": 0.707836,
+      "candidate_ms": 1.331159,
+      "input_domain": "bounded FP8-quantized activations",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 4,
+      "sharing": 2,
+      "control_ms": 0.953458,
+      "candidate_ms": 1.665469,
+      "input_domain": "bounded FP8-quantized activations",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 5,
+      "sharing": 2,
+      "control_ms": 1.19838,
+      "candidate_ms": 1.985289,
+      "input_domain": "bounded FP8-quantized activations",
+      "valid": false
+    },
+    {
+      "variant": "matrix",
+      "rows": 6,
+      "sharing": 2,
+      "control_ms": 1.440029,
+      "candidate_ms": 2.445289,
+      "input_domain": "bounded FP8-quantized activations",
+      "valid": false
+    },
+    {
+      "variant": "row",
+      "rows": 1,
+      "sharing": 0,
+      "control_ms": 0.231987,
+      "candidate_ms": 0.229758,
+      "valid": true
+    },
+    {
+      "variant": "row",
+      "rows": 2,
+      "sharing": 0,
+      "control_ms": 0.468932,
+      "candidate_ms": 0.457255,
+      "valid": true
+    },
+    {
+      "variant": "row",
+      "rows": 3,
+      "sharing": 0,
+      "control_ms": 0.700188,
+      "candidate_ms": 0.691089,
+      "valid": true
+    },
+    {
+      "variant": "row",
+      "rows": 4,
+      "sharing": 0,
+      "control_ms": 0.934477,
+      "candidate_ms": 0.927747,
+      "valid": true
+    },
+    {
+      "variant": "row",
+      "rows": 5,
+      "sharing": 0,
+      "control_ms": 1.169495,
+      "candidate_ms": 1.159857,
+      "valid": true
+    },
+    {
+      "variant": "row",
+      "rows": 6,
+      "sharing": 0,
+      "control_ms": 1.408977,
+      "candidate_ms": 1.386331,
+      "valid": true
+    },
+    {
+      "variant": "row",
+      "rows": 1,
+      "sharing": 1,
+      "control_ms": 0.232609,
+      "candidate_ms": 0.229279,
+      "valid": true
+    },
+    {
+      "variant": "row",
+      "rows": 2,
+      "sharing": 1,
+      "control_ms": 0.468023,
+      "candidate_ms": 0.460125,
+      "valid": true
+    },
+    {
+      "variant": "row",
+      "rows": 3,
+      "sharing": 1,
+      "control_ms": 0.701594,
+      "candidate_ms": 0.691859,
+      "valid": true
+    },
+    {
+      "variant": "row",
+      "rows": 4,
+      "sharing": 1,
+      "control_ms": 0.942021,
+      "candidate_ms": 0.922708,
+      "valid": true
+    },
+    {
+      "variant": "row",
+      "rows": 5,
+      "sharing": 1,
+      "control_ms": 1.180625,
+      "candidate_ms": 1.165727,
+      "valid": true
+    },
+    {
+      "variant": "row",
+      "rows": 6,
+      "sharing": 1,
+      "control_ms": 1.417268,
+      "candidate_ms": 1.392229,
+      "valid": true
+    },
+    {
+      "variant": "row",
+      "rows": 1,
+      "sharing": 2,
+      "control_ms": 0.232789,
+      "candidate_ms": 0.229807,
+      "valid": true
+    },
+    {
+      "variant": "row",
+      "rows": 2,
+      "sharing": 2,
+      "control_ms": 0.471531,
+      "candidate_ms": 0.461523,
+      "valid": true
+    },
+    {
+      "variant": "row",
+      "rows": 3,
+      "sharing": 2,
+      "control_ms": 0.705724,
+      "candidate_ms": 0.694305,
+      "valid": true
+    },
+    {
+      "variant": "row",
+      "rows": 4,
+      "sharing": 2,
+      "control_ms": 0.946849,
+      "candidate_ms": 0.936091,
+      "valid": true
+    },
+    {
+      "variant": "row",
+      "rows": 5,
+      "sharing": 2,
+      "control_ms": 1.191052,
+      "candidate_ms": 1.166513,
+      "valid": true
+    },
+    {
+      "variant": "row",
+      "rows": 6,
+      "sharing": 2,
+      "control_ms": 1.425164,
+      "candidate_ms": 1.39874,
+      "valid": true
+    },
+    {
+      "variant": "factor",
+      "rows": 1,
+      "sharing": 0,
+      "control_ms": 0.233003,
+      "candidate_ms": 0.230174,
+      "valid": true
+    },
+    {
+      "variant": "factor",
+      "rows": 2,
+      "sharing": 0,
+      "control_ms": 0.470828,
+      "candidate_ms": 0.460234,
+      "valid": true
+    },
+    {
+      "variant": "factor",
+      "rows": 3,
+      "sharing": 0,
+      "control_ms": 0.701297,
+      "candidate_ms": 0.692099,
+      "valid": true
+    },
+    {
+      "variant": "factor",
+      "rows": 4,
+      "sharing": 0,
+      "control_ms": 0.93819,
+      "candidate_ms": 0.92806,
+      "valid": true
+    },
+    {
+      "variant": "factor",
+      "rows": 5,
+      "sharing": 0,
+      "control_ms": 1.184651,
+      "candidate_ms": 1.16119,
+      "valid": true
+    },
+    {
+      "variant": "factor",
+      "rows": 6,
+      "sharing": 0,
+      "control_ms": 1.415956,
+      "candidate_ms": 1.391805,
+      "valid": true
+    },
+    {
+      "variant": "factor",
+      "rows": 1,
+      "sharing": 1,
+      "control_ms": 0.233721,
+      "candidate_ms": 0.229794,
+      "valid": true
+    },
+    {
+      "variant": "factor",
+      "rows": 2,
+      "sharing": 1,
+      "control_ms": 0.468789,
+      "candidate_ms": 0.461943,
+      "valid": true
+    },
+    {
+      "variant": "factor",
+      "rows": 3,
+      "sharing": 1,
+      "control_ms": 0.703521,
+      "candidate_ms": 0.692576,
+      "valid": true
+    },
+    {
+      "variant": "factor",
+      "rows": 4,
+      "sharing": 1,
+      "control_ms": 0.94837,
+      "candidate_ms": 0.933313,
+      "valid": true
+    },
+    {
+      "variant": "factor",
+      "rows": 5,
+      "sharing": 1,
+      "control_ms": 1.184396,
+      "candidate_ms": 1.15643,
+      "valid": true
+    },
+    {
+      "variant": "factor",
+      "rows": 6,
+      "sharing": 1,
+      "control_ms": 1.417417,
+      "candidate_ms": 1.398266,
+      "valid": true
+    },
+    {
+      "variant": "factor",
+      "rows": 1,
+      "sharing": 2,
+      "control_ms": 0.233156,
+      "candidate_ms": 0.230633,
+      "valid": true
+    },
+    {
+      "variant": "factor",
+      "rows": 2,
+      "sharing": 2,
+      "control_ms": 0.470406,
+      "candidate_ms": 0.467247,
+      "valid": true
+    },
+    {
+      "variant": "factor",
+      "rows": 3,
+      "sharing": 2,
+      "control_ms": 0.707062,
+      "candidate_ms": 0.69568,
+      "valid": true
+    },
+    {
+      "variant": "factor",
+      "rows": 4,
+      "sharing": 2,
+      "control_ms": 0.941828,
+      "candidate_ms": 0.930622,
+      "valid": true
+    },
+    {
+      "variant": "factor",
+      "rows": 5,
+      "sharing": 2,
+      "control_ms": 1.182263,
+      "candidate_ms": 1.173271,
+      "valid": true
+    },
+    {
+      "variant": "factor",
+      "rows": 6,
+      "sharing": 2,
+      "control_ms": 1.424531,
+      "candidate_ms": 1.404852,
+      "valid": true
+    }
+  ],
+  "matrix_check_exit": 1,
+  "bounded_matrix_check_exit": 1,
+  "checks": [
+    {
+      "variant": "early",
+      "passed": 324,
+      "total": 324
+    },
+    {
+      "variant": "pipeline",
+      "passed": 324,
+      "total": 324
+    },
+    {
+      "variant": "matrix",
+      "input_domain": "generic scalar stress inputs outside matrix bound",
+      "passed": 210,
+      "total": 324
+    },
+    {
+      "variant": "matrix",
+      "input_domain": "bounded FP8-quantized activations",
+      "passed": 249,
+      "total": 324
+    },
+    {
+      "variant": "row",
+      "exit": 0,
+      "summary": "expert batch mxfp4: 324/324 GPU checks passed\n"
+    },
+    {
+      "variant": "factor",
+      "exit": 0,
+      "summary": "expert batch mxfp4: 324/324 GPU checks passed\n"
+    }
+  ]
+}

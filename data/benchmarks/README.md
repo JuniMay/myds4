@@ -76,7 +76,7 @@ verification rows and do not represent newly useful prefetches.
 
 ```python
 import json
-from tools.benchmark_suite import Config, run_paired, select_cases
+from tools.bench.benchmark_suite import Config, run_paired, select_cases
 
 cases = select_cases(seed=0, reasoning=8, coding=4, context_turns=12)
 # Supply checkpoint and q2_shard from command-line arguments or configuration.
@@ -94,7 +94,7 @@ To reproduce the long-response input, construct an ungraded case from the
 preserved fixture. Supply `checkpoint` through the caller's configuration:
 
 ```python
-from tools.benchmark_suite import Case, Config, DATA, run_case
+from tools.bench.benchmark_suite import Case, Config, DATA, run_case
 
 case = Case("scheduler-long", "context", (DATA / "long_scheduler.txt").read_text(), "ungraded")
 config = Config("online-long", checkpoint, draft=2, draft_cache=32,

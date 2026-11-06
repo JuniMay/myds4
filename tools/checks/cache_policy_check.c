@@ -99,6 +99,55 @@ static void busy_victim(int optional, int prefill) {
   }
 }
 
+// A prediction for layer 1 is refined while layer 0 is still serving.
+// Its canceled slot must remain reusable when actual routing advances to 1.
+static void refined_empty_setup(void) {
+  setup(10, 0);
+  memset(where, 0xff, sizeof where);
+  slots[0].layer = 1, slots[0].expert = 0;
+  slots[1].layer = 0, slots[1].expert = 1;
+  slots[2].layer = 1, slots[2].expert = 2;
+  where[1][0] = 0, where[0][1] = 1, where[1][2] = 2;
+  score[0] = escore[EXPERTS] = 1;
+  score[2] = escore[EXPERTS + 2] = 3;
+  slots[0].prefetched = 1, slots[0].used = token;
+  slots[0].npiece = 1, slots[0].background_load = 1;
+  atomic_store(&slots[0].taken[0], 0);
+  atomic_store(&slots[0].unfinished, 1);
+  atomic_store(&prefetching, 1);
+  slots[0].loading = dispatch_group_create();
+  dispatch_group_enter(slots[0].loading);
+  serving = 0;
+  int keep = 2;
+  cache_refine(1, &keep, 1);
+  expect("refinement leaves an empty completed slot", where[1][0] == -1 && slots[0].expert == -1 &&
+         score[0] == -INFINITY && !slots[0].loading && !atomic_load(&prefetching));
+  // This is the next operation in read_ahead/read_residual_ahead. Already
+  // resident candidates do not consume the slot before actual routing.
+  cache_prefetch(1, &keep, 1, 1, 6);
+  expect("resident forecast leaves the refined slot available", slots[0].expert == -1 && where[1][2] == 2);
+}
+
+static void refined_empty_reuse(void) {
+  refined_empty_setup();
+  int routed[] = {2, 3};
+  cache_request(1, routed, 2);
+  expect("actual routing reuses its layer's refined empty slot", where[1][3] == 0);
+  expect("refined empty reuse preserves another layer's ready expert", where[0][1] == 1);
+  expect("refined empty reuse preserves the selected resident", where[1][2] == 2 && slots[2].used == token);
+  expect("refinement regression performs no I/O", cache_stats.bytes == 0);
+
+  refined_empty_setup();
+  serving = published = 1;
+  expect("published layer permits a refined empty slot", victim() == 0);
+#ifdef MYDS4_RUNAHEAD
+  slots[0].holds = 1;
+  expect("a reservation still excludes an otherwise empty slot", victim() == 1);
+  slots[0].holds = 0;
+  expect("releasing the reservation restores empty-slot eligibility", victim() == 0);
+#endif
+}
+
 int main(void) {
   alarm(20);
   setup(0, 0);
@@ -197,6 +246,7 @@ int main(void) {
   busy_victim(1, 0);
   busy_victim(1, 1);
   busy_victim(0, 0);
+  refined_empty_reuse();
   for (int i = 0; i < max_slots; i++) finish(i);
   fprintf(stderr, "cache policy: %d/%d checks passed\n", checks - failures, checks);
   return failures != 0;

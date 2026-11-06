@@ -1,0 +1,797 @@
+{
+  "schema_version": 1,
+  "kind": "draft",
+  "runs": [
+    {
+      "date_utc": "2026-11-05T08:43:47.091487+00:00",
+      "role": "control",
+      "settings": {
+        "workload": "harness",
+        "prompt_tokens": 13772,
+        "prompt_sha256": "3b223ff1100e56b76d76053a27705303b43a4a024d23aa86f86cb1695a0e034e",
+        "checkpoint_name": "DeepSeek-V4.1-Flash-1017",
+        "expert_file": null,
+        "requested_tokens": 512,
+        "context": 32768,
+        "cache_gib": 20.0,
+        "reserve_gib": 8.0,
+        "quant": "mxfp4",
+        "kind": "draft",
+        "control_binary": "myds4",
+        "candidate_binary": "myds4-causal-early",
+        "workload_revision": "3d27cf4fbcaa9ed714fe7704f7ae9fb33d45c3fd",
+        "control_binary_sha256": "7da8d96085d11dea12d06ae1f2f12809a638539c4edaa9e84b886086b12b3223",
+        "candidate_binary_sha256": "128955b55a9e84e735500497564ca8520a364236812aa1d88a255dd3be08692c",
+        "control_args": [
+          "--expert-batch",
+          "--prefill-prune"
+        ],
+        "candidate_args": [
+          "--expert-batch",
+          "--prefill-prune"
+        ],
+        "desktop_load": true,
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 12345,
+        "think": "max",
+        "draft": null,
+        "draft_cache": null,
+        "draft_trim": null,
+        "online_predictor": false,
+        "substitute": false,
+        "draft_by_role": {
+          "control": 0,
+          "candidate": 5
+        },
+        "draft_cache_by_role": {
+          "control": 0,
+          "candidate": 32
+        },
+        "draft_trim_by_role": {
+          "control": false,
+          "candidate": true
+        },
+        "harness_session": "session-966ce56d-998a-41a0-a0dd-3b09517043ba",
+        "before_seq": 35,
+        "prompt_mode": "reconstructed Harness request; recorded tool calls are not executed"
+      },
+      "valid": true,
+      "exit": 0,
+      "wall_seconds": 71.808,
+      "correctness_valid": true,
+      "timing_valid": true,
+      "timing_exclusion": null,
+      "output_sha256": "628dedba110203ca4615255228f32b52ac91c5b4483cb05951eb0587835c1521",
+      "output_matches_control": null,
+      "output_shape": {
+        "bytes": 1115,
+        "think_close_seen": true,
+        "bytes_before_think_close": 174,
+        "bytes_after_think_close": 933
+      },
+      "copy_exact": null,
+      "metrics": {
+        "prefill_prune": {
+          "applied": true,
+          "tokens": 13772,
+          "decoder_tokens": 3532,
+          "decoder_row_layers": 67108,
+          "chunks": 1,
+          "prefix_tokens": 0
+        },
+        "decode_experts": {
+          "computed_rows": 308,
+          "selected": 73920,
+          "unique_layer_requests": 73920
+        },
+        "decode_cache": {
+          "bytes_at_start": 21460156416,
+          "min_bytes": 21460156416,
+          "max_bytes": 21460156416,
+          "slots_released": 0
+        },
+        "workspace": {
+          "resizable_after_prefill_bytes": 2914433708,
+          "resizable_after_decode_bytes": 9743750
+        },
+        "prefill": {
+          "tokens": 13772,
+          "seconds": 22.14,
+          "tokens_per_second": 621.91,
+          "existing_slot_hit_percent": 99.8,
+          "logical_read_gb_reported": 276.19,
+          "read_wait_seconds": 8.02,
+          "main_queue_gpu_seconds": 12.83
+        },
+        "decode": {
+          "tokens": 308,
+          "seconds": 48.29,
+          "tokens_per_second": 6.38,
+          "existing_slot_hit_percent": 78.4,
+          "logical_read_gb_reported": 599.43,
+          "read_wait_seconds": 37.81,
+          "main_queue_gpu_seconds": 10.58
+        },
+        "cache": {
+          "main_slots_at_end": 1137,
+          "gib_including_draft_at_end": 20.0,
+          "cumulative_evictions": 50056
+        },
+        "cache_initial": {
+          "main_slots": 1137,
+          "main_gib": 20.0
+        },
+        "reads_per_emitted_token": {
+          "demand": 51.8,
+          "prefetch_admitted": 66.8,
+          "prefetch_used": 40.3,
+          "prefetch_late": 39.6,
+          "prefetch_cancelled": 12.6
+        }
+      },
+      "grouping": {
+        "scope": "all small backbone batches",
+        "calls": 0,
+        "row_expert_pairs": 0,
+        "weight_groups": 0
+      },
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 6.0,
+            "renderer_percent": 6.0,
+            "gpu_resident_gib": 0.59,
+            "desktop_load": true,
+            "reserve_gib": 8.0,
+            "required_free_gib": 42.0,
+            "memory": {
+              "free_gib": 52.93780517578125,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 5.0,
+            "renderer_percent": 5.0,
+            "gpu_resident_gib": 0.59,
+            "desktop_load": true,
+            "reserve_gib": 8.0,
+            "required_free_gib": 42.0,
+            "memory": {
+              "free_gib": 52.93922424316406,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 6.0,
+            "renderer_percent": 6.0,
+            "gpu_resident_gib": 0.6,
+            "desktop_load": true,
+            "reserve_gib": 8.0,
+            "required_free_gib": 42.0,
+            "memory": {
+              "free_gib": 52.941192626953125,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          }
+        ]
+      },
+      "gpu_activity_during_run": [
+        {
+          "elapsed_seconds": 2.113,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 18.24
+        },
+        {
+          "elapsed_seconds": 12.558,
+          "model_gpu_client_visible": true,
+          "device_percent": 100.0,
+          "renderer_percent": 100.0,
+          "gpu_resident_gib": 31.48
+        },
+        {
+          "elapsed_seconds": 22.963,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 31.48
+        },
+        {
+          "elapsed_seconds": 33.365,
+          "model_gpu_client_visible": true,
+          "device_percent": 84.0,
+          "renderer_percent": 11.0,
+          "gpu_resident_gib": 28.77
+        },
+        {
+          "elapsed_seconds": 43.772,
+          "model_gpu_client_visible": true,
+          "device_percent": 76.0,
+          "renderer_percent": 1.0,
+          "gpu_resident_gib": 28.77
+        },
+        {
+          "elapsed_seconds": 54.179,
+          "model_gpu_client_visible": true,
+          "device_percent": 75.0,
+          "renderer_percent": 8.0,
+          "gpu_resident_gib": 28.77
+        },
+        {
+          "elapsed_seconds": 64.587,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 28.77
+        }
+      ],
+      "background_cpu_helpers": [],
+      "background_cpu_peak": 0.0,
+      "timing_environment": "recorded desktop load; GPU not isolated",
+      "details": [
+        "expert cache: 1137 slots (20.0 GiB) to start, up to 1137 mapped for the GPU, 44.1 GiB free and 0.0 GiB of file cache beyond the kernel's share, 8.0 GiB kept for other programs, GPU resident memory 0.6 GiB (51.9 GiB below the GPU's limit), GPU working set 107.5 GiB",
+        "cache:   1137 slots, 20.0 GiB, 50056 evictions; available memory 25.9 GiB, footprint 28.4 GiB, GPU resident memory (all processes) 28.8 GiB; 0 pages swapped out and 0 compressed by the system meanwhile, this process's memory compressed at most 0 MiB",
+        "decode reads per token: 51.8 on demand, 66.8 ahead (40.3 used, 39.6 of them late), 12.6 cancelled; 0.0 experts substituted, 0.0 mapped for the GPU again",
+        "decode per token (ms): rows 0.2, waits 30.0, loads 122.7, prefetch 2.2, encode 0.3, adapt 0.1, drafting 0.0; GPU idle between command buffers 121.5 (40.7 gaps over 100 us); 0.0 layers' experts recomputed"
+      ],
+      "error": null
+    },
+    {
+      "date_utc": "2026-11-05T08:45:10.999926+00:00",
+      "role": "candidate",
+      "settings": {
+        "workload": "harness",
+        "prompt_tokens": 13772,
+        "prompt_sha256": "3b223ff1100e56b76d76053a27705303b43a4a024d23aa86f86cb1695a0e034e",
+        "checkpoint_name": "DeepSeek-V4.1-Flash-1017",
+        "expert_file": null,
+        "requested_tokens": 512,
+        "context": 32768,
+        "cache_gib": 20.0,
+        "reserve_gib": 8.0,
+        "quant": "mxfp4",
+        "kind": "draft",
+        "control_binary": "myds4",
+        "candidate_binary": "myds4-causal-early",
+        "workload_revision": "3d27cf4fbcaa9ed714fe7704f7ae9fb33d45c3fd",
+        "control_binary_sha256": "7da8d96085d11dea12d06ae1f2f12809a638539c4edaa9e84b886086b12b3223",
+        "candidate_binary_sha256": "128955b55a9e84e735500497564ca8520a364236812aa1d88a255dd3be08692c",
+        "control_args": [
+          "--expert-batch",
+          "--prefill-prune"
+        ],
+        "candidate_args": [
+          "--expert-batch",
+          "--prefill-prune"
+        ],
+        "desktop_load": true,
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 12345,
+        "think": "max",
+        "draft": null,
+        "draft_cache": null,
+        "draft_trim": null,
+        "online_predictor": false,
+        "substitute": false,
+        "draft_by_role": {
+          "control": 0,
+          "candidate": 5
+        },
+        "draft_cache_by_role": {
+          "control": 0,
+          "candidate": 32
+        },
+        "draft_trim_by_role": {
+          "control": false,
+          "candidate": true
+        },
+        "harness_session": "session-966ce56d-998a-41a0-a0dd-3b09517043ba",
+        "before_seq": 35,
+        "prompt_mode": "reconstructed Harness request; recorded tool calls are not executed"
+      },
+      "valid": true,
+      "exit": 0,
+      "wall_seconds": 79.626,
+      "correctness_valid": true,
+      "timing_valid": true,
+      "timing_exclusion": null,
+      "output_sha256": "628dedba110203ca4615255228f32b52ac91c5b4483cb05951eb0587835c1521",
+      "output_matches_control": true,
+      "output_shape": {
+        "bytes": 1115,
+        "think_close_seen": true,
+        "bytes_before_think_close": 174,
+        "bytes_after_think_close": 933
+      },
+      "copy_exact": null,
+      "metrics": {
+        "prefill_prune": {
+          "applied": true,
+          "tokens": 13772,
+          "decoder_tokens": 3532,
+          "decoder_row_layers": 67108,
+          "chunks": 1,
+          "prefix_tokens": 0
+        },
+        "decode_experts": {
+          "computed_rows": 308,
+          "scheduled_rows": 414,
+          "selected": 91446,
+          "unique_layer_requests": 91446
+        },
+        "decode_cache": {
+          "bytes_at_start": 21460156416,
+          "min_bytes": 21460156416,
+          "max_bytes": 21460156416,
+          "slots_released": 0
+        },
+        "workspace": {
+          "resizable_after_prefill_bytes": 2914433708,
+          "resizable_after_decode_bytes": 75357478
+        },
+        "early_verify": {
+          "calls": 69,
+          "attempted_rows": 414,
+          "finished_rows": 308,
+          "sampled_rows": 308,
+          "cancelled_rows": 106,
+          "requested_row_layers": 15241,
+          "skipped_expert_row_layers": 1423
+        },
+        "ready_groups": {
+          "groups": 2122,
+          "rows": 6471
+        },
+        "forecast_work": {
+          "route_only_row_layers": 15241
+        },
+        "prefill": {
+          "tokens": 13772,
+          "seconds": 22.27,
+          "tokens_per_second": 618.52,
+          "existing_slot_hit_percent": 99.8,
+          "logical_read_gb_reported": 276.19,
+          "read_wait_seconds": 7.86,
+          "main_queue_gpu_seconds": 13.09
+        },
+        "decode": {
+          "tokens": 308,
+          "seconds": 55.73,
+          "tokens_per_second": 5.53,
+          "existing_slot_hit_percent": 61.0,
+          "logical_read_gb_reported": 683.17,
+          "read_wait_seconds": 39.6,
+          "main_queue_gpu_seconds": 11.39
+        },
+        "draft": {
+          "passes": 69,
+          "accepted_per_pass_reported": 3.46,
+          "maximum_drafts": 5,
+          "acceptance_is_rounded": true
+        },
+        "cache": {
+          "main_slots_at_end": 1041,
+          "gib_including_draft_at_end": 20.0,
+          "cumulative_evictions": 49812
+        },
+        "cache_initial": {
+          "main_slots": 1041,
+          "main_gib": 18.3
+        },
+        "draft_cache_initial": {
+          "slots_per_stage": 32,
+          "reserved_gib": 1.7,
+          "loading": "on_demand"
+        },
+        "reads_per_emitted_token": {
+          "demand": 117.8,
+          "prefetch_admitted": 0.0,
+          "prefetch_used": 0.0,
+          "prefetch_late": 0.0,
+          "prefetch_cancelled": 0.0
+        }
+      },
+      "grouping": {
+        "scope": "all small backbone batches",
+        "calls": 1959,
+        "row_expert_pairs": 36762,
+        "weight_groups": 27618
+      },
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 0.0,
+            "renderer_percent": 0.0,
+            "gpu_resident_gib": 0.59,
+            "desktop_load": true,
+            "reserve_gib": 8.0,
+            "required_free_gib": 42.0,
+            "memory": {
+              "free_gib": 52.93894958496094,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 5.0,
+            "renderer_percent": 5.0,
+            "gpu_resident_gib": 0.6,
+            "desktop_load": true,
+            "reserve_gib": 8.0,
+            "required_free_gib": 42.0,
+            "memory": {
+              "free_gib": 52.9354248046875,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 5.0,
+            "renderer_percent": 5.0,
+            "gpu_resident_gib": 0.59,
+            "desktop_load": true,
+            "reserve_gib": 8.0,
+            "required_free_gib": 42.0,
+            "memory": {
+              "free_gib": 52.93437194824219,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          }
+        ]
+      },
+      "gpu_activity_during_run": [
+        {
+          "elapsed_seconds": 2.146,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 20.6
+        },
+        {
+          "elapsed_seconds": 12.615,
+          "model_gpu_client_visible": true,
+          "device_percent": 82.0,
+          "renderer_percent": 82.0,
+          "gpu_resident_gib": 32.16
+        },
+        {
+          "elapsed_seconds": 23.051,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 32.33
+        },
+        {
+          "elapsed_seconds": 33.462,
+          "model_gpu_client_visible": true,
+          "device_percent": 52.0,
+          "renderer_percent": 2.0,
+          "gpu_resident_gib": 29.51
+        },
+        {
+          "elapsed_seconds": 43.866,
+          "model_gpu_client_visible": true,
+          "device_percent": 22.0,
+          "renderer_percent": 4.0,
+          "gpu_resident_gib": 29.51
+        },
+        {
+          "elapsed_seconds": 54.286,
+          "model_gpu_client_visible": true,
+          "device_percent": 0.0,
+          "renderer_percent": 0.0,
+          "gpu_resident_gib": 29.51
+        },
+        {
+          "elapsed_seconds": 64.711,
+          "model_gpu_client_visible": true,
+          "device_percent": 40.0,
+          "renderer_percent": 2.0,
+          "gpu_resident_gib": 29.67
+        },
+        {
+          "elapsed_seconds": 75.126,
+          "model_gpu_client_visible": true,
+          "device_percent": 21.0,
+          "renderer_percent": 5.0,
+          "gpu_resident_gib": 29.51
+        }
+      ],
+      "background_cpu_helpers": [],
+      "background_cpu_peak": 0.0,
+      "timing_environment": "recorded desktop load; GPU not isolated",
+      "details": [
+        "expert cache: 1041 slots (18.3 GiB) to start, up to 1041 mapped for the GPU, 43.4 GiB free and 0.0 GiB of file cache beyond the kernel's share, 8.0 GiB kept for other programs, GPU resident memory 0.6 GiB (51.9 GiB below the GPU's limit), GPU working set 107.5 GiB",
+        "cache:   1041 slots, 20.0 GiB, 49812 evictions; available memory 25.0 GiB, footprint 29.2 GiB, GPU resident memory (all processes) 29.5 GiB; 0 pages swapped out and 0 compressed by the system meanwhile, this process's memory compressed at most 0 MiB",
+        "decode reads per token: 117.8 on demand, 0.0 ahead (0.0 used, 0.0 of them late), 0.0 cancelled; 0.0 experts substituted, 0.0 mapped for the GPU again",
+        "decode per token (ms): rows 0.0, waits 0.0, loads 0.0, prefetch 0.0, encode 0.0, adapt 0.0, drafting 4.6; GPU idle between command buffers 140.9 (21.1 gaps over 100 us); 0.0 layers' experts recomputed"
+      ],
+      "error": null
+    },
+    {
+      "date_utc": "2026-11-05T08:46:27.229953+00:00",
+      "role": "control",
+      "settings": {
+        "workload": "harness",
+        "prompt_tokens": 13772,
+        "prompt_sha256": "3b223ff1100e56b76d76053a27705303b43a4a024d23aa86f86cb1695a0e034e",
+        "checkpoint_name": "DeepSeek-V4.1-Flash-1017",
+        "expert_file": null,
+        "requested_tokens": 512,
+        "context": 32768,
+        "cache_gib": 20.0,
+        "reserve_gib": 8.0,
+        "quant": "mxfp4",
+        "kind": "draft",
+        "control_binary": "myds4",
+        "candidate_binary": "myds4-causal-early",
+        "workload_revision": "3d27cf4fbcaa9ed714fe7704f7ae9fb33d45c3fd",
+        "control_binary_sha256": "7da8d96085d11dea12d06ae1f2f12809a638539c4edaa9e84b886086b12b3223",
+        "candidate_binary_sha256": "128955b55a9e84e735500497564ca8520a364236812aa1d88a255dd3be08692c",
+        "control_args": [
+          "--expert-batch",
+          "--prefill-prune"
+        ],
+        "candidate_args": [
+          "--expert-batch",
+          "--prefill-prune"
+        ],
+        "desktop_load": true,
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 12345,
+        "think": "max",
+        "draft": null,
+        "draft_cache": null,
+        "draft_trim": null,
+        "online_predictor": false,
+        "substitute": false,
+        "draft_by_role": {
+          "control": 0,
+          "candidate": 5
+        },
+        "draft_cache_by_role": {
+          "control": 0,
+          "candidate": 32
+        },
+        "draft_trim_by_role": {
+          "control": false,
+          "candidate": true
+        },
+        "harness_session": "session-966ce56d-998a-41a0-a0dd-3b09517043ba",
+        "before_seq": 35,
+        "prompt_mode": "reconstructed Harness request; recorded tool calls are not executed"
+      },
+      "valid": true,
+      "exit": 0,
+      "wall_seconds": 71.933,
+      "correctness_valid": true,
+      "timing_valid": true,
+      "timing_exclusion": null,
+      "output_sha256": "628dedba110203ca4615255228f32b52ac91c5b4483cb05951eb0587835c1521",
+      "output_matches_control": true,
+      "output_shape": {
+        "bytes": 1115,
+        "think_close_seen": true,
+        "bytes_before_think_close": 174,
+        "bytes_after_think_close": 933
+      },
+      "copy_exact": null,
+      "metrics": {
+        "prefill_prune": {
+          "applied": true,
+          "tokens": 13772,
+          "decoder_tokens": 3532,
+          "decoder_row_layers": 67108,
+          "chunks": 1,
+          "prefix_tokens": 0
+        },
+        "decode_experts": {
+          "computed_rows": 308,
+          "selected": 73920,
+          "unique_layer_requests": 73920
+        },
+        "decode_cache": {
+          "bytes_at_start": 21460156416,
+          "min_bytes": 21460156416,
+          "max_bytes": 21460156416,
+          "slots_released": 0
+        },
+        "workspace": {
+          "resizable_after_prefill_bytes": 2914433708,
+          "resizable_after_decode_bytes": 9743750
+        },
+        "prefill": {
+          "tokens": 13772,
+          "seconds": 22.26,
+          "tokens_per_second": 618.58,
+          "existing_slot_hit_percent": 99.8,
+          "logical_read_gb_reported": 276.19,
+          "read_wait_seconds": 7.9,
+          "main_queue_gpu_seconds": 13.04
+        },
+        "decode": {
+          "tokens": 308,
+          "seconds": 48.29,
+          "tokens_per_second": 6.38,
+          "existing_slot_hit_percent": 78.4,
+          "logical_read_gb_reported": 599.43,
+          "read_wait_seconds": 37.82,
+          "main_queue_gpu_seconds": 10.56
+        },
+        "cache": {
+          "main_slots_at_end": 1137,
+          "gib_including_draft_at_end": 20.0,
+          "cumulative_evictions": 50053
+        },
+        "cache_initial": {
+          "main_slots": 1137,
+          "main_gib": 20.0
+        },
+        "reads_per_emitted_token": {
+          "demand": 51.7,
+          "prefetch_admitted": 66.8,
+          "prefetch_used": 40.3,
+          "prefetch_late": 39.6,
+          "prefetch_cancelled": 12.7
+        }
+      },
+      "grouping": {
+        "scope": "all small backbone batches",
+        "calls": 0,
+        "row_expert_pairs": 0,
+        "weight_groups": 0
+      },
+      "guard": {
+        "method": "process scan and three GPU/memory samples; not an exclusive reservation",
+        "samples": [
+          {
+            "device_percent": 0.0,
+            "renderer_percent": 0.0,
+            "gpu_resident_gib": 0.59,
+            "desktop_load": true,
+            "reserve_gib": 8.0,
+            "required_free_gib": 42.0,
+            "memory": {
+              "free_gib": 52.816131591796875,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 5.0,
+            "renderer_percent": 5.0,
+            "gpu_resident_gib": 0.59,
+            "desktop_load": true,
+            "reserve_gib": 8.0,
+            "required_free_gib": 42.0,
+            "memory": {
+              "free_gib": 52.865478515625,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          },
+          {
+            "device_percent": 5.0,
+            "renderer_percent": 5.0,
+            "gpu_resident_gib": 0.6,
+            "desktop_load": true,
+            "reserve_gib": 8.0,
+            "required_free_gib": 42.0,
+            "memory": {
+              "free_gib": 52.89408874511719,
+              "compressions": 42049,
+              "swapouts": 16
+            },
+            "ac_power": true,
+            "competing_processes": [],
+            "background_cpu_helpers": [],
+            "reasons": []
+          }
+        ]
+      },
+      "gpu_activity_during_run": [
+        {
+          "elapsed_seconds": 2.143,
+          "model_gpu_client_visible": true,
+          "device_percent": 100.0,
+          "renderer_percent": 77.0,
+          "gpu_resident_gib": 18.24
+        },
+        {
+          "elapsed_seconds": 12.599,
+          "model_gpu_client_visible": true,
+          "device_percent": 99.0,
+          "renderer_percent": 40.0,
+          "gpu_resident_gib": 31.48
+        },
+        {
+          "elapsed_seconds": 23.023,
+          "model_gpu_client_visible": true,
+          "device_percent": 100.0,
+          "renderer_percent": 100.0,
+          "gpu_resident_gib": 31.48
+        },
+        {
+          "elapsed_seconds": 33.43,
+          "model_gpu_client_visible": true,
+          "device_percent": 77.0,
+          "renderer_percent": 8.0,
+          "gpu_resident_gib": 28.77
+        },
+        {
+          "elapsed_seconds": 43.843,
+          "model_gpu_client_visible": true,
+          "device_percent": 79.0,
+          "renderer_percent": 15.0,
+          "gpu_resident_gib": 28.77
+        },
+        {
+          "elapsed_seconds": 54.237,
+          "model_gpu_client_visible": true,
+          "device_percent": 85.0,
+          "renderer_percent": 2.0,
+          "gpu_resident_gib": 28.77
+        },
+        {
+          "elapsed_seconds": 64.649,
+          "model_gpu_client_visible": true,
+          "device_percent": 78.0,
+          "renderer_percent": 1.0,
+          "gpu_resident_gib": 28.77
+        }
+      ],
+      "background_cpu_helpers": [],
+      "background_cpu_peak": 0.0,
+      "timing_environment": "recorded desktop load; GPU not isolated",
+      "details": [
+        "expert cache: 1137 slots (20.0 GiB) to start, up to 1137 mapped for the GPU, 44.1 GiB free and 0.0 GiB of file cache beyond the kernel's share, 8.0 GiB kept for other programs, GPU resident memory 0.6 GiB (51.9 GiB below the GPU's limit), GPU working set 107.5 GiB",
+        "cache:   1137 slots, 20.0 GiB, 50053 evictions; available memory 25.9 GiB, footprint 28.4 GiB, GPU resident memory (all processes) 28.8 GiB; 0 pages swapped out and 0 compressed by the system meanwhile, this process's memory compressed at most 0 MiB",
+        "decode reads per token: 51.7 on demand, 66.8 ahead (40.3 used, 39.6 of them late), 12.7 cancelled; 0.0 experts substituted, 0.0 mapped for the GPU again",
+        "decode per token (ms): rows 0.2, waits 29.9, loads 122.8, prefetch 2.2, encode 0.3, adapt 0.1, drafting 0.0; GPU idle between command buffers 121.6 (40.6 gaps over 100 us); 0.0 layers' experts recomputed"
+      ],
+      "error": null
+    }
+  ]
+}

@@ -10,12 +10,13 @@ static size_t different(const void *a, const void *b, size_t n) {
 }
 
 int main(int argc, char **argv) {
-  if (argc < 2 || argc > 4) die("usage: expert-compact-model-check CHECKPOINT [EXPERT_GGUF] [--long]");
+  if (argc < 2 || argc > 5) die("usage: expert-compact-model-check CHECKPOINT [EXPERT_GGUF] [--long] [--all-missing]");
   alarm(600);
-  int length = 257;
+  int length = 257, all_missing = 0, waves = 0, preencode = 0, limits = 0;
   const char *experts = NULL;
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--long")) length = 16521;
+    else if (!strcmp(argv[i], "--all-missing")) all_missing = 1;
     else if (!experts) experts = argv[i];
     else die("invalid expert compaction check argument");
   }
@@ -28,6 +29,18 @@ int main(int argc, char **argv) {
                .experts = experts};
   model_load(argv[1], &o);
   expert_compact_enabled = 0;
+#ifdef MYDS4_LATE_PREENCODE
+  late_preencode_enabled = 0, preencode = 1;
+#endif
+#ifdef MYDS4_EXPERT_WAVES
+  expert_waves_enabled = 0, waves = 1;
+  if (all_missing) die("--all-missing is for the ordinary two-batch check");
+#endif
+#ifdef MYDS4_PIPELINE_LIMIT
+  int limited_up = K_moe_up, limited_down = K_moe_down;
+  K_moe_up = gpu_kernel_limited("moe_up", 0), K_moe_down = gpu_kernel_limited("moe_down", 0);
+  limits = 1;
+#endif
   int next = sample_argmax(model_forward(tokens, length, 0), VOCAB);
   FixtureState *prefix = fixture_capture();
   float *reference = xmalloc((size_t)STEPS * VOCAB * sizeof(float));
@@ -49,8 +62,18 @@ int main(int argc, char **argv) {
     }
   fixture_restore(prefix);
   fixture_free(prefix);
-  expert_compact_enabled = 1, expert_compact_force_split = 1;
+  expert_compact_enabled = 1, expert_compact_force_split = all_missing ? 2 : 1;
   expert_compact_calls = expert_compact_active = 0;
+#ifdef MYDS4_LATE_PREENCODE
+  late_preencode_enabled = 1, late_preencode_mixed = late_preencode_missing = 0;
+#endif
+#ifdef MYDS4_EXPERT_WAVES
+  expert_waves_enabled = 1, expert_waves_limit = 1;
+  expert_wave_layers = expert_wave_batches = 0;
+#endif
+#ifdef MYDS4_PIPELINE_LIMIT
+  K_moe_up = limited_up, K_moe_down = limited_down;
+#endif
   size_t logit_diff = 0, global_diff = 0;
   int nonfinite = 0;
   for (int r = 0; r < STEPS; r++) {
@@ -70,11 +93,15 @@ int main(int argc, char **argv) {
       free(global[l][k]);
     }
   printf("{\"expert_compact_model\":{\"quant\":\"%s\",\"prompt_tokens\":%d,\"steps\":%d,"
+         "\"waves\":%d,\"preencode\":%d,\"pipeline_limits\":%d,\"all_missing\":%d,"
          "\"batches\":%llu,\"active_experts\":%llu,\"logit_bytes_differ\":%zu,\"local_bytes_differ\":%zu,"
          "\"global_bytes_differ\":%zu,\"nonfinite\":%d}}\n", experts ? "iq2" : "mxfp4", length, STEPS,
+         waves, preencode, limits, all_missing,
          (unsigned long long)expert_compact_calls, (unsigned long long)expert_compact_active,
          logit_diff, state_diff, global_diff, nonfinite);
   free(reference), free(state);
+  uint64_t batches = (uint64_t)STEPS * LAYERS * (waves ? TOPK : all_missing ? 0 : 2);
+  uint64_t contributions = all_missing ? 0 : (uint64_t)STEPS * LAYERS * TOPK;
   return logit_diff || state_diff || global_diff || nonfinite ||
-         (!experts && (expert_compact_calls != STEPS * LAYERS * 2 || expert_compact_active != STEPS * LAYERS * TOPK));
+         (!experts && (expert_compact_calls != batches || expert_compact_active != contributions));
 }
