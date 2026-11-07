@@ -1,4 +1,4 @@
-// Decoding B sequences together (model_forward_rows), for the decode bound:
+// Decoding B sequences together (deepseek_forward_rows), for the decode bound:
 // per step, the wall time, the GPU's busy and idle time, and per decoded row
 // the experts read on demand, the expert bytes read and the slots mapped for
 // the GPU again. Each sequence has its own prompt, prefilled alone: an
@@ -13,7 +13,7 @@
 //
 // usage: rows-bench CHECKPOINT ROWS [--experts GGUF] [--cache GIB] [--steps N]
 //                   [--warm N] [--text FILE --prompt-tokens N] [--show]
-#include "../../src/engine/model.c"
+#include "../../src/model/deepseek.c"
 
 // The share of gen's 8-token windows that occurred nowhere before them.
 static double distinct_8grams(const int *gen, int n) {
@@ -48,7 +48,7 @@ int main(int argc, char **argv) {
   if (!file != !length || length < 0) die("--text and --prompt-tokens go together");
   o.ctx = length + 4096;
   tok_load(argv[1]);
-  model_load(argv[1], &o);
+  deepseek_load(argv[1], &o);
   static const char *openings[] = {"A lighthouse keeper finds a bottle.", "A baker opens a shop at dawn.",
                                    "Two engineers debate a cache design.", "A sailor maps an unknown coast.",
                                    "A child learns to play the violin.", "A detective reads an old letter."};
@@ -79,9 +79,9 @@ int main(int argc, char **argv) {
       n = tok_encode(openings[r], prompt, 64);
       memcpy(prompt + n, common, (size_t)ncommon * sizeof *prompt), n += ncommon;
     }
-    st[r] = model_state_new();
-    model_state_use(st[r]);
-    tok[r] = sample_argmax(model_forward(prompt, n, 0), VOCAB);
+    st[r] = deepseek_state_new();
+    deepseek_state_use(st[r]);
+    tok[r] = sample_argmax(deepseek_forward(prompt, n, 0), VOCAB);
     pos[r] = n;
   }
   int *gen = xmalloc((size_t)(warm + steps + 1) * sizeof *gen), ng = 0;  // the first sequence's tokens
@@ -93,7 +93,7 @@ int main(int argc, char **argv) {
       c0 = cache_stats, t0 = now(), g0 = gpu_busy, i0 = gpu_gap, gpu_profile_reset();
       memcpy(ph0, phase_s, sizeof ph0);
     }
-    const float *logits = model_forward_rows(st, tok, pos, rows);
+    const float *logits = deepseek_forward_rows(st, tok, pos, rows);
     for (int r = 0; r < rows; r++) tok[r] = sample_argmax(logits + (size_t)r * VOCAB, VOCAB), pos[r]++;
     gen[ng++] = tok[0];
   }

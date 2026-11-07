@@ -38,7 +38,7 @@ static void fixture_idle(void) { cache_maintenance++; }
 #define gpu_sync fixture_sync
 #define cache_adapt fixture_adapt
 #define cache_idle fixture_idle
-#include "../../src/engine/model.c"
+#include "../../src/model/deepseek.c"
 
 static int checks, failures;
 static void expect(const char *name, int ok) {

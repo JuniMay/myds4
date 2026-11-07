@@ -13,14 +13,11 @@
 #include <unistd.h>
 
 #include "../engine/myds4.h"
-
-_Alignas(4) static const char kernel_source[] = {
-#embed "qwen.metal"
-    , 0};
+#include "model.h"
 
 #define ROWS QWEN_ROWS
 #define PF QWEN_PREFILL
-#define BLK 256  // positions per attention block (qwen.metal's BLK)
+#define BLK 256  // positions per attention block (gqa.metal's BLK)
 
 // A matrix: NVFP4 ('n': codes and E4M3 scales), FP8 ('8') or BF16 ('b'),
 // times scale.
@@ -76,6 +73,10 @@ struct QwenState {
   Buf hid[2];           // the last row's hidden (the MTP head's input), and the saved row's
   int cur, pos, cap;
   int saved;  // the position after the saved row that the spare holds (-1: none)
+  // The MTP head's keys (model.h's interface fills them): the first position
+  // without its key, and the token after the saved row when that row's key is
+  // still owed (a kept draft; -1: none).
+  int mtp_next, mtp_kept;
 };
 
 struct QwenSnap {
@@ -83,7 +84,7 @@ struct QwenSnap {
   int pos;
 };
 
-// A row's sequence, as qwen.metal's Seq.
+// A row's sequence, as deltanet.metal's Seq.
 typedef struct {
   uint64_t gdn, gdn_save, conv, conv_save, k, v;
   uint32_t pos, cap;
@@ -236,19 +237,19 @@ void qwen_load(const char *dir) {
   const Json *types = json_get(t, "layer_types");
   if (!types || types->type != J_ARR || types->n != c.layers) die("%s: no layer_types", path);
 
-  gpu_init(kernel_source, sizeof kernel_source - 1);
+  gpu_start();
   K_mv1[0] = gpu_kernel("mv1_nvfp4"), K_mv1[1] = gpu_kernel("mv1_fp8"), K_mv1[2] = gpu_kernel("mv1_bf16");
   K_mvr[0] = gpu_kernel("mvr_nvfp4"), K_mvr[1] = gpu_kernel("mvr_fp8"), K_mvr[2] = gpu_kernel("mvr_bf16");
   K_gate_up[0] = gpu_kernel("gate_up_nvfp4"), K_gate_up[1] = gpu_kernel("gate_up_fp8"), K_gate_up[2] = gpu_kernel("gate_up_bf16");
   K_add_norm = gpu_kernel("add_norm");
-  K_mm[0] = gpu_kernel("mm_nvfp4"), K_mm[1] = gpu_kernel("mm_fp8"), K_mm[2] = gpu_kernel("mm_bf16");
+  K_mm[0] = gpu_kernel("gemm_nvfp4"), K_mm[1] = gpu_kernel("gemm_fp8"), K_mm[2] = gpu_kernel("gemm_bf16");
   K_x_bf16 = gpu_kernel("x_bf16"), K_concat = gpu_kernel("concat");
-  K_q_half = gpu_kernel("q_half"), K_attend_prompt = gpu_kernel("attend_prompt");
-  K_embed = gpu_kernel("embed"), K_rms_norm = gpu_kernel("rms_norm"), K_l2_norm = gpu_kernel("l2_norm");
+  K_q_half = gpu_kernel("gqa_q_half"), K_attend_prompt = gpu_kernel("gqa_prompt");
+  K_embed = gpu_kernel("embed_rows"), K_rms_norm = gpu_kernel("rms_norm"), K_l2_norm = gpu_kernel("l2_norm");
   K_conv = gpu_kernel("conv"), K_gdn_gates = gpu_kernel("gdn_gates"), K_gdn = gpu_kernel("gdn");
   K_qk_rope = gpu_kernel("qk_rope"), K_kv_store = gpu_kernel("kv_store");
-  K_attend_block = gpu_kernel("attend_block"), K_attend_combine = gpu_kernel("attend_combine");
-  K_swiglu = gpu_kernel("swiglu"), K_add = gpu_kernel("add");
+  K_attend_block = gpu_kernel("gqa_block"), K_attend_combine = gpu_kernel("gqa_combine");
+  K_swiglu = gpu_kernel("silu_mul"), K_add = gpu_kernel("add");
 
   st_open(dir);
   double t0 = now();
@@ -359,7 +360,7 @@ QwenState *qwen_state_new(void) {
     s->gdn[i] = zeros(gdn_bytes()), s->conv[i] = zeros(conv_bytes()), s->hid[i] = zeros(hid_bytes());
   s->cap = 1024;
   s->kv = own(gpu_alloc(kv_bytes(s->cap)));
-  s->saved = -1;
+  s->saved = -1, s->mtp_kept = -1;
   grow_blocks(s->cap);
   return s;
 }
@@ -405,6 +406,7 @@ void qwen_state_copy(QwenState *dst, const QwenState *src, int positions) {
   memcpy(dst->hid[dst->cur].ptr, src->hid[src->cur].ptr, hid_bytes());
   kv_rows(dst->kv.ptr, dst->cap, src->kv.ptr, src->cap, positions);
   dst->pos = positions, dst->saved = -1;
+  dst->mtp_next = positions > 0 ? positions - 1 : 0, dst->mtp_kept = -1;  // the last key waits for the next token
 }
 
 void qwen_state_back(QwenState *s) {
@@ -432,6 +434,7 @@ void qwen_snap_restore(QwenState *s, const QwenSnap *n) {
   memcpy(s->conv[s->cur].ptr, n->conv.ptr, conv_bytes());
   memcpy(s->hid[s->cur].ptr, n->hid.ptr, hid_bytes());
   s->pos = n->pos, s->saved = -1;
+  s->mtp_next = n->pos > 0 ? n->pos - 1 : 0, s->mtp_kept = -1;
 }
 
 int qwen_snap_pos(const QwenSnap *n) { return n->pos; }
@@ -467,10 +470,10 @@ static int nrows, prompt_pass;
 static void mv(const Mat *m, const Buf *x, size_t xo, const Buf *y, size_t yo, int n) {
   int f = m->kind == 'n' ? 0 : m->kind == '8' ? 1 : 2;
   if (prompt_pass) {
-    uint32_t k = (uint32_t)m->cols;
+    uint32_t k = (uint32_t)m->cols, kl[2] = {k, k};  // x_bf16's row strides of XB and x; k % 512 == 0 (mat)
     gpu_kern(K_x_bf16);
-    gpu_buf(0, x, xo), gpu_buf(1, &XB, 0), gpu_bytes(2, &k, 4);
-    gpu_go((k / 4 + 255) / 256, (uint32_t)n, 1, 256, 1, 1);
+    gpu_buf(0, x, xo), gpu_buf(1, &XB, 0), gpu_bytes(2, kl, sizeof kl);
+    gpu_go(k / 256, (uint32_t)n, 1, 64, 1, 1);
     MMp p = {(uint32_t)n, (uint32_t)m->rows, k, 0, m->scale, 0, 0, 0};
     gpu_kern(K_mm[f]);
     gpu_buf(0, &m->w, 0), gpu_buf(1, m->kind == 'n' ? &m->s : &m->w, 0);
@@ -745,6 +748,7 @@ static const float *pass(const QwenRow *rows, int n, int logits, int prompt) {
     QwenState *s = rows[i].state;
     s->pos++;
     if (rows[i].save) s->saved = s->pos;
+    if (mtp && prompt) s->mtp_next = s->pos - 1;  // every key of the pass's positions but its last
   }
   return logits ? (const float *)LOGITS.ptr : 0;
 }
@@ -780,3 +784,171 @@ const float *qwen_mtp(const QwenMtpRow *rows, int n, int logits) {
 
 const float *qwen_forward(const QwenRow *rows, int n, int logits) { return pass(rows, n, logits, 0); }
 const float *qwen_prefill(const QwenRow *rows, int n, int logits) { return pass(rows, n, logits, 1); }
+
+// ---- the model interface (model.h) ----
+
+static Options qopt;
+static const float *last_logits;  // what the last call returned, for a snapshot's logits
+static double last_pass;          // when the last pass ran (now())
+enum { RELEASE_AFTER = 60 };      // seconds without passes before the buffers leave the residency set
+
+static void q_load(const char *dir, const Options *o) {
+  if (o->experts || o->ced || o->substitute > 0 || o->online_predictor || o->prefill_prune || o->draft_cache ||
+      o->dump_fd >= 0 || o->routes_fd >= 0 || o->runahead)
+    die("qwen3_5: --experts, --ced, --substitute, --online-predictor, --prefill-prune, --draft-cache, --dump-fd, "
+        "--routes-fd and --runahead apply to DeepSeek's routed experts and layers");
+  qopt = *o;
+  qwen_load(dir);
+  last_pass = now();
+}
+
+static int q_vocab(void) { return c.vocab; }
+static int q_max_rows(void) { return ROWS; }
+static int q_max_verify(void) { return mtp ? 2 : 1; }
+static int q_draft_block(void) { return mtp && qopt.draft > 0 ? 1 : 0; }
+static int q_rewind(void) { return 0; }
+static int q_stop(int token) { return qwen_stop(token); }
+
+static ModelState *q_state_new(void) { return (ModelState *)qwen_state_new(); }
+static void q_state_free(ModelState *s) { qwen_state_free((QwenState *)s); }
+static size_t q_state_bytes(const ModelState *s, int positions) { return qwen_state_bytes(positions); }
+static void q_state_copy(ModelState *dst, const ModelState *src, int positions) {
+  qwen_state_copy((QwenState *)dst, (const QwenState *)src, positions);
+}
+
+typedef struct {
+  QwenSnap *snap;
+  float *logits;  // or null
+} Taken;
+
+static ModelSnapshot *q_snapshot_take(ModelState *s, int pos, int with_logits) {
+  QwenState *q = (QwenState *)s;
+  if (pos != q->pos) die("qwen3_5: a snapshot at %d of a state at %d", pos, q->pos);
+  Taken *t = xmalloc(sizeof *t);
+  *t = (Taken){qwen_snap_take(q), 0};
+  if (with_logits) {
+    if (!last_logits) die("qwen3_5: a snapshot's logits before any pass");
+    t->logits = xmalloc((size_t)c.vocab * 4), memcpy(t->logits, last_logits, (size_t)c.vocab * 4);
+  }
+  return (ModelSnapshot *)t;
+}
+static void q_snapshot_restore(ModelState *s, const ModelSnapshot *x) {
+  qwen_snap_restore((QwenState *)s, ((const Taken *)x)->snap);
+}
+static void q_snapshot_free(ModelSnapshot *x) {
+  if (!x) return;
+  qwen_snap_free(((Taken *)x)->snap), free(((Taken *)x)->logits), free(x);
+}
+static size_t q_snapshot_bytes(int with_logits) { return qwen_snap_bytes() + (with_logits ? (size_t)c.vocab * 4 : 0); }
+static const float *q_snapshot_logits(const ModelSnapshot *x) { return ((const Taken *)x)->logits; }
+
+// The MTP head's keys a state owes before the token at its position runs: a
+// kept draft's (the saved row's hidden), then its last row's with `token`.
+// Only while drafts are on: without them no key is read. With logits, the
+// last row's draft logits.
+static const float *mtp_fill(QwenState *s, int token, int logits) {
+  if (!mtp || qopt.draft <= 0) return 0;
+  QwenMtpRow rows[2];
+  int n = 0;
+  if (s->mtp_next == s->pos - 2) {
+    if (s->mtp_kept < 0 || s->saved != s->pos - 1) die("qwen3_5: an MTP key owed without its hidden");
+    rows[n++] = (QwenMtpRow){s, s->mtp_kept, 1};
+  } else if (s->mtp_next < s->pos - 2) die("qwen3_5: MTP keys %d to %d owed", s->mtp_next, s->pos - 1);
+  if (s->pos > 0 && (s->mtp_next < s->pos || logits)) rows[n++] = (QwenMtpRow){s, token, 0};
+  s->mtp_next = s->pos, s->mtp_kept = -1;
+  return n ? qwen_mtp(rows, n, logits ? 1 : 0) : 0;
+}
+
+static const float *q_prefill(ModelState *st, const int *tokens, int n, int from, int replay, int capture,
+                              ModelSnapshot **captured, float *every) {
+  QwenState *s = (QwenState *)st;
+  if (replay && from) die("qwen3_5: no replay (replay_rows)");
+  if (from != s->pos) die("qwen3_5: a prefill from %d of a state at %d", from, s->pos);
+  if (captured) *captured = 0;
+  if (capture >= 0 && (capture <= from || capture >= n || !captured))
+    die("qwen3_5: a capture at %d in a prefill of positions %d to %d", capture, from, n);
+  if (mtp && qopt.draft > 0 && s->mtp_next == from - 2) {  // a kept draft's key, before the prompt pass fills the next
+    QwenMtpRow r = {s, s->mtp_kept, 1};
+    qwen_mtp(&r, 1, 0);
+  }
+  static QwenRow rows[PF];
+  // with every position's logits, passes of ROWS rows (the head takes at most
+  // ROWS): a prompt's rows give the same logits however it is split
+  int most = every ? ROWS : PF;
+  const float *lg = 0;
+  for (int at = from; at < n;) {
+    int end = capture > at && capture < n ? capture : n, k = end - at < most ? end - at : most;
+    for (int i = 0; i < k; i++) rows[i] = (QwenRow){s, tokens[at + i], 0};
+    lg = qwen_prefill(rows, k, every ? k : 1);
+    if (every) memcpy(every + (size_t)(at - from) * c.vocab, lg, (size_t)k * c.vocab * 4), lg += (size_t)(k - 1) * c.vocab;
+    at += k;
+    if (at == capture) *captured = q_snapshot_take(st, at, 0);
+  }
+  last_pass = now();
+  return last_logits = lg;
+}
+
+static const float *q_rows(ModelState *const *states, const int *tokens, const int *pos, int m) {
+  if (m < 1 || m > ROWS) die("qwen3_5: %d rows", m);
+  QwenRow rows[ROWS];
+  for (int r = 0; r < m; r++) {
+    QwenState *s = (QwenState *)states[r];
+    if (pos[r] != s->pos) die("qwen3_5: a row at %d of a state at %d", pos[r], s->pos);
+    mtp_fill(s, tokens[r], 0);
+    rows[r] = (QwenRow){s, tokens[r], 0};
+  }
+  last_pass = now();
+  return last_logits = qwen_forward(rows, m, m);
+}
+
+static void q_draft(ModelState *st, int token, int pos, int *drafts, int n) {
+  QwenState *s = (QwenState *)st;
+  if (n < 1 || !q_draft_block()) die("qwen3_5: %d drafts (the MTP head drafts one)", n);
+  if (pos != s->pos) die("qwen3_5: a draft at %d of a state at %d", pos, s->pos);
+  drafts[0] = sample_argmax(mtp_fill(s, token, 1), c.vocab);
+}
+
+static const float *q_verify(ModelState *st, const int *tokens, int m, int pos) {
+  QwenState *s = (QwenState *)st;
+  if (m < 1 || m > q_max_verify()) die("qwen3_5: a verify pass of %d rows", m);
+  if (pos != s->pos) die("qwen3_5: a verify pass at %d of a state at %d", pos, s->pos);
+  mtp_fill(s, tokens[0], 0);
+  QwenRow rows[2] = {{s, tokens[0], m > 1}, {s, m > 1 ? tokens[1] : 0, 0}};
+  last_pass = now();
+  return last_logits = qwen_forward(rows, m, m);
+}
+
+static void q_accept(ModelState *st, const int *tokens, int n, int pos) {
+  QwenState *s = (QwenState *)st;
+  if (n == s->pos - pos) {  // every row kept: a kept draft owes the saved row's key
+    if (n == 2) s->mtp_kept = tokens[1];
+    return;
+  }
+  if (n != 1 || s->pos - pos != 2) die("qwen3_5: %d of %d rows kept", n, s->pos - pos);
+  qwen_state_back(s);
+}
+
+static void q_seek(ModelState *s, const int *tokens, int pos) {}
+static int q_replay_rows(int k) { return -1; }  // a DeltaNet state cannot be rebuilt from copied rows
+static int q_replay_start(int k) { return k; }
+
+static int q_idle(void) {
+  if (now() - last_pass >= RELEASE_AFTER) qwen_reside(0);
+  return 0;
+}
+
+static void q_chat(char *text, size_t cap, const char *prompt, int images, int think) {
+  snprintf(text, cap, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n%s", prompt,
+           think ? "<think>\n" : "<think>\n\n</think>\n\n");
+}
+
+static const char *const q_types[] = {"qwen3_5", "qwen3_5_text", 0};
+
+const ModelOps qwen_ops = {
+    .family = "Qwen3.8", .model_types = q_types, .load = q_load, .vocab = q_vocab, .max_rows = q_max_rows,
+    .max_verify = q_max_verify, .draft_block = q_draft_block, .rewind = q_rewind, .stop = q_stop,
+    .state_new = q_state_new, .state_free = q_state_free, .state_bytes = q_state_bytes, .state_copy = q_state_copy,
+    .snapshot_take = q_snapshot_take, .snapshot_restore = q_snapshot_restore, .snapshot_free = q_snapshot_free,
+    .snapshot_bytes = q_snapshot_bytes, .snapshot_logits = q_snapshot_logits, .prefill = q_prefill,
+    .replay_rows = q_replay_rows, .replay_start = q_replay_start, .rows = q_rows, .draft = q_draft, .verify = q_verify, .accept = q_accept,
+    .seek = q_seek, .idle = q_idle, .chat = q_chat};

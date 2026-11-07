@@ -23,9 +23,9 @@ enum {
   // position, for the KV prefix cache's resumes: each layer's window ring
   // keeps this many rows beyond its window. The rewind margin is at least
   // this, and at least the drafts or --lookup proposals that a verify pass
-  // writes after the token (model_rewind).
+  // writes after the token (deepseek_rewind).
   REWIND = 8,
-  BATCH_ROWS = 6,  // rows of different sequences that one decode pass takes (model_forward_rows, --batch)
+  BATCH_ROWS = 6,  // rows of different sequences that one decode pass takes (deepseek_forward_rows, --batch)
   DRAFT_CACHE_MIN = BLOCK * DRAFT_TOPK,  // one stage's largest union of native selections
   CACHE_LAYERS = LAYERS + DRAFTS,  // the expert cache's layers: the backbone's, then the stages'
 };
@@ -74,7 +74,9 @@ int sample_argmax(const float *logits, int count);
 int sample_token(const float *logits, int count, Sampler *s);
 // logits contains ndraft + 1 rows of count values; drafts contains ndraft
 // tokens. The sampler is independent of the model's verification row limit.
-int sample_verify(const float *logits, int count, const int *drafts, int ndraft, int eos, Sampler *s, int *accepted);
+// stop (or null): whether a token ends the reply, which also ends the kept drafts
+int sample_verify(const float *logits, int count, const int *drafts, int ndraft, int (*stop)(int token), Sampler *s,
+                  int *accepted);
 typedef struct {
   char *p;
   size_t n, cap;
@@ -123,6 +125,7 @@ typedef struct {
   uint32_t off;  // byte offset of the payload inside the buffer
 } Buf;
 void gpu_init(const char *source, size_t len);
+void gpu_start(void);  // gpu_init with every model's kernels (src/kernels/library.c), once per process
 int gpu_kernel(const char *name);
 Buf gpu_alloc(size_t size);  // resident from the start
 Buf gpu_new(size_t size);    // outside the residency set
@@ -227,7 +230,7 @@ void cache_wait(int layer, const int *experts, int n);     // waits for their re
 int cache_slot(int layer, int expert);   // it has a slot: resident, or being read
 int cache_hold(int layer, const int *experts, int n);
 void cache_unhold(int layer, const int *experts, int n);
-uint64_t model_ready_groups(void);
+uint64_t deepseek_ready_groups(void);
 int cache_ready(int layer, int expert);  // resident and read
 int cache_where(int layer, int expert);  // 0 only on the SSD, 1 in memory, 2 read ahead, 3 read ahead and still being read
 // Starts reading the n predicted experts that are not resident, in order,
@@ -305,7 +308,7 @@ typedef struct {
   uint16_t *patch;  // vh vw rows of VIT_K BF16 values
   uint64_t hash;    // of the image file's bytes
   int start;        // the position of its span in the prompt
-  uint16_t *rows;   // once encoded (model_image): th tw feature rows of DIM BF16 values
+  uint16_t *rows;   // once encoded (deepseek_image): th tw feature rows of DIM BF16 values
 } Image;
 // Decodes an image file (any format macOS reads) and prepares its patches;
 // 0 with *err if it cannot.
@@ -334,7 +337,7 @@ typedef struct {
   int cache_read_cost;  // weight decode eviction priorities by aligned read bytes / slot size
   int dump_fd;        // -1, or a pipe receiving per-layer streams
   int routes_fd;      // -1, or a pipe receiving every decoded token's routes, predictions and router logits
-  int draft;          // keep the DSpark stages' windows, for model_draft
+  int draft;          // keep the DSpark stages' windows, for deepseek_draft
   int lookup;         // 0: off; otherwise up to VERIFY_DRAFTS context-copy candidates
   int draft_cache;    // draft expert slots per stage; 0 = all 128 preloaded
   const char *predictor_state; // load or create online state; save on clean completion
@@ -358,53 +361,53 @@ void online_predictor_bind(const unsigned char identity[32]);
 int online_predictor_load(const char *path, char *error, size_t capacity); // 1 loaded, 0 absent, -1 error
 int online_predictor_save(const char *path, char *error, size_t capacity); // 1 saved, -1 error
 int online_predictor_dirty(void);
-void model_save_predictor(void);
-void model_load(const char *dir, const Options *o);
+void deepseek_save_predictor(void);
+void deepseek_load(const char *dir, const Options *o);
 // Runs the tokens at positions pos.. and returns the logits of the last one.
-const float *model_forward(const int *tokens, int n, int pos);
+const float *deepseek_forward(const int *tokens, int n, int pos);
 typedef struct {
   int tokens, chunks, decoder_tokens, ced_tokens, ced_applied, prune_applied;
   int decoder_row_layers; // token rows actually processed across layers 21 through 39
   int prefix_tokens, prefix_encoder_only;
-} ModelForwardInfo;
-ModelForwardInfo model_forward_info(void);
+} DeepSeekForwardInfo;
+DeepSeekForwardInfo deepseek_forward_info(void);
 // The DSpark draft for `token` at position pos, every position before it
 // having run (with Options.draft): the tokens it drafts for pos + 1 .. pos + BLOCK.
-void model_draft(int token, int pos, int *drafts, int n); // the first n of BLOCK drafts
+void deepseek_draft(int token, int pos, int *drafts, int n); // the first n of BLOCK drafts
 // Speculative decoding: runs the token at pos and its drafts (m rows) and
-// returns each row's logits; model_accept keeps the first n of the rows.
-const float *model_verify(const int *tokens, int m, int pos);
-void model_accept(const int *tokens, int n, int pos);
-void model_bench(void);
-void model_reset(void);
+// returns each row's logits; deepseek_accept keeps the first n of the rows.
+const float *deepseek_verify(const int *tokens, int m, int pos);
+void deepseek_accept(const int *tokens, int n, int pos);
+void deepseek_bench(void);
+void deepseek_reset(void);
 // One sequence's attention state: the window rings, compressed rows, index
 // keys and compressor rows of the layers, the draft's windows and the
 // Engram history. The layers work on one state at a time.
 typedef struct State State;
-State *model_state_new(void);    // zeroed; the first takes over the state model_load made
-void model_state_free(State *s);  // not the one in use
-size_t model_state_bytes(const State *s, int positions);  // s (null: a new state) holding that many
-void model_state_use(State *s);
+State *deepseek_state_new(void);    // zeroed; the first takes over the state deepseek_load made
+void deepseek_state_free(State *s);  // not the one in use
+size_t deepseek_state_bytes(const State *s, int positions);  // s (null: a new state) holding that many
+void deepseek_state_use(State *s);
 // The rows of the state in use that later positions overwrite, saved in the
 // state and restored (a rewind point, for the CLI's checks); a restored state
-// continues at the saved position or up to model_rewind() positions before it.
-void model_state_save(void);
-void model_state_restore(void);
+// continues at the saved position or up to deepseek_rewind() positions before it.
+void deepseek_state_save(void);
+void deepseek_state_restore(void);
 // For the server's KV prefix cache. A snapshot holds a state's rolling part
 // at one position: the window rings, compressor rows and draft rings that
 // later positions overwrite, and the Engram history.
 typedef struct Snapshot Snapshot;
-Snapshot *model_snapshot(State *s, int pos, int with_logits);  // s's rolling rows now, as at pos; and the last logits
-void model_snapshot_restore(State *s, const Snapshot *x);
-void model_snapshot_free(Snapshot *x);
-size_t model_snapshot_bytes(int with_logits);
-int model_snapshot_pos(const Snapshot *x);
-int model_snapshot_extent(const Snapshot *x);  // the last layer it holds: LAYERS - 1, or 20 (CED)
-const float *model_snapshot_logits(const Snapshot *x);  // null without
+Snapshot *deepseek_snapshot(State *s, int pos, int with_logits);  // s's rolling rows now, as at pos; and the last logits
+void deepseek_snapshot_restore(State *s, const Snapshot *x);
+void deepseek_snapshot_free(Snapshot *x);
+size_t deepseek_snapshot_bytes(int with_logits);
+int deepseek_snapshot_pos(const Snapshot *x);
+int deepseek_snapshot_extent(const Snapshot *x);  // the last layer it holds: LAYERS - 1, or 20 (CED)
+const float *deepseek_snapshot_logits(const Snapshot *x);  // null without
 // The global rows (compressed rows, index keys) of src before positions, into
 // dst, which is not in use (its rewind point is dropped). A running src is
 // fine: no later step changes them.
-void model_state_copy(State *dst, const State *src, int positions);
+void deepseek_state_copy(State *dst, const State *src, int positions);
 // Prefills positions from .. n - 1 of a prompt (tokens: all n of them) in the
 // state in use, and returns the last one's logits. Without replay, the state
 // holds every position before from (its own, or a copy and a restored
@@ -420,42 +423,42 @@ void model_state_copy(State *dst, const State *src, int positions);
 // n; a replay's branch point is from. Under CED compaction, unless the
 // decoder layers start a ring or more before it, the capture holds layers
 // 0-20 only (extent 20).
-const float *model_prefill(const int *tokens, int n, int from, int replay, int capture, Snapshot **captured);
+const float *deepseek_prefill(const int *tokens, int n, int from, int replay, int capture, Snapshot **captured);
 // What a replay at k computes again before k, per layer on average (rounded
 // up): with --ced off at most k, about 2,613 for long prefixes; with --ced
 // the ring (WINDOW plus the rewind margin, 136 positions; at most k).
-int model_replay_rows(int k);
+int deepseek_replay_rows(int k);
 // The rewind margin: the positions beyond its window that each layer's ring
 // keeps, and so how far a state can continue before its end. REWIND, or more
 // with --draft or --lookup: a verify pass writes their rows after the token.
-int model_rewind(void);
+int deepseek_rewind(void);
 // The first position a replay at k computes again (layer 0's), from which its
 // prompt's images must be encoded.
-int model_replay_start(int k);
+int deepseek_replay_start(int k);
 // The experts row `row` of the latest decode step chose in each layer (TOPK
 // each, layer by layer) and where each one was (0 in memory, 1 read ahead,
 // 2 late, 3 substituted, 4 from the SSD); 0 when the row did not run in it.
-int model_routes(int row, uint16_t *id, uint8_t *from);
+int deepseek_routes(int row, uint16_t *id, uint8_t *from);
 // One token for each of m sequences at once (m <= BATCH_ROWS, no drafts):
 // row r is tokens[r] at position pos[r] of state st[r], every position before
-// it having run. Each row is computed as model_forward computes a token
+// it having run. Each row is computed as deepseek_forward computes a token
 // alone. Returns the m rows' logits.
-const float *model_forward_rows(State **st, const int *tokens, const int *pos, int m);
+const float *deepseek_forward_rows(State **st, const int *tokens, const int *pos, int m);
 // Continues the state in use at pos, given the tokens before it: at most
-// model_rewind() positions before the last one that ran, or after a reset at 0.
-void model_seek(const int *tokens, int pos);
+// deepseek_rewind() positions before the last one that ran, or after a reset at 0.
+void deepseek_seek(const int *tokens, int pos);
 // The vision encoder (inference/vision.py ViT and Aligner): the image's
 // feature rows into im->rows. Weights load on first use.
-void model_image(Image *im);
-// The images whose spans (their starts set) the prompts that model_forward
+void deepseek_image(Image *im);
+// The images whose spans (their starts set) the prompts that deepseek_forward
 // runs next hold as negative tokens (image_keys); a span's positions may be
 // in any of its batches.
-void model_images(const Image *im, int n);
+void deepseek_images(const Image *im, int n);
 
 // model.c: the statistics of decoded rows and of prompt rows since start
 extern CacheStats decode_stats, prefill_stats;
 extern uint64_t decode_rows, prefill_rows;
 extern double decode_gpu_s, decode_s;
 extern int prefill_layer, prefill_n;  // a prompt pass's layer (0 between prompts) and rows
-uint64_t model_dense_bytes(void);
-uint64_t model_workspace_bytes(void); // resizable request/layer buffers; excludes fixed scratch, weights and KV
+uint64_t deepseek_dense_bytes(void);
+uint64_t deepseek_workspace_bytes(void); // resizable request/layer buffers; excludes fixed scratch, weights and KV

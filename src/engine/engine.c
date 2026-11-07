@@ -131,7 +131,7 @@ int myds4_load(const myds4_config *c) {
   if (opt.predictor_state) shutdown_watch();  // an interrupt while loading still saves the state
   pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);  // the model's GPU work goes before background work
   myds4_tokenizer(cfg.model);
-  model_load(cfg.model, &opt);
+  deepseek_load(cfg.model, &opt);
   shutdown_watch();
   loaded = 1;
   say("prefill: ced_depth=%d (%s); dependency pruning=%s; rewind margin=%d; context lookup=%d", opt.ced,
@@ -140,7 +140,7 @@ int myds4_load(const myds4_config *c) {
 }
 
 void myds4_finish(void) {
-  model_save_predictor();
+  deepseek_save_predictor();
   online_predictor_report(stderr);
 }
 
@@ -158,25 +158,25 @@ int myds4_idle(void) {
 int myds4_max_rows(void) { return BATCH_ROWS; }
 int myds4_draft_block(void) { return opt.draft; }
 int myds4_max_verify(void) { return VERIFY_DRAFTS + 1; }
-int myds4_rewind(void) { return model_rewind(); }
+int myds4_rewind(void) { return deepseek_rewind(); }
 int myds4_vocab(void) { return VOCAB; }
 
 // ---- attention states and snapshots ----
 
-myds4_state *myds4_state_new(void) { return model_state_new(); }
-void myds4_state_free(myds4_state *s) { model_state_free(s); }
-size_t myds4_state_bytes(const myds4_state *s, int positions) { return model_state_bytes(s, positions); }
-void myds4_state_copy(myds4_state *dst, const myds4_state *src, int positions) { model_state_copy(dst, src, positions); }
-void myds4_state_use(myds4_state *s) { model_state_use(s); }
-void myds4_reset(void) { model_reset(); }
+myds4_state *myds4_state_new(void) { return deepseek_state_new(); }
+void myds4_state_free(myds4_state *s) { deepseek_state_free(s); }
+size_t myds4_state_bytes(const myds4_state *s, int positions) { return deepseek_state_bytes(s, positions); }
+void myds4_state_copy(myds4_state *dst, const myds4_state *src, int positions) { deepseek_state_copy(dst, src, positions); }
+void myds4_state_use(myds4_state *s) { deepseek_state_use(s); }
+void myds4_reset(void) { deepseek_reset(); }
 
 myds4_snapshot *myds4_snapshot_take(myds4_state *s, int pos, int with_logits) {
-  return model_snapshot(s, pos, with_logits);
+  return deepseek_snapshot(s, pos, with_logits);
 }
-void myds4_snapshot_restore(myds4_state *s, const myds4_snapshot *x) { model_snapshot_restore(s, x); }
-void myds4_snapshot_free(myds4_snapshot *x) { model_snapshot_free(x); }
-size_t myds4_snapshot_bytes(int with_logits) { return model_snapshot_bytes(with_logits); }
-const float *myds4_snapshot_logits(const myds4_snapshot *x) { return model_snapshot_logits(x); }
+void myds4_snapshot_restore(myds4_state *s, const myds4_snapshot *x) { deepseek_snapshot_restore(s, x); }
+void myds4_snapshot_free(myds4_snapshot *x) { deepseek_snapshot_free(x); }
+size_t myds4_snapshot_bytes(int with_logits) { return deepseek_snapshot_bytes(with_logits); }
+const float *myds4_snapshot_logits(const myds4_snapshot *x) { return deepseek_snapshot_logits(x); }
 
 // ---- running the model, in the state in use ----
 
@@ -192,14 +192,14 @@ const float *myds4_prefill(const int32_t *tokens, int n, int from, int replay, i
                            myds4_snapshot **captured, myds4_prefill_info *info) {
   if (captured) *captured = 0;
   if (n < 1 || from < 0 || from >= n || n > opt.ctx || !in_vocabulary(tokens, n, 1)) return 0;
-  int start = replay && from > 0 ? model_replay_start(from) : from;
+  int start = replay && from > 0 ? deepseek_replay_start(from) : from;
   if (capture >= 0 && (!captured || capture <= start || capture >= n)) return 0;
   Snapshot *x = 0;
-  const float *lg = model_prefill(tokens, n, from, replay, capture, &x);
-  if (x && model_snapshot_extent(x) != LAYERS - 1) model_snapshot_free(x), x = 0;  // no whole state to restore
+  const float *lg = deepseek_prefill(tokens, n, from, replay, capture, &x);
+  if (x && deepseek_snapshot_extent(x) != LAYERS - 1) deepseek_snapshot_free(x), x = 0;  // no whole state to restore
   if (captured) *captured = x;
   if (info) {
-    ModelForwardInfo f = model_forward_info();
+    DeepSeekForwardInfo f = deepseek_forward_info();
     *info = (myds4_prefill_info){.chunks = f.chunks, .tokens = f.tokens, .decoder_tokens = f.decoder_tokens,
                                  .ced_applied = f.ced_applied, .prune_applied = f.prune_applied,
                                  .prefix_tokens = f.prefix_tokens};
@@ -207,31 +207,31 @@ const float *myds4_prefill(const int32_t *tokens, int n, int from, int replay, i
   return lg;
 }
 
-int myds4_replay_rows(int k) { return model_replay_rows(k); }
-int myds4_replay_start(int k) { return model_replay_start(k); }
+int myds4_replay_rows(int k) { return deepseek_replay_rows(k); }
+int myds4_replay_start(int k) { return deepseek_replay_start(k); }
 
 const float *myds4_step(int32_t token, int pos) {
   if (!in_vocabulary(&token, 1, 0) || pos < 0 || pos >= opt.ctx) return 0;
-  return model_forward(&token, 1, pos);
+  return deepseek_forward(&token, 1, pos);
 }
 
 const float *myds4_rows(myds4_state **states, const int32_t *tokens, const int32_t *pos, int m) {
   if (m < 1 || m > BATCH_ROWS || !in_vocabulary(tokens, m, 0)) return 0;
   for (int r = 0; r < m; r++)
     if (pos[r] < 0 || pos[r] >= opt.ctx) return 0;
-  return model_forward_rows(states, tokens, pos, m);
+  return deepseek_forward_rows(states, tokens, pos, m);
 }
 
-void myds4_draft(int32_t token, int pos, int32_t *drafts, int n) { model_draft(token, pos, drafts, n); }
+void myds4_draft(int32_t token, int pos, int32_t *drafts, int n) { deepseek_draft(token, pos, drafts, n); }
 
 const float *myds4_verify(const int32_t *rows, int m, int pos) {
   if (m < 1 || m > VERIFY_DRAFTS + 1 || pos < 0 || pos + m > opt.ctx || !in_vocabulary(rows, m, 0)) return 0;
-  return model_verify(rows, m, pos);
+  return deepseek_verify(rows, m, pos);
 }
 
-void myds4_accept(const int32_t *rows, int n, int pos) { model_accept(rows, n, pos); }
+void myds4_accept(const int32_t *rows, int n, int pos) { deepseek_accept(rows, n, pos); }
 
-void myds4_seek(const int32_t *tokens, int pos) { model_seek(tokens, pos); }
+void myds4_seek(const int32_t *tokens, int pos) { deepseek_seek(tokens, pos); }
 
 // ---- sampling ----
 
@@ -253,9 +253,13 @@ void myds4_sampler_free(myds4_sampler *s) { free(s); }
 
 int32_t myds4_sample(const float *logits, myds4_sampler *s) { return sample_token(logits, VOCAB, &s->sp); }
 
+static int32_t verify_eos;
+static int is_verify_eos(int token) { return token == verify_eos; }
+
 int32_t myds4_sample_verify(const float *logits, const int32_t *drafts, int n, int32_t eos, myds4_sampler *s,
                             int *accepted) {
-  return sample_verify(logits, VOCAB, drafts, n, eos, &s->sp, accepted);
+  verify_eos = eos;
+  return sample_verify(logits, VOCAB, drafts, n, is_verify_eos, &s->sp, accepted);
 }
 
 // ---- context-copy drafts ----
@@ -302,14 +306,14 @@ int myds4_images_expand(myds4_images *x, const int32_t *in, int n, int32_t *out,
 int myds4_images_encode(myds4_images *x, int from) {
   int encoded = 0;  // the encoder runs for the images the prefill reaches; the others are in the state's rows
   for (int i = 0; i < x->n; i++)
-    if (x->ims[i].start + image_span(&x->ims[i]) > from) model_image(&x->ims[i]), encoded++;
-  model_images(x->ims, x->n);
+    if (x->ims[i].start + image_span(&x->ims[i]) > from) deepseek_image(&x->ims[i]), encoded++;
+  deepseek_images(x->ims, x->n);
   return encoded;
 }
 
 void myds4_images_close(myds4_images *x) {
   if (!x) return;
-  model_images(0, 0);
+  deepseek_images(0, 0);
   for (int i = 0; i < x->n; i++) image_free(&x->ims[i]);
   free(x->ims), free(x);
 }
@@ -325,7 +329,7 @@ static myds4_cache_counts counts(const CacheStats *c) {
                               .row_ssd = c->row_ssd, .read_s = c->read_s};
 }
 
-int myds4_routes(int row, uint16_t *experts, uint8_t *sources) { return model_routes(row, experts, sources); }
+int myds4_routes(int row, uint16_t *experts, uint8_t *sources) { return deepseek_routes(row, experts, sources); }
 
 void myds4_stats_get(myds4_stats *s) {
   MemInfo m;
@@ -335,7 +339,7 @@ void myds4_stats_get(myds4_stats *s) {
                      .decode_gpu_seconds = decode_gpu_s, .prefill_layer = prefill_layer, .prefill_rows_now = prefill_n,
                      .slots = cache_slots(), .mapped = cache_mapped(), .cap = cache_cap(), .max_slots = cache_max(),
                      .experts = LAYERS * EXPERTS, .slot_bytes = cache_slot_bytes(), .cache_bytes = cache_bytes(),
-                     .dense_bytes = model_dense_bytes(), .footprint = mem_footprint(), .gpu_in_use = mem_gpu(),
+                     .dense_bytes = deepseek_dense_bytes(), .footprint = mem_footprint(), .gpu_in_use = mem_gpu(),
                      .available = mem_available(), .gpu_limit = mem_gpu_limit(), .total = m.total, .free = m.free,
                      .file = m.file, .file_kept = m.file_kept, .wired = m.wired, .compressor = m.compressor,
                      .compressed = m.compressed, .swap_used = m.swap_used, .swapouts = m.swapouts,

@@ -19,7 +19,7 @@ static void spy_go(uint32_t x, uint32_t y, uint32_t z, uint32_t tx, uint32_t ty,
 #define gpu_buf spy_buffer
 #define gpu_bytes spy_bytes
 #define gpu_go spy_go
-#include "../../src/engine/model.c"
+#include "../../src/model/deepseek.c"
 
 static int checks, failures;
 static void expect(const char *name, int ok) {

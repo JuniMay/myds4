@@ -1,9 +1,11 @@
 // CED numerical comparisons and prefill/DSpark timing checks.
 // Including the model lets this diagnostic inspect caches without a public API.
 #define MYDS4_CED_CHECK 1
-#include "../../src/engine/model.c"
+#include "../../src/model/deepseek.c"
 
 typedef struct { uint64_t count, different; double signal, error, max_abs; } Error;
+static int eos_token;
+static int is_eos(int token) { return token == eos_token; }
 static int prompt_n, observed[LAYERS][WINDOW][TOPK], reference_routes[LAYERS][WINDOW][TOPK];
 static uint16_t reference_ring[LAYERS][(WINDOW + VERIFY_DRAFTS) * HEAD_DIM];
 static uint16_t *reference_global[LAYERS][2];
@@ -12,14 +14,14 @@ static void benchmark(int *tokens, int generate, int keep) {
   ced_check_first = keep > 0 && prompt_n > keep ? prompt_n - keep : 0;
   CacheStats c0 = cache_stats;
   double g0 = gpu_busy, t0 = now();
-  const float *lg = model_forward(tokens, prompt_n, 0);
+  const float *lg = deepseek_forward(tokens, prompt_n, 0);
   unsigned char prefill_digest[CC_SHA256_DIGEST_LENGTH];
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
   CC_SHA256(lg, VOCAB * 4, prefill_digest);
 #pragma clang diagnostic pop
   double t1 = now(), g1 = gpu_busy;
-  ModelForwardInfo plan = model_forward_info();
+  DeepSeekForwardInfo plan = deepseek_forward_info();
   CacheStats c1 = cache_stats;
   uint64_t rows0 = decode_rows, slots0 = cache_bytes(), minimum = slots0, maximum = slots0;
   Sampler sampler = {.temp = 1, .top_p = 1};
@@ -30,13 +32,14 @@ static void benchmark(int *tokens, int generate, int keep) {
     int rows[BLOCK + 1] = {current}, k = opt.draft, a = 0, next;
     if (k > generate - gen - 1) k = generate - gen - 1;
     if (k > 0) {
-      model_draft(current, pos, rows + 1, k);
-      lg = model_verify(rows, k + 1, pos);
-      next = sample_verify(lg, VOCAB, rows + 1, k, eos, &sampler, &a);
-      model_accept(rows, a + 1, pos);
+      deepseek_draft(current, pos, rows + 1, k);
+      lg = deepseek_verify(rows, k + 1, pos);
+      eos_token = eos;
+      next = sample_verify(lg, VOCAB, rows + 1, k, is_eos, &sampler, &a);
+      deepseek_accept(rows, a + 1, pos);
       passes++, proposals += k, accepted += a;
     } else {
-      lg = model_forward(&current, 1, pos);
+      lg = deepseek_forward(&current, 1, pos);
       next = sample_token(lg, VOCAB, &sampler);
     }
     for (int r = 0; r <= a; r++) tokens[pos + r] = rows[r];
@@ -250,7 +253,7 @@ int main(int argc, char **argv) {
   Options o = {.ctx = 32768, .budget_gb = cache_gib, .reserve_gb = reserve_gib, .experts = experts,
                .draft = dspark_depth, .draft_cache = dspark_depth ? 32 : 0,
                .dump_fd = -1, .routes_fd = -1, .quiet = 1, .ced = runtime_ced};
-  model_load(argv[1], &o);
+  deepseek_load(argv[1], &o);
   if (bench_tokens >= 0) {
     benchmark(tokens, bench_tokens, keep_setting);
     free(tokens);
@@ -264,14 +267,14 @@ int main(int argc, char **argv) {
   int continuation[64], eos = tok_find("<｜end▁of▁sentence｜>");
   Sampler sampler = {.temp = 1, .top_p = 1}, draws[64];
   sampler_seed(&sampler, 12345);
-  const float *lg = model_forward(tokens, prompt_n, 0);
+  const float *lg = deepseek_forward(tokens, prompt_n, 0);
   snapshot();
   for (int j = 0; j < steps; j++) {
     memcpy(reference_logits + (size_t)j * VOCAB, lg, VOCAB * sizeof(float));
     draws[j] = sampler;
     continuation[j] = sample_token(lg, VOCAB, &sampler);
     if (continuation[j] == eos) steps = j + 1;
-    if (j + 1 < steps) lg = model_forward(continuation + j, 1, prompt_n + j);
+    if (j + 1 < steps) lg = deepseek_forward(continuation + j, 1, prompt_n + j);
   }
   printf("{\"ced_reference\":{\"teacher_forced_positions\":%d}}\n", steps), fflush(stdout);
   int keeps[] = {prompt_n, 128, 256, 512, 1024};
@@ -280,11 +283,11 @@ int main(int argc, char **argv) {
   for (size_t trial = 0; trial < trials; trial++) {
     int keep = keeps[trial];
     if (trial && keep >= prompt_n) continue;
-    model_reset();
+    deepseek_reset();
     if (compare_compact) ced_check_compact = 1;
     ced_check_first = prompt_n > keep ? prompt_n - keep : 0;
     memset(observed, 0, sizeof observed);
-    lg = model_forward(tokens, prompt_n, 0);
+    lg = deepseek_forward(tokens, prompt_n, 0);
     uint64_t cache_different = report_cache(keep);
     Error errors = {0};
     double kl_sum = 0, kl_max = 0, tv_sum = 0, tv_max = 0, nll_delta = 0;
@@ -305,7 +308,7 @@ int main(int argc, char **argv) {
       argmax_equal += sample_argmax(ref, VOCAB) == sample_argmax(lg, VOCAB);
       Sampler same_draw = draws[j];
       sampled_equal += sample_token(lg, VOCAB, &same_draw) == chosen;
-      if (j + 1 < steps) lg = model_forward(continuation + j, 1, prompt_n + j);
+      if (j + 1 < steps) lg = deepseek_forward(continuation + j, 1, prompt_n + j);
     }
     printf("{\"ced_logits\":{\"keep_tokens\":%d,\"positions\":%d,\"argmax_equal\":%d,\"same_draw_sample_equal\":%d,"
            "\"mean_kl_nats\":%.9g,\"max_kl_nats\":%.9g,\"mean_total_variation\":%.9g,\"max_total_variation\":%.9g,"

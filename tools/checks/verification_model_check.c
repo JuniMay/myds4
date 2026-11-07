@@ -30,19 +30,19 @@ int main(int argc, char **argv) {
   int length = tok_encode(" Review the queue, keep duplicate jobs, and preserve cancellation order.\n", seed, 128);
   if (!length) die("empty fixture prompt");
   for (int i = 0; i < n; i++) tokens[i] = seed[i % length];
-  model_load(argv[1], &o);
+  deepseek_load(argv[1], &o);
   int rows[VERIFY_DRAFTS + 2];
-  rows[0] = sample_argmax(model_forward(tokens, n, 0), VOCAB);
+  rows[0] = sample_argmax(deepseek_forward(tokens, n, 0), VOCAB);
   for (int i = 1; i < VERIFY_DRAFTS + 2; i++) rows[i] = seed[(i * 7) % length];
-  model_state_save();
+  deepseek_state_save();
   float *reference = xmalloc((size_t)(VERIFY_DRAFTS + 2) * VOCAB * sizeof(float));
   int draft_reference[VERIFY_DRAFTS + 2][2];
   for (int r = 0; r < VERIFY_DRAFTS + 2; r++) {
-    if (o.draft) model_draft(rows[r], n + r, draft_reference[r], 2);
-    memcpy(reference + (size_t)r * VOCAB, model_forward(rows + r, 1, n + r), VOCAB * sizeof(float));
+    if (o.draft) deepseek_draft(rows[r], n + r, draft_reference[r], 2);
+    memcpy(reference + (size_t)r * VOCAB, deepseek_forward(rows + r, 1, n + r), VOCAB * sizeof(float));
   }
-  model_state_restore();
-  const float *got = model_verify(rows, VERIFY_DRAFTS + 1, n);
+  deepseek_state_restore();
+  const float *got = deepseek_verify(rows, VERIFY_DRAFTS + 1, n);
   int failed = 0;
   for (int r = 0; r <= VERIFY_DRAFTS; r++) {
     int different = compare(got + (size_t)r * VOCAB, reference + (size_t)r * VOCAB);
@@ -53,14 +53,14 @@ int main(int argc, char **argv) {
   const int kept_cases[] = {1, 2, 6, 15, 16};
   for (size_t i = 0; i < sizeof kept_cases / sizeof *kept_cases; i++) {
     int kept = kept_cases[i], drafts[2], draft_diff = 0;
-    model_state_restore();
-    model_verify(rows, VERIFY_DRAFTS + 1, n);
-    model_accept(rows, kept, n);
+    deepseek_state_restore();
+    deepseek_verify(rows, VERIFY_DRAFTS + 1, n);
+    deepseek_accept(rows, kept, n);
     if (o.draft) {
-      model_draft(rows[kept], n + kept, drafts, 2);
+      deepseek_draft(rows[kept], n + kept, drafts, 2);
       draft_diff = memcmp(drafts, draft_reference[kept], sizeof drafts) != 0;
     }
-    got = model_forward(rows + kept, 1, n + kept);
+    got = deepseek_forward(rows + kept, 1, n + kept);
     int different = compare(got, reference + (size_t)kept * VOCAB);
     printf("{\"rollback_kept\":%d,\"different_logits\":%d,\"different_drafts\":%d}\n", kept, different, draft_diff);
     fflush(stdout);

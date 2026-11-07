@@ -2,6 +2,7 @@
 // other values the reference keeps in BF16 are rounded where it rounds them, and
 // its activation quantization (FP8 E4M3, FP4 E2M1 with block scales) is
 // applied exactly, so the GPU computes what inference/model.py computes.
+// The shared number formats (fp8, fp4, bf16x4) are in formats.metal.
 #include <metal_stdlib>
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -140,11 +141,6 @@ kernel void mv_fp8(device const uchar *w [[buffer(0)]], device const uchar *s [[
     }
   }
   mv_store(acc, part, y, p, n, row, sg, lane);
-}
-
-inline float4 bf16x4(uint2 q) {
-  return float4(as_type<float>(q.x << 16), as_type<float>(q.x & 0xFFFF0000u),
-                as_type<float>(q.y << 16), as_type<float>(q.y & 0xFFFF0000u));
 }
 
 // BF16 weights.
@@ -1271,11 +1267,6 @@ kernel void engram_gate(device bfloat *h [[buffer(0)]], device const float *kv [
 // and of the dequantized weights, both exact in BF16, accumulating in FP32.
 
 struct MM { uint m, n, k, round, lda, ldy; };  // lda, ldy: row strides of x and y
-
-inline float fp8(uchar b) {
-  return float(as_type<half>(ushort(((b & 0x7Fu) << 7) | ((b & 0x80u) << 8)))) * 256.0f;
-}
-inline float fp4(uchar nib) { return float(as_type<half>(ushort(((nib & 7u) << 9) | ((nib & 8u) << 12)))) * 16384.0f; }
 
 #define MM_STORE(expr)                                          \
   for (uint16_t i = 0; i < c.get_capacity(); i++)               \

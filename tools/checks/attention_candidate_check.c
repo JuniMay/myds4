@@ -13,7 +13,7 @@ static void spy_go(int x, int y, int z, int tx, int ty, int tz) {}
 #define gpu_buf spy_buffer
 #define gpu_bytes spy_bytes
 #define gpu_go spy_go
-#include "../../src/engine/model.c"
+#include "../../src/model/deepseek.c"
 
 int main(void) {
   opt.ctx = 32768, cand_words = 129, sc_rows = 256;

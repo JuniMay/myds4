@@ -79,6 +79,8 @@ static void check(const char *what, const uint8_t *blocks, int nb) {
 
 int main(int argc, char **argv) {
   static const char source[] = {
+#embed "../../src/kernels/formats.metal"
+      , '\n',
 #embed "../../src/kernels/kernels.metal"
       , '\n',
 #embed "../../src/kernels/gguf_grids.metal"

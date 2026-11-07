@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include "myds4.h"
+#include "model.h"
 #include "../experimental/prefill_prune.h"
 
 typedef struct { Buf w, s; int n, k, group; } Lin;  // s.obj is null for BF16 weights; group: rows
@@ -53,7 +54,7 @@ static uint64_t runahead_group_count, runahead_group_rows;
 static int runahead_route_only;
 static uint64_t runahead_route_only_rows;
 static int verifying;
-// The rewind margin (model_rewind): REWIND, or the most rows a verify pass
+// The rewind margin (deepseek_rewind): REWIND, or the most rows a verify pass
 // writes after its token, when --draft or --lookup asks for more.
 static int replay_margin(void) {
   int m = REWIND;
@@ -70,8 +71,8 @@ static int prefill_prune_active, prefill_prune_end;
 
 static uint32_t ced_first;
 static int ced_active, ced_compact;
-static ModelForwardInfo forward_info;
-// A bounded replay (model_prefill's replay under --ced, as DeepInfer's
+static DeepSeekForwardInfo forward_info;
+// A bounded replay (deepseek_prefill's replay under --ced, as DeepInfer's
 // encoder SWA bounded replay; approximate): every layer computes again from
 // bounded_first, its windows cut off there, and the copied compressed rows
 // and index keys of the groups completed before bounded_keep (the branch
@@ -182,13 +183,13 @@ struct State {
   Buf ring[LAYERS], comp[LAYERS], keys[LAYERS], cstate[LAYERS], dring[DRAFTS];
   int32_t history[3];
   int cap;
-  char *saved;  // the rolling rows model_state_save copied, for model_state_restore
+  char *saved;  // the rolling rows deepseek_state_save copied, for deepseek_state_restore
 };
 static State *active;  // the state the layers work on
 
 // A state's rolling part at one position: the rows that later positions
 // overwrite (every window ring, the compressor rows, the draft rings) and
-// the Engram history, in save_rows' layout (see model_snapshot).
+// the Engram history, in save_rows' layout (see deepseek_snapshot).
 struct Snapshot {
   int pos;        // the position the state continues at
   int extent;     // the last layer whose rows it holds: LAYERS - 1, or 20 (CED's encoder-only capture)
@@ -460,9 +461,9 @@ static void predictor_identity(uint8_t result[32]) {
 }
 #pragma clang diagnostic pop
 
-uint64_t model_ready_groups(void) { return runahead_group_count; }
+uint64_t deepseek_ready_groups(void) { return runahead_group_count; }
 
-void model_save_predictor(void) {
+void deepseek_save_predictor(void) {
   if (runahead_group_count)
     fprintf(stderr, "{\"ready_groups\":{\"groups\":%llu,\"rows\":%llu}}\n",
             (unsigned long long)runahead_group_count, (unsigned long long)runahead_group_rows);
@@ -474,7 +475,7 @@ void model_save_predictor(void) {
   fprintf(stderr, "saved online predictor state: %s\n", opt.predictor_state);
 }
 
-void model_load(const char *dir, const Options *options) {
+void deepseek_load(const char *dir, const Options *options) {
   if (options->ced && options->dump_fd >= 0) die("per-layer dumps require --ced off");
   lock_model();
   opt = *options;
@@ -487,16 +488,7 @@ void model_load(const char *dir, const Options *options) {
   if (opt.ced && (opt.ced < WINDOW || opt.ced > 1 << 20)) die("--ced takes off or 128 to 1048576 replay tokens");
   if (opt.predictor_state) opt.online_predictor = 64;
   if (opt.online_predictor && opt.online_predictor != 64) die("online predictor requires rank 64");
-  static const char source[] = {
-#embed "../kernels/kernels.metal"
-      , '\n',
-#embed "../kernels/gguf_grids.metal"
-      , '\n',
-#embed "../kernels/gguf.metal"
-      , '\n',
-#embed "../kernels/vision.metal"
-  };
-  gpu_init(source, sizeof source);
+  gpu_start();
 #define K(name) K_##name = gpu_kernel(#name)
   K(mm_fp8), K(mm_bf16), K(mv_fp8), K(mv_bf16), K(mvm_fp8), K(mvm_bf16), K(mv_fp8_3), K(mv_bf16_3), K(mvm_fp8_3);
   K(mvm_bf16_3), K(moe_up), K(moe_down), K(moe_up_m), K(moe_down_m), K(gg_gather), K(act_quant_h);
@@ -909,7 +901,7 @@ static void attend_one(const Buf *q, size_t q_off, const Buf *ring, const Buf *c
   gpu_go(HEADS, 2, 1, 128, 1, 1);
 }
 
-// Rows of several sequences at once (model_forward_rows): row r is the token
+// Rows of several sequences at once (deepseek_forward_rows): row r is the token
 // at position row_pos[r] of state row_state[r]. 0 rows: one sequence.
 static State *row_state[FEW];
 static int row_pos[FEW], nrows;
@@ -1326,13 +1318,13 @@ static void read_ahead_rows(int m, int l, const int *pr, int ahead, int inflight
 
 // The experts each decoded row chose in the model's layers, where each one
 // was (0 in memory, 1 read ahead, 2 late, 3 substituted, 4 from the SSD) and
-// the decode step that chose them, for the live view (model_routes). The
+// the decode step that chose them, for the live view (deepseek_routes). The
 // router's results are on the CPU already: recording them is a copy.
 static uint16_t route_id[FEW][LAYERS][TOPK];
 static uint8_t route_from[FEW][LAYERS][TOPK];
 static uint64_t route_step[FEW][LAYERS], route_steps;
 
-int model_routes(int row, uint16_t *id, uint8_t *from) {
+int deepseek_routes(int row, uint16_t *id, uint8_t *from) {
   if (row < 0 || row >= FEW || !route_steps) return 0;
   for (int l = 0; l < LAYERS; l++)
     if (route_step[row][l] != route_steps) return 0;  // the row did not run every layer in the latest step
@@ -1554,7 +1546,7 @@ static void draft_keys(int rows, int p0) {
   gpu_sync();
 }
 
-// The draft keys after a step of m sequences' rows (model_forward_rows): row
+// The draft keys after a step of m sequences' rows (deepseek_forward_rows): row
 // r's into st[r]'s rings at pos[r], each as draft_keys(1, pos[r]) writes them
 // when the sequence decodes alone (the rows' products keep each row's order).
 static void draft_rows(State *const *st, const int *pos, int m) {
@@ -1769,9 +1761,9 @@ static void step(const int *tokens, int m, int pos) {
   decode_rows += m, decode_gpu_s += gpu_busy - g0, decode_s += now() - t0;
 }
 
-uint64_t model_dense_bytes(void) { return dense_bytes; }
+uint64_t deepseek_dense_bytes(void) { return dense_bytes; }
 
-uint64_t model_workspace_bytes(void) {
+uint64_t deepseek_workspace_bytes(void) {
   uint64_t bytes = HS.size + MF.size + SEL.size + CAND.size + IMG.size;
   for (int e = 0; e < 2; e++) bytes += EC[e].size + ES[e].size;
   for (size_t i = 0; i < sizeof work_buffers / sizeof *work_buffers; i++) bytes += work_buffers[i]->size;
@@ -1880,7 +1872,7 @@ static void prefix_complete(void) {
   prefix_capture.at = -1;
 }
 
-// An exact replay at k (model_prefill) rebuilds the rolling rows at k from the
+// An exact replay at k (deepseek_prefill) rebuilds the rolling rows at k from the
 // global rows a state copied: layer l must compute again, from replay_first[l],
 // the window keys that its own ring at k and the layer above it need. Layer
 // l's keys at a position come from layer l - 1's output there, and that
@@ -1901,18 +1893,18 @@ static void replay_starts(int k) {
   }
 }
 
-int model_rewind(void) { return replay_margin(); }
+int deepseek_rewind(void) { return replay_margin(); }
 
-int model_replay_rows(int k) {
+int deepseek_replay_rows(int k) {
   if (k <= 0) return 0;
   if (opt.ced) return k < RING ? k : RING;  // a bounded replay: the last ring's positions, in every layer
-  replay_starts(k);  // model_prefill sets them again for its own replay
+  replay_starts(k);  // deepseek_prefill sets them again for its own replay
   long rows = 0;
   for (int l = 0; l < LAYERS; l++) rows += k - replay_first[l];
   return (int)((rows + LAYERS - 1) / LAYERS);
 }
 
-int model_replay_start(int k) {
+int deepseek_replay_start(int k) {
   if (k <= 0) return 0;
   if (opt.ced) return k > RING ? k - RING : 0;
   replay_starts(k);
@@ -2074,7 +2066,7 @@ static const float *forward(const int *tokens, int n, int pos, int prefix_pos, c
   if (predict_probe_enabled()) prefill_prune_active = 0;
 #endif
   prefill_prune_end = pos + n;
-  forward_info = (ModelForwardInfo){.tokens = n, .ced_tokens = opt.ced,
+  forward_info = (DeepSeekForwardInfo){.tokens = n, .ced_tokens = opt.ced,
                                    .ced_applied = ced_compact && ced_first > (uint32_t)pos};
   prefix_prepare(prefix_pos, pos, prefix_dst);
   for (int done = 0, k; done < n; done += k) {
@@ -2100,14 +2092,14 @@ static const float *forward(const int *tokens, int n, int pos, int prefix_pos, c
   return (const float *)logits.ptr;
 }
 
-const float *model_forward(const int *tokens, int n, int pos) { return forward(tokens, n, pos, -1, 0, 0); }
+const float *deepseek_forward(const int *tokens, int n, int pos) { return forward(tokens, n, pos, -1, 0, 0); }
 
-const float *model_prefill(const int *tokens, int n, int from, int replay, int capture, Snapshot **captured) {
+const float *deepseek_prefill(const int *tokens, int n, int from, int replay, int capture, Snapshot **captured) {
   if (from < 0 || from >= n || n > opt.ctx) die("invalid prefill of positions %d to %d", from, n);
   if (!from) replay = 0;
   int start = from;
   if (replay && opt.ced) {  // the bounded replay: the ring's positions before from, windows cut off there
-    start = model_replay_start(from);
+    start = deepseek_replay_start(from);
     bounded = 1, bounded_first = (uint32_t)start, bounded_keep = (uint32_t)from;
   } else if (replay) {
     replay_starts(from), start = replay_first[0], replaying = 1;
@@ -2121,7 +2113,7 @@ const float *model_prefill(const int *tokens, int n, int from, int replay, int c
     x = xmalloc(sizeof *x);
     *x = (Snapshot){.pos = capture, .extent = LAYERS - 1, .rows = xmalloc(saved_bytes())};
   }
-  model_seek(tokens, start);
+  deepseek_seek(tokens, start);
   const float *lg = forward(tokens + start, n - start, start, capture, x ? x->rows : 0, 1);
   replaying = 0, bounded = 0;
   if (x) {
@@ -2131,7 +2123,7 @@ const float *model_prefill(const int *tokens, int n, int from, int replay, int c
   return lg;
 }
 
-ModelForwardInfo model_forward_info(void) { return forward_info; }
+DeepSeekForwardInfo deepseek_forward_info(void) { return forward_info; }
 
 // ---- the vision encoder (inference/vision.py ViT and Aligner) ----
 
@@ -2143,7 +2135,7 @@ static struct {
   VitBlock b[32];
   uint16_t start[DIM], end[DIM], newline[DIM];  // the spans' delimiters (BF16)
 } vit;
-static const Image *imgs;  // the prompt's images (model_images)
+static const Image *imgs;  // the prompt's images (deepseek_images)
 static int nimgs;
 
 // The vision encoder's weights (0.97 GB) load at the first image.
@@ -2216,7 +2208,7 @@ static void vit_gelu_row(void *ctx, size_t r) {
   for (int i = 0; i < DIM; i++) g[i] = bf_cpu((float)(0.5 * g[i] * (1 + erf(g[i] / sqrt(2.0)))));
 }
 
-void model_image(Image *im) {
+void deepseek_image(Image *im) {
   work_capacity(MB);
   uint32_t n = (uint32_t)(im->vh * im->vw), L = (uint32_t)(im->th * im->tw);
   uint32_t np = (n + 63) / 64 * 64, dims[2] = {n, np};  // vit_attn's rows: the patches, padded to its tiles
@@ -2277,7 +2269,7 @@ void model_image(Image *im) {
   for (size_t i = 0; i < sizeof all / sizeof *all; i++) gpu_free(all[i]);
 }
 
-void model_images(const Image *im, int n) { imgs = im, nimgs = n; }
+void deepseek_images(const Image *im, int n) { imgs = im, nimgs = n; }
 
 // The embedding of prompt position pos inside an image span
 // (merge_image_embeddings): the delimiters' learned rows, or the image's
@@ -2402,9 +2394,9 @@ static void draft_stage(int d, int pos) {
 // token, then the previous draft) give the next draft, on the GPU. Every
 // stage computes all BLOCK rows, whose keys every query sees; the head and
 // bias use the first n rows, whose drafts are wanted.
-void model_draft(int token, int pos, int *drafts, int n) {
+void deepseek_draft(int token, int pos, int *drafts, int n) {
   if (token < 0) die("a draft after an image's token (position %d)", pos);
-  if (n < 1 || n > BLOCK) die("model_draft needs 1 to %d draft rows", BLOCK);
+  if (n < 1 || n > BLOCK) die("deepseek_draft needs 1 to %d draft rows", BLOCK);
   work_capacity(BLOCK);
   double t0 = now();
   int64_t t = token;
@@ -2461,11 +2453,11 @@ void model_draft(int token, int pos, int *drafts, int n) {
 
 // A pass of the token at pos and its drafts. Rows after the accepted ones
 // leave nothing later positions read (see RING and PENDING), except the
-// Engram history, which model_accept rebuilds, and the draft's windows, which
+// Engram history, which deepseek_accept rebuilds, and the draft's windows, which
 // it writes for the accepted rows only.
 static int32_t verify_history[3];
 
-const float *model_verify(const int *tokens, int m, int pos) {
+const float *deepseek_verify(const int *tokens, int m, int pos) {
   if (m < 1 || m > replay_margin() + 1 || m > FEW) die("invalid target verification row count");
   memcpy(verify_history, history, sizeof history);
   verifying = 1;
@@ -2475,7 +2467,7 @@ const float *model_verify(const int *tokens, int m, int pos) {
 }
 
 
-void model_accept(const int *tokens, int n, int pos) {
+void deepseek_accept(const int *tokens, int n, int pos) {
 #ifdef MYDS4_PREDICT_PROBE
   predict_probe_emit(6, pos, -1, n, 0, 0, 0, 0, n, tokens);
 #endif
@@ -2490,7 +2482,7 @@ void model_accept(const int *tokens, int n, int pos) {
 
 // Clears the request's state: window rings, compressed rows, compressor
 // rows and the Engram history. A state that grew shrinks back.
-void model_reset(void) {
+void deepseek_reset(void) {
   // The online learner belongs to the engine, not a conversation's KV state.
   shrink();
   gpu_sync();
@@ -2555,7 +2547,7 @@ static void bench_attend(int r) {
   attend_one(&Q, 0, &L[5].ring, &L[2].comp, &SEL, 0, &L[5].sink, &cs_comp, 0, &O, 0, &at);
 }
 
-void model_bench(void) {
+void deepseek_bench(void) {
   work_capacity(MB);
 #define OFF(f) offsetof(Layer, f)
   struct { const char *name; size_t field; const Buf *in; } mats[] = {
@@ -2714,8 +2706,8 @@ void model_bench(void) {
 
 // ---- the attention state of several sequences ----
 
-// active: model_load's state, or the one model_state_use chose
-static int taken;      // model_load's state went to a caller of model_state_new
+// active: deepseek_load's state, or the one deepseek_state_use chose
+static int taken;      // deepseek_load's state went to a caller of deepseek_state_new
 
 static int start_cap(void) { return opt.ctx < CAP ? opt.ctx : CAP; }
 
@@ -2740,8 +2732,8 @@ static size_t saved_bytes(void) {
 // The bytes a state owns once it holds `positions` (s null: a new state):
 // its rolling buffers (saved_bytes() less the history, which lives in the
 // State itself), its compressed rows and index keys, and the rewind copy
-// that model_state_save made, if any.
-size_t model_state_bytes(const State *s, int positions) {
+// that deepseek_state_save made, if any.
+size_t deepseek_state_bytes(const State *s, int positions) {
   int cap = grown(s ? s->cap : start_cap(), positions);
   size_t n = saved_bytes() - sizeof history + (s && s->saved ? saved_bytes() : 0);
   for (int l = 0; l < LAYERS; l++)
@@ -2775,7 +2767,7 @@ static void shrink(void) {  // the state in use back to its first capacity
   if (active->cap > start_cap()) resize(active, start_cap(), 0);
 }
 
-static void base_state(void) {  // model_load's buffers as the state in use
+static void base_state(void) {  // deepseek_load's buffers as the state in use
   active = xmalloc(sizeof *active);
   for (int l = 0; l < LAYERS; l++) {
     active->ring[l] = L[l].ring;
@@ -2785,7 +2777,7 @@ static void base_state(void) {  // model_load's buffers as the state in use
   active->cap = start_cap();
 }
 
-State *model_state_new(void) {
+State *deepseek_state_new(void) {
   if (!taken) return taken = 1, active;
   State *s = xmalloc(sizeof *s);
   s->cap = start_cap();
@@ -2799,7 +2791,7 @@ State *model_state_new(void) {
   return s;
 }
 
-void model_state_free(State *s) {
+void deepseek_state_free(State *s) {
   if (s == active) die("the attention state in use cannot be freed");
   for (int l = 0; l < LAYERS; l++) {
     gpu_free(&s->ring[l]);
@@ -2818,7 +2810,7 @@ static void bind(const State *s) {  // the layers' state buffers: s's, for the d
   for (int d = 0; opt.draft && d < DRAFTS; d++) D[d].ring = s->dring[d];
 }
 
-void model_state_use(State *s) {
+void deepseek_state_use(State *s) {
   gpu_sync();
   memcpy(active->history, history, sizeof history);
   bind(s);
@@ -2828,7 +2820,7 @@ void model_state_use(State *s) {
 
 #include "../experimental/runahead.c"
 
-const float *model_forward_rows(State **st, const int *tokens, const int *pos, int m) {
+const float *deepseek_forward_rows(State **st, const int *tokens, const int *pos, int m) {
   if (m < 1 || m > BATCH_ROWS) die("%d rows of sequences at once: 1 to %d", m, BATCH_ROWS);
   for (int r = 0; r < m; r++) {
     if (pos[r] >= opt.ctx) die("context full (%d tokens)", opt.ctx);
@@ -2863,8 +2855,8 @@ static void save_rows(int restore) {
   else memcpy(p, history, sizeof history);
 }
 
-void model_state_save(void) { save_rows(0); }
-void model_state_restore(void) { save_rows(1); }
+void deepseek_state_save(void) { save_rows(0); }
+void deepseek_state_restore(void) { save_rows(1); }
 
 // ---- snapshots and row copies, for the server's KV prefix cache ----
 
@@ -2882,7 +2874,7 @@ static void rolling(State *s, char *p, int restore) {
   else memcpy(p, h, sizeof history);
 }
 
-Snapshot *model_snapshot(State *s, int pos, int with_logits) {
+Snapshot *deepseek_snapshot(State *s, int pos, int with_logits) {
   gpu_sync();
   Snapshot *x = xmalloc(sizeof *x);
   *x = (Snapshot){.pos = pos, .extent = LAYERS - 1, .rows = xmalloc(saved_bytes())};
@@ -2891,22 +2883,22 @@ Snapshot *model_snapshot(State *s, int pos, int with_logits) {
   return x;
 }
 
-void model_snapshot_restore(State *s, const Snapshot *x) {
+void deepseek_snapshot_restore(State *s, const Snapshot *x) {
   if (x->extent != LAYERS - 1) die("an encoder-only snapshot cannot restore a whole state");
   gpu_sync();
   rolling(s, x->rows, 1);
 }
 
-void model_snapshot_free(Snapshot *x) {
+void deepseek_snapshot_free(Snapshot *x) {
   if (x) free(x->rows), free(x->logits), free(x);
 }
 
-size_t model_snapshot_bytes(int with_logits) { return saved_bytes() + (with_logits ? VOCAB * 4 : 0); }
-int model_snapshot_pos(const Snapshot *x) { return x->pos; }
-int model_snapshot_extent(const Snapshot *x) { return x->extent; }
-const float *model_snapshot_logits(const Snapshot *x) { return x->logits; }
+size_t deepseek_snapshot_bytes(int with_logits) { return saved_bytes() + (with_logits ? VOCAB * 4 : 0); }
+int deepseek_snapshot_pos(const Snapshot *x) { return x->pos; }
+int deepseek_snapshot_extent(const Snapshot *x) { return x->extent; }
+const float *deepseek_snapshot_logits(const Snapshot *x) { return x->logits; }
 
-void model_state_copy(State *dst, const State *src, int positions) {
+void deepseek_state_copy(State *dst, const State *src, int positions) {
   if (dst == active || dst == src) die("the attention state in use cannot be overwritten");
   if (positions < 0 || positions > src->cap) die("invalid state copy of %d positions", positions);
   gpu_sync();
@@ -2923,9 +2915,159 @@ void model_state_copy(State *dst, const State *src, int positions) {
   }
 }
 
-void model_seek(const int *tokens, int pos) {
+void deepseek_seek(const int *tokens, int pos) {
   for (int s = 0; s < 3; s++) {
     int t = pos > s ? tokens[pos - 1 - s] : 0;
     history[s] = t < 0 ? -1 : engram_map[t];  // an image position: dead (see engram_hash)
   }
 }
+
+// ---- the model interface (model.h) ----
+
+static int end_token = -1;  // config.json's eos_token_id
+
+static void ds_load(const char *dir, const Options *o) {
+  char path[1024];
+  snprintf(path, sizeof path, "%s/config.json", dir);
+  char *text = read_file(path, 0);
+  const Json *eos = json_get(json_parse(text), "eos_token_id");
+  if (!eos || eos->type != J_NUM) die("%s: no eos_token_id", path);
+  end_token = (int)eos->num;
+  free(text);
+  deepseek_load(dir, o);
+}
+
+// The state the layers work on: s, bound when it is not already.
+static void use(ModelState *s) {
+  if ((State *)s != active) deepseek_state_use((State *)s);
+}
+
+static int ds_vocab(void) { return VOCAB; }
+static int ds_max_rows(void) { return BATCH_ROWS; }
+static int ds_max_verify(void) { return VERIFY_DRAFTS + 1; }
+static int ds_draft_block(void) { return opt.draft; }
+static int ds_rewind(void) { return deepseek_rewind(); }
+static int ds_stop(int token) { return token == end_token; }
+static ModelState *ds_state_new(void) { return (ModelState *)deepseek_state_new(); }
+static void ds_state_free(ModelState *s) { deepseek_state_free((State *)s); }
+static size_t ds_state_bytes(const ModelState *s, int positions) {
+  return deepseek_state_bytes((const State *)s, positions);
+}
+static void ds_state_copy(ModelState *dst, const ModelState *src, int positions) {
+  deepseek_state_copy((State *)dst, (const State *)src, positions);
+}
+static ModelSnapshot *ds_snapshot_take(ModelState *s, int pos, int with_logits) {
+  return (ModelSnapshot *)deepseek_snapshot((State *)s, pos, with_logits);
+}
+static void ds_snapshot_restore(ModelState *s, const ModelSnapshot *x) {
+  deepseek_snapshot_restore((State *)s, (const Snapshot *)x);
+}
+static void ds_snapshot_free(ModelSnapshot *x) { deepseek_snapshot_free((Snapshot *)x); }
+static size_t ds_snapshot_bytes(int with_logits) { return deepseek_snapshot_bytes(with_logits); }
+static const float *ds_snapshot_logits(const ModelSnapshot *x) { return deepseek_snapshot_logits((const Snapshot *)x); }
+
+static const float *ds_prefill(ModelState *s, const int *tokens, int n, int from, int replay, int capture,
+                               ModelSnapshot **captured, float *every) {
+  use(s);
+  if (every && replay && from) die("every position's logits of a replay");
+  Snapshot *x = 0;
+  all_logits = every;
+  const float *lg = deepseek_prefill(tokens, n, from, replay, capture, captured ? &x : 0);
+  all_logits = 0;
+  // a capture of layers 0-20 only (under CED compaction) restores no whole state
+  if (x && deepseek_snapshot_extent(x) != LAYERS - 1) deepseek_snapshot_free(x), x = 0;
+  if (captured) *captured = (ModelSnapshot *)x;
+  return lg;
+}
+
+static const float *ds_rows(ModelState *const *states, const int *tokens, const int *pos, int m) {
+  if (m == 1) {  // one state's token: the decoding path with its read-aheads
+    use(states[0]);
+    return deepseek_forward(tokens, 1, pos[0]);
+  }
+  return deepseek_forward_rows((State **)states, tokens, pos, m);
+}
+
+static void ds_draft(ModelState *s, int token, int pos, int *drafts, int n) {
+  use(s);
+  deepseek_draft(token, pos, drafts, n);
+}
+static const float *ds_verify(ModelState *s, const int *tokens, int m, int pos) {
+  use(s);
+  return deepseek_verify(tokens, m, pos);
+}
+static void ds_accept(ModelState *s, const int *tokens, int n, int pos) {
+  use(s);
+  deepseek_accept(tokens, n, pos);
+}
+static void ds_seek(ModelState *s, const int *tokens, int pos) {
+  use(s);
+  deepseek_seek(tokens, pos);
+}
+static int ds_idle(void) {
+  cache_idle();
+  return cache_slots();
+}
+static void ds_finish(void) {
+  deepseek_save_predictor();
+  online_predictor_report(stderr);
+}
+
+// A CLI generation's report: the prompt's plan after its prefill, and per
+// decoded token the expert selections, the workspace, and where decoding's
+// time went.
+static void ds_report(FILE *out, int at, int tokens) {
+  static uint64_t rows0, unique0, workspace;
+  static double phase0[7], gap0;
+  static long gaps0;
+  if (at == 0) {
+    DeepSeekForwardInfo f = deepseek_forward_info();
+    fprintf(out,
+            "{\"prefill_prune\":{\"applied\":%s,\"tokens\":%d,\"decoder_tokens\":%d,\"decoder_row_layers\":%d,"
+            "\"chunks\":%d,\"prefix_tokens\":%d}}\n",
+            f.prune_applied ? "true" : "false", f.tokens, f.decoder_tokens, f.decoder_row_layers, f.chunks,
+            f.prefix_tokens);
+    rows0 = decode_rows, unique0 = cache_stats.row_unique, workspace = deepseek_workspace_bytes();
+    memcpy(phase0, phase_s, sizeof phase0);
+    gap0 = gpu_gap, gaps0 = gpu_gaps;
+    return;
+  }
+  uint64_t computed = decode_rows - rows0;
+  fprintf(out, "{\"decode_experts\":{\"computed_rows\":%llu,\"selected\":%llu,\"unique_layer_requests\":%llu}}\n",
+          (unsigned long long)computed, (unsigned long long)(computed * LAYERS * TOPK),
+          (unsigned long long)(cache_stats.row_unique - unique0));
+  fprintf(out, "{\"workspace\":{\"resizable_after_prefill_bytes\":%llu,\"resizable_after_decode_bytes\":%llu}}\n",
+          (unsigned long long)workspace, (unsigned long long)deepseek_workspace_bytes());
+  double per = tokens ? 1e3 / tokens : 0;
+  fprintf(out,
+          "decode per token (ms): rows %.1f, waits %.1f, loads %.1f, prefetch %.1f, encode %.1f, adapt %.1f, "
+          "drafting %.1f; GPU idle between command buffers %.1f (%.1f gaps over 100 us)\n",
+          (phase_s[0] - phase0[0]) * per, (phase_s[1] - phase0[1]) * per, (phase_s[2] - phase0[2]) * per,
+          (phase_s[3] - phase0[3]) * per, (phase_s[4] - phase0[4]) * per, (phase_s[5] - phase0[5]) * per,
+          (phase_s[6] - phase0[6]) * per, (gpu_gap - gap0) * per, (double)(gpu_gaps - gaps0) / (tokens ? tokens : 1));
+  cache_metrics_report(out);
+}
+
+static void ds_chat(char *text, size_t cap, const char *prompt, int images, int think) {
+  char user[16 * 32 + 1] = "";
+  for (int i = 0; i < images && i < 16; i++) strcat(user, IMAGE_MARK "\n\n");  // each image's place, then the text
+  if (think)
+    snprintf(text, cap,
+             "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: %d (range 1-100, the higher "
+             "the value, the more thorough the reasoning)\n\n<｜User｜>%s%s<｜Assistant｜><think>",
+             think, user, prompt);
+  else snprintf(text, cap, "<｜begin▁of▁sentence｜><｜User｜>%s%s<｜Assistant｜></think>", user, prompt);
+}
+
+static const char *const ds_types[] = {"deepseek_v41", 0};
+
+const ModelOps deepseek_ops = {
+    .family = "DeepSeek V4.1", .model_types = ds_types, .load = ds_load, .vocab = ds_vocab,
+    .max_rows = ds_max_rows, .max_verify = ds_max_verify, .draft_block = ds_draft_block, .rewind = ds_rewind,
+    .stop = ds_stop, .state_new = ds_state_new, .state_free = ds_state_free, .state_bytes = ds_state_bytes,
+    .state_copy = ds_state_copy, .snapshot_take = ds_snapshot_take, .snapshot_restore = ds_snapshot_restore,
+    .snapshot_free = ds_snapshot_free, .snapshot_bytes = ds_snapshot_bytes, .snapshot_logits = ds_snapshot_logits,
+    .prefill = ds_prefill, .replay_rows = deepseek_replay_rows, .replay_start = deepseek_replay_start,
+    .rows = ds_rows, .draft = ds_draft, .verify = ds_verify, .accept = ds_accept, .seek = ds_seek, .idle = ds_idle,
+    .finish = ds_finish, .report = ds_report, .image = deepseek_image, .images = deepseek_images, .chat = ds_chat,
+    .bench = deepseek_bench};

@@ -15,6 +15,8 @@ int main(void) {
   alarm(90);
   lock_model();
   static const char source[] = {
+#embed "../../src/kernels/formats.metal"
+      , '\n',
 #embed "../../src/kernels/kernels.metal"
       , '\n',
 #embed "../../src/kernels/gguf_grids.metal"

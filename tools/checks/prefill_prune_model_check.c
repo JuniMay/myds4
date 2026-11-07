@@ -1,5 +1,5 @@
 // Compare dependency-pruned prefill with the full model at identical batch boundaries.
-#include "../../src/engine/model.c"
+#include "../../src/model/deepseek.c"
 
 static size_t bytes_differ(const void *a, const void *b, size_t count) {
   const uint8_t *x = a, *y = b;
@@ -48,13 +48,13 @@ int main(int argc, char **argv) {
     for (int i = 0; i < n; i++) tokens[i] = pattern[i % pn];
   }
   if (prefix < 1 || prefix >= n || n + 8 > o.ctx) die("invalid prefix or input length");
-  model_load(argv[1], &o);
+  deepseek_load(argv[1], &o);
   prefill_chunk = 16384;
   opt.prefill_prune = 0;
   float *reference = xmalloc(VOCAB * sizeof(float));
   Snapshot *captured_reference = 0, *captured = 0;  // the rolling rows at prefix, taken during each prefill
-  memcpy(reference, model_prefill(tokens, n, 0, 0, prefix, &captured_reference), VOCAB * sizeof(float));
-  model_state_save();
+  memcpy(reference, deepseek_prefill(tokens, n, 0, 0, prefix, &captured_reference), VOCAB * sizeof(float));
+  deepseek_state_save();
   size_t state_size = saved_bytes();
   uint8_t *state = xmalloc(state_size);
   memcpy(state, active->saved, state_size);
@@ -68,22 +68,22 @@ int main(int argc, char **argv) {
       memcpy(globals[l][k], b->ptr, b->size);
     }
   int draft_reference[2] = {0}, first = sample_argmax(reference, VOCAB);
-  if (o.draft) model_draft(first, n, draft_reference, 2);
+  if (o.draft) deepseek_draft(first, n, draft_reference, 2);
   enum { STEPS = 8 };
   int continuation[STEPS];
   float *future = xmalloc((size_t)STEPS * VOCAB * sizeof(float));
   const float *lg = reference;
   for (int i = 0; i < STEPS; i++) {
     continuation[i] = sample_argmax(lg, VOCAB);
-    lg = model_forward(continuation + i, 1, n + i);
+    lg = deepseek_forward(continuation + i, 1, n + i);
     memcpy(future + (size_t)i * VOCAB, lg, VOCAB * sizeof(float));
   }
-  model_reset();
+  deepseek_reset();
   opt.prefill_prune = 1;
   prefill_chunk = chunk32 ? 32768 : 16384;
-  lg = model_prefill(tokens, n, 0, 0, prefix, &captured);
-  int encoder_only = model_snapshot_extent(captured) != LAYERS - 1;
-  ModelForwardInfo info = model_forward_info();
+  lg = deepseek_prefill(tokens, n, 0, 0, prefix, &captured);
+  int encoder_only = deepseek_snapshot_extent(captured) != LAYERS - 1;
+  DeepSeekForwardInfo info = deepseek_forward_info();
   int candidates = n;
   if (n > CAND_TOP * 8) {
     const uint32_t *bits = (const uint32_t *)CAND.ptr + (size_t)((n - 1) % prefill_chunk) * cand_words;
@@ -92,7 +92,7 @@ int main(int argc, char **argv) {
   }
   size_t logit_diff = bytes_differ(reference, lg, VOCAB * sizeof(float));
   for (int i = 0; i < VOCAB; i++) logit_diff += !isfinite(reference[i]) || !isfinite(lg[i]);
-  model_state_save();
+  deepseek_state_save();
   size_t state_diff = bytes_differ(state, active->saved, state_size);
   size_t prefix_diff = bytes_differ(captured_reference->rows, captured->rows, state_size), global_diff = 0;
   for (int l = 0; l < LAYERS; l++) if (L[l].kv_source)
@@ -102,22 +102,22 @@ int main(int argc, char **argv) {
       global_diff += bytes_differ(globals[l][k], b->ptr, b->size);
     }
   int drafts[2] = {0}, draft_diff = 0;
-  if (o.draft) model_draft(first, n, drafts, 2), draft_diff = memcmp(drafts, draft_reference, sizeof drafts) != 0;
+  if (o.draft) deepseek_draft(first, n, drafts, 2), draft_diff = memcmp(drafts, draft_reference, sizeof drafts) != 0;
   size_t continuation_diff = 0;
   for (int i = 0; i < STEPS; i++)
-    continuation_diff += bytes_differ(future + (size_t)i * VOCAB, model_forward(continuation + i, 1, n + i), VOCAB * sizeof(float));
+    continuation_diff += bytes_differ(future + (size_t)i * VOCAB, deepseek_forward(continuation + i, 1, n + i), VOCAB * sizeof(float));
   size_t resume_diff = 0;
   if (resume) {  // the state's rows before prefix are the same; its rolling rows come from each capture
     opt.prefill_prune = 0;
     prefill_chunk = 16384;
-    model_snapshot_restore(active, captured_reference);
-    memcpy(reference, model_prefill(tokens, n, prefix, 0, -1, 0), VOCAB * sizeof(float));
+    deepseek_snapshot_restore(active, captured_reference);
+    memcpy(reference, deepseek_prefill(tokens, n, prefix, 0, -1, 0), VOCAB * sizeof(float));
     opt.prefill_prune = 1;
     prefill_chunk = chunk32 ? 32768 : 16384;
-    model_snapshot_restore(active, captured);
-    resume_diff = bytes_differ(reference, model_prefill(tokens, n, prefix, 0, -1, 0), VOCAB * sizeof(float));
+    deepseek_snapshot_restore(active, captured);
+    resume_diff = bytes_differ(reference, deepseek_prefill(tokens, n, prefix, 0, -1, 0), VOCAB * sizeof(float));
   }
-  model_snapshot_free(captured_reference), model_snapshot_free(captured);
+  deepseek_snapshot_free(captured_reference), deepseek_snapshot_free(captured);
   printf("{\"prefill_prune_check\":{\"rendered_input\":%s,\"last_query_candidates\":%d,\"context\":%d,\"prompt_tokens\":%d,\"prefix_tokens\":%d,\"decoder_tokens\":%d,\"decoder_row_layers\":%d,\"chunk_rows\":%d,"
          "\"chunks\":%d,\"wide\":%d,\"draft\":%d,\"different_logit_bytes\":%zu,\"different_state_bytes\":%zu,"
          "\"different_prefix_bytes\":%zu,\"different_global_bytes\":%zu,\"different_continuation_bytes\":%zu,"

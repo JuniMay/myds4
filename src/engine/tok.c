@@ -52,6 +52,7 @@ static struct { uint64_t pair; int rank, id; } *merges;
 static uint64_t mcap;
 static char **pieces;  // raw bytes of each id
 static int *piece_len, nvocab;
+static int splits_known;  // tokenizer.json's pre-tokenizer is the three splits above
 static struct { const char *s; int n, id; } added[2048];
 static int nadded;
 
@@ -120,7 +121,15 @@ void tok_load(const char *dir) {
   snprintf(path, sizeof path, "%s/tokenizer.json", dir);
   Json *root = json_parse(read_file(path, 0)), *model = json_get(root, "model");
   Json *v = json_get(model, "vocab"), *m = json_get(model, "merges"), *add = json_get(root, "added_tokens");
-  nvocab = VOCAB;
+  nvocab = 0;  // the highest id of the vocabulary and the added tokens, plus one
+  for (int i = 0; i < v->n; i++) nvocab = (int)v->kid[i].num >= nvocab ? (int)v->kid[i].num + 1 : nvocab;
+  for (int i = 0; i < add->n; i++) {
+    int id = (int)json_get(&add->kid[i], "id")->num;
+    nvocab = id >= nvocab ? id + 1 : nvocab;
+  }
+  const Json *pre = json_get(json_get(root, "pre_tokenizer"), "pretokenizers"), *first;
+  splits_known = pre && pre->type == J_ARR && pre->n == 4 && (first = json_get(json_get(&pre->kid[0], "pattern"), "Regex")) &&
+                 first->type == J_STR && !strcmp(first->s, "\\p{N}{1,3}");
   pieces = xmalloc(nvocab * sizeof *pieces);
   piece_len = xmalloc(nvocab * sizeof *piece_len);
   // Added tokens use literal UTF-8. Some also occur in model.vocab, where
@@ -315,6 +324,7 @@ static int encode_text(const char *text, int len, int *out, int max) {
 
 // chat: IMAGE_MARK is the image token, and the image token's text is text.
 static int encode(const char *text, int *out, int max, int chat) {
+  if (!splits_known) die("tokenizer.json: a pre-tokenizer this tokenizer does not implement");
   int n = 0, len = strlen(text), start = 0;
   for (int i = 0; i < len;) {
     int best = -1, id, skip;

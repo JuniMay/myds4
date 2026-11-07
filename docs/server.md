@@ -25,12 +25,12 @@ going to the model it names ([Several models](#several-models)).
 | The KV prefix cache: which attention states and snapshots to keep, and how a prompt resumes from them | Rust | `server/src/kv.rs` |
 | The engine's ABI in Rust: declarations and thin wrappers | Rust | `server/src/engine.rs` |
 | The engine: loading, attention states and snapshots, prefill (with a replay, exact or bounded under `--ced`, and a capture position), decoding, drafts, sampling, context-copy drafts, images, statistics, the tokenizer, the log | C | `src/engine/engine.c` |
-| The model, the expert cache, the vision encoder, the tokenizer, signals | C, Metal | `src/engine/model.c`, `src/engine/io.c`, `src/engine/gpu.c`, `src/engine/vision.c`, `src/engine/tok.c`, `src/engine/util.c` |
+| The models behind one interface, the expert cache, the vision encoder, the tokenizer, signals | C, Metal | `src/model/model.h`, `src/model/deepseek.c`, `src/engine/io.c`, `src/engine/gpu.c`, `src/engine/vision.c`, `src/engine/tok.c`, `src/engine/util.c`, `src/kernels/` |
 | Several models: the other models' server processes, their logs, and forwarding requests to them | Rust | `server/src/peers.rs` |
 | Qwen3.8 requests: conversion, the chat template, the tokenizer (ICU), the reply's reasoning and tool calls, the responses | Rust | `server/src/qwen/mod.rs`, `template.rs`, `tokenizer.rs`, `icu.rs`, `protocol.rs` |
 | The Qwen worker: the queue, prompt and decoding passes, MTP drafts, the KV prefix cache's plans | Rust | `server/src/qwen/worker.rs` |
 | The Qwen engine's ABI in Rust | Rust | `server/src/qwen/engine.rs` |
-| The Qwen engine: states, snapshots, prompt and decoding passes, the MTP head | C, Metal | `src/qwen/qwen.c`, `src/qwen/qwen.metal` ([Qwen3.8 models](qwen.md)) |
+| The Qwen model: states, snapshots, prompt and decoding passes, the MTP head | C, Metal | `src/model/qwen.c`, its kernels in `src/kernels/` ([Qwen3.8 models](qwen.md)) |
 
 ## Threads
 
@@ -567,7 +567,7 @@ make server
 ```
 
 builds `build/libmyds4.a` (the engines: the C sources but `src/cli/main.c`,
-with the Qwen engine of `src/qwen/qwen.c`),
+with the Qwen model of `src/model/qwen.c`),
 then the crate with `cargo build --release --target-dir build/cargo`, and
 copies the executable to `build/myds4-server`. Beside `build/myds4`, it takes the same lock,
 `build/myds4.lock`, so only one of the two loads the model at a time. The

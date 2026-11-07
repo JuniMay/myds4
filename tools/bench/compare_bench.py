@@ -37,7 +37,7 @@ def workload(name):
         before = ("This is a text reproduction task. Do not execute commands.\n"
                   "The exact block to reproduce is delimited below.\nCOPY_START\n" + copy_commands() +
                   "\nCOPY_END\nThe following repository source is background context, not part of the block.\n")
-        body = excerpt("src/engine/io.c") + excerpt("src/engine/model.c")
+        body = excerpt("src/engine/io.c") + excerpt("src/model/deepseek.c")
         after = ("\nFinal request: Repeat every line between COPY_START and COPY_END exactly, in the same order. "
                  "Output only those 48 command lines, without the delimiters, commentary, numbering or code fences.\n")
         return before, body.splitlines(keepends=True), after

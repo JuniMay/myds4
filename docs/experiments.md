@@ -142,7 +142,7 @@ measurable gain.
 the `--draft` requirement), `server/src/main.rs`, the `draft_trim` fields
 of `Options` (`src/engine/myds4.h`), `myds4_config` (`src/engine/engine.h`)
 and `server/src/engine.rs`, and its validation in `src/engine/engine.c`.
-In `src/engine/model.c`: the trimmed final-stage call in `draft_generate`,
+In `src/model/deepseek.c`: the trimmed final-stage call in `draft_generate`,
 the separate-products branch of `draft_stage` for fewer than five rows, and
 the trimmed stream sizes of the prediction probe. Checks and scripts that
 set the flag were changed to omit it.
@@ -225,7 +225,7 @@ of `GET /v1/status`); the switch `MYDS4_EXPERT_BATCH` and the targets
 the grouped kernels `moe_up_rows` and `moe_down_rows` in
 `src/kernels/kernels.metal` and `gg_up_rows` and `gg_down_rows` in
 `src/kernels/gguf.metal`; `src/engine/expert_batch.h` with its group
-descriptors; and, in `src/engine/model.c`, `experts_rows`, the `EROWS`
+descriptors; and, in `src/model/deepseek.c`, `experts_rows`, the `EROWS`
 descriptor buffer, the `expert_batch` exit record and the grouped branches
 of `routed_rows` that served verification passes and several sequences
 decoded together.
@@ -308,7 +308,7 @@ unfinished. The later MXFP4 run was about 1.7% slower than the mean of
 its controls. The user removed the option as no help.
 
 **What was removed.** The option in the CLI, the server and
-`myds4_config`. In `src/engine/model.c`: `step_spec`, `layer_spec`,
+`myds4_config`. In `src/model/deepseek.c`: `step_spec`, `layer_spec`,
 `encode_spec`, `fix_layer`, `resolve`, `spec_entries`, the per-layer rows
 of routing and predictions (`gpu_step`, `slice`), the `RU` buffer,
 `ready_tab` and the `spec_fixups` counter. The `resolve` kernel in
@@ -355,7 +355,7 @@ estimates of multi-token acceptance.
 outweigh the added synchronization and CPU sampling.
 
 **What was removed.** The switch, `model_draft_coupled` and the sampled
-branch of `draft_generate` in `src/engine/model.c`, the targets
+branch of `draft_generate` in `src/model/deepseek.c`, the targets
 `build/myds4-coupled-draft` and `build/draft-distribution-probe`, and
 `tools/experimental/draft_distribution_probe.c`.
 
@@ -646,7 +646,7 @@ In the same MXFP4 runs, the CPU waited about 42 s for expert reads over
 308 emitted tokens, about 137 ms per token.
 
 **What was removed.** With `--expert-batch`, whose kernels it used: the
-switch, `draft_experts_grouped` in `src/engine/model.c`, the target
+switch, `draft_experts_grouped` in `src/model/deepseek.c`, the target
 `build/myds4-draft-expert-batch`, and `tools/checks/draft_expert_batch_check.c`
 (`build/draft-expert-batch-check`).
 
@@ -1754,7 +1754,7 @@ beyond the controls' spread. This suggests that indexer scoring is a
 small part of a pass at these lengths.
 
 **What was removed.** The switch, `index_prune.metal`, its kernel
-selection in `src/engine/model.c` and in
+selection in `src/model/deepseek.c` and in
 `tools/checks/prefill_prune_model_check.c`, the seven targets named above
 and `tools/checks/index_mask_check.c`.
 
@@ -1894,7 +1894,7 @@ than serial decoding. On the same four-state workload, the public
 
 **What was removed.** The switch, the three environment variables,
 `credit_batch_uses` and the budget wrappers (`batch_budget_active`,
-`forecast_admission`, `forecast_inflight`) in `src/engine/model.c`,
+`forecast_admission`, `forecast_inflight`) in `src/model/deepseek.c`,
 `cache_repeat_credit` in `src/engine/io.c`, the `admit` argument of
 `cache_prefetch` and `cache_prefetch_from` (every remaining caller admits
 the whole list), the targets `build/libmyds4-prefetch-study.a`,

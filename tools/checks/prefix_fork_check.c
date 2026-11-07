@@ -32,7 +32,7 @@
 // differ. The check reads the state's buffers directly and writes no files.
 #include <math.h>
 
-#include "../../src/engine/model.c"
+#include "../../src/model/deepseek.c"
 
 // How much further from the cold prefill a replay over decoded rows may be
 // than the conversation continued at the fork, in dB per kind of tensor; and
@@ -234,22 +234,22 @@ static int *read_text(const char *path, int rendered, int *count) {
 static Diff decoded_against_prefilled(const int *text, int n, int m) {
   int *tokens = xmalloc((size_t)(n + m) * sizeof *tokens);
   memcpy(tokens, text, (size_t)n * sizeof *tokens);
-  State *a = model_state_new(), *b = model_state_new();
-  model_state_use(a);
-  model_reset();
-  const float *lg = model_forward(tokens, n, 0);
+  State *a = deepseek_state_new(), *b = deepseek_state_new();
+  deepseek_state_use(a);
+  deepseek_reset();
+  const float *lg = deepseek_forward(tokens, n, 0);
   for (int i = 0; i < m; i++) {
     tokens[n + i] = sample_argmax(lg, VOCAB);
-    lg = model_forward(tokens + n + i, 1, n + i);
+    lg = deepseek_forward(tokens + n + i, 1, n + i);
   }
   Tensors decoded = {0}, prefilled = {0};
   take(&decoded, lg);
-  model_state_use(b);
-  model_reset();
-  lg = model_forward(tokens, n + m, 0);
+  deepseek_state_use(b);
+  deepseek_reset();
+  lg = deepseek_forward(tokens, n + m, 0);
   take(&prefilled, lg);
-  model_state_use(a);
-  model_state_free(b);
+  deepseek_state_use(a);
+  deepseek_state_free(b);
   free(tokens);
   Diff d = compare(&prefilled, &decoded, n, n + m);
   drop(&decoded), drop(&prefilled);
@@ -336,29 +336,29 @@ static Outcome finish(const float *lg, int n) {
   take(&o.t, lg);
   for (int i = 0; i < NEXT; i++) {
     int t = o.next[i] = sample_argmax(lg, VOCAB);
-    lg = model_forward(&t, 1, n + i);
+    lg = deepseek_forward(&t, 1, n + i);
   }
   return o;
 }
 
 static State *fresh(void) {
-  State *s = model_state_new();
-  model_state_use(s);
-  model_reset();
-  model_state_use(source);
+  State *s = deepseek_state_new();
+  deepseek_state_use(s);
+  deepseek_reset();
+  deepseek_state_use(source);
   return s;
 }
 
 static void done_with(State *s) {
-  model_state_use(source);
-  model_state_free(s);
+  deepseek_state_use(source);
+  deepseek_state_free(s);
 }
 
 // The fork's prompt with no cache: a cold prefill from position 0.
 static Outcome cold(const int *f, int n) {
   State *c = fresh();
-  model_state_use(c);
-  Outcome o = finish(model_prefill(f, n, 0, 0, -1, 0), n);
+  deepseek_state_use(c);
+  Outcome o = finish(deepseek_prefill(f, n, 0, 0, -1, 0), n);
   done_with(c);
   return o;
 }
@@ -368,15 +368,15 @@ static Outcome cold(const int *f, int n) {
 // bytes. The server keeps no snapshot of the encoder layers only (--ced).
 static void check_branch(State *s, Snapshot *branch, const int *f, int n, int p, const Outcome *first, const char *what) {
   if (!branch) return;
-  if (model_snapshot_extent(branch) != LAYERS - 1) {
+  if (deepseek_snapshot_extent(branch) != LAYERS - 1) {
     printf("  %s: the branch snapshot at %d holds the encoder layers only\n", what, p);
     return;
   }
   State *q = fresh();
-  model_state_copy(q, s, p);
-  model_state_use(q);
-  model_snapshot_restore(q, branch);
-  Outcome o = finish(model_prefill(f, n, p, 0, -1, 0), n);
+  deepseek_state_copy(q, s, p);
+  deepseek_state_use(q);
+  deepseek_snapshot_restore(q, branch);
+  Outcome o = finish(deepseek_prefill(f, n, p, 0, -1, 0), n);
   done_with(q);
   size_t bad = differ_state(&o.t, &first->t, n);
   printf("  %s: its branch snapshot at %d resumed against the %s itself: %zu bytes differ, next tokens %s\n", what, p,
@@ -391,12 +391,12 @@ static void check_branch(State *s, Snapshot *branch, const int *f, int n, int p,
 // captures them there, as the server does (its branch-point snapshot).
 static Outcome replay(const int *f, int n, int p) {
   State *r = fresh();
-  model_state_copy(r, source, p);
-  model_state_use(r);
+  deepseek_state_copy(r, source, p);
+  deepseek_state_use(r);
   Snapshot *branch = 0;
-  Outcome o = finish(model_prefill(f, n, p, 1, p > 0 ? p : -1, &branch), n);
+  Outcome o = finish(deepseek_prefill(f, n, p, 1, p > 0 ? p : -1, &branch), n);
   check_branch(r, branch, f, n, p, &o, "replay");
-  model_snapshot_free(branch);
+  deepseek_snapshot_free(branch);
   done_with(r);
   return o;
 }
@@ -406,13 +406,13 @@ static Outcome replay(const int *f, int n, int p) {
 static Outcome resume(const int *f, int n, int k, int p) {
   int b = saved[k].pos;
   State *q = fresh();
-  model_state_copy(q, source, b);
-  model_state_use(q);
-  model_snapshot_restore(q, saved[k].snap);
+  deepseek_state_copy(q, source, b);
+  deepseek_state_use(q);
+  deepseek_snapshot_restore(q, saved[k].snap);
   Snapshot *branch = 0;
-  Outcome o = finish(model_prefill(f, n, b, 0, b < p ? p : -1, b < p ? &branch : 0), n);
+  Outcome o = finish(deepseek_prefill(f, n, b, 0, b < p ? p : -1, b < p ? &branch : 0), n);
   check_branch(q, branch, f, n, p, &o, "snapshot resume");
-  model_snapshot_free(branch);
+  deepseek_snapshot_free(branch);
   done_with(q);
   return o;
 }
@@ -422,10 +422,10 @@ static Outcome resume(const int *f, int n, int k, int p) {
 // and the state continued at p.
 static Outcome rewound(const int *f, int n, int k, int p) {
   State *q = fresh();
-  model_state_copy(q, source, p);
-  model_state_use(q);
-  model_snapshot_restore(q, saved[k].snap);
-  Outcome o = finish(model_prefill(f, n, p, 0, -1, 0), n);
+  deepseek_state_copy(q, source, p);
+  deepseek_state_use(q);
+  deepseek_snapshot_restore(q, saved[k].snap);
+  Outcome o = finish(deepseek_prefill(f, n, p, 0, -1, 0), n);
   done_with(q);
   return o;
 }
@@ -438,14 +438,14 @@ static Outcome continued(const int *f, int n, int b) {
   int k = 0;
   while (saved[k].pos != prompt1) k++;
   State *c = fresh();
-  model_state_copy(c, source, prompt1);
-  model_state_use(c);
-  model_snapshot_restore(c, saved[k].snap);
-  model_seek(conv, prompt1);
-  for (int i = prompt1; i < b && i < reply1; i++) model_forward(conv + i, 1, i);
-  if (b > reply1) model_prefill(conv, b < prompt2 ? b : prompt2, reply1, 0, -1, 0);
-  for (int i = prompt2; i < b; i++) model_forward(conv + i, 1, i);
-  Outcome o = finish(model_prefill(f, n, b, 0, -1, 0), n);
+  deepseek_state_copy(c, source, prompt1);
+  deepseek_state_use(c);
+  deepseek_snapshot_restore(c, saved[k].snap);
+  deepseek_seek(conv, prompt1);
+  for (int i = prompt1; i < b && i < reply1; i++) deepseek_forward(conv + i, 1, i);
+  if (b > reply1) deepseek_prefill(conv, b < prompt2 ? b : prompt2, reply1, 0, -1, 0);
+  for (int i = prompt2; i < b; i++) deepseek_forward(conv + i, 1, i);
+  Outcome o = finish(deepseek_prefill(f, n, b, 0, -1, 0), n);
   done_with(c);
   return o;
 }
@@ -459,7 +459,7 @@ static void keep_source_rows(void) {
 
 static void snapshot_source(int pos, int with_logits) {
   if (nsaved == MAXSAVED) die("too many snapshots");
-  saved[nsaved].pos = pos, saved[nsaved++].snap = model_snapshot(source, pos, with_logits);
+  saved[nsaved].pos = pos, saved[nsaved++].snap = deepseek_snapshot(source, pos, with_logits);
 }
 
 // The conversation: the prompt, a decoded reply, a tool-like result, a second
@@ -468,15 +468,15 @@ static void snapshot_source(int pos, int with_logits) {
 static void build(const int *prompt, int n) {
   static const char *result =
       "\n\nTool result:\n$ make -s server-check\ntest result: ok. 23 passed; 0 failed\n$ git status --short\n"
-      " M src/engine/model.c\n M src/engine/myds4.h\n?? tools/checks/prefix_fork_check.c\n"
+      " M src/model/deepseek.c\n M src/engine/myds4.h\n?? tools/checks/prefix_fork_check.c\n"
       "The build is clean. Summarize what changed and what is left to check, in two sentences.\n";
   int extra[1024], ne = tok_encode(result, extra, 1024);
   conv = xmalloc((size_t)(n + REPLY1 + ne + REPLY2) * sizeof *conv);
   memcpy(conv, prompt, (size_t)n * sizeof *conv);
-  source = model_state_new();
-  model_state_use(source);
-  model_reset();
-  const float *lg = model_prefill(conv, n, 0, 0, -1, 0);
+  source = deepseek_state_new();
+  deepseek_state_use(source);
+  deepseek_reset();
+  const float *lg = deepseek_prefill(conv, n, 0, 0, -1, 0);
   prompt1 = n;
   snapshot_source(prompt1, 1);
   if (prompt_only) {  // --prompt-only: the prompt alone, for quick checks of prompt rows
@@ -489,7 +489,7 @@ static void build(const int *prompt, int n) {
   for (int i = 0; i < REPLY1; i++) {
     int pos = prompt1 + i;
     conv[pos] = sample_argmax(lg, VOCAB);
-    lg = model_forward(conv + pos, 1, pos);
+    lg = deepseek_forward(conv + pos, 1, pos);
     for (int k = 0; k < 2; k++)
       if (pos + 1 == inside1[k]) snapshot_source(pos + 1, 0);
   }
@@ -497,12 +497,12 @@ static void build(const int *prompt, int n) {
   snapshot_source(reply1, 0);
   memcpy(conv + reply1, extra, (size_t)ne * sizeof *conv);
   prompt2 = reply1 + ne;
-  lg = model_prefill(conv, prompt2, reply1, 0, -1, 0);
+  lg = deepseek_prefill(conv, prompt2, reply1, 0, -1, 0);
   snapshot_source(prompt2, 1);
   for (int i = 0; i < REPLY2; i++) {
     int pos = prompt2 + i;
     conv[pos] = sample_argmax(lg, VOCAB);
-    lg = model_forward(conv + pos, 1, pos);
+    lg = deepseek_forward(conv + pos, 1, pos);
     for (int k = 0; k < 2; k++)
       if (pos + 1 == prompt2 + inside2[k]) snapshot_source(pos + 1, 0);
   }
@@ -624,15 +624,15 @@ static void room_resume(Snapshot *x, const State *rows, int k, const int *suffix
   memcpy(f, conv, (size_t)k * sizeof *f);
   memcpy(f + k, suffix, (size_t)ns * sizeof *f);
   State *q = fresh();
-  model_state_copy(q, rows, k);
-  model_state_use(q);
-  model_snapshot_restore(q, x);
-  Outcome o = finish(model_prefill(f, n, k, 0, -1, 0), n);
+  deepseek_state_copy(q, rows, k);
+  deepseek_state_use(q);
+  deepseek_snapshot_restore(q, x);
+  Outcome o = finish(deepseek_prefill(f, n, k, 0, -1, 0), n);
   done_with(q);
   Outcome c = cold(f, n);
   size_t bad = differ_state(&o.t, &c.t, n);
   printf("  %s, continued %d positions before it (%s the room): %zu bytes differ from the cold prefill, next tokens %s\n",
-         what, model_snapshot_pos(x) - k, within ? "within" : "past", bad, same_next(&o, &c) ? "equal" : "DIFFERENT");
+         what, deepseek_snapshot_pos(x) - k, within ? "within" : "past", bad, same_next(&o, &c) ? "equal" : "DIFFERENT");
   if (within && (bad || !same_next(&o, &c))) fail("%s continued at %d, within its room, differs from the cold prefill", what, k);
   drop(&o.t), drop(&c.t);
   free(f);
@@ -648,38 +648,38 @@ static void check_room(const int *suffix, int ns) {
   //    prompt's end for a prompt that ends there: its rows of the 3 decoded
   //    positions stay, 3 stale rows. 3 tokens decoded at its end replace them.
   State *s = fresh();
-  model_state_copy(s, source, prompt1);
-  model_state_use(s);
-  model_snapshot_restore(s, saved[k].snap);
-  for (int i = 0; i < 3; i++) model_forward(conv + prompt1 + i, 1, prompt1 + i);
+  deepseek_state_copy(s, source, prompt1);
+  deepseek_state_use(s);
+  deepseek_snapshot_restore(s, saved[k].snap);
+  for (int i = 0; i < 3; i++) deepseek_forward(conv + prompt1 + i, 1, prompt1 + i);
   int *g = xmalloc((size_t)prompt1 * sizeof *g);
   memcpy(g, conv, (size_t)prompt1 * sizeof *g);
   g[prompt1 - 1] = suffix[0];
-  model_prefill(g, prompt1, prompt1 - 1, 0, -1, 0);
-  Snapshot *x = model_snapshot(s, prompt1, 0);
-  for (int i = 0; i < 3; i++) model_forward(conv + prompt1 + i, 1, prompt1 + i);
-  Snapshot *y = model_snapshot(s, prompt1 + 3, 0);
-  model_state_use(source);
+  deepseek_prefill(g, prompt1, prompt1 - 1, 0, -1, 0);
+  Snapshot *x = deepseek_snapshot(s, prompt1, 0);
+  for (int i = 0; i < 3; i++) deepseek_forward(conv + prompt1 + i, 1, prompt1 + i);
+  Snapshot *y = deepseek_snapshot(s, prompt1 + 3, 0);
+  deepseek_state_use(source);
   room_resume(x, s, prompt1 - (R - 3), suffix, ns, 1, "a short prompt's end, 3 stale rows");
   room_resume(x, s, prompt1 - R, suffix, ns, 0, "a short prompt's end, 3 stale rows");
   room_resume(y, s, prompt1 + 3 - R, suffix, ns, 1, "3 tokens later, no stale rows");
-  model_snapshot_free(x), model_snapshot_free(y);
-  model_state_free(s);
+  deepseek_snapshot_free(x), deepseek_snapshot_free(y);
+  deepseek_state_free(s);
   free(g);
   // 2. A verify pass of 4 rows keeps 1 token: its 3 rows after it took the
   //    places of the margin's 3 oldest rows.
   State *v = fresh();
-  model_state_copy(v, source, prompt1);
-  model_state_use(v);
-  model_snapshot_restore(v, saved[k].snap);
-  model_verify(conv + prompt1, 4, prompt1);
-  model_accept(conv + prompt1, 1, prompt1);
-  Snapshot *z = model_snapshot(v, prompt1 + 1, 0);
-  model_state_use(source);
+  deepseek_state_copy(v, source, prompt1);
+  deepseek_state_use(v);
+  deepseek_snapshot_restore(v, saved[k].snap);
+  deepseek_verify(conv + prompt1, 4, prompt1);
+  deepseek_accept(conv + prompt1, 1, prompt1);
+  Snapshot *z = deepseek_snapshot(v, prompt1 + 1, 0);
+  deepseek_state_use(source);
   room_resume(z, v, prompt1 + 1 - (R - 3), suffix, ns, 1, "a verify pass keeping 1 of 4 rows, 3 stale rows");
   room_resume(z, v, prompt1 + 1 - R, suffix, ns, 0, "a verify pass keeping 1 of 4 rows, 3 stale rows");
-  model_snapshot_free(z);
-  model_state_free(v);
+  deepseek_snapshot_free(z);
+  deepseek_state_free(v);
 }
 
 static int only[64], nonly;  // --at P: these fork positions only
@@ -743,6 +743,6 @@ int main(int argc, char **argv) {
   tok_load(argv[1]);
   int count, *tokens = read_text(text, rendered, &count);
   if (limit > 0 && count > limit) count = limit;
-  model_load(argv[1], &o);
+  deepseek_load(argv[1], &o);
   return mode == 1 ? measure(tokens, count, rendered) : fork_test(tokens, count, randoms);
 }

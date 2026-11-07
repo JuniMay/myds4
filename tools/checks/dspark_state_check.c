@@ -1,5 +1,5 @@
 // Accepted DSpark history must match a sequential run of the same tokens.
-#include "../../src/engine/model.c"
+#include "../../src/model/deepseek.c"
 
 int main(int argc, char **argv) {
   if (argc < 2 || argc > 3) die("usage: dspark-state-check CHECKPOINT [EXPERT_GGUF]");
@@ -11,24 +11,24 @@ int main(int argc, char **argv) {
                          "<｜Assistant｜></think>", tokens, 2048);
   Options o = {.ctx = 2048, .budget_gb = 20, .reserve_gb = 4, .draft = 1, .draft_cache = 32,
                .experts = argc == 3 ? argv[2] : NULL, .dump_fd = -1, .routes_fd = -1, .quiet = 1};
-  model_load(argv[1], &o);
-  const float *lg = model_forward(tokens, n, 0);
+  deepseek_load(argv[1], &o);
+  const float *lg = deepseek_forward(tokens, n, 0);
   int rows[BLOCK + 1];
   rows[0] = sample_argmax(lg, VOCAB);
-  model_state_save();
+  deepseek_state_save();
   size_t bytes = D[0].ring.size;
   void *expected = xmalloc((size_t)(BLOCK + 1) * DRAFTS * bytes);
   for (int r = 0; r <= BLOCK; r++) {
-    lg = model_forward(rows + r, 1, n + r);
+    lg = deepseek_forward(rows + r, 1, n + r);
     if (r < BLOCK) rows[r + 1] = sample_argmax(lg, VOCAB);
     for (int d = 0; d < DRAFTS; d++)
       memcpy((char *)expected + ((size_t)r * DRAFTS + d) * bytes, D[d].ring.ptr, bytes);
   }
   int failed = 0;
   for (int kept = 1; kept <= BLOCK + 1; kept++) {
-    model_state_restore();
-    model_verify(rows, BLOCK + 1, n);
-    model_accept(rows, kept, n);
+    deepseek_state_restore();
+    deepseek_verify(rows, BLOCK + 1, n);
+    deepseek_accept(rows, kept, n);
     uint64_t different = 0;
     for (int d = 0; d < DRAFTS; d++) {
       const uint16_t *ref = (const uint16_t *)((const char *)expected + ((size_t)(kept - 1) * DRAFTS + d) * bytes);

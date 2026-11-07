@@ -2,15 +2,20 @@
 
 ## Files
 
-The C sources are in four folders:
+The C sources are in five folders:
 
-- `src/engine/`: the engine. `build/libmyds4.a`, which the server links,
-  holds these files and `src/experimental/online_predictor.c` and
-  `context_lookup.c`.
+- `src/engine/`: what every model shares: the GPU layer, SSD reads and the
+  routed-expert cache, the tokenizer, sampling, images, the JSON and
+  safetensors readers, and the C ABI for the server (`engine.c`).
+- `src/model/`: the models. Each family is one file (`deepseek.c`, `qwen.c`)
+  that fills the model interface of `model.h`; `model.c` opens a checkpoint
+  with the family whose model types include its `config.json`'s
+  `model_type`. The CLI, the engine and the checks run every model through
+  that interface.
+- `src/kernels/`: every model's Metal kernels, compiled into one library per
+  process (`library.c`).
 - `src/cli/`: the command line (`main.c`) for generation, the checks and the
-  benchmarks. `build/myds4` holds it, the engine's files without `engine.c`,
-  the online predictor and context lookup.
-- `src/kernels/`: the Metal kernels, which `src/engine/model.c` embeds.
+  benchmarks, for any model.
 - `src/experimental/`: optional features. `build/myds4` and the server
   include the online predictor, context lookup, the prefill-pruning plan and
   runahead (an option of the server), each off unless its option is given.
@@ -30,22 +35,27 @@ in [Removed experiments](experiments.md).
 
 | File | Contents |
 | --- | --- |
-| `src/engine/model.c` | Weights, request state, the forward pass for decoding and prefill, `--bench`. |
+| `src/model/model.h`, `src/model/model.c` | The model interface: limits, states, snapshots, prefill, decoding passes, drafts and their verification, the CLI's chat turn and report; and opening a checkpoint by its `model_type`. |
+| `src/model/deepseek.c` | DeepSeek V4.1 Flash: weights, request state, the forward pass for decoding and prefill, DSpark, the vision encoder, `--bench`. |
+| `src/model/qwen.c`, `src/model/qwen.h` | Qwen3.8 (`qwen3_5`): weights, states with their DeltaNet and key-value rows, prompt and decoding passes, the MTP head (see [Qwen3.8 models](qwen.md)). |
 | `src/engine/io.c` | SSD reads, the routed-expert cache, memory monitoring. |
 | `src/engine/gpu.c` | Metal through the Objective-C runtime from C, the profiler. |
-| `src/engine/tok.c` | The tokenizer and the embedded tables. |
+| `src/engine/tok.c` | The tokenizer (byte-level BPE from the checkpoint's `tokenizer.json`; it encodes text for the pre-tokenizer of DeepSeek's checkpoint, and decodes any) and the embedded tables. |
 | `src/engine/util.c` | Errors, strings, a JSON parser for the model's own files, the safetensors index, GGUF headers. |
 | `src/engine/vision.c` | Images: decoding, the reference's grid, Pillow's resize and padding, the vision encoder's patches and RoPE angles, an image's span of tokens. |
-| `src/engine/sample.c` | Shared temperature/top-p sampling and DSpark prefix verification. |
+| `src/engine/sample.c` | Shared temperature/top-p sampling and the verification of drafts. |
 | `src/engine/myds4.h` | The engine's shared declarations: the model's shape, the options, and the GPU, cache, tokenizer and model interfaces. |
 | `src/experimental/context_lookup.c`, `src/experimental/context_lookup.h` | Bounded CPU history matching for the CLI and server's context-copy drafts. |
 | `src/experimental/prefill_prune.h` | The dependency plan of `--prefill-prune`. |
-| `src/experimental/runahead.c` | `--runahead`'s scheduler for concurrent requests; included by `model.c`. |
+| `src/experimental/runahead.c` | `--runahead`'s scheduler for concurrent requests; included by `deepseek.c`. |
 | `src/engine/engine.c`, `src/engine/engine.h` | The engine behind a C ABI for the server: loading, attention states and their snapshots, prefill (with a replay: exact, or bounded under `--ced`, and a capture position), decoding, drafts, sampling, context-copy drafts, images, statistics, the tokenizer and the log. Requests, their scheduling and the KV prefix cache are the server's (see [The server](server.md)). |
-| `src/kernels/kernels.metal` | The GPU kernels. |
+| `src/kernels/library.c` | Every kernel source in one string, compiled once per process (`gpu_start`). |
+| `src/kernels/formats.metal` | The number formats every source decodes (E4M3, E2M1, BF16) and small shared functions. |
+| `src/kernels/kernels.metal` | DeepSeek's kernels. |
 | `src/kernels/gguf.metal`, `src/kernels/gguf_grids.metal` | The kernels for routed experts in GGUF codes (`--experts`), and their codebook grids, generated from llama.cpp's `ggml-common.h` (MIT License). |
 | `src/kernels/vision.metal` | The vision encoder's kernels. |
-| `src/cli/main.c` | Command line, chat template, sampling, statistics, `--check-prefill`, `--perplexity`. |
+| `src/kernels/rows.metal`, `products.metal`, `deltanet.metal`, `gqa.metal` | Operations on activation rows; products of matrices with one scale each (NVFP4, FP8, BF16); the gated DeltaNet; grouped-query attention over FP16 keys and values. |
+| `src/cli/main.c` | Command line for any model: the model's chat turn, sampling, statistics, `--check-prefill`, `--check-batch`, `--perplexity`. |
 | `src/experimental/online_predictor.c`, `src/experimental/online_predictor_math.h` | Online CPU prefetch correction, owned forecast/label records, recursive least-squares updates and learner metrics. |
 | `server/` | The server, in Rust on `deepseek-recipe`: HTTP, request conversion, prompts, output and the live view (`--tui`; see [The server](server.md)). |
 | `tools/checks/` | Regression checks: C programs that the Makefile builds (most need no model or GPU), Python checks of the command line and the server, and `regression.sh`, which compares two CLI builds' outputs and decode speed. |
@@ -57,9 +67,13 @@ in [Removed experiments](experiments.md).
 
 Metal is used from C: every message goes through `objc_msgSend` cast to the
 method's exact type, so the project has no Objective-C or C++ sources besides
-the Metal kernels. The kernels compile at startup with the IEEE math mode and
-Metal 4.1, which provides the tensor operations that drive the GPU's matrix
-units.
+the Metal kernels. The kernels compile when the first model loads, all
+sources as one library (the shared formats first), with the IEEE math mode
+and Metal 4.1, which provides the tensor operations that drive the GPU's
+matrix units. Kernel names are unique across the sources: a kernel that
+computes something else under a name another source uses takes a name of its
+own (`gemm_*` for products of matrices with one scale each, beside the
+block-scaled `mm_fp8`).
 
 ## Weights
 

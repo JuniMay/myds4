@@ -83,12 +83,13 @@ int sample_token(const float *logits, int count, Sampler *s) {
 // Draft sources supply deterministic proposals. Sampling from the target and
 // keeping a matching prefix preserves its distribution and random stream.
 // A mismatch is already the next token: never draw it a second time.
-int sample_verify(const float *logits, int count, const int *drafts, int ndraft, int eos, Sampler *s, int *accepted) {
+int sample_verify(const float *logits, int count, const int *drafts, int ndraft, int (*stop)(int token), Sampler *s,
+                  int *accepted) {
   if (ndraft < 0 || count < 1) die("invalid draft verification size");
   int n = 0;
   for (;;) {
     int next = sample_token(logits + (size_t)n * count, count, s);
-    if (n == ndraft || next == eos || next != drafts[n]) {
+    if (n == ndraft || (stop && stop(next)) || next != drafts[n]) {
       *accepted = n;
       return next;
     }

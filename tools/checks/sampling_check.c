@@ -6,6 +6,8 @@
 #include <unistd.h>
 
 static int checks, failures;
+static int stop_token;
+static int is_stop(int token) { return token == stop_token; }
 static void expect(const char *name, int ok) {
   checks++;
   if (!ok) failures++, fprintf(stderr, "FAIL: %s\n", name);
@@ -80,7 +82,7 @@ int main(void) {
         if (mismatch < k) drafts[mismatch] = (drafts[mismatch] + 1) % N;
         Sampler speculative = original;
         int accepted;
-        int next = sample_verify(logits, N, drafts, k, -1, &speculative, &accepted);
+        int next = sample_verify(logits, N, drafts, k, 0, &speculative, &accepted);
         matches &= accepted == mismatch && next == expected[mismatch];
         rng_matches &= !memcmp(speculative.seed, after[mismatch].seed, sizeof speculative.seed);
         if (original.temp == 0) greedy_matches &= accepted == mismatch && next == expected[mismatch];
@@ -90,7 +92,8 @@ int main(void) {
         for (int r = 0; r < k; r++) drafts[r] = expected[r];
         Sampler speculative = original;
         int accepted;
-        int next = sample_verify(logits, N, drafts, k, expected[0], &speculative, &accepted);
+        stop_token = expected[0];
+        int next = sample_verify(logits, N, drafts, k, is_stop, &speculative, &accepted);
         eos_stops &=
             next == expected[0] && accepted == 0 && !memcmp(speculative.seed, after[0].seed, sizeof speculative.seed);
       }
@@ -116,7 +119,7 @@ int main(void) {
           drafts[r] = sample_token(q, N, &proposal);
         }
       }
-      int next = sample_verify(logits, N, drafts, 5, -1, &target, &accepted);
+      int next = sample_verify(logits, N, drafts, 5, 0, &target, &accepted);
       if (!changed) coupled_equal &= accepted == 5;
       for (int r = 0; r < accepted; r++) coupled_exact &= drafts[r] == expected[r];
       coupled_exact &= next == expected[accepted] && !memcmp(target.seed, after[accepted].seed, sizeof target.seed);

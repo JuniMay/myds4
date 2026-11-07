@@ -226,7 +226,7 @@ experts. A pass takes at least the larger of two times:
 - the experts it reads from the SSD, at 13.6 GB/s.
 
 Measured on 2026-11-06 with `build/rows-bench`: B sequences, each continuing
-its own 4,096-token part of `src/engine/model.c` (prefilled alone), decode
+its own 4,096-token part of DeepSeek's model source (now `src/model/deepseek.c`; prefilled alone), decode
 greedily in lockstep, 128 timed passes after 128, each B in a fresh process.
 The generated text was C code, not a loop (0.92 to 0.98 of the first
 sequence's 8-token windows were new). The bounds use each run's measured

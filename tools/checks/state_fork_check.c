@@ -27,7 +27,7 @@ static void fixture_sync(void) { pending = 0; }
 #define gpu_alloc fixture_alloc
 #define gpu_free fixture_free
 #define gpu_sync fixture_sync
-#include "../../src/engine/model.c"
+#include "../../src/model/deepseek.c"
 
 static int checks, failures;
 static void expect(const char *name, int ok) {
@@ -82,14 +82,14 @@ static void run(int ratio, int positions, int large, int draft) {
   active = src;
   bind(src);
   // What the server's KV prefix cache charges for a state (myds4_state_bytes).
-  expect("a state is charged the bytes it owns", model_state_bytes(src, src->cap) == owned(src));
+  expect("a state is charged the bytes it owns", deepseek_state_bytes(src, src->cap) == owned(src));
   State *fresh = make_state(grown(start_cap(), positions));
-  expect("a new state is charged what it will own", model_state_bytes(NULL, positions) == owned(fresh));
-  model_state_free(fresh);
+  expect("a new state is charged what it will own", deepseek_state_bytes(NULL, positions) == owned(fresh));
+  deepseek_state_free(fresh);
   rolling_fill(src, 0x42);
   int32_t fork_history[3] = {11, 12, 13};
   memcpy(history, fork_history, sizeof history);  // the state in use keeps its history in `history`
-  Snapshot *x = model_snapshot(src, positions, 0);
+  Snapshot *x = deepseek_snapshot(src, positions, 0);
   rolling_fill(src, 0x39);
   for (int i = 0; i < 3; i++) history[i] = src->history[i] = 70 + i;
   memset(src->comp[2].ptr, 0x31, src->comp[2].size);
@@ -97,10 +97,10 @@ static void run(int ratio, int positions, int large, int draft) {
   size_t saved = saved_bytes();
   dst->saved = xmalloc(saved);  // a rewind point of the destination's old rows
   memset(dst->saved, 0x67, saved);
-  expect("a state is charged its rewind copy", model_state_bytes(dst, dst->cap) == owned(dst));
+  expect("a state is charged its rewind copy", deepseek_state_bytes(dst, dst->cap) == owned(dst));
   pending = 1;
-  model_state_copy(dst, src, positions);
-  model_snapshot_restore(dst, x);
+  deepseek_state_copy(dst, src, positions);
+  deepseek_snapshot_restore(dst, x);
   size_t main_used = rows_bytes(2, positions, 0), keys_used = rows_bytes(2, positions, 1);
   expect("capacity follows the prefix, not the source allocation", dst->cap == grown(start_cap(), positions));
   expect("required global KV rows and guard row are copied", !memcmp(src->comp[2].ptr, dst->comp[2].ptr, main_used));
@@ -119,9 +119,9 @@ static void run(int ratio, int positions, int large, int draft) {
   if (large)
     fprintf(stderr, "prefix copy: %zu required global bytes; %zu bytes in source capacity\n",
             main_used + keys_used, src->comp[2].size + src->keys[2].size);
-  model_snapshot_free(x);
+  deepseek_snapshot_free(x);
   active = NULL;
-  model_state_free(dst), model_state_free(src);
+  deepseek_state_free(dst), deepseek_state_free(src);
 }
 
 int main(void) {

@@ -1,5 +1,5 @@
 // Prefill must retain the window plus the server's allowed rewind margin.
-#include "../../src/engine/model.c"
+#include "../../src/model/deepseek.c"
 
 int main(int argc, char **argv) {
   if (argc < 2 || argc > 3) die("usage: prefill-state-check CHECKPOINT [EXPERT_GGUF]");
@@ -11,8 +11,8 @@ int main(int argc, char **argv) {
   for (int i = 0; i < 256; i++) tokens[i] = pattern[i % pn];
   Options o = {.ctx = 2048, .budget_gb = 20, .reserve_gb = 4,
                .experts = argc == 3 ? argv[2] : NULL, .dump_fd = -1, .routes_fd = -1, .quiet = 1};
-  model_load(argv[1], &o);
-  model_forward(tokens, 256, 0);
+  deepseek_load(argv[1], &o);
+  deepseek_forward(tokens, 256, 0);
   const uint16_t *all = (const uint16_t *)WIN.ptr;
   const uint16_t *ring = (const uint16_t *)L[LAYERS - 1].ring.ptr;
   uint64_t bad_window = 0, bad_margin = 0;

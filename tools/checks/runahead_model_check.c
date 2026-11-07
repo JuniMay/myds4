@@ -1,5 +1,5 @@
 // Compare independent layer scheduling with ordinary multi-request decoding.
-#include "../../src/engine/model.c"
+#include "../../src/model/deepseek.c"
 
 static size_t differences(const void *a, const void *b, size_t bytes) {
   const uint8_t *x = a, *y = b;
@@ -21,7 +21,7 @@ int main(int argc, char **argv) {
   if (count < 2 || count > BATCH_ROWS) die("runahead check needs 2 to %d requests", BATCH_ROWS);
   alarm(600);
   tok_load(argv[1]);
-  model_load(argv[1], &o);
+  deepseek_load(argv[1], &o);
   enum { STEPS = 4 };
   State *states[FEW];
   Snapshot *prefix[FEW];
@@ -29,24 +29,24 @@ int main(int argc, char **argv) {
   int pn = tok_encode(" Review the queue, preserve cancellation, and explain the regression tests. alpha beta gamma 12345.\n", pattern, 128);
   int *prompt = xmalloc((length + FEW * 17) * sizeof(int));
   for (int r = 0; r < count; r++) {
-    states[r] = model_state_new();
-    model_state_use(states[r]);
+    states[r] = deepseek_state_new();
+    deepseek_state_use(states[r]);
     positions[r] = length + r * 17;
     for (int i = 0; i < positions[r]; i++) prompt[i] = pattern[(i + r * 3) % pn];
-    rows[0][r] = sample_argmax(model_forward(prompt, positions[r], 0), VOCAB);
-    prefix[r] = model_snapshot(states[r], positions[r], 0);
+    rows[0][r] = sample_argmax(deepseek_forward(prompt, positions[r], 0), VOCAB);
+    prefix[r] = deepseek_snapshot(states[r], positions[r], 0);
   }
   float *reference = xmalloc((size_t)STEPS * count * VOCAB * sizeof(float));
   runahead_enabled = 0;
   for (int step = 0; step < STEPS; step++) {
-    const float *p = model_forward_rows(states, rows[step], positions, count);
+    const float *p = deepseek_forward_rows(states, rows[step], positions, count);
     memcpy(reference + (size_t)step * count * VOCAB, p, (size_t)count * VOCAB * sizeof(float));
     for (int r = 0; r < count; r++) rows[step + 1][r] = sample_argmax(p + (size_t)r * VOCAB, VOCAB), positions[r]++;
   }
   size_t saved = saved_bytes();
   uint8_t *local[FEW], *global[FEW][LAYERS][2] = {{{0}}};
   for (int r = 0; r < count; r++) {
-    model_state_use(states[r]);
+    deepseek_state_use(states[r]);
     local[r] = xmalloc(saved);
     rolling(states[r], (char *)local[r], 0);
     for (int l = 0; l < LAYERS; l++) if (L[l].kv_source)
@@ -55,27 +55,27 @@ int main(int argc, char **argv) {
         global[r][l][k] = xmalloc(b->size);
         memcpy(global[r][l][k], b->ptr, b->size);
       }
-    model_snapshot_restore(states[r], prefix[r]);
-    model_snapshot_free(prefix[r]);
+    deepseek_snapshot_restore(states[r], prefix[r]);
+    deepseek_snapshot_free(prefix[r]);
     positions[r] -= STEPS;
   }
   runahead_enabled = 1;
   size_t logit_diff = 0, local_diff = 0, global_diff = 0;
   int nonfinite = 0, active_changed = 0;
   for (int step = 0; step < STEPS; step++) {
-    model_state_use(states[0]);
+    deepseek_state_use(states[0]);
     State *previous_active = active;
-    const float *p = model_forward_rows(states, rows[step], positions, count);
+    const float *p = deepseek_forward_rows(states, rows[step], positions, count);
     active_changed += active != previous_active;
     logit_diff += differences(reference + (size_t)step * count * VOCAB, p, (size_t)count * VOCAB * sizeof(float));
     for (size_t i = 0; i < (size_t)count * VOCAB; i++) nonfinite += !isfinite(p[i]);
     for (int r = 0; r < count; r++) positions[r]++;
   }
   for (int r = 0; r < count; r++) {
-    model_state_use(states[r]);
-    Snapshot *actual = model_snapshot(states[r], positions[r], 0);
+    deepseek_state_use(states[r]);
+    Snapshot *actual = deepseek_snapshot(states[r], positions[r], 0);
     local_diff += differences(local[r], actual->rows, saved);
-    model_snapshot_free(actual);
+    deepseek_snapshot_free(actual);
     for (int l = 0; l < LAYERS; l++) if (L[l].kv_source)
       for (int k = 0; k < 2; k++) {
         Buf *b = k ? &L[l].keys : &L[l].comp;
