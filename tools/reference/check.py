@@ -46,6 +46,12 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+
+def model_status(call):
+    """The served model's status: GET /v1/models/{id}'s "status" (the first model's)."""
+    model = call("/v1/models")["data"][0]["id"]
+    return call(f"/v1/models/{model}")["status"]
+
 TEXTS = [
     "Hello, world! It's 2026-10-28; price $1,234.56.",
     "  leading spaces\n\n\ttabs\r\n and   trailing   ",
@@ -607,7 +613,7 @@ def settled(call):
     footprint has settled (it falls for about 2 s after a request). Sends a
     short request when none has just ended."""
     while True:
-        s = call("/v1/status")
+        s = model_status(call)
         done = s["totals"]["requests"]
         if s["phase"] != "idle" or s["waiting"] or (done and s["phase_seconds"] < 3):
             time.sleep(0.25)
@@ -635,7 +641,7 @@ def idle(url, key_file):
     for _ in range(20):
         s = settled(call)
         time.sleep(10 - s["phase_seconds"])
-        t = call("/v1/status")
+        t = model_status(call)
         if t["phase"] != "idle" or t["waiting"] or t["totals"]["requests"] != s["totals"]["requests"]:
             continue  # another request came
         if free_gib() < 11:
@@ -664,7 +670,7 @@ def demand(url, key_file):
     held = bytearray(take)
     held[::16384] = b"\x01" * len(range(0, take, 16384))  # every page written
     time.sleep(5)
-    t = call("/v1/status")
+    t = model_status(call)
     del held
     a, b = s["expert_cache"]["gib"], t["expert_cache"]["gib"]
     print(f"demand: took {take / 2**30:.1f} GiB; expert slots {s['expert_cache']['slots']} ({a:.1f} GiB), "

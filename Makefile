@@ -1,14 +1,14 @@
 .DEFAULT_GOAL := build/myds4
 CC = clang
 CFLAGS = -std=c23 -O2 -Wall -Wextra -Wno-unused-parameter -Isrc/engine $(shell pkg-config --cflags yyjson libjpeg)
-LDLIBS = -framework Metal -framework Foundation -framework IOKit -framework ImageIO -framework CoreGraphics -framework Accelerate -lobjc \
+LDLIBS = -framework Metal -framework Foundation -framework IOKit -framework ImageIO -framework CoreGraphics -framework Accelerate -lobjc -licucore \
          $(shell pkg-config --libs yyjson libjpeg)
 SRC = src/cli/main.c src/model/model.c src/model/deepseek.c src/model/qwen.c src/kernels/library.c src/engine/io.c src/engine/gpu.c src/engine/tok.c src/engine/util.c src/engine/vision.c src/experimental/online_predictor.c src/experimental/context_lookup.c src/engine/sample.c
 MODEL_HEADERS = src/engine/myds4.h src/model/model.h src/model/qwen.h src/experimental/online_predictor_math.h src/experimental/context_lookup.h src/experimental/prefill_prune.h src/experimental/runahead.c
 KERNELS = src/kernels/formats.metal src/kernels/kernels.metal src/kernels/gguf_grids.metal src/kernels/gguf.metal \
           src/kernels/vision.metal src/kernels/rows.metal src/kernels/products.metal src/kernels/deltanet.metal src/kernels/gqa.metal
 
-build/myds4: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+build/myds4: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDLIBS)
 
@@ -17,7 +17,7 @@ build/myds4: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
 LIB_SRC = src/model/model.c src/model/deepseek.c src/model/qwen.c src/kernels/library.c src/engine/io.c src/engine/gpu.c src/engine/tok.c src/engine/util.c src/engine/vision.c src/experimental/online_predictor.c src/experimental/context_lookup.c src/engine/sample.c src/engine/engine.c
 LIB_OBJ = $(LIB_SRC:src/%.c=build/lib/%.o)
 
-build/lib/%.o: src/%.c $(MODEL_HEADERS) src/engine/engine.h $(KERNELS) data/engram.bin data/unicode.bin
+build/lib/%.o: src/%.c $(MODEL_HEADERS) src/engine/engine.h $(KERNELS) data/engram.bin
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
@@ -68,38 +68,42 @@ build/prefill-prune-check: tools/checks/prefill_prune_check.c src/experimental/p
 	$(CC) $(CFLAGS) -o $@ tools/checks/prefill_prune_check.c
 
 # Host-backed workspace checks; no Metal device or model weights are opened.
-build/workspace-check: tools/checks/workspace_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+build/workspace-check: tools/checks/workspace_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/workspace_check.c $(filter-out src/cli/main.c src/model/deepseek.c,$(SRC)) $(LDLIBS)
 
 workspace-check: build/workspace-check
 	./build/workspace-check
 
-build/state-fork-check: tools/checks/state_fork_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+build/state-fork-check: tools/checks/state_fork_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/state_fork_check.c $(filter-out src/cli/main.c src/model/deepseek.c,$(SRC)) $(LDLIBS)
 
 state-fork-check: build/state-fork-check
 	./build/state-fork-check
 
-build/verification-schedule-check: tools/checks/verification_schedule_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+build/verification-schedule-check: tools/checks/verification_schedule_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/verification_schedule_check.c $(filter-out src/cli/main.c src/model/deepseek.c,$(SRC)) $(LDLIBS)
 
 verification-schedule-check: build/verification-schedule-check
 	./build/verification-schedule-check
 
-build/attention-candidate-check: tools/checks/attention_candidate_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+build/attention-candidate-check: tools/checks/attention_candidate_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/attention_candidate_check.c $(filter-out src/cli/main.c src/model/deepseek.c,$(SRC)) $(LDLIBS)
 
-build/tokenizer-added-check: tools/checks/tokenizer_added_check.c src/engine/tok.c src/engine/util.c $(MODEL_HEADERS) data/engram.bin data/unicode.bin
+build/tokenizer-added-check: tools/checks/tokenizer_added_check.c src/engine/tok.c src/engine/util.c $(MODEL_HEADERS) data/engram.bin
 	@mkdir -p build
-	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ tools/checks/tokenizer_added_check.c src/engine/tok.c src/engine/util.c $(shell pkg-config --libs yyjson)
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ tools/checks/tokenizer_added_check.c src/engine/tok.c src/engine/util.c $(shell pkg-config --libs yyjson) -licucore
 
-build/tokenizer-long-check: tools/checks/tokenizer_long_check.c src/engine/tok.c src/engine/util.c $(MODEL_HEADERS) data/engram.bin data/unicode.bin
+build/tokenizer-reference-check: tools/checks/tokenizer_reference_check.c src/engine/tok.c src/engine/util.c src/engine/myds4.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ tools/checks/tokenizer_long_check.c src/engine/tok.c src/engine/util.c $(shell pkg-config --libs yyjson)
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ tools/checks/tokenizer_reference_check.c src/engine/tok.c src/engine/util.c $(shell pkg-config --libs yyjson) -licucore
+
+build/tokenizer-long-check: tools/checks/tokenizer_long_check.c src/engine/tok.c src/engine/util.c $(MODEL_HEADERS) data/engram.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ tools/checks/tokenizer_long_check.c src/engine/tok.c src/engine/util.c $(shell pkg-config --libs yyjson) -licucore
 
 build/online-predictor-unit: tools/experimental/online_predictor_unit.c src/experimental/online_predictor.c src/experimental/online_predictor_math.h src/engine/myds4.h
 	@mkdir -p build
@@ -230,48 +234,48 @@ gguf-decode-check: build/gguf-decode-check
 
 # ---- Checks that load the model ----
 
-build/prefill-prune-model-check: tools/checks/prefill_prune_model_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+build/prefill-prune-model-check: tools/checks/prefill_prune_model_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/prefill_prune_model_check.c $(filter-out src/cli/main.c src/model/deepseek.c,$(SRC)) $(LDLIBS)
 
-build/draft-rows-check: tools/checks/draft_rows_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+build/draft-rows-check: tools/checks/draft_rows_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/draft_rows_check.c $(filter-out src/cli/main.c src/model/deepseek.c,$(SRC)) $(LDLIBS)
 
-build/prefix-fork-check: tools/checks/prefix_fork_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+build/prefix-fork-check: tools/checks/prefix_fork_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/prefix_fork_check.c $(filter-out src/cli/main.c src/model/deepseek.c,$(SRC)) $(LDLIBS)
 
-build/verification-model-check: tools/checks/verification_model_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+build/verification-model-check: tools/checks/verification_model_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/verification_model_check.c $(filter-out src/cli/main.c,$(SRC)) $(LDLIBS)
 
 # CED numerical and prefill/DSpark timing checks.
-build/ced-check: tools/checks/ced_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+build/ced-check: tools/checks/ced_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/ced_check.c $(filter-out src/cli/main.c src/model/deepseek.c,$(SRC)) $(LDLIBS)
 
-build/dspark-state-check: tools/checks/dspark_state_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+build/dspark-state-check: tools/checks/dspark_state_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/dspark_state_check.c $(filter-out src/cli/main.c src/model/deepseek.c,$(SRC)) $(LDLIBS)
 
-build/prefill-state-check: tools/checks/prefill_state_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+build/prefill-state-check: tools/checks/prefill_state_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/prefill_state_check.c $(filter-out src/cli/main.c src/model/deepseek.c,$(SRC)) $(LDLIBS)
 
-build/runahead-model-check: tools/checks/runahead_model_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+build/runahead-model-check: tools/checks/runahead_model_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/runahead_model_check.c $(filter-out src/cli/main.c src/model/deepseek.c,$(SRC)) $(LDLIBS)
 
 # Decoding B sequences together: step time, GPU busy and idle, reads per row.
-build/rows-bench: tools/bench/rows_bench.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+build/rows-bench: tools/bench/rows_bench.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/bench/rows_bench.c $(filter-out src/cli/main.c src/model/deepseek.c,$(SRC)) $(LDLIBS)
 
 # ---- Diagnostics ----
 
 # Diagnostic pipe capture only; its synchronous writes change inference timing.
-build/myds4-predict-probe: $(SRC) tools/experimental/predict_probe.c $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+build/myds4-predict-probe: $(SRC) tools/experimental/predict_probe.c $(MODEL_HEADERS) $(KERNELS) data/engram.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -DMYDS4_PREDICT_PROBE -o $@ $(SRC) tools/experimental/predict_probe.c $(LDLIBS)
 

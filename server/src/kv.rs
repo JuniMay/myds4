@@ -166,9 +166,9 @@ impl Plan {
     }
 }
 
-/// The engine's limits and costs that plans depend on.
-#[derive(Clone, Copy, Debug)]
-pub struct Limits {
+/// The engine's limits and costs that plans depend on, for one model.
+#[derive(Clone, Copy)]
+pub struct Limits<'a> {
     /// The positions a state can continue before its end or a snapshot's
     /// position while its rings hold their rows (myds4_rewind), its stale
     /// rows apart.
@@ -179,7 +179,7 @@ pub struct Limits {
     /// tokens: the rows before k each layer computes again, on average
     /// (myds4_replay_rows: exact, at most k, about 2,613 for long prefixes;
     /// bounded with --ced, the ring's 136).
-    pub replay_cost: fn(usize) -> usize,
+    pub replay_cost: &'a dyn Fn(usize) -> usize,
 }
 
 /// The stale rows at `pos` of rows continued from `origin` (its position and
@@ -242,7 +242,7 @@ impl Cache {
 
     /// The cheapest way to resume the prompt `p` (exact, but for a replay
     /// under --ced).
-    pub fn plan(&self, p: &[i32], limits: Limits) -> Plan {
+    pub fn plan(&self, p: &[i32], limits: Limits<'_>) -> Plan {
         let n = p.len();
         let mut best = (n, 3usize, Plan::Cold); // cost, then preference: in place, snapshot, replay, cold
         let mut branch = 0; // where the prompt parts from every state
@@ -616,7 +616,7 @@ mod tests {
         (0..40).map(|j| k.min(133 + 127 * j)).sum::<usize>().div_ceil(40)
     }
 
-    const LIMITS: Limits = Limits { rewind: 5, replay: true, replay_cost: replay_rows };
+    const LIMITS: Limits<'static> = Limits { rewind: 5, replay: true, replay_cost: &replay_rows };
     const SNAP: u64 = 6 << 20;
 
     fn seq(range: std::ops::Range<i32>) -> Vec<i32> {
@@ -726,7 +726,7 @@ mod tests {
         // the new state's rings hold all of the margin at its prompt's end
         assert_eq!(stale_at(c.origin(&plan, next.len()), next.len()), 0);
         // also with the bounded replay (--ced), which recomputes a ring
-        let ced = Limits { replay_cost: |k| k.min(133), ..LIMITS };
+        let ced = Limits { replay_cost: &|k| k.min(133), ..LIMITS };
         assert_eq!(c.plan(&next, ced), plan);
         // the rewind margin's edge: 5 positions before it, not 6
         let edge = [&p[..3995], &seq(-60..0)[..]].concat();
@@ -834,7 +834,7 @@ mod tests {
     #[test]
     fn under_ced_the_bounded_replay_wins_past_a_ring() {
         // the bounded replay's cost under --ced with LIMITS' margin of 5: the ring, 133 positions
-        let ced = Limits { replay_cost: |k| k.min(133), ..LIMITS };
+        let ced = Limits { replay_cost: &|k| k.min(133), ..LIMITS };
         let mut c = Cache::new(u64::MAX, 256);
         let s = state(&mut c, &seq(0..6000), &[]);
         c.add_snap(s, Snap { pos: 4125, kind: Kind::Branch, bytes: SNAP, stale: 0 });

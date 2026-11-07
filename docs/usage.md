@@ -25,7 +25,6 @@ later for the standard-library `compression.zstd` module.
 
 - `data/engram.bin`: the Engram hashing constants and the compressed token
   map, computed by the checkpoint's `inference/engram.py`.
-- `data/unicode.bin`: Unicode general-category runs for the tokenizer.
 
 ## Running the model
 
@@ -40,7 +39,7 @@ DeepSeek (see [Server](#server) and [Qwen3.8 models](qwen.md)).
 | --- | --- |
 | `-m DIR` | The checkpoint directory: DeepSeek V4.1 Flash, or a Qwen3.8 `qwen3_5` model ([Qwen3.8 models](qwen.md)). Its `config.json`'s `model_type` picks the model. Options that apply only to DeepSeek's routed experts and layers (`--experts`, `--ced`, `--substitute`, `--online-predictor`, `--prefill-prune`, `--draft-cache`, `--dump-fd`, `--routes-fd`) are refused for a model without them. |
 | `-p TEXT`, `-f FILE` | The user message (wrapped in the model's chat template). |
-| `--tokens IDS` | The prompt as token ids: comma-separated, or `@FILE` (commas, spaces or newlines between them). Without `--perplexity`, each token runs alone and nothing is generated. Qwen3.8 prompts need it: the engine's tokenizer encodes text only for DeepSeek's pre-tokenizer. |
+| `--tokens IDS` | The prompt as token ids: comma-separated, or `@FILE` (commas, spaces or newlines between them). Without `--perplexity`, each token runs alone and nothing is generated. |
 | `--raw` | Use the text as is, without the chat template. |
 | `--rendered` | Use an already rendered server chat prompt without adding a template. Matches the server's tokenizer: a literal `<｜deepseek_image｜>` in source text stays text. Works with `--tokenize`. |
 | `--think N` | Thinking effort 1 to 100; 0, the default, disables thinking. |
@@ -102,48 +101,58 @@ response for 60 s, ends its request (see
 
 The [README](../README.md#run) shows how to create a key file and start the server.
 
-`-m` may be given more than once: the server serves every model side by side
-on the same port, and each request goes to the model its `model` field names
-(as `GET /v1/models` lists them). The first model runs in the server's
-process, each further one in a child process on the next ports, with the same
-options. A model is DeepSeek V4.1 Flash or a Qwen3.8 (`qwen3_5_text`)
-checkpoint such as Qwen3.8-27B NVFP4 ([Qwen3.8 models](qwen.md)); for a Qwen
-model `--ctx` is at most the model's own context (262,144), `--kv-cache` and
-`--batch` (up to 8) apply as below, and the DeepSeek-only options (experts,
-cache, drafts, `--ced`, the predictor) do nothing. For example, DeepSeek with
-its experts and the 27B (`QWEN`, its directory) beside it:
+`-m DIR` serves one model with the options after it on the command line;
+`--config FILE` serves several in one process, from a JSON file that lists
+them, each with its own options under the names below without the dashes
+(`-` as `_`), and each request goes to the model its `model` field names (as
+`GET /v1/models` lists them). A model is DeepSeek V4.1 Flash or a Qwen3.8
+(`qwen3_5`) checkpoint such as Qwen3.8-27B NVFP4 ([Qwen3.8 models](qwen.md));
+for a Qwen model `ctx` is at most the model's own context (262,144), `batch`
+goes up to 8, `draft` is 0 or 1 (the MTP head), and DeepSeek's options
+(experts, cache, `ced`, `substitute`, the predictor) are refused. For
+example, DeepSeek with its experts and the 27B beside it:
 
-```sh
-build/myds4-server -m "$CHECKPOINT" --experts "$EXPERTS" --cache 56 \
-  -m "$QWEN" --serve 8008 --api-key-file ~/.config/myds4/api-key
+```json
+{"models": [
+  {"model": "/path/to/DeepSeek-V4.1-Flash-1017", "experts": "/path/to/UD-IQ1_M-00001-of-00004.gguf", "cache": 56},
+  {"model": "/path/to/Qwen3.8-27B-NVFP4", "draft": 1}
+]}
 ```
 
-See [Several models](server.md#several-models) for routing and memory, and
-[Qwen3.8 models](server.md#qwen38-models) for a Qwen model's requests.
+```sh
+build/myds4-server --config models.json --serve 8008 --api-key-file ~/.config/myds4/api-key
+```
+
+See [Models](server.md#models) for routing, scheduling and memory, and
+[Chat formats](server.md#chat-formats) for a Qwen model's requests.
 
 | Option | Effect |
 | --- | --- |
-| `--serve PORT` | Serve on this port. `--experts`, cache settings, draft settings, `--substitute` and `--ctx` apply to every request. |
+| `-m DIR` | The model to serve, its options after it; or `--config FILE` for several. |
+| `--config FILE` | Serve the models the JSON file lists (`{"models": [{"model": DIR, ...}]}`), each with its own options. |
+| `--serve PORT` | Serve on this port. |
 | `--host ADDR` | The IPv4 address to listen on (default `127.0.0.1`, this machine only). The server speaks plain HTTP: on another address, keys and conversations cross the network unencrypted. |
 | `--api-key-file FILE` | The key clients must send. |
-| `--kv-cache GB` | The memory the KV prefix cache may take (default 8 GiB, apart from `--cache`): the attention states it keeps (55 MiB at first, up to 3.1 GiB at 1,048,576 tokens) and their snapshots (5.6 MiB each, 6.1 MiB with a prompt end's logits; more with `--draft`). Spare snapshots and then the least recently used states are dropped to make room; a request that does not fit even then is refused before anything is dropped. A decoding request whose state needs more room (past 16,384 positions, then each doubling) makes room the same way before its state grows; when only decoding states are left, the state grows past the limit and the server logs it. |
-| `-t T`, `--temperature T` | The temperature of requests that set none (default 1, the checkpoint's recommendation; 0 is greedy). |
-| `--top-p P` | The nucleus probability of requests that set none (default 1). |
+| `--id NAME` | The name requests give in `model` (default `deepseek-v4.1-flash`, or a Qwen model's directory's name in lower case). |
+| `--kv-cache GB` | The memory the model's KV prefix cache may take (default 8 GiB, apart from `--cache`): the attention states it keeps (55 MiB at first, up to 3.1 GiB at 1,048,576 tokens) and their snapshots (5.6 MiB each, 6.1 MiB with a prompt end's logits; more with `--draft`). Spare snapshots and then the least recently used states are dropped to make room; a request that does not fit even then is refused before anything is dropped. A decoding request whose state needs more room (past 16,384 positions, then each doubling) makes room the same way before its state grows; when only decoding states are left, the state grows past the limit and the server logs it. |
+| `-t T`, `--temperature T` | The temperature of requests that set none (default: the checkpoint's `generation_config.json`, else 1; 0 is greedy). |
+| `--top-p P` | The nucleus probability of requests that set none (default: `generation_config.json`'s, else 1). |
+| `--top-k K` | The top_k of requests that set none, 0 for every token (default: `generation_config.json`'s, else 0). |
 | `--seed N` | The sampling seed of requests that set none. Without this option, each request receives a random seed. |
-| `--think N` | The thinking default: 1–100 enables thinking at that effort; 0 disables it. Without this option, the server enables thinking at effort 75. Request fields take precedence. |
-| `--batch N` | Requests decoded together at most, 1 to 6 (default 4). Overlapping requests share forward passes. Aggregate throughput depends on expert-cache contention and the workload (see [Performance](performance.md#concurrent-requests)). A request alone runs the same at any N. |
+| `--think N` | DeepSeek's thinking default: 1–100 enables thinking at that effort; 0 disables it. Without this option, the server enables thinking at effort 75. Request fields take precedence. |
+| `--batch N` | The model's requests running together at most, up to its rows per pass (DeepSeek 6, Qwen 8; default 4). Overlapping requests share forward passes. Aggregate throughput depends on expert-cache contention and the workload (see [Performance](performance.md#concurrent-requests)). A request alone runs the same at any N. |
 | `--runahead` | Let ready concurrent requests advance while other requests' expert reads run. Groups ready requests at the same layer; each loads its own experts. Applies with two or more decoding requests; off by default. Requires no `--draft`, `--online-predictor` or `--substitute`. Context lookup remains available for a request running alone. |
-| `--tui` | A live view on the terminal in place of the log, in five tabs (see below); the `q` key stops the server as Ctrl-C does. |
+| `--tui` | A live view on the terminal in place of the log, in five tabs (see below), of one model at a time (`n` shows the next); the `q` key stops the server as Ctrl-C does. |
 | `--tui-theme auto\|light\|dark` | The live view's colors: by the terminal's background color, which the view asks the terminal for (`auto`, the default; light colors when it does not answer), or the light or dark ones. |
-| `--render FILE` | Print the prompt of a JSON test case of the checkpoint's `encoding/tests` (or a request's messages, tools, thinking mode and effort) as the server renders it, and exit; for `tools/reference/check.py encoding`. |
+| `--render FILE` | Print the prompt of a JSON test case of DeepSeek's `encoding/tests` (or a request's messages, tools, thinking mode and effort) as the server renders it, and exit; for `tools/reference/check.py encoding`. |
 
 Endpoints:
 
 | Endpoint | Answer |
 | --- | --- |
 | `POST /v1/chat/completions` | A chat completion: streamed as server-sent events (`"stream": true`, with usage when `stream_options.include_usage` is set) or as one JSON response. Reasoning arrives in `reasoning_content`, tool calls in `tool_calls`. |
-| `GET /v1/models` | The model `deepseek-v4.1-flash`, its context (`context_length`) and output cap (`max_output_tokens`). |
-| `GET /v1/status` | What the server is doing: the phase (idle, prefill, decode) and its request, the waiting requests, the KV prefix cache's states (`sessions`), the KV and expert caches, memory, and totals. |
+| `GET /v1/models` | Every model served (OpenAI's model objects), with its context (`context_length`, `max_model_len`) and output cap (`max_output_tokens`). |
+| `GET /v1/models/{id}` | The model's object and its status under `status`: the phase (idle, prefill, decode) and its request, the waiting requests, the KV prefix cache's states (`sessions`), the KV and expert caches, memory, and totals. |
 | `GET /health` | `{"status": "ok"}`, without a key. |
 
 A request may set `messages` (roles `system`, `developer`, `user`,
@@ -238,7 +247,7 @@ Prefill logs show how the prompt resumed (`new`, `kept`, `saved` or
 `forked`), new and reused tokens, configured CED depth, actual chunk count,
 encoder and decoder token counts, the capture position, speed and expert reads.
 Queue admission also reports requests taken together for subsequent prefills.
-`GET /v1/status` includes `ced_depth` (0 means off) and `last_prefill` with the
+A DeepSeek model's status (`GET /v1/models/{id}`) includes `ced_depth` (0 means off) and `last_prefill` with the
 last completed plan. These fields distinguish separate HTTP requests from
 chunks inside one prompt. The log also shows the
 decoding's progress every 10 s, and its end (tokens, speed, expert hits,
@@ -385,6 +394,7 @@ The app stores the key in its own credential file (`~/.dsh/.credentials.yaml`).
 | `make build/verification-model-check`, then `build/verification-model-check CHECKPOINT` | All sixteen verification rows against sequential decoding and rollback after partial acceptance. `--draft`, `--online`, `--long` and `--experts GGUF` select additional cases. Uses the GPU and model. |
 | `.venv/bin/python tools/reference/check.py tok CHECKPOINT` | The tokenizer against the `tokenizers` library on 17 texts. |
 | `make build/tokenizer-added-check`, then `ASAN_OPTIONS=detect_leaks=0 build/tokenizer-added-check CHECKPOINT` | Loads the checkpoint under address and undefined-behavior sanitizers. Checks literal added tokens that also appear in the BPE vocabulary and ordinary text round trips. |
+| `make build/tokenizer-reference-check`, then `ASAN_OPTIONS=detect_leaks=0 build/tokenizer-reference-check CHECKPOINT tools/checks/fixtures/tokenizer_FAMILY.json` | A checkpoint's tokenizer against the reference tokenizer's ids: 155 texts of every kind (code, CJK, emoji, combining marks, NUL and other control characters, line separators), with the ids Hugging Face's `tokenizers` gives them (`tokenizer_deepseek_v41.json`, `tokenizer_qwen3_5.json`). Under the same sanitizers. No model or GPU. |
 | `make build/tokenizer-long-check`, then `ASAN_OPTIONS=detect_leaks=0 build/tokenizer-long-check CHECKPOINT` | Pre-tokens longer than 1,024 bytes (400 CJK characters, a 1,400-byte run of letters, 1,500 letters, 1,099 spaces) against the ids of the `tokenizers` library: BPE runs over the whole piece. Under the same sanitizers. |
 | `make build/gpu-wait-check`, then `build/gpu-wait-check` | A blocking wait (`gpu_wait_signal`) for a value the GPU never signals, in a spawned copy of the check: it must end the program after 60 s with the reason, not return. About a minute; runs no kernels and loads no model. |
 | `make build/draft-rows-check`, then `build/draft-rows-check CHECKPOINT GGUF` | With `--draft`: two sequences decode their next token alone, then together (`deepseek_forward_rows`); afterwards each sequence's draft window keys must equal the alone ones byte for byte. One model process, about a minute. |
@@ -423,7 +433,7 @@ The app stores the key in its own credential file (`~/.dsh/.credentials.yaml`).
 | `tools/checks/regression.sh CANDIDATE BASELINE CHECKPOINT GGUF` | A regression check of one CLI build against another, both with the GGUF experts and `--cache 40`, one model process at a time. Outputs: the hashes of two greedy 150-token generations (the story and the Python prompts of the [README](../README.md#performance)), of the logits of a perplexity run over the first 1,998 bytes of the checkpoint's README, and `--check-batch --draft 2`, which must report no differing logits. Speed: three 256-token decodes of the story prompt per build, the builds alternating. It fails when an output differs, a run produces none, or the candidate's median decode speed is below the baseline's by more than the baseline's spread (at least 1%). Before each run it requires AC power, no other `myds4` or `myds4-server` process and an idle GPU (three samples a second apart at most 35% busy; it waits up to five minutes). With UD-IQ2_XXS experts its 14 model runs take about five minutes. |
 | `python3 tools/bench/compare_bench.py --checkpoint CHECKPOINT --candidate BUILD [--control BUILD] [--quant iq2\|iq1 --experts GGUF]` | Serial comparison of two CLI builds (the control defaults to `build/myds4`) in the order `--order` gives (control, candidate, control by default), on a repository-review, copy or reconstructed Harness prompt (`--workload`), with temperature 1, top-p 1, seed 12345, two drafts by default, a fixed cache (`--cache`, default 24 GiB) and the GPU guard. A run is valid only if its output matches the control's and the cache keeps its budget. `--kind` (memory, representation, lookup, draft, prefill or cache; default draft) labels the study in the `--results` file, which holds aggregates and output digests. Progress lines start with `COMPARE_START` and `COMPARE_RESULT`. |
 | `python3 tools/bench/session_bench.py --checkpoint CHECKPOINT --harness-session SESSION` | Server throughput on concurrent reconstructed Harness requests over HTTP, one server at a time: `--modes` gives each run's `--batch` (1, 2, 4 or 6; default `1 2 1`), `--runahead` one 0 or 1 per mode, and `--run-binaries` one server executable per mode. Compares returned text, reasoning and tool arguments, and records prefill, latency, model counters and expert reads. Needs Python 3.14 for the compressed session. |
-| `python3 tools/bench/turn_bench.py --checkpoint CHECKPOINT --binaries SERVER... [--experts GGUF] [--cache GIB]` | Decoding after a long prompt in the same conversation, for server builds run in turn (`--order`, default 0 1 1 0): a first turn about a source excerpt, then a second that adds a long document as a tool's output would. For each turn it reads `/v1/status` when the first token streams and when the reply ends, so the decode figures exclude the prefill: rows per second, expert-cache misses, read waits and requested expert bytes per row, and the prefill's misses and expert gigabytes. Greedy; replies must match between builds. Prompts come from the committed repository files. |
+| `python3 tools/bench/turn_bench.py --checkpoint CHECKPOINT --binaries SERVER... [--experts GGUF] [--cache GIB]` | Decoding after a long prompt in the same conversation, for server builds run in turn (`--order`, default 0 1 1 0): a first turn about a source excerpt, then a second that adds a long document as a tool's output would. For each turn it reads the model's status (`GET /v1/models/{id}`) when the first token streams and when the reply ends, so the decode figures exclude the prefill: rows per second, expert-cache misses, read waits and requested expert bytes per row, and the prefill's misses and expert gigabytes. Greedy; replies must match between builds. Prompts come from the committed repository files. |
 | `make build/rows-bench`, then `build/rows-bench CHECKPOINT ROWS [--experts GGUF] [--cache GIB] [--steps N] [--warm N] [--text FILE --prompt-tokens N] [--show]` | B sequences (1 to 6) decoding together in lockstep after each prefilled its own prompt (a short story request, or with `--text` sequence r's own run of N tokens of FILE): per pass the wall time, the GPU's busy and idle time, and per row the experts read on demand, the read-ahead hits, the expert bytes read and the slots mapped for the GPU again. One B per process, so each starts from a cold cache; `--steps` timed passes (default 96) after `--warm` (default 32). `distinct_8grams` is the share of the first sequence's 8-token windows not seen before in its generation (1: no repeats), and `--show` prints its text: check them before taking a speed as valid (see [Performance](performance.md)). |
 | `python3 tools/analysis/model_bytes.py CHECKPOINT [GGUF...]` | From the files' headers alone: the checkpoint's tensors by group, and for each expert source the bytes of one expert per layer, their mean and the bytes a token's 240 experts take. Loads no weights. |
 | `python3 tools/analysis/ssd_bench.py CHECKPOINT [--threads N] [--count N] [--layers A B]` | Cold SSD throughput for whole MXFP4 experts read with `F_NOCACHE`, as the engine reads them, from the given layers. Pick layers nothing read recently, or the result includes the file cache. |

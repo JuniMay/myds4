@@ -1,60 +1,57 @@
 # The server
 
-`server/` is myds4's HTTP server, written in Rust on DeepSeek's
-[`deepseek-recipe`](https://github.com/deepseek-ai/deepseek-recipe) crates
-(version 0.2.0, MIT License). The C and Metal code of `src/` runs the model
-behind a C ABI, [`src/engine/engine.h`](../src/engine/engine.h), and the Rust
-code handles HTTP, request conversion, prompts, output and the live view. It
+`server/` is myds4's HTTP server, written in Rust. The C and Metal code of
+`src/` runs the models behind a C ABI,
+[`src/engine/engine.h`](../src/engine/engine.h), and the Rust code handles
+HTTP, each model family's chat format, scheduling and the live view. It
 serves `POST /v1/chat/completions`, streamed or as one response,
-`GET /v1/models`, `GET /v1/status` and `GET /health`; its options are in
-[Usage](usage.md#server). It serves DeepSeek V4.1 Flash, a Qwen3.8 model
-([Qwen3.8 models](qwen.md)), or several models side by side, each request
-going to the model it names ([Several models](#several-models)).
+`GET /v1/models`, `GET /v1/models/{id}` and `GET /health`; its options are in
+[Usage](usage.md#server). It serves one model, or several in one process,
+each request going to the model it names ([Models](#models)): DeepSeek V4.1
+Flash, whose requests take DeepSeek's
+[`deepseek-recipe`](https://github.com/deepseek-ai/deepseek-recipe) crates
+(version 0.2.0, MIT License), and Qwen3.8 models ([Qwen3.8 models](qwen.md)).
 
 ## Parts
 
 | Part | Language | Files |
 | --- | --- | --- |
-| HTTP: endpoints, the API key, server-sent events, the options | Rust | `server/src/main.rs` |
+| HTTP: endpoints, the API key, routing by model, the options | Rust | `server/src/main.rs` |
+| The models and their settings: `-m` and its options, or `--config` | Rust | `server/src/config.rs` |
 | Connections: the accept loop, the limits and timeouts | Rust | `server/src/http.rs` |
-| Requests: the compatibility steps, recipe's Chat Completions conversion, sampling settings, images from `data:` URLs | Rust | `server/src/chat.rs` |
-| Prompts: recipe's V4.1 rendering | Rust | `server/src/chat.rs` |
-| Output: recipe's stream processor (reasoning, content, tool calls, usage) and its Chat Completions chunks | Rust | `server/src/chat.rs` |
+| The chat formats: the errors both share (`format/mod.rs`); DeepSeek's compatibility steps, recipe's conversion and V4.1 rendering, images from `data:` URLs, recipe's stream processor (`format/deepseek.rs`); Qwen's conversion, chat template, reply protocol and responses (`format/qwen.rs`, `qwen_template.rs`, `qwen_protocol.rs`) | Rust | `server/src/format/` |
 | The live view (`--tui`): the terminal, the keys and the mouse, the statistics windows and the tabs, on ratatui; in `view/`: the chrome, the colors, the last minute's samples and each tab (Overview, KV cache, Experts, Last minute) | Rust | `server/src/view.rs`, `server/src/view/` |
-| The worker: the queue, scheduling and batching, drafts, events, cancellation, the status and the live view's snapshot | Rust | `server/src/worker.rs` |
-| The KV prefix cache: which attention states and snapshots to keep, and how a prompt resumes from them | Rust | `server/src/kv.rs` |
+| The worker: the engine thread, every model's queue, scheduling and batching, prefills in calls, drafts, events, cancellation, each model's status and the live view's snapshot | Rust | `server/src/worker.rs` |
+| The KV prefix cache: which attention states and snapshots of a model to keep, and how a prompt resumes from them | Rust | `server/src/kv.rs` |
 | The engine's ABI in Rust: declarations and thin wrappers | Rust | `server/src/engine.rs` |
-| The engine: loading, attention states and snapshots, prefill (with a replay, exact or bounded under `--ced`, and a capture position), decoding, drafts, sampling, context-copy drafts, images, statistics, the tokenizer, the log | C | `src/engine/engine.c` |
-| The models behind one interface, the expert cache, the vision encoder, the tokenizer, signals | C, Metal | `src/model/model.h`, `src/model/deepseek.c`, `src/engine/io.c`, `src/engine/gpu.c`, `src/engine/vision.c`, `src/engine/tok.c`, `src/engine/util.c`, `src/kernels/` |
-| Several models: the other models' server processes, their logs, and forwarding requests to them | Rust | `server/src/peers.rs` |
-| Qwen3.8 requests: conversion, the chat template, the tokenizer (ICU), the reply's reasoning and tool calls, the responses | Rust | `server/src/qwen/mod.rs`, `template.rs`, `tokenizer.rs`, `icu.rs`, `protocol.rs` |
-| The Qwen worker: the queue, prompt and decoding passes, MTP drafts, the KV prefix cache's plans | Rust | `server/src/qwen/worker.rs` |
-| The Qwen engine's ABI in Rust | Rust | `server/src/qwen/engine.rs` |
-| The Qwen model: states, snapshots, prompt and decoding passes, the MTP head | C, Metal | `src/model/qwen.c`, its kernels in `src/kernels/` ([Qwen3.8 models](qwen.md)) |
+| The engine: the process (log, stop), and for each model its loading, states and snapshots, prefill (with a replay where the model has one, and a capture position), decoding, drafts, sampling, context-copy drafts, images, statistics and its tokenizer | C | `src/engine/engine.c` |
+| The models behind one interface, the expert cache, the vision encoder, the tokenizer, signals | C, Metal | `src/model/`, `src/engine/io.c`, `src/engine/gpu.c`, `src/engine/vision.c`, `src/engine/tok.c`, `src/engine/util.c`, `src/kernels/` |
 
 ## Threads
 
-- **The worker's thread** (`worker::start` creates it with a 16 MiB stack;
-  `myds4_load` gives it the user-interactive QoS class). It loads the model
-  and then runs the worker loop: it admits waiting requests while fewer than
-  `--batch` decode, resumes each from the KV prefix cache and prefills the
-  rest, advances every decoding request by a step and ends finished ones.
-  Every engine call that runs the model happens on this thread, because
-  `gpu.c` keeps an autorelease pool per thread, the model's work buffers are
-  shared and one attention state is in use at a time. While no request runs,
-  it lets the expert cache resize every second (`myds4_idle`).
+- **The engine thread** (`worker::start` creates it with a 16 MiB stack;
+  `myds4_init` gives it the user-interactive QoS class). It loads every
+  model and then runs the worker loop ([Models](#models)). Every engine call
+  that runs a model happens on this thread, so every model's passes go
+  through one GPU command queue: `gpu.c` keeps its command buffers and an
+  autorelease pool per thread, and each model family's work buffers are its
+  own. While no model runs a request, it lets each model give memory back
+  every second (`myds4_idle`: DeepSeek's expert cache resizes; a Qwen model's
+  buffers leave the GPU's residency set after 60 s without passes).
 - **The live view's thread** (`--tui`): twice a second it takes the worker's
-  snapshot (`worker::view`) and keeps a sample of it for the last minute; it
-  draws the tab shown on stderr's alternate screen, and again at once after a
-  key or a click that changes it. A KV node's text is a question to the
-  worker (`worker::ask_text`), which answers between its steps with the
-  tokens the KV prefix cache holds (`worker::text_answer`); the view turns
-  them into text. With each snapshot the view asks for the decoding
-  requests' routed rows (`worker::ask_routes`); the worker copies them
-  (`myds4_routes`) after its next decode step, and the next snapshot takes
-  them.
+  snapshot of the model it shows (`worker::view`) and keeps a sample of it
+  for the last minute; it draws the tab shown on stderr's alternate screen,
+  and again at once after a key or a click that changes it. A KV node's text
+  is a question to the worker (`worker::ask_text`), which answers between its
+  steps with the tokens the model's KV prefix cache holds
+  (`worker::text_answer`); the view turns them into text with the model's
+  tokenizer. With each snapshot the view asks for the decoding requests'
+  routed rows (`worker::ask_routes`); the worker copies them
+  (`myds4_routes`) after its next decoding pass of a model with routed
+  experts, and the next snapshot takes them.
 - **Tokio's threads** run HTTP: reading requests, converting, rendering and
-  tokenizing them, submitting them to the worker, and turning the worker's
+  tokenizing them with their model's tokenizer (the engine's tokenizers take
+  any thread), submitting them to the worker, and turning the worker's
   events into response chunks.
 
 Signals belong to the engine: SIGINT and SIGTERM request the stop, and the
@@ -62,61 +59,103 @@ live view's `q` (or Ctrl-C, which the terminal's raw mode delivers as a key)
 requests it through `worker::request_stop`, which also wakes the worker.
 The server checks `myds4_stopping()` several times a second, stops accepting
 connections, waits for the open responses to end (the worker ends every
-request), and calls `worker::stop`, which waits for the worker's thread to
-save the predictor state (`--predictor-state`, `myds4_finish`) and end. The
-live view then gives the terminal back with the last log lines. It also does
-so before a fatal error's message, the engine's (`on_die`) or the server's,
-and after a panic; a panic on the worker's thread ends the process, since
-its requests could not end otherwise.
+request), and calls `worker::stop`, which waits for the engine thread to
+let each model save what it keeps (`--predictor-state`, `myds4_finish`) and
+end. The live view then gives the terminal back with the last log lines. It
+also does so before a fatal error's message, the engine's (`on_die`) or the
+server's, and after a panic; a panic on the engine thread ends the process,
+since its requests could not end otherwise.
 
-## Several models
+## Models
 
-Each `-m` names a checkpoint; its `config.json` tells DeepSeek V4.1 Flash
-from a Qwen3.8 (`qwen3_5_text`) model. The first runs in the server's own
-process. Each further model runs in a child process of the server, the same
-executable with the same options but its own `-m`, on the next port (the
-second model on `--serve`'s port + 1, the third on + 2) at 127.0.0.1; it
-takes the API key from the environment and ends when the server does
-(`--parent`, checked several times a second). Its log lines come into the
-server's log (and its live view) with the model's id in front. The server
-stops its children with SIGTERM when it stops.
+`-m DIR` serves one model, its options on the command line; `--config FILE`
+serves the models a JSON file lists, each with its own options under the same
+names without the dashes (`-` as `_`):
+
+```json
+{"models": [
+  {"model": "/path/to/DeepSeek-V4.1-Flash-1017", "experts": "/path/to/UD-IQ1_M-00001-of-00004.gguf",
+   "cache": 72, "ced": 128, "kv_cache": 16},
+  {"model": "/path/to/Qwen3.8-27B-NVFP4", "draft": 1, "ctx": 65536, "kv_cache": 8}
+]}
+```
+
+A checkpoint's `config.json` tells its family (`model_type` `deepseek_v41`,
+or `qwen3_5`); a family refuses options it has no use for at startup (the
+expert-cache, CED and DSpark options for a Qwen model), and the process
+loads at most one model of each family. Every model has its own name
+(`id`; by default `deepseek-v4.1-flash`, or a Qwen model's directory's name
+in lower case), context, batch, KV prefix cache (`kv_cache`), drafts and
+request defaults.
 
 | Request | Answer |
 | --- | --- |
-| `GET /v1/models` | Every model: DeepSeek's `deepseek-v4.1-flash`, a Qwen model by its directory's name in lower case (`qwen3.8-27b-nvfp4`), with its context. |
-| `"model"` names this process's model, or none | This process answers. |
-| `"model"` names another model (case does not matter) | The server forwards the request to that model's process (HTTP/1.0 over loopback, so that the response's body ends with the connection) and passes the response back as it comes. Before that process listens: 502. |
-| `"model"` names no model served | 404 that lists the models; with one model served, that model answers whatever the name. |
+| `GET /v1/models` | Every model's object: OpenAI's fields (`id`, `object`, `created`, `owned_by`) with its name, `context_length` and `max_model_len`. |
+| `GET /v1/models/{id}` | The model's object and its live status under `status`: what it is doing and its request, the waiting requests, its KV prefix cache's states (`sessions`), its counters (`model_decode`, `last_prefill`), its expert cache where it has one, and the process's memory. |
+| `"model"` names a served model (case does not matter) | That model answers. |
+| `"model"` names none, or no model served | With one model served, that model answers; with several, 404 that lists them. |
 
-Each process schedules its own model, and the GPU runs their command
-buffers in turn. Memory is shared through the system: a Qwen model's weights
-(20 GB) stay resident on the GPU while it serves (after 60 s without
-requests they leave the GPU's residency set until its next request), and
-DeepSeek's expert cache adapts around them. Its slots follow the memory available (with `--reserve` left to other
-programs), and its GPU-mapped slots follow the GPU's resident memory of all
-processes, which past about 55 GiB stalls the GPU: past that point the
-cache unmaps the excess within about a second, also while idle (the worker's
-idle check runs every second). Measured with DeepSeek (UD-IQ1_M
-experts, `--cache 72`) and Qwen3.8-27B served together, on 300-token code
-replies, greedy: DeepSeek decoded at 23.9 tokens/s with the Qwen model
-resident and idle, and at 24.2 after the Qwen model's buffers had left the
-residency set; with both decoding at once, DeepSeek at 12.8 tokens/s and the
-Qwen model at 30.3 (with MTP drafts, 85% accepted).
+**Scheduling.** The worker keeps a queue for each model (16 requests wait at
+most; more get 429) and gives every model one step a turn, in turn. A step
+admits the model's waiting requests while fewer than its batch run,
+planning each against the model's KV prefix cache when it is admitted, so
+that it resumes from what the prefills before it left; it runs one prefill
+call of the model's oldest prefilling request; and it advances every
+decoding request of the model by a token: alone with the model's drafts
+(`draft`, `lookup`), or together in one decoding pass. One prefill call is
+the rest of the prompt for a model that plans its prefill over the whole
+prompt (DeepSeek: replay, CED and pruning; `myds4_prefill_rows` 0), and
+otherwise up to the model's prefill rows (a Qwen model's 512 positions, 128
+while others of its requests decode), so that a long prompt does not stall
+the replies in progress. Passes of different models therefore alternate on
+the GPU, a pass at a time.
 
-## Qwen3.8 models
+**Memory.** All models share the process's memory: a Qwen model's weights
+(20 GB) stay resident while it serves (after 60 s without passes its
+buffers leave the GPU's residency set until its next pass), and DeepSeek's
+expert cache adapts around them. Its slots follow the memory available
+(with `reserve` left to other programs), and its GPU-mapped slots follow the
+GPU's resident memory of all processes, which past about 55 GiB stalls the
+GPU: past that point the cache unmaps the excess within about a second, also
+while idle.
 
-A Qwen model's requests take their own path ([Qwen3.8 models](qwen.md) for
-the engine):
+Beside a Qwen model, DeepSeek's expert cache held fewer experts than its
+`cache` allows. On 2026-11-07 (DeepSeek V4.1 Flash, `UD-IQ1_M` experts,
+`cache` 72, Qwen3.8-27B NVFP4 in the same process, through the server, one
+request at a time, a 34-token request for ISO 8601 parsing code answered
+greedily in 236 tokens), the cache held 3,509 slots (33.9 GiB) after four
+requests while 35 GiB of memory stayed available: about half of what
+`cache` 72 allows. Why it stopped growing there is not yet determined. The
+same request sent again repeats the same greedy tokens, and so the same
+experts: it hit 100.0% of its experts with DeepSeek alone and 94.0% beside
+Qwen. A repeat like this shows what the cache kept, not a decoding speed. A
+valid comparison of DeepSeek's decoding speed alone and beside Qwen has not
+been made.
 
-1. **Conversion** (`qwen/mod.rs`): the messages' text (content parts of
+Qwen3.8-27B with `draft` 1 decoded its 300-token reply to the same prompt at
+40.7 tokens/s beside DeepSeek (147 of 151 drafts accepted). When both models
+decode at once, their passes alternate on the GPU.
+
+## Chat formats
+
+Each model family has its chat format (`server/src/format/`): its request
+conversion, its chat template, its prompt tokens and the reading of its
+replies. Both answer with the same Chat Completions fields:
+`reasoning_content`, `content`, `tool_calls`, and the usage with the prompt
+tokens the KV prefix cache reused (`prompt_cache_hit_tokens`,
+`prompt_tokens_details.cached_tokens`). DeepSeek's format is
+[Requests](#requests), [Prompts and tokens](#prompts-and-tokens) and
+[Responses](#responses) below. A Qwen model's:
+
+1. **Conversion** (`format/qwen.rs`): the messages' text (content parts of
    type `text`; images are refused), the leading `system` and `developer`
    messages joined as the system message (a later one speaks as the user,
    since the template takes one system message, first), assistant
    `reasoning_content` (or `reasoning`) and `tool_calls` (their `arguments`
    parsed as a JSON object), tool messages, and `tools` as given.
-2. **The chat template** (`template.rs`): the checkpoint's
+2. **The chat template** (`format/qwen_template.rs`): the checkpoint's
    `chat_template.jinja` as code, checked against renderings of the template
-   itself (`server/src/qwen/fixtures/`): every assistant turn keeps its
+   itself (`server/src/format/fixtures/`): every assistant turn keeps its
    reasoning, tools are listed as the request gives them, tool responses
    join in one user turn. Thinking and its effort:
 
@@ -128,81 +167,61 @@ the engine):
    | `reasoning_effort` `medium` (or 51-75) | `medium` |
    | `reasoning_effort` `high`, `xhigh`, `max`, `ultra` (or 76-100) | `xhigh` |
 
-3. **Tokens** (`tokenizer.rs`, `icu.rs`): the checkpoint's byte-level BPE
-   with NFC and its split regex through macOS's ICU, checked against the
-   reference tokenizer's ids for 155 texts. The template's markers become
-   their token ids; text from messages is encoded without the added
-   vocabulary, so a message that spells `<|im_start|>` stays text.
-4. **The worker** (`qwen/worker.rs`, one thread that owns the engine): up to
-   `--batch` requests run at once and 16 wait. Each turn of its loop runs one
-   prompt pass of the request prefilling (512 positions, or 128 while others
-   decode), then one decoding pass for every decoding request. Prefills run
-   one at a time, and a request is planned against the KV prefix cache only
-   when its prefill is about to start, so it resumes from what the prefills
-   before it left: four requests that arrived together with the same
-   6.7K-token system prompt and tools finished in 21.8 s, the later three
-   resuming at 6,144 and 6,747 positions.
-   A request that decodes alone verifies the MTP head's draft in its pass
-   (two rows). With several decoding, drafts would double the pass's rows,
-   which by the measured pass times gives about as many tokens a second for
-   two requests and fewer for more, so the rows are one each. Every decoded
-   token gives the MTP head its keys.
-5. **The KV prefix cache** (`kv.rs`, with no rewind room and no replay): a
+3. **Tokens**: the model's tokenizer in the engine (`src/engine/tok.c`): the
+   checkpoint's byte-level BPE after NFC and its split regex. The template's
+   markers become their token ids; text from messages is encoded as text
+   alone, so a message that spells `<|im_start|>` stays text.
+4. **The KV prefix cache** (`kv.rs`, with no rewind room and no replay): a
    prompt continues an idle state that it extends, resumes from a snapshot
    (the source's keys copied before it), or starts cold. Every prompt end
    gets a snapshot with its logits (an identical retry resumes at once), a
-   prefill captures the point where its prompt parts from every state (a
-   later request that parts there resumes from it), and takes one at every
-   multiple of 2,048 positions when the budget (`--kv-cache`) allows, so
-   that a request sharing a long start with another (the same system prompt
-   and tools) resumes near where they part; a reply's end gets one when the
-   budget allows. Three requests with the same 6.7K-token system prompt and
-   24 tools and different questions took 10.3 s (cold), 1.4 s (resumed at
-   6,144) and 0.4 s (resumed at the second's branch point, 6,721). A state takes 314 MB plus
-   68 KiB a position (in rooms doubling from 1,024 positions), a snapshot
-   157 MB.
+   prefill captures the point where its prompt parts from every state, and
+   takes one at every multiple of 2,048 positions when the budget
+   (`kv_cache`) allows, since without a replay a later prompt can only resume
+   at a snapshot; a reply's end gets one when the budget allows. A state
+   takes 314 MB plus 68 KiB a position (in rooms doubling from 1,024
+   positions), a snapshot 157 MB.
+5. **Drafts**: with `draft 1`, a request that decodes alone verifies the MTP
+   head's draft in its pass (two rows); with several decoding, each takes one
+   row. The engine keeps the MTP head's keys complete while drafts are on.
 6. **Sampling**: `temperature`, `top_p`, `top_k` and `seed` from the
-   request; otherwise `-t` and `--top-p` when given, else the checkpoint's
+   request; otherwise the model's configured ones, else the checkpoint's
    `generation_config.json` (Qwen3.8-27B: temperature 1, top_p 0.95,
    top_k 20). The end tokens are `generation_config.json`'s.
-7. **The reply** (`protocol.rs`): reasoning up to `</think>` streams as
-   `reasoning_content`, then text as `content` (the template's newlines
-   after `</think>` left out); a standalone `<tool_call>` line at the top
-   level (not in a code block) starts the calls, which are parsed at the
-   end: after an end token they become `tool_calls` (`finish_reason`
+7. **The reply** (`format/qwen_protocol.rs`): reasoning up to `</think>`
+   streams as `reasoning_content`, then text as `content` (the template's
+   newlines after `</think>` left out); a standalone `<tool_call>` line at
+   the top level (not in a code block) starts the calls, which are parsed at
+   the end: after an end token they become `tool_calls` (`finish_reason`
    `tool_calls`), each parameter a string where its schema takes one and
    JSON otherwise; calls that do not parse, or a reply cut short, come back
-   as text. `stop` strings end the reply before them. The usage gives the
-   prompt tokens reused (`prompt_cache_hit_tokens`,
-   `prompt_tokens_details.cached_tokens`).
-
-`GET /v1/status` gives the model's id. The live view shows DeepSeek's
-engine; with a Qwen model in the server's own process the log stays on
-stderr.
+   as text. `stop` strings end the reply before them.
 
 ## A request's path
 
 1. The server reads the request within the [connections' limits](#connections)
    and checks the API key: SHA-256 digests compared in constant time, from
    `Authorization: Bearer KEY` or `x-api-key`.
-2. It applies the [compatibility steps](#compatibility-steps) to the JSON,
-   reads the sampling settings itself, and converts the rest with recipe's
-   `ChatCompletionRequest::convert`.
-3. recipe's `DeepseekV41Encoding` renders the conversation. Each image
-   place becomes the byte 0xFF (`IMAGE_MARK`) in the rendered prompt.
-4. The images of `data:` URLs are decoded to their files' bytes.
-5. `worker::submit` tokenizes the prompt (`myds4_tokenize`, as a rendered
-   prompt) and queues it with its images, sampling settings and token
-   limit. Invalid input (a 400) and a full queue (a 429, at 16 waiting) are
-   answered before the response starts.
-6. The response starts: server-sent events for `"stream": true`, else one
+2. Its `model` picks the served model ([Models](#models)).
+3. The model's chat format converts and renders it, and the model's
+   tokenizer gives the prompt's tokens ([Chat formats](#chat-formats)). For
+   DeepSeek: the [compatibility steps](#compatibility-steps), recipe's
+   `ChatCompletionRequest::convert` and `DeepseekV41Encoding`'s rendering,
+   each image place the byte 0xFF (`IMAGE_MARK`) in the rendered prompt and
+   then the image token, and the images of `data:` URLs decoded to their
+   files' bytes.
+4. `worker::submit` queues the tokens with the model, the images, sampling
+   settings and token limit. Invalid input (a 400) and a full queue (a 429,
+   at 16 waiting for the model) are answered before the response starts.
+5. The response starts: server-sent events for `"stream": true`, else one
    JSON body at the end. Each of the worker's events (the prefill's end, each
-   step's tokens, the end, or a refusal) becomes an input of recipe's
-   `StreamProcessor`, whose Chat Completions chunks are written as they
-   come. Every request gets exactly one last event, also one cancelled or
+   step's tokens, the end, or a refusal) becomes the format's output:
+   DeepSeek's through recipe's `StreamProcessor`, whose Chat Completions
+   chunks are written as they come; a Qwen model's through its reply
+   protocol. Every request gets exactly one last event, also one cancelled or
    stopped before its prefill.
-7. When the client closes its connection or stops reading for 60 s, or the
-   processor stops early (a stop sequence), the server cancels the request:
+6. When the client closes its connection or stops reading for 60 s, or the
+   format stops early (a stop sequence), the server cancels the request:
    dropping its guard (`worker::Cancel`) sets its flag, which the worker reads
    before each step and when it admits requests.
 
@@ -230,82 +249,92 @@ it keeps reading the connection meanwhile; reads have no deadline then.
 ## The C ABI
 
 [`src/engine/engine.h`](../src/engine/engine.h) is the whole interface. Its
-version is `MYDS4_ABI = 7`. Callers must use the matching `myds4_config`
-layout and rebuild with the engine. The engine runs the model; everything
-about requests (their queue, scheduling, the KV prefix cache, the status
-and the live view's data) is the server's. Every function that runs the
-model or touches states, snapshots, samplers, lookups or images runs on
-one thread, the worker's; the log, the stop, the statistics and the
-tokenizer may be called from any thread. Its parts:
+version is `MYDS4_ABI = 8`. Callers must use the matching structure layouts
+and rebuild with the engine. The engine runs the models; everything about
+requests (their queues, scheduling, the KV prefix caches, the status and the
+live view's data) is the server's. Every function that runs a model or
+touches states, snapshots, samplers, lookups or images runs on one thread,
+the engine thread; the log, the stop, the statistics and the tokenizers may
+be called from any thread. Its parts:
 
-- **Loading and the stop.** `myds4_load(config)` takes the model and engine
-  options (`myds4_config`: the checkpoint, `--experts`, `--ctx`, the cache
-  settings, `--substitute`, the draft settings, the online
-  predictor, `--ced`, `--lookup` and `--prefill-prune`) and
-  two hooks: `on_log`, which receives the log's lines instead of stderr (the
-  live view's pane), and `on_die`, which runs before a fatal error's message
-  (the live view gives the terminal back). It waits for the model lock
-  (`myds4.lock` beside the executable, or `$MYDS4_LOCK`) and loads the model
-  on the calling thread, which from then on is the engine's.
-  `myds4_finish()` saves the predictor state, `myds4_stopping()` reports a
-  requested stop, `myds4_request_stop()` requests one, `myds4_idle()` lets
-  the expert cache give memory back while no request runs, and
-  `myds4_log(line)` writes a line to the log with the time.
-- **Limits.** The rows of different states one step takes (6), DSpark's
-  drafts per pass (`--draft`), the rows of one verify pass (16), the
-  positions a state can continue before its end (`max(8, lookup_depth)`) and
-  the vocabulary.
-- **States and snapshots.** `myds4_state_new`, `myds4_state_free`,
-  `myds4_state_bytes`, `myds4_state_use`, `myds4_reset`;
-  `myds4_state_copy(dst, src, positions)` copies a state's compressed rows
-  and index keys before a position into another state, also while a request
-  decodes in the source. `myds4_snapshot_take(state, pos, with_logits)` keeps
-  a state's rolling rows (window rings, compressor rows, draft rings, Engram
-  history) and optionally the last logits; `myds4_snapshot_restore` puts them
-  back into a state that holds the snapshot state's rows before `pos`.
-- **Running the model**, in the state in use.
-  `myds4_prefill(tokens, n, from, replay, capture, &captured, &info)`
-  prefills positions `from` to `n - 1` and returns the last one's logits.
-  With `replay`, the state holds only the copied rows before `from`, and the
-  prefill starts earlier to rebuild the rolling rows at `from`. Without
-  `--ced` the replay is exact: each layer starts where its window needs.
-  With `--ced` it is bounded: every layer starts a ring before `from` (136
-  positions with the default `--lookup`), the windows of the rows it
-  computes stop there, and the
-  copied compressed rows and index keys stay as they are. A `capture`
-  position after the prefill's first position and before `n` returns the
-  rolling rows there as a snapshot (a fork's branch point), or none when
-  they would hold the encoder layers only (under `--ced`, before the
-  retained decoder suffix). `myds4_replay_rows(k)` and
-  `myds4_replay_start(k)` give a replay's cost and first position, for
-  either kind. `myds4_step`, `myds4_rows` (one token for each of up
-  to 6 states), `myds4_draft`, `myds4_verify` and `myds4_accept` decode;
-  `myds4_seek` sets the Engram history. Calls with invalid arguments return
-  null instead of logits.
+- **The process.** `myds4_init(process)` installs two hooks, `on_log`, which
+  receives the log's lines instead of stderr (the live view's pane), and
+  `on_die`, which runs before a fatal error's message (the live view gives the
+  terminal back), and the stop's signal handlers, on the calling thread,
+  which from then on is the engine's. `myds4_stopping()` reports a requested
+  stop, `myds4_request_stop()` requests one, and `myds4_log(line)` writes a
+  line to the log with the time.
+- **Models.** `myds4_load(config)` takes one model's options
+  (`myds4_config`: the checkpoint, the context, the drafts and lookups, and
+  DeepSeek's `experts`, cache settings, `substitute`, `draft_cache`, online
+  predictor, `ced`, `prefill_prune` and `runahead`) and returns the model,
+  its family from `config.json`; a family refuses options it has no use for,
+  and the process holds one model of each family. A DeepSeek model waits for
+  the model lock (`myds4.lock` beside the executable, or `$MYDS4_LOCK`).
+  `myds4_finish(model)` saves what the model keeps (the predictor state), and
+  `myds4_idle(model)` lets it give memory back while it runs no request.
+- **Limits.** For each model: the rows of different states one decoding pass
+  takes, the drafts per pass it makes itself, the rows of one verify pass,
+  the positions a state can continue before its end (DeepSeek's
+  `max(8, lookup_depth)`, a Qwen model's 0), the vocabulary, the most rows
+  one prefill call should take (`myds4_prefill_rows`: 0 for the whole prompt,
+  DeepSeek's), and whether a token ends a reply (`myds4_stop`).
+- **States and snapshots**, each of one model: `myds4_state_new`,
+  `myds4_state_free`, `myds4_state_bytes`; `myds4_state_copy(model, dst,
+  src, positions)` copies the rows of a state that later positions do not
+  change before a position into another state (DeepSeek's compressed rows and
+  index keys, a Qwen model's keys and values), also while a request decodes
+  in the source. `myds4_snapshot_take(model, state, pos, with_logits)` keeps
+  a state's rolling part (DeepSeek's window rings, compressor rows, draft
+  rings and Engram history; a Qwen model's DeltaNet and convolution states
+  and last hidden) and optionally the last logits; `myds4_snapshot_restore`
+  puts them back into a state that holds the snapshot state's rows before
+  `pos`.
+- **Running a model**, on explicit states.
+  `myds4_prefill(model, state, tokens, n, from, replay, capture, &captured,
+  &info)` prefills positions `from` to `n - 1` and returns the last one's
+  logits. With `replay` (DeepSeek), the state holds only the copied rows
+  before `from`, and the prefill starts earlier to rebuild the rolling rows
+  at `from`. Without `--ced` the replay is exact: each layer starts where its
+  window needs. With `--ced` it is bounded: every layer starts a ring before
+  `from` (136 positions with the default `--lookup`), the windows of the rows
+  it computes stop there, and the copied compressed rows and index keys stay
+  as they are. A `capture` position after the prefill's first position and
+  before `n` returns the rolling rows there as a snapshot (a fork's branch
+  point), or none when they would hold the encoder layers only (under
+  `--ced`, before the retained decoder suffix). `myds4_replay_rows(k)` (-1
+  for a model without a replay) and `myds4_replay_start(k)` give a replay's
+  cost and first position. `myds4_rows` (one token for each of several
+  states), `myds4_draft`, `myds4_verify` and `myds4_accept` decode;
+  `myds4_seek` sets DeepSeek's Engram history. Calls with invalid arguments
+  return null instead of logits.
 - **Sampling, context-copy drafts and images.** Samplers with the request's
-  temperature, top_p and seed (`myds4_sample`, `myds4_sample_verify` for a
-  verify pass); `--lookup`'s history matcher; a prompt's images
-  (`myds4_images_open`, `myds4_images_expand` to write each image's span of
-  keys in place of its mark, `myds4_images_encode` for the images that a
-  prefill reaches).
-- **Statistics.** `myds4_stats_get` fills the expert cache's counters, the
-  decoded and prompt rows' statistics, the running prefill's progress and
-  memory, which the status and the live view show. `myds4_routes(row, ...)`
-  gives the experts that a row of the latest decode step chose in each layer
-  and where each one was, for the live view's expert map: the engine keeps
-  them when it counts each row's experts by where they are, a copy of
-  numbers the CPU has already, so decoding computes nothing more.
-- **Tokenizer.** `myds4_tokenizer(dir)` loads the checkpoint's tokenizer
-  without the model; `myds4_tokenize`, `myds4_piece` (a token's bytes),
-  `myds4_added` (whether a token is one of the tokenizer's added tokens) and
-  `myds4_special` (a special token's id) serve the prompts and the output
-  decoding below. The tokenizer keeps its work buffers in static memory, so
-  the engine serializes its calls.
+  temperature, top_p, top_k and seed (`myds4_sample`, `myds4_sample_verify`
+  for a verify pass, a model's end tokens ending the kept drafts); the
+  lookup's history matcher; a prompt's images for a model with a vision
+  encoder (`myds4_images_open`, `myds4_images_expand` to write each image's
+  span of keys in place of its mark, `myds4_images_encode` for the images
+  that a prefill reaches).
+- **Statistics.** `myds4_stats_get(model, ...)` fills the model's counters
+  (decoded and prompt rows, its expert cache's where it has one, the running
+  prefill's progress) and the process's memory, which the status and the live
+  view show. `myds4_routes(model, row, ...)` gives the experts that a row of
+  the model's latest decoding pass chose in each layer and where each one
+  was, for the live view's expert map: the engine keeps them when it counts
+  each row's experts by where they are, a copy of numbers the CPU has
+  already, so decoding computes nothing more.
+- **Tokenizers.** `myds4_model_tokenizer(model)` gives a model's tokenizer,
+  `myds4_tokenizer_open(dir, image)` a checkpoint's without its model (the
+  tests'); `myds4_tokenize` (text alone, with the added tokens' spellings, or
+  a rendered prompt), `myds4_piece` (a token's bytes), `myds4_added` (whether
+  a token is an added token, and whether tokenizer.json marks it special) and
+  `myds4_special` (an added token's id) serve the prompts and the output
+  decoding. Each tokenizer has its own lock.
 
 A request's system, user, tool and context messages arrive as one prompt.
-The worker resumes it from the KV prefix cache (see
+The worker resumes it from the model's KV prefix cache (see
 [The KV prefix cache](design.md#the-kv-prefix-cache)) and prefills the
-rest in one call. The model divides more than 16,384
+rest: for DeepSeek in one call. The model divides more than 16,384
 new tokens into chunks to bound working memory. The scheduler prefills
 separate requests in queue order while other requests wait to decode.
 Rendering and tokenization precede enqueueing, so HTTP arrival order and
@@ -349,10 +378,9 @@ remain reserved until every consuming job completes. Per-request sampling
 and selected experts are preserved. A request running alone follows ordinary
 decoding, including context lookup when configured.
 
-Runahead is off by default. The server rejects combinations with DSpark,
-substitution or the online predictor. CED retains its configured prefill behavior. The C ABI
-offers `myds4_set_runahead(0|1)` before loading, without changing the config
-structure. `/v1/status` reports `runahead` and cumulative `model_decode`
+Runahead is off by default. The engine refuses combinations with DSpark,
+substitution or the online predictor. CED retains its configured prefill behavior. The model's
+status (`GET /v1/models/{id}`) reports `runahead` and cumulative `model_decode`
 counters: computed rows, model wall time, main-queue GPU time, expert-read
 bytes and read-wait time. These times overlap and must not be added together.
 
@@ -369,7 +397,7 @@ chunks, encoder/decoder tokens, CED application, its capture position
 (`prefix=`, a fork's branch point, or 0) and, after a replay (`an exact
 replay`, or `a bounded replay` with `--ced`), how many earlier rows it
 computed again. These are counts, without conversation
-text or API keys. `GET /v1/status` includes configured `ced_depth`,
+text or API keys. The model's status includes configured `ced_depth`,
 `lookup_depth`, `prefill_prune` and the `last_prefill` plan.
 `last_prefill.prune_applied` reports whether that pass actually skipped
 decoder work. A separate title request therefore has its own arrival
@@ -586,9 +614,9 @@ not call them: prompts and output use the engine's tokenizer.
 | Command | What it checks |
 | --- | --- |
 | `.venv/bin/python tools/reference/check.py encoding CHECKPOINT` | The server's prompts (`build/myds4-server --render FILE`) against `encoding.py` on the test cases and the generated conversations ([above](#prompts-compared-with-encodingpy)). |
-| `make server-check` (`MYDS4_CHECKPOINT=CHECKPOINT` for the tokenizer test, `MYDS4_QWEN=DIR` for the Qwen tokenizer's) | The Qwen path: the template's renderings against the checkpoint's own template (`server/src/qwen/fixtures/`: ten conversations, and five with tools, tool history, thinking off and the low and medium efforts, rendered with jinja2 as Hugging Face renders them), the tokenizer's ids against the reference tokenizer's for 155 texts (with `MYDS4_QWEN`), ICU's normalization and split, the reply's reasoning and calls at every chunk boundary, prose and code-block examples kept as text, calls that do not parse given back as text, the request conversion (roles, content parts, tool history, effort and thinking), sampling (greedy, top-k, top-p), and a child process's arguments. The compatibility steps, a numeric effort in the prompt, the worker's events through recipe's processor with the checkpoint's tokenizer (reasoning, content, finish, usage), the KV prefix cache's decisions (`server/src/kv.rs`), and the live view's tabs on a test terminal: the title and the tabs first, every line within the terminal's width at sizes from 220 x 60 down to 12 x 4, each tab's parts, the keys and clicks that choose tabs, nodes and requests, a node's text answered while its session grows and a chosen node kept through a fork that splits it, the last minute's samples (the counters' differences, arrivals, routed rows of the snapshot's size, the SSD's rate from the reads as they complete, a prefill's rate with no sample between two prefills), the throughput's windows and its since-start figures from counters counted together, per-request speeds, the colors (the terminal's answer for its background, light and dark, the 256 colors) and the quit keys; and the connections' limits on a local socket, with short timeouts: 503 beyond the connection limit, 431, a late head, 408 and 413, and a client that leaves or stops reading ending its request. No model is loaded; without `MYDS4_CHECKPOINT` the tokenizer test is skipped. With `MYDS4_EXPERTS` (a GGUF file) set too, it also runs the fork tests through HTTP (next row). |
-| `MYDS4_CHECKPOINT=CHECKPOINT MYDS4_EXPERTS=GGUF cargo test --release --manifest-path server/Cargo.toml --target-dir build/cargo --test prefix_fork -- --nocapture` | The fork test through HTTP (`server/tests/prefix_fork.rs`, about 12 minutes, one model process at a time): a conversation with a long system prompt and user turn decodes, and 20 forks of it, cut in the system prompt or the user turn and continued differently, must each reuse at least the prefix they share with it less what an exact replay there computes again, and no more than that prefix, and must give the tokens that a server starting without a cache gives. With `--ced 128` the same forks must each reuse at least the shared prefix less 136 tokens; their tokens are printed. A thinking turn's next turn, which shares all of the turn's prompt but its last token (`<think>` there, `</think>` in the next turn's history), must reuse that shared prefix and compute only its new tokens (`last_prefill.tokens` in `/v1/status`), with and without `--ced 128`, and without `--ced` give the cold server's tokens. A fork after an image (a 32 x 32 PNG the test builds) must give the cold server's tokens. Two tests check the budget with a tight `--kv-cache` set from what a first server reports: a retry of a saved prompt must fit a cache filled to within 2 MiB of its limit, and a generation that takes its state past 16,384 positions must free an idle state before its state grows and keep the cache within its limit in every status sample. `MYDS4_SERVER` and `MYDS4_CLI` pick the binaries (default `build/myds4-server` and `build/myds4`). |
-| `MYDS4_QWEN=DIR cargo test --release --manifest-path server/Cargo.toml --target-dir build/cargo --test qwen -- --nocapture --test-threads 1` | A Qwen3.8 model through HTTP (`server/tests/qwen.rs`, about 3 minutes, one model process at a time): a request whose client leaves during the prefill of a 38K-token prompt, and then a prompt that extends that whole prompt, which must reuse only what the cut-short state ran and give the reply the same conversation gets where nothing was cancelled; and a reply that runs to the context's end (`--ctx 160`) must take every position up to it. |
+| `make server-check` (`MYDS4_CHECKPOINT=CHECKPOINT` for the tokenizer test) | The models' settings: one model's options on the command line, a configuration file's models each with its own options, and unknown or invalid options refused. Qwen's format: the template's renderings against the checkpoint's own template (`server/src/format/fixtures/`: ten conversations, and five with tools, tool history, thinking off and the low and medium efforts, rendered with jinja2 as Hugging Face renders them), the reply's text as tokens arrive (whole UTF-8 characters), the reply's reasoning and calls at every chunk boundary, prose and code-block examples kept as text, calls that do not parse given back as text, a stop string across tokens, and the request conversion (roles, content parts, tool history, effort and thinking). DeepSeek's format: the compatibility steps, a numeric effort in the prompt, the worker's events through recipe's processor with the checkpoint's tokenizer (reasoning, content, finish, usage). The KV prefix cache's decisions (`server/src/kv.rs`), and the live view's tabs on a test terminal: the title and the tabs first, every line within the terminal's width at sizes from 220 x 60 down to 12 x 4, each tab's parts, the keys and clicks that choose tabs, nodes and requests, a node's text answered while its session grows and a chosen node kept through a fork that splits it, the last minute's samples (the counters' differences, arrivals, routed rows of the snapshot's size, the SSD's rate from the reads as they complete, a prefill's rate with no sample between two prefills), the throughput's windows and its since-start figures from counters counted together, per-request speeds, the colors (the terminal's answer for its background, light and dark, the 256 colors) and the quit keys; and the connections' limits on a local socket, with short timeouts: 503 beyond the connection limit, 431, a late head, 408 and 413, and a client that leaves or stops reading ending its request. No model is loaded; without `MYDS4_CHECKPOINT` the tokenizer test is skipped. With `MYDS4_EXPERTS` (a GGUF file) set too, it also runs the fork tests through HTTP (next row). The tokenizers' ids against the reference tokenizer's are a C check (`build/tokenizer-reference-check`, [Usage](usage.md#checks-and-diagnostics)). |
+| `MYDS4_CHECKPOINT=CHECKPOINT MYDS4_EXPERTS=GGUF cargo test --release --manifest-path server/Cargo.toml --target-dir build/cargo --test prefix_fork -- --nocapture` | The fork test through HTTP (`server/tests/prefix_fork.rs`, about 12 minutes, one model process at a time): a conversation with a long system prompt and user turn decodes, and 20 forks of it, cut in the system prompt or the user turn and continued differently, must each reuse at least the prefix they share with it less what an exact replay there computes again, and no more than that prefix, and must give the tokens that a server starting without a cache gives. With `--ced 128` the same forks must each reuse at least the shared prefix less 136 tokens; their tokens are printed. A thinking turn's next turn, which shares all of the turn's prompt but its last token (`<think>` there, `</think>` in the next turn's history), must reuse that shared prefix and compute only its new tokens (`last_prefill.tokens` in the model's status, `GET /v1/models/{id}`), with and without `--ced 128`, and without `--ced` give the cold server's tokens. A fork after an image (a 32 x 32 PNG the test builds) must give the cold server's tokens. Two tests check the budget with a tight `--kv-cache` set from what a first server reports: a retry of a saved prompt must fit a cache filled to within 2 MiB of its limit, and a generation that takes its state past 16,384 positions must free an idle state before its state grows and keep the cache within its limit in every status sample. `MYDS4_SERVER` and `MYDS4_CLI` pick the binaries (default `build/myds4-server` and `build/myds4`). |
+| `MYDS4_QWEN=DIR cargo test --release --manifest-path server/Cargo.toml --target-dir build/cargo --test qwen -- --nocapture --test-threads 1` | A Qwen3.8 model through HTTP (`server/tests/qwen.rs`, about 3 minutes, one model process at a time): a request whose client leaves during the prefill of a 38K-token prompt, and then a prompt that extends that whole prompt, which must reuse only what the cut-short state ran and give the reply the same conversation gets where nothing was cancelled; and a reply that runs to the context's end (`--ctx 160`) must take every position up to it. With `--draft 1`, replies must take exactly `max_tokens` tokens (20 to 23) and, at `--ctx` 160 and 161, every position up to the context's end. With `MYDS4_CHECKPOINT` and `MYDS4_EXPERTS` set too, DeepSeek and the Qwen model run in one process from a config file: each must answer, and while both are idle the log may report the expert cache shrinking only to the slots it really has. |
 | `MYDS4_CHECKPOINT=CHECKPOINT MYDS4_EXPERTS=GGUF cargo test --release --manifest-path server/Cargo.toml --target-dir build/cargo --test live_view -- --nocapture` | The live view with a model (`server/tests/live_view.rs`, about 40 s, one model process): the server runs with `--tui` in a pseudo-terminal of 160 x 46 cells that answers the view's question for its background as a dark terminal would. While a request decodes, the test presses the tabs' keys and rebuilds the screen from the output: the dark colors, the expert map's request at four experts a cell, the KV tree, a node's text, the last minute and the log must be drawn, the mouse taken and given back, and the server must exit with status 0 after `q`. `MYDS4_SERVER` picks the server (default `build/myds4-server`). |
 | `build/prefix-fork-check CHECKPOINT --text FILE [--rendered] [--limit N] [--experts GGUF] [--draft N] [--cache GB] [--ced N] --fork [--random N] [--at P]... [--prompt-only] [--suffix N]` | The fork test in the engine (`tools/checks/prefix_fork_check.c`): a conversation (the text's prompt, or its first `--limit` tokens, then a decoded reply, a tool-like result and a second decoded reply) forked at 26 position classes and N random positions (default 16). Where the history before a fork came from prompts, the exact replay, the latest snapshot and the first snapshot after the fork within the rewind margin (continued at the fork) must give a cold prefill's bytes in the logits, every state tensor and the next 16 greedy tokens; where it holds decoded rows, both snapshot resumes must give the bytes of the conversation computed again as it ran, and the replay must be about as close to the cold prefill as that conversation is. Each fork's branch-point snapshot, resumed over that fork's rows, must give the fork's own bytes. Without `--ced` it also checks the KV cache's stale-row count: a state with 3 stale rows (a short prompt continued before a state's end, or a verify pass of 4 rows that keeps 1 token), resumed within the room the cache gives it, and the state 3 tokens later, resumed the whole margin before its end, must give the cold prefill's bytes; resumes past the room are printed. With `--ced N` the replay is bounded: it must keep the copied compressed rows and index keys byte for byte and give finite logits, and each fork's distance from the cold prefill is printed. `--measure` prints how far decoding a reply and prefilling it differ. |
 
@@ -676,7 +704,7 @@ and a JPEG photo (4096 x 2160) with a question (960 prompt tokens).
 The same run checked: `GET /health` without a key (200);
 401 without a key and with a wrong one; `x-api-key`; 405, 404 and the 400s of
 a body that is not JSON, a last message of the assistant, an `https` image
-and a negative temperature; `/v1/models` and `/v1/status`; a client that
+and a negative temperature; `/v1/models` and `/v1/models/{id}`; a client that
 closes a stream after 12 chunks (the engine logged `client gone` after 12
 tokens and was idle 0.2 s later); and SIGTERM during a stream (an `error`
 event, no `[DONE]`, exit status 0 after 0.6 s).

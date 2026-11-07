@@ -1,5 +1,6 @@
 // Compare independent layer scheduling with ordinary multi-request decoding.
 #include "../../src/model/deepseek.c"
+static Tokenizer *tk;  // the checkpoint's tokenizer
 
 static size_t differences(const void *a, const void *b, size_t bytes) {
   const uint8_t *x = a, *y = b;
@@ -20,13 +21,13 @@ int main(int argc, char **argv) {
   }
   if (count < 2 || count > BATCH_ROWS) die("runahead check needs 2 to %d requests", BATCH_ROWS);
   alarm(600);
-  tok_load(argv[1]);
+  tk = tok_open(argv[1], deepseek_ops.image_token);
   deepseek_load(argv[1], &o);
   enum { STEPS = 4 };
   State *states[FEW];
   Snapshot *prefix[FEW];
   int positions[FEW], rows[STEPS + 1][FEW], pattern[128];
-  int pn = tok_encode(" Review the queue, preserve cancellation, and explain the regression tests. alpha beta gamma 12345.\n", pattern, 128);
+  int pn = tok_encode(tk, " Review the queue, preserve cancellation, and explain the regression tests. alpha beta gamma 12345.\n", pattern, 128);
   int *prompt = xmalloc((length + FEW * 17) * sizeof(int));
   for (int r = 0; r < count; r++) {
     states[r] = deepseek_state_new();

@@ -24,6 +24,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
+def model_status(call):
+    """The served model's status: GET /v1/models/{id}'s "status" (the first model's)."""
+    model = call("/v1/models")["data"][0]["id"]
+    return call(f"/v1/models/{model}")["status"]
+
+
 class Capture:
     def __init__(self, process):
         self.process = process
@@ -379,7 +385,7 @@ def main():
                 "scope": "image input and text output smoke; visual accuracy is not graded",
             }
         while True:
-            status = call("/v1/status")
+            status = model_status(call)
             if status.get("totals", {}).get("requests", 0) >= args.requests + 1 + args.image_smoke:
                 break
             time.sleep(0.05)

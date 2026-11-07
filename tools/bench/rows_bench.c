@@ -14,6 +14,7 @@
 // usage: rows-bench CHECKPOINT ROWS [--experts GGUF] [--cache GIB] [--steps N]
 //                   [--warm N] [--text FILE --prompt-tokens N] [--show]
 #include "../../src/model/deepseek.c"
+static Tokenizer *tk;  // the checkpoint's tokenizer
 
 // The share of gen's 8-token windows that occurred nowhere before them.
 static double distinct_8grams(const int *gen, int n) {
@@ -47,7 +48,7 @@ int main(int argc, char **argv) {
     die("rows-bench takes 1 to %d rows, at least one step and no negative warm-up", BATCH_ROWS);
   if (!file != !length || length < 0) die("--text and --prompt-tokens go together");
   o.ctx = length + 4096;
-  tok_load(argv[1]);
+  tk = tok_open(argv[1], deepseek_ops.image_token);
   deepseek_load(argv[1], &o);
   static const char *openings[] = {"A lighthouse keeper finds a bottle.", "A baker opens a shop at dawn.",
                                    "Two engineers debate a cache design.", "A sailor maps an unknown coast.",
@@ -62,11 +63,11 @@ int main(int argc, char **argv) {
     fclose(f);
     text[got] = 0;
     all = xmalloc((16u << 20) * sizeof *all);
-    int count = tok_encode(text, all, 16 << 20);
+    int count = tok_encode(tk, text, all, 16 << 20);
     if (count < rows * length) die("%s has %d tokens, fewer than %d rows of %d", file, count, rows, length);
     free(text);
   } else {
-    ncommon = tok_encode(body, common, 256);
+    ncommon = tok_encode(tk, body, common, 256);
   }
   State *st[FEW];
   int tok[FEW], pos[FEW];
@@ -76,7 +77,7 @@ int main(int argc, char **argv) {
     if (all) {  // the r-th run of length tokens: each sequence its own part of the text
       memcpy(prompt, all + (size_t)r * length, (size_t)length * sizeof *prompt), n = length;
     } else {
-      n = tok_encode(openings[r], prompt, 64);
+      n = tok_encode(tk, openings[r], prompt, 64);
       memcpy(prompt + n, common, (size_t)ncommon * sizeof *prompt), n += ncommon;
     }
     st[r] = deepseek_state_new();
@@ -113,7 +114,7 @@ int main(int argc, char **argv) {
   if (show) {
     for (int i = 0; i < ng; i++) {
       int len;
-      const char *piece = tok_piece(gen[i], &len);
+      const char *piece = tok_piece(tk, gen[i], &len);
       fwrite(piece, 1, (size_t)len, stderr);
     }
     fputc('\n', stderr);

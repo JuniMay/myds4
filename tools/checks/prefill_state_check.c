@@ -1,12 +1,13 @@
 // Prefill must retain the window plus the server's allowed rewind margin.
 #include "../../src/model/deepseek.c"
+static Tokenizer *tk;  // the checkpoint's tokenizer
 
 int main(int argc, char **argv) {
   if (argc < 2 || argc > 3) die("usage: prefill-state-check CHECKPOINT [EXPERT_GGUF]");
   alarm(180);
-  tok_load(argv[1]);
+  tk = tok_open(argv[1], deepseek_ops.image_token);
   int pattern[64], tokens[256];
-  int pn = tok_encode(" alpha beta gamma delta epsilon", pattern, 64);
+  int pn = tok_encode(tk, " alpha beta gamma delta epsilon", pattern, 64);
   if (!pn) die("empty pattern");
   for (int i = 0; i < 256; i++) tokens[i] = pattern[i % pn];
   Options o = {.ctx = 2048, .budget_gb = 20, .reserve_gb = 4,

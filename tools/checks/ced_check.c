@@ -2,6 +2,7 @@
 // Including the model lets this diagnostic inspect caches without a public API.
 #define MYDS4_CED_CHECK 1
 #include "../../src/model/deepseek.c"
+static Tokenizer *tk;  // the checkpoint's tokenizer
 
 typedef struct { uint64_t count, different; double signal, error, max_abs; } Error;
 static int eos_token;
@@ -26,7 +27,7 @@ static void benchmark(int *tokens, int generate, int keep) {
   uint64_t rows0 = decode_rows, slots0 = cache_bytes(), minimum = slots0, maximum = slots0;
   Sampler sampler = {.temp = 1, .top_p = 1};
   sampler_seed(&sampler, 12345);
-  int current = sample_token(lg, VOCAB, &sampler), eos = tok_find("<｜end▁of▁sentence｜>");
+  int current = sample_token(lg, VOCAB, &sampler), eos = tok_find(tk, "<｜end▁of▁sentence｜>");
   int gen = 0, pos = prompt_n, proposals = 0, accepted = 0, passes = 0;
   while (gen < generate && current != eos && !shutdown_requested()) {
     int rows[BLOCK + 1] = {current}, k = opt.draft, a = 0, next;
@@ -234,9 +235,9 @@ int main(int argc, char **argv) {
     snprintf(text, size, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher "
              "the value, the more thorough the reasoning)\n\n<｜User｜>%s<｜Assistant｜><think>", input);
   }
-  tok_load(argv[1]);
+  tk = tok_open(argv[1], deepseek_ops.image_token);
   int *tokens = xmalloc(32768 * sizeof(int));
-  prompt_n = tok_encode_chat(text, tokens, 16384);
+  prompt_n = tok_encode_chat(tk, text, tokens, 16384);
   if (prompt_n < 2 || prompt_n >= 16384 || prompt_n + steps >= 32768 || prompt_n + bench_tokens >= 32768)
     die("prompt is outside the diagnostic bounds");
   if (text != input) free(text);
@@ -264,7 +265,7 @@ int main(int argc, char **argv) {
     ced_check_compact = 0;
   }
   float *reference_logits = xmalloc((size_t)steps * VOCAB * sizeof(float));
-  int continuation[64], eos = tok_find("<｜end▁of▁sentence｜>");
+  int continuation[64], eos = tok_find(tk, "<｜end▁of▁sentence｜>");
   Sampler sampler = {.temp = 1, .top_p = 1}, draws[64];
   sampler_seed(&sampler, 12345);
   const float *lg = deepseek_forward(tokens, prompt_n, 0);

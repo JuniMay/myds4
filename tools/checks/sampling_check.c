@@ -127,6 +127,40 @@ int main(void) {
   }
   expect("shared uniforms accept an identical draft distribution", coupled_equal);
   expect("shared uniforms preserve target tokens and RNG with a different draft distribution", coupled_exact);
+  // top-k: draws stay within the k highest-ranked tokens (the higher logit,
+  // then the lower id, as a full sort ranks them), one draw each; k = 1 is
+  // greedy; k at the vocabulary is the unrestricted sampler.
+  enum { V = 300 };
+  float tied[V];
+  for (int i = 0; i < V; i++) tied[i] = (float)((i * 7919) % 41) * 0.25f;  // many equal logits
+  int rank[V];
+  for (int i = 0; i < V; i++) rank[i] = i;
+  for (int i = 1; i < V; i++)  // a full sort, the reference order
+    for (int j = i; j > 0 && (tied[rank[j]] > tied[rank[j - 1]] ||
+                              (tied[rank[j]] == tied[rank[j - 1]] && rank[j] < rank[j - 1])); j--) {
+      int x = rank[j]; rank[j] = rank[j - 1], rank[j - 1] = x;
+    }
+  int within = 1, greedy = 1, unrestricted = 1, seen_last = 0;
+  for (int k = 1; k <= 24; k += 23) {
+    Sampler s = {.temp = 1.3, .top_p = 1, .top_k = k};
+    sampler_seed(&s, 1234 + k);
+    for (int d = 0; d < 4000; d++) {
+      int t = sample_token(tied, V, &s), in = 0;
+      for (int r = 0; r < k; r++) in |= rank[r] == t;
+      within &= in;
+      if (k == 1) greedy &= t == sample_argmax(tied, V);
+      else seen_last |= t == rank[k - 1];
+    }
+  }
+  for (int trial = 0; trial < 64; trial++) {
+    Sampler a = {.temp = 0.8, .top_p = trial % 2 ? 1 : .9}, b = a;
+    b.top_k = V;
+    sampler_seed(&a, 77 + trial), sampler_seed(&b, 77 + trial);
+    unrestricted &= sample_token(tied, V, &a) == sample_token(tied, V, &b);
+  }
+  expect("top-k draws only among the k highest-ranked tokens, the last of them included", within && seen_last);
+  expect("top-k of 1 is greedy", greedy);
+  expect("top-k of the whole vocabulary draws as without top-k", unrestricted);
   fprintf(stderr, "sampling: %d/%d CPU checks passed\n", checks - failures, checks);
   return failures != 0;
 }

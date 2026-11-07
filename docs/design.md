@@ -40,7 +40,7 @@ in [Removed experiments](experiments.md).
 | `src/model/qwen.c`, `src/model/qwen.h` | Qwen3.8 (`qwen3_5`): weights, states with their DeltaNet and key-value rows, prompt and decoding passes, the MTP head (see [Qwen3.8 models](qwen.md)). |
 | `src/engine/io.c` | SSD reads, the routed-expert cache, memory monitoring. |
 | `src/engine/gpu.c` | Metal through the Objective-C runtime from C, the profiler. |
-| `src/engine/tok.c` | The tokenizer (byte-level BPE from the checkpoint's `tokenizer.json`; it encodes text for the pre-tokenizer of DeepSeek's checkpoint, and decodes any) and the embedded tables. |
+| `src/engine/tok.c` | A checkpoint's tokenizer, one per model: byte-level BPE after the `tokenizer.json`'s normalizer (none or NFC) and its sequence of Split regexes, which run in the system's ICU library (`libicucore`); a pipeline with other steps is refused. |
 | `src/engine/util.c` | Errors, strings, a JSON parser for the model's own files, the safetensors index, GGUF headers. |
 | `src/engine/vision.c` | Images: decoding, the reference's grid, Pillow's resize and padding, the vision encoder's patches and RoPE angles, an image's span of tokens. |
 | `src/engine/sample.c` | Shared temperature/top-p sampling and the verification of drafts. |

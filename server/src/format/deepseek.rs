@@ -1,5 +1,6 @@
-//! Chat Completions: a request's JSON through the compatibility steps into
-//! recipe's conversion and V4.1 rendering, and the engine's events through
+//! DeepSeek V4.1's chat format: a Chat Completions request's JSON through the
+//! compatibility steps into recipe's conversion and V4.1 rendering, its
+//! prompt tokens from the model's tokenizer, and the worker's events through
 //! recipe's stream processor into response chunks (docs/server.md).
 
 use std::ops::Range;
@@ -27,46 +28,27 @@ use serde_json::{Map, Value, json};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_stream::{Stream, StreamExt};
 
+use super::{DEFAULT_MAX_TOKENS, Error, bad, error, error_json, response_id};
 use crate::engine;
-use crate::worker::{self, Event, Finish};
+use crate::worker::{self, Event, Finish, Sampling};
 
-/// The model's name in responses and in GET /v1/models.
+/// A DeepSeek checkpoint's name in responses and in GET /v1/models, unless
+/// the server's configuration names it otherwise.
 pub const MODEL_ID: &str = "deepseek-v4.1-flash";
 /// The checkpoint's spelling of the image token (id 129264); recipe's
 /// default, `<｜image｜>`, is not in its tokenizer.
-const IMAGE: &str = "<｜deepseek_image｜>";
+pub const IMAGE: &str = "<｜deepseek_image｜>";
 /// The model name with which recipe converts and renders for V4.1.
 const RECIPE_MODEL: &str = "DeepSeek-V4.1-Flash";
-/// `max_tokens` of a request that sets none, at most what the context leaves.
-pub const DEFAULT_MAX_TOKENS: i64 = 262_144;
-
-/// The server's defaults for requests that set no value.
+/// The server's defaults for requests that set no value, and the model's name.
 #[derive(Clone)]
 pub struct Defaults {
+    pub id: String,
     pub temperature: f64,
     pub top_p: f64,
     pub seed: Option<u64>,
     pub thinking: bool,
     pub effort: u32,
-}
-
-/// A request the server answers with an error before its response starts.
-#[derive(Debug)]
-pub struct Error {
-    pub status: StatusCode,
-    pub message: String,
-}
-
-fn bad(message: impl Into<String>) -> Error {
-    Error { status: StatusCode::BAD_REQUEST, message: message.into() }
-}
-
-pub fn error_json(kind: &str, message: &str) -> String {
-    json!({"error": {"message": message, "type": kind, "code": null}}).to_string()
-}
-
-pub fn error(status: StatusCode, kind: &str, message: &str) -> Response {
-    (status, [(header::CONTENT_TYPE, "application/json")], error_json(kind, message)).into_response()
 }
 
 fn special_tokens() -> SpecialTokensMap {
@@ -149,7 +131,7 @@ fn compatible(root: &mut Map<String, Value>, d: &Defaults) -> Result<Settings, E
     if max_tokens < 1 {
         return Err(bad("max_tokens must be at least 1"));
     }
-    let model = root.get("model").and_then(Value::as_str).unwrap_or(MODEL_ID).to_string();
+    let model = root.get("model").and_then(Value::as_str).unwrap_or(&d.id).to_string();
     root.insert("model".into(), RECIPE_MODEL.into());
 
     // A thinking setting decides; without one, an effort of "none" turns
@@ -288,6 +270,7 @@ fn render(root: Map<String, Value>, d: &Defaults) -> Result<Rendered, Error> {
 
 /// A request ready for the engine.
 pub struct Prepared {
+    tokenizer: engine::Tokenizer,
     request: ConversationRequest,
     prompt: Vec<u8>,  // the rendered prompt, the byte 0xFF at each image's place
     images: Vec<Vec<u8>>,
@@ -298,16 +281,20 @@ pub struct Prepared {
 }
 
 impl Prepared {
-    pub fn engine_request<'a>(&'a self, note: &'a str) -> worker::Request<'a> {
-        worker::Request {
-            note,
-            prompt: &self.prompt,
-            images: &self.images,
-            temperature: self.settings.temperature,
-            top_p: self.settings.top_p,
-            seed: self.settings.seed,
-            max_tokens: self.settings.max_tokens,
+    /// The worker's request for model `model`: the rendered prompt's tokens,
+    /// each image's place the image token, as many as the images.
+    pub fn engine_request(&self, model: usize, note: String) -> Result<worker::Request, Error> {
+        let prompt = self.tokenizer.tokenize_prompt(&self.prompt);
+        let image = self.tokenizer.special(IMAGE);
+        let places = prompt.iter().filter(|&&t| Some(t) == image).count();
+        if prompt.is_empty() {
+            return Err(bad("the prompt is empty"));
         }
+        if places != self.images.len() {
+            return Err(bad(format!("the prompt has {places} image places and {} images", self.images.len())));
+        }
+        let sampling = Sampling { temperature: self.settings.temperature, top_p: self.settings.top_p, top_k: 0, seed: self.settings.seed };
+        Ok(worker::Request { model, prompt, images: self.images.clone(), sampling, max_tokens: self.settings.max_tokens, note })
     }
 
     /// For the log: "thinking effort N" or "thinking off".
@@ -317,8 +304,8 @@ impl Prepared {
 }
 
 /// A request's body as the engine's request: checked, converted, rendered,
-/// its images read.
-pub fn prepare(body: &[u8], d: &Defaults) -> Result<Prepared, Error> {
+/// its images read; `tokenizer` is the model's.
+pub fn prepare(body: &[u8], d: &Defaults, tokenizer: engine::Tokenizer) -> Result<Prepared, Error> {
     let Ok(Value::Object(root)) = serde_json::from_slice::<Value>(body) else {
         return Err(bad("the body is not a JSON object"));
     };
@@ -356,16 +343,11 @@ pub fn prepare(body: &[u8], d: &Defaults) -> Result<Prepared, Error> {
         at = s.end;
     }
     prompt.extend_from_slice(r.prompt[at..].as_bytes());
-    Ok(Prepared { stream: r.request.stream, request: r.request, prompt, images, settings: r.settings, messages, tools })
+    Ok(Prepared { tokenizer, stream: r.request.stream, request: r.request, prompt, images, settings: r.settings, messages, tools })
 }
 
 // ---- responses ----
 
-fn response_id() -> String {
-    use rand::Rng;
-    let s: String = rand::rng().sample_iter(&rand::distr::Alphanumeric).take(24).map(char::from).collect();
-    format!("chatcmpl-{s}")
-}
 
 /// The engine's events as recipe's inference chunks. The end token goes on as
 /// one token without text, as the engine counts it; the server's stop sets
@@ -415,13 +397,14 @@ fn inference(
 fn chunks(
     mut request: ConversationRequest,
     model: String,
+    tokenizer: engine::Tokenizer,
     first: Event,
     rx: UnboundedReceiver<Event>,
 ) -> (impl Stream<Item = Result<ChatCompletionChunk, String>> + Send, Arc<AtomicBool>) {
     let stopped = Arc::new(AtomicBool::new(false));
     let generator = ChatCompletionRequest::chunk_generator(&request, response_id(), model);
     let options = std::mem::take(&mut request.parsing_options);
-    let processor = StreamProcessor::new(generator, options).with_tokenizer(engine::Tokenizer);
+    let processor = StreamProcessor::new(generator, options).with_tokenizer(tokenizer);
     let chunks = processor
         .into_protocol_stream(inference(first, rx, stopped.clone()))
         .filter(|c| !c.as_ref().is_ok_and(empty))
@@ -472,7 +455,7 @@ pub fn stream(p: Prepared, cancel: worker::Cancel, mut rx: UnboundedReceiver<Eve
             Some(event) => event,
             None => return,
         };
-        let (chunks, stopped) = chunks(p.request, p.settings.model, first, rx);
+        let (chunks, stopped) = chunks(p.request, p.settings.model, p.tokenizer, first, rx);
         let mut chunks = pin!(chunks);
         let mut calls = 0;
         while let Some(chunk) = chunks.next().await {
@@ -516,7 +499,7 @@ pub async fn whole(p: Prepared, cancel: worker::Cancel, mut rx: UnboundedReceive
     };
     let created = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let model = p.settings.model.clone();
-    let (chunks, stopped) = chunks(p.request, p.settings.model, first, rx);
+    let (chunks, stopped) = chunks(p.request, p.settings.model, p.tokenizer, first, rx);
     let mut chunks = pin!(chunks);
     let mut response = ChatCompletionResponse::new(response_id(), model, created, 0, 0);
     let mut calls = 0;
@@ -596,7 +579,7 @@ pub fn render_file(path: &str) -> i32 {
     }
     let mut urls = Vec::new();
     mark_images(&mut root["messages"], &mut urls);
-    let defaults = Defaults { temperature: 0.0, top_p: 1.0, seed: None, thinking: false, effort: 75 };
+    let defaults = Defaults { id: MODEL_ID.into(), temperature: 0.0, top_p: 1.0, seed: None, thinking: false, effort: 75 };
     let r = match render(root, &defaults) {
         Ok(r) => r,
         Err(e) => {
@@ -635,7 +618,7 @@ mod tests {
     use super::*;
 
     fn defaults() -> Defaults {
-        Defaults { temperature: 1.0, top_p: 1.0, seed: None, thinking: true, effort: 75 }
+        Defaults { id: MODEL_ID.into(), temperature: 1.0, top_p: 1.0, seed: None, thinking: true, effort: 75 }
     }
 
     fn settings(v: Value) -> (Map<String, Value>, Settings) {
@@ -698,9 +681,9 @@ mod tests {
     #[tokio::test]
     async fn events_become_chunks() {
         let Ok(dir) = std::env::var("MYDS4_CHECKPOINT") else { return };
-        engine::load_tokenizer(&dir);
-        let think: Vec<u32> = engine::tokenize("Hmm.").iter().map(|&t| t as u32).collect();
-        let answer: Vec<u32> = engine::tokenize("Hi there! 你好").iter().map(|&t| t as u32).collect();
+        let t = engine::Tokenizer::open(&dir, Some(IMAGE));
+        let think: Vec<u32> = t.tokenize("Hmm.").iter().map(|&t| t as u32).collect();
+        let answer: Vec<u32> = t.tokenize("Hi there! 你好").iter().map(|&t| t as u32).collect();
         let request = json!({"messages": [{"role": "user", "content": "hi"}], "stream": true});
         let Value::Object(root) = request else { unreachable!() };
         let r = render(root, &defaults()).ok().expect("rendered");
@@ -714,7 +697,7 @@ mod tests {
         }
         tx.send(Event::Done { finish: Finish::Stop }).unwrap();
         let first = Event::Started { prompt: 10, reused: 4 };
-        let (chunks, stopped) = chunks(r.request, MODEL_ID.into(), first, rx);
+        let (chunks, stopped) = chunks(r.request, MODEL_ID.into(), t, first, rx);
         let chunks: Vec<ChatCompletionChunk> = chunks.map(|c| c.expect("a chunk")).collect().await;
         assert!(!stopped.load(Ordering::Relaxed));
         let text = |f: fn(&ChatCompletionChunk) -> Option<String>| chunks.iter().filter_map(f).collect::<String>();

@@ -128,8 +128,11 @@ static double num(const Json *o, const char *key) {
   return v->num;
 }
 
+static uint64_t weight_bytes;  // the weights uploaded
+
 static Buf upload(Tensor t) {
   Buf b = own(gpu_alloc(t.size));
+  weight_bytes += t.size;
   size_t done = 0;
   while (done < t.size) {  // macOS refuses reads above INT_MAX bytes
     size_t want = t.size - done < (1u << 30) ? t.size - done : (1u << 30);
@@ -791,15 +794,34 @@ static Options qopt;
 static const float *last_logits;  // what the last call returned, for a snapshot's logits
 static double last_pass;          // when the last pass ran (now())
 enum { RELEASE_AFTER = 60 };      // seconds without passes before the buffers leave the residency set
+static ModelCounters counted;     // decoding and prompt passes' rows and times
+
+static const char *q_refuse(const Options *o) {
+  if (o->experts || o->ced || o->substitute > 0 || o->online_predictor || o->predictor_state || o->prefill_prune ||
+      o->draft_cache || o->dump_fd >= 0 || o->routes_fd >= 0 || o->runahead || o->budget_gb || o->reserve_gb || o->cache_half_life ||
+      o->cache_read_cost)
+    return "experts, ced, substitute, online-predictor, predictor-state, prefill-prune, draft-cache, cache, reserve, "
+           "cache-half-life, cache-read-cost, dump-fd, routes-fd and runahead apply to DeepSeek's routed experts and "
+           "layers, which a qwen3_5 model does not have";
+  if (o->draft > 1) return "draft: the MTP head drafts one token";
+  return 0;
+}
 
 static void q_load(const char *dir, const Options *o) {
-  if (o->experts || o->ced || o->substitute > 0 || o->online_predictor || o->prefill_prune || o->draft_cache ||
-      o->dump_fd >= 0 || o->routes_fd >= 0 || o->runahead)
-    die("qwen3_5: --experts, --ced, --substitute, --online-predictor, --prefill-prune, --draft-cache, --dump-fd, "
-        "--routes-fd and --runahead apply to DeepSeek's routed experts and layers");
+  const char *why = q_refuse(o);
+  if (why) die("qwen3_5: %s", why);
   qopt = *o;
   qwen_load(dir);
   last_pass = now();
+  counted.dense_bytes = weight_bytes;
+}
+
+static void q_counters(ModelCounters *c) { *c = counted; }
+
+// A decoding pass's rows and times into the counters.
+static const float *decoded(const float *logits, int rows, double t0, double g0) {
+  counted.decode_rows += rows, counted.decode_seconds += now() - t0, counted.decode_gpu_seconds += gpu_busy - g0;
+  return logits;
 }
 
 static int q_vocab(void) { return c.vocab; }
@@ -808,6 +830,7 @@ static int q_max_verify(void) { return mtp ? 2 : 1; }
 static int q_draft_block(void) { return mtp && qopt.draft > 0 ? 1 : 0; }
 static int q_rewind(void) { return 0; }
 static int q_stop(int token) { return qwen_stop(token); }
+static int q_prefill_rows(void) { return PF; }
 
 static ModelState *q_state_new(void) { return (ModelState *)qwen_state_new(); }
 static void q_state_free(ModelState *s) { qwen_state_free((QwenState *)s); }
@@ -879,7 +902,9 @@ static const float *q_prefill(ModelState *st, const int *tokens, int n, int from
   for (int at = from; at < n;) {
     int end = capture > at && capture < n ? capture : n, k = end - at < most ? end - at : most;
     for (int i = 0; i < k; i++) rows[i] = (QwenRow){s, tokens[at + i], 0};
+    counted.prefill_rows_now = k, counted.prefill_layer = 1;
     lg = qwen_prefill(rows, k, every ? k : 1);
+    counted.prefill_rows += k, counted.prefill_rows_now = 0, counted.prefill_layer = 0;
     if (every) memcpy(every + (size_t)(at - from) * c.vocab, lg, (size_t)k * c.vocab * 4), lg += (size_t)(k - 1) * c.vocab;
     at += k;
     if (at == capture) *captured = q_snapshot_take(st, at, 0);
@@ -897,8 +922,8 @@ static const float *q_rows(ModelState *const *states, const int *tokens, const i
     mtp_fill(s, tokens[r], 0);
     rows[r] = (QwenRow){s, tokens[r], 0};
   }
-  last_pass = now();
-  return last_logits = qwen_forward(rows, m, m);
+  double t0 = last_pass = now(), g0 = gpu_busy;
+  return last_logits = decoded(qwen_forward(rows, m, m), m, t0, g0);
 }
 
 static void q_draft(ModelState *st, int token, int pos, int *drafts, int n) {
@@ -914,8 +939,8 @@ static const float *q_verify(ModelState *st, const int *tokens, int m, int pos) 
   if (pos != s->pos) die("qwen3_5: a verify pass at %d of a state at %d", pos, s->pos);
   mtp_fill(s, tokens[0], 0);
   QwenRow rows[2] = {{s, tokens[0], m > 1}, {s, m > 1 ? tokens[1] : 0, 0}};
-  last_pass = now();
-  return last_logits = qwen_forward(rows, m, m);
+  double t0 = last_pass = now(), g0 = gpu_busy;
+  return last_logits = decoded(qwen_forward(rows, m, m), m, t0, g0);
 }
 
 static void q_accept(ModelState *st, const int *tokens, int n, int pos) {
@@ -945,8 +970,10 @@ static void q_chat(char *text, size_t cap, const char *prompt, int images, int t
 static const char *const q_types[] = {"qwen3_5", "qwen3_5_text", 0};
 
 const ModelOps qwen_ops = {
-    .family = "Qwen3.8", .model_types = q_types, .load = q_load, .vocab = q_vocab, .max_rows = q_max_rows,
+    .family = "Qwen3.8", .model_types = q_types, .refuse = q_refuse, .load = q_load, .counters = q_counters,
+    .vocab = q_vocab, .max_rows = q_max_rows,
     .max_verify = q_max_verify, .draft_block = q_draft_block, .rewind = q_rewind, .stop = q_stop,
+    .prefill_rows = q_prefill_rows,
     .state_new = q_state_new, .state_free = q_state_free, .state_bytes = q_state_bytes, .state_copy = q_state_copy,
     .snapshot_take = q_snapshot_take, .snapshot_restore = q_snapshot_restore, .snapshot_free = q_snapshot_free,
     .snapshot_bytes = q_snapshot_bytes, .snapshot_logits = q_snapshot_logits, .prefill = q_prefill,

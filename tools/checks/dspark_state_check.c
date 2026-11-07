@@ -1,12 +1,13 @@
 // Accepted DSpark history must match a sequential run of the same tokens.
 #include "../../src/model/deepseek.c"
+static Tokenizer *tk;  // the checkpoint's tokenizer
 
 int main(int argc, char **argv) {
   if (argc < 2 || argc > 3) die("usage: dspark-state-check CHECKPOINT [EXPERT_GGUF]");
   alarm(300);
-  tok_load(argv[1]);
+  tk = tok_open(argv[1], deepseek_ops.image_token);
   int tokens[2048];
-  int n = tok_encode_chat("<｜begin▁of▁sentence｜><｜User｜>Write a short deterministic task scheduler. "
+  int n = tok_encode_chat(tk, "<｜begin▁of▁sentence｜><｜User｜>Write a short deterministic task scheduler. "
                          "Preserve dependency order and cancel queued work when a required input fails."
                          "<｜Assistant｜></think>", tokens, 2048);
   Options o = {.ctx = 2048, .budget_gb = 20, .reserve_gb = 4, .draft = 1, .draft_cache = 32,

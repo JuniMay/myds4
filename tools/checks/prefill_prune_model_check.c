@@ -1,5 +1,6 @@
 // Compare dependency-pruned prefill with the full model at identical batch boundaries.
 #include "../../src/model/deepseek.c"
+static Tokenizer *tk;  // the checkpoint's tokenizer
 
 static size_t bytes_differ(const void *a, const void *b, size_t count) {
   const uint8_t *x = a, *y = b;
@@ -26,7 +27,7 @@ int main(int argc, char **argv) {
     else die("invalid pruning check option");
   }
   alarm(600);
-  tok_load(argv[1]);
+  tk = tok_open(argv[1], deepseek_ops.image_token);
   int pattern[128], n = count ? count : longer ? 16384 + 137 : 8192;
   if (n < 2 || n + 8 > o.ctx) die("invalid fixture token count");
   int *tokens = xmalloc((size_t)o.ctx * sizeof *tokens);
@@ -36,15 +37,15 @@ int main(int argc, char **argv) {
     size_t count = fread(text, 1, limit, stdin);
     if (!count || count == limit || ferror(stdin)) die("invalid rendered input");
     text[count] = 0;
-    n = tok_encode_chat(text, tokens, o.ctx);
+    n = tok_encode_chat(tk, text, tokens, o.ctx);
     free(text);
     if (!prefix_set) {
-      int user = tok_find("<｜User｜>");
+      int user = tok_find(tk, "<｜User｜>");
       prefix = 0;
       while (prefix < n && tokens[prefix] != user) prefix++;
     }
   } else {
-    int pn = tok_encode(" Review this code, preserve cancellation order, and explain the tests. alpha beta gamma 12345.\n", pattern, 128);
+    int pn = tok_encode(tk, " Review this code, preserve cancellation order, and explain the tests. alpha beta gamma 12345.\n", pattern, 128);
     for (int i = 0; i < n; i++) tokens[i] = pattern[i % pn];
   }
   if (prefix < 1 || prefix >= n || n + 8 > o.ctx) die("invalid prefix or input length");

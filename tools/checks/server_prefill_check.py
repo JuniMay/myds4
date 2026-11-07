@@ -24,6 +24,12 @@ from gpu_guard import ROOT, memory_snapshot, process_snapshot, wait_for_gpu
 from online_predictor_server_check import image_data_url, stop
 
 
+def model_status(call):
+    """The served model's status: GET /v1/models/{id}'s "status" (the first model's)."""
+    model = call("/v1/models")["data"][0]["id"]
+    return call(f"/v1/models/{model}")["status"]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--checkpoint", type=Path, required=True)
@@ -135,7 +141,7 @@ def main():
             first_message = first_copy["choices"][0]["message"]
             assert first_message == second_copy["choices"][0]["message"], "lookup retry changed its seeded reply"
             assert first_message["content"].strip() == copied, "lookup copy request did not reproduce the requested text"
-        state = call("/v1/status")
+        state = model_status(call)
         assert state["ced_depth"] == (0 if args.ced == "off" else int(args.ced))
         assert state["lookup_depth"] == args.lookup
         assert state["prefill_prune"] == args.prefill_prune

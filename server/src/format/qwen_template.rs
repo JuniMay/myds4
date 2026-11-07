@@ -11,7 +11,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use super::tokenizer::Tokenizer;
+use crate::engine::Tokenizer;
 
 /// The template's reasoning instructions by effort (`medium` has none).
 fn instructions(effort: &str) -> &'static str {
@@ -116,15 +116,15 @@ impl Prompt {
             if let Some(m) = marker {
                 match t.special(m) {
                     Some(id) => {
-                        t.encode(&run, &mut out)?;
+                        out.extend(t.tokenize_text(&run).iter().map(|&x| x as u32));
                         run.clear();
-                        out.push(id);
+                        out.push(id as u32);
                     }
                     None => run.push_str(m),
                 }
             }
         }
-        t.encode(&run, &mut out)?;
+        out.extend(t.tokenize_text(&run).iter().map(|&x| x as u32));
         Ok(out)
     }
 }

@@ -140,6 +140,14 @@ impl Server {
         http(self.port, &self.key, "GET", path, None)
     }
 
+    /// The served model's status: GET /v1/models/{id}'s "status".
+    fn status(&self) -> (u16, Value) {
+        let models: Value = serde_json::from_slice(&self.get("/v1/models").1).unwrap_or(Value::Null);
+        let id = models["data"][0]["id"].as_str().unwrap_or("").to_string();
+        let (code, body) = self.get(&format!("/v1/models/{id}"));
+        (code, serde_json::from_slice::<Value>(&body).map(|v| v["status"].clone()).unwrap_or(Value::Null))
+    }
+
     fn chat(&self, body: &Value) -> Value {
         let (status, answer) = http(self.port, &self.key, "POST", "/v1/chat/completions", Some(body));
         let v: Value = serde_json::from_slice(&answer).unwrap_or(Value::Null);
@@ -214,12 +222,12 @@ fn reply(answer: &Value) -> String {
     format!("{}|{}", m["reasoning_content"].as_str().unwrap_or(""), m["content"].as_str().unwrap_or(""))
 }
 
-/// The rows the server's last prefill computed (/v1/status): the prompt's
-/// new tokens, and with a replay also the earlier rows it computed again.
+/// The rows the server's last prefill computed (the model's status): the
+/// prompt's new tokens, and with a replay also the earlier rows it computed
+/// again.
 fn last_prefill(server: &Server) -> i64 {
-    let (status, answer) = server.get("/v1/status");
-    assert_eq!(status, 200, "GET /v1/status");
-    let v: Value = serde_json::from_slice(&answer).expect("the status's JSON");
+    let (code, v) = server.status();
+    assert_eq!(code, 200, "GET /v1/models/{{id}}");
     v["last_prefill"]["tokens"].as_i64().unwrap_or(-1)
 }
 
@@ -499,7 +507,7 @@ fn image_forks_give_the_cold_tokens() {
 
 // ---- the cache's budget (--kv-cache) ----
 
-/// What GET /v1/status tells of the cache: its charge and limit in GiB, the
+/// What the model's status tells of the cache: its charge and limit in GiB, the
 /// phase, the requests that ended, and each state's positions.
 struct Status {
     kv: f64,
@@ -510,7 +518,7 @@ struct Status {
 }
 
 fn status(server: &Server) -> Status {
-    let v: Value = serde_json::from_slice(&server.get("/v1/status").1).unwrap_or(Value::Null);
+    let v = server.status().1;
     Status {
         kv: v["kv_cache_gib"].as_f64().unwrap_or(f64::NAN),
         limit: v["kv_cache_limit_gib"].as_f64().unwrap_or(f64::NAN),

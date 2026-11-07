@@ -23,6 +23,12 @@ from ced_bench import harness_request
 from gpu_guard import ROOT, guarded_process, memory_snapshot, process_snapshot, wait_for_gpu
 
 
+def model_status(call):
+    """The served model's status: GET /v1/models/{id}'s "status" (the first model's)."""
+    model = call("/v1/models")["data"][0]["id"]
+    return call(f"/v1/models/{model}")["status"]
+
+
 def stop(process):
     if process.poll() is None:
         process.terminate()
@@ -128,7 +134,7 @@ def run(args, mode, bodies, runahead=0):
                     stop(process)
                     return
                 try:
-                    state = call("/v1/status")
+                    state = model_status(call)
                     slots = state["expert_cache"]["slots"]
                     # Slots allocate lazily while the first prompt fills the
                     # cache. A smaller count afterward is a capacity change.
@@ -197,7 +203,7 @@ def run(args, mode, bodies, runahead=0):
                 raise RuntimeError("server failed to become ready")
             try:
                 call("/health")
-                initial = call("/v1/status")
+                initial = model_status(call)
                 break
             except OSError:
                 time.sleep(.2)
@@ -209,7 +215,7 @@ def run(args, mode, bodies, runahead=0):
             outputs = list(pool.map(completion, bodies))
         elapsed = time.monotonic() - began
         counters["request_running"] = False
-        final = call("/v1/status")
+        final = model_status(call)
         generated = sum(r["usage"]["completion_tokens"] for r in outputs)
         prefill = sum(prefill_times)
         valid = (not failures and not counters["cache_shrank"] and

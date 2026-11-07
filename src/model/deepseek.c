@@ -23,6 +23,17 @@
 
 #include "myds4.h"
 #include "model.h"
+
+// Engram hashing (data/engram.bin): multipliers [2][4], primes [2][3][8],
+// offsets [2][24], the compressed pad id and token map.
+_Alignas(8) static const unsigned char engram_data[] = {
+#embed "../../data/engram.bin"
+};
+static const int64_t *const engram_mult = (const int64_t *)engram_data;
+static const int64_t *const engram_primes = (const int64_t *)engram_data + 8;
+static const int64_t *const engram_offsets = (const int64_t *)engram_data + 56;
+static const int32_t *const engram_map = (const int32_t *)(engram_data + (8 + 48 + 48) * 8 + 8);
+static int engram_pad(void) { return *(const int32_t *)(engram_data + 104 * 8); }
 #include "../experimental/prefill_prune.h"
 
 typedef struct { Buf w, s; int n, k, group; } Lin;  // s.obj is null for BF16 weights; group: rows
@@ -2942,18 +2953,30 @@ static void use(ModelState *s) {
   if ((State *)s != active) deepseek_state_use((State *)s);
 }
 
+// Before a state in use is freed or overwritten: the layers bind an empty
+// state, which nothing runs on until the next use binds a real one.
+static State parked;
+static void park(const ModelState *s) {
+  if ((const State *)s == active) deepseek_state_use(&parked);
+}
+
 static int ds_vocab(void) { return VOCAB; }
 static int ds_max_rows(void) { return BATCH_ROWS; }
 static int ds_max_verify(void) { return VERIFY_DRAFTS + 1; }
 static int ds_draft_block(void) { return opt.draft; }
 static int ds_rewind(void) { return deepseek_rewind(); }
 static int ds_stop(int token) { return token == end_token; }
+static int ds_prefill_rows(void) { return 0; }  // replay, CED and pruning plan the whole prompt
 static ModelState *ds_state_new(void) { return (ModelState *)deepseek_state_new(); }
-static void ds_state_free(ModelState *s) { deepseek_state_free((State *)s); }
+static void ds_state_free(ModelState *s) {
+  park(s);
+  deepseek_state_free((State *)s);
+}
 static size_t ds_state_bytes(const ModelState *s, int positions) {
   return deepseek_state_bytes((const State *)s, positions);
 }
 static void ds_state_copy(ModelState *dst, const ModelState *src, int positions) {
+  park(dst);
   deepseek_state_copy((State *)dst, (const State *)src, positions);
 }
 static ModelSnapshot *ds_snapshot_take(ModelState *s, int pos, int with_logits) {
@@ -3004,6 +3027,21 @@ static void ds_seek(ModelState *s, const int *tokens, int pos) {
   use(s);
   deepseek_seek(tokens, pos);
 }
+static const char *ds_refuse(const Options *o) { return 0; }
+
+static void ds_counters(ModelCounters *c) {
+  *c = (ModelCounters){.decode_rows = decode_rows, .prefill_rows = prefill_rows, .decode_seconds = decode_s,
+                       .decode_gpu_seconds = decode_gpu_s, .prefill_layer = prefill_layer, .prefill_rows_now = prefill_n,
+                       .layers = LAYERS, .experts_per_row = LAYERS * TOPK, .dense_bytes = dense_bytes,
+                       .decode = decode_stats, .prefill = prefill_stats};
+}
+
+static void ds_plan(ModelPlan *p) {
+  DeepSeekForwardInfo f = deepseek_forward_info();
+  *p = (ModelPlan){.chunks = f.chunks, .tokens = f.tokens, .decoder_tokens = f.decoder_tokens,
+                   .ced_applied = f.ced_applied, .prune_applied = f.prune_applied, .prefix_tokens = f.prefix_tokens};
+}
+
 static int ds_idle(void) {
   cache_idle();
   return cache_slots();
@@ -3062,8 +3100,10 @@ static void ds_chat(char *text, size_t cap, const char *prompt, int images, int 
 static const char *const ds_types[] = {"deepseek_v41", 0};
 
 const ModelOps deepseek_ops = {
-    .family = "DeepSeek V4.1", .model_types = ds_types, .load = ds_load, .vocab = ds_vocab,
+    .family = "DeepSeek V4.1", .model_types = ds_types, .image_token = "<｜deepseek_image｜>", .refuse = ds_refuse,
+    .load = ds_load, .counters = ds_counters, .plan = ds_plan, .routes = deepseek_routes, .vocab = ds_vocab,
     .max_rows = ds_max_rows, .max_verify = ds_max_verify, .draft_block = ds_draft_block, .rewind = ds_rewind,
+    .prefill_rows = ds_prefill_rows,
     .stop = ds_stop, .state_new = ds_state_new, .state_free = ds_state_free, .state_bytes = ds_state_bytes,
     .state_copy = ds_state_copy, .snapshot_take = ds_snapshot_take, .snapshot_restore = ds_snapshot_restore,
     .snapshot_free = ds_snapshot_free, .snapshot_bytes = ds_snapshot_bytes, .snapshot_logits = ds_snapshot_logits,

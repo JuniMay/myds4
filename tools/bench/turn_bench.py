@@ -3,7 +3,7 @@
 Each run starts one server and sends two turns of one conversation. The first
 turn asks about a source excerpt; the second adds a long document, as a
 tool's output would, and asks about it. For each turn the script reads
-/v1/status when the first token streams (the prompt's prefill is done) and
+the model's status (GET /v1/models/{id}) when the first token streams (the prompt's prefill is done) and
 when the reply ends, so the decode figures exclude the prefill: tokens per
 second, expert-cache misses and read waits per decoded row. Runs alternate
 between the builds given; with greedy decoding their replies must match.
@@ -54,8 +54,11 @@ def call(port, key, path, body=None, timeout=10):
 
 
 def status(port, key):
-    with call(port, key, "/v1/status") as response:
-        return json.loads(response.read(1 << 20))
+    """The served model's status: GET /v1/models/{id}'s "status"."""
+    with call(port, key, "/v1/models") as response:
+        model = json.loads(response.read(1 << 20))["data"][0]["id"]
+    with call(port, key, f"/v1/models/{model}") as response:
+        return json.loads(response.read(1 << 20))["status"]
 
 
 def turn(port, key, messages, tokens, timeout):

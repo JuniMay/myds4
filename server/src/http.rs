@@ -32,7 +32,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::Sleep;
 
-use crate::{chat, engine};
+use crate::{engine, format};
 
 /// The limits on connections and requests.
 #[derive(Clone, Copy)]
@@ -107,7 +107,7 @@ fn large_head(r: &Request, limit: usize) -> Response {
     let peer = r.extensions().get::<ConnectInfo<std::net::SocketAddr>>().map(|c| c.0.ip().to_string());
     engine::log(&format!("{}: 431: a request's line and headers above {} KB", peer.unwrap_or_default(), limit >> 10));
     let message = format!("the request's line and headers are larger than {} KB", limit >> 10);
-    chat::error(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, "invalid_request_error", &message)
+    format::error(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, "invalid_request_error", &message)
 }
 
 /// The answer to a connection beyond the limit, before its request is read.
@@ -115,7 +115,7 @@ fn large_head(r: &Request, limit: usize) -> Response {
 /// head's worth, for at most 2 s): closing with it unread would reset the
 /// connection, which can discard the answer before the client reads it.
 async fn refuse(mut stream: TcpStream, limits: Limits) {
-    let body = chat::error_json("server_error", "too many connections");
+    let body = format::error_json("server_error", "too many connections");
     let head = format!(
         "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -143,8 +143,8 @@ async fn refuse(mut stream: TcpStream, limits: Limits) {
 
 /// A request's body: at most limits.body bytes, each part arriving within
 /// limits.timeout of the one before.
-pub async fn read_body(mut body: Body, limits: Limits) -> Result<Bytes, chat::Error> {
-    let large = || chat::Error {
+pub async fn read_body(mut body: Body, limits: Limits) -> Result<Bytes, format::Error> {
+    let large = || format::Error {
         status: StatusCode::PAYLOAD_TOO_LARGE,
         message: format!("the request's body is larger than {} MB", limits.body >> 20),
     };
@@ -156,11 +156,11 @@ pub async fn read_body(mut body: Body, limits: Limits) -> Result<Bytes, chat::Er
         match tokio::time::timeout(limits.timeout, body.frame()).await {
             Err(_) => {
                 let message = format!("the request's body stopped arriving for {} s", limits.timeout.as_secs());
-                return Err(chat::Error { status: StatusCode::REQUEST_TIMEOUT, message });
+                return Err(format::Error { status: StatusCode::REQUEST_TIMEOUT, message });
             }
             Ok(None) => return Ok(out.into()),
             Ok(Some(Err(_))) => {
-                return Err(chat::Error { status: StatusCode::BAD_REQUEST, message: "the request's body ended early".into() });
+                return Err(format::Error { status: StatusCode::BAD_REQUEST, message: "the request's body ended early".into() });
             }
             Ok(Some(Ok(frame))) => {
                 if let Ok(data) = frame.into_data() {

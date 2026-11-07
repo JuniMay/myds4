@@ -1,17 +1,17 @@
-//! myds4-server: the OpenAI Chat Completions API over myds4's engine, with
-//! DeepSeek's deepseek-recipe for requests, prompts and output
-//! (docs/server.md). The engine (src/engine/engine.c behind
-//! src/engine/engine.h, engine.rs) runs the model and owns the stop on SIGINT
-//! or SIGTERM; the worker (worker.rs) owns the queue, the batching and the
-//! requests' events, the KV prefix cache (kv.rs) the states kept between
-//! requests; the live view (--tui) is view.rs.
+//! myds4-server: the OpenAI Chat Completions API over myds4's engine
+//! (docs/server.md), for one model or several in one process. The engine
+//! (src/engine/engine.c behind src/engine/engine.h, engine.rs) runs the
+//! models and owns the stop on SIGINT or SIGTERM; the worker (worker.rs)
+//! owns the engine thread, every model's queue, batching and requests'
+//! events, and each model's KV prefix cache (kv.rs) the states kept between
+//! requests; each model family's chat format (format/) renders its requests
+//! and reads its replies; the live view (--tui) is view.rs.
 
-mod chat;
+mod config;
 mod engine;
+mod format;
 mod http;
 mod kv;
-mod peers;
-mod qwen;
 mod view;
 mod worker;
 
@@ -20,38 +20,48 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::process::exit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::chat::{Defaults, MODEL_ID};
+use crate::config::ModelConfig;
+use crate::format::{Family, deepseek, qwen};
 
-const USAGE: &str = "usage: myds4-server -m MODEL --serve PORT [options]
+const USAGE: &str = "usage: myds4-server (-m MODEL [model options] | --config FILE) --serve PORT [options]
   See docs/server.md.
-  -m DIR          a checkpoint directory (DeepSeek V4.1 Flash or Qwen3.8 qwen3_5); give it again to serve
-                  more models side by side, each in its own process on the next port, chosen by a
-                  request's model field (see docs/server.md)
+  -m DIR          a checkpoint directory (DeepSeek V4.1 Flash, or a Qwen3.8 qwen3_5 model), its options below
+  --config FILE   several models in one process: a JSON file {\"models\": [{\"model\": DIR, ...}]} with each
+                  model's options under the names below (without dashes, - as _); a request's model field
+                  picks its model
   --serve PORT    serve OpenAI Chat Completions at http://HOST:PORT/v1 (needs MYDS4_API_KEY or --api-key-file)
   --host ADDR     the IPv4 address to serve on (default 127.0.0.1)
   --api-key-file FILE  the API key clients must send (16 to 256 characters)
-  --kv-cache GB   bound of the KV prefix cache: attention states and snapshots kept between requests (default 8)
-  --batch N       requests decoding together at most, 1 to 6 (default 4)
   --tui           a live view in the terminal (requests, speed, experts, memory, the KV cache) instead of the
-                  log on stderr; q stops the server, and the last log lines print on exit
+                  log on stderr; q stops the server, n shows the next model, and the last log lines print on exit
   --tui-theme T   the live view's colors: auto (default: by the terminal's background, light without an
                   answer), light or dark
-  -t T, --temperature T  the temperature of requests that set none (default 1; 0 is greedy)
-  --top-p P       the top_p of requests that set none, 0 to 1 (default 1)
+  --render FILE   print the prompt of a JSON test case of DeepSeek's encoding/tests, and exit
+ a model's options:
+  --id NAME       the name requests give in model (default: deepseek-v4.1-flash, or a Qwen directory's name)
+  --kv-cache GB   bound of its KV prefix cache: attention states and snapshots kept between requests (default 8)
+  --batch N       its requests running together at most, at most its rows per pass (default 4)
+  -t T, --temperature T  the temperature of requests that set none (default: generation_config.json's, else 1)
+  --top-p P       the top_p of requests that set none, 0 to 1 (default: generation_config.json's, else 1)
+  --top-k K       the top_k of requests that set none, 0 for all (default: generation_config.json's, else 0)
   --seed N        the seed of requests that set none (default: random for each)
-  --think N       thinking effort 1-100 of requests that set none; 0 turns thinking off (default 75)
-  --ctx N         context capacity in tokens, at most 1048576 (default 1048576)
+  --think N       DeepSeek: thinking effort 1-100 of requests that set none; 0 turns thinking off (default 75)
+  --ctx N         context capacity in tokens, at most 1048576 and the model's own (default: the most)
+  --draft N       verify up to N drafts per pass, the model's own (DeepSeek's DSpark 1-5, Qwen's MTP 1)
+  --lookup off|N  verify up to N (1-15) context-copy drafts; --draft supplies fallback
+  DeepSeek only:
   --ced off|N     approximate prefill: replay N decoder tokens, 128-1048576 (default off), plus the rewind margin (8)
   --prefill-prune  skip decoder batches outside required history; CED and substitution must be off (default off)
   --cache GB      expert cache budget (default: from available memory)
@@ -60,13 +70,10 @@ const USAGE: &str = "usage: myds4-server -m MODEL --serve PORT [options]
   --cache-read-cost   weight decode eviction priority by expert read bytes
   --experts GGUF  read the routed experts from a GGUF file or set of shards
   --substitute D  approximate: replace selected experts not in memory (see build/myds4)
-  --draft N       verify up to N (1-5) DSpark drafts per pass
-  --lookup off|N  verify up to N (1-15) context-copy drafts; --draft supplies fallback
   --runahead     overlap exact concurrent requests with expert reads
   --draft-cache N  with --draft: expert slots per stage, 15-128
   --online-predictor  CPU prefetch correction learned online
   --predictor-state FILE  online learning, its state loaded and saved
-  --render FILE   print the prompt of a JSON test case of the model's encoding/tests, and exit
 ";
 
 fn usage() -> ! {
@@ -80,38 +87,12 @@ fn die(message: &str) -> ! {
     exit(1)
 }
 
-fn value<T: std::str::FromStr>(flag: &str, v: &str) -> T {
-    v.parse().unwrap_or_else(|_| die(&format!("{flag}: not a valid value: {v}")))
-}
-
-fn ced_depth(v: &str) -> Option<i32> {
-    if v == "off" { Some(0) } else { v.parse().ok().filter(|n| (128..=1 << 20).contains(n)) }
-}
-
-#[test]
-fn ced_accepts_off_or_a_bounded_replay_depth() {
-    assert_eq!(ced_depth("off"), Some(0));
-    assert_eq!(ced_depth("128"), Some(128));
-    assert_eq!(ced_depth("512"), Some(512));
-    assert_eq!(ced_depth("1048576"), Some(1048576));
-    for v in ["", "on", "0", "127", "-1", "1048577", "128.0", "128x"] {
-        assert_eq!(ced_depth(v), None, "{v}");
-    }
-}
-
 struct Args {
-    engine: engine::Config,
-    /// Every -m, in order: the first runs in this process.
-    models: Vec<String>,
-    /// -t and --top-p as given (a Qwen model's own defaults stand otherwise).
-    temperature: Option<f64>,
-    top_p: Option<f64>,
-    /// --parent PID: a process this one serves for, ending with it.
-    parent: Option<i32>,
+    /// -m and its options, or --config's models.
+    models: Vec<ModelConfig>,
     port: Option<u16>,
     host: String,
     key_file: Option<String>,
-    defaults: Defaults,
     render: Option<String>,
     tui: bool,
     tui_colors: view::Colors,
@@ -119,87 +100,40 @@ struct Args {
 
 fn parse(args: &[String]) -> Args {
     let mut a = Args {
-        engine: engine::Config { ctx: 1 << 20, kv_gb: 8.0, batch: 4, ..Default::default() },
         models: Vec::new(),
-        temperature: None,
-        top_p: None,
-        parent: None,
         port: None,
         host: "127.0.0.1".into(),
         key_file: None,
-        defaults: Defaults { temperature: 1.0, top_p: 1.0, seed: None, thinking: true, effort: 75 },
         render: None,
         tui: false,
         tui_colors: view::Colors::Auto,
     };
+    let mut one: Option<ModelConfig> = None;
+    let mut options: Vec<(String, Value)> = Vec::new(); // -m's options, in order
+    let mut file = None;
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
-        if flag == "--tui" {
-            a.tui = true;
-            i += 1;
-            continue;
-        }
-        let e = &mut a.engine;
+        let switch = |name: &str| (name.to_string(), Value::Bool(true));
         match flag {
-            "--cache-read-cost" => e.cache_read_cost = true,
-            "--runahead" => e.runahead = true,
-            "--prefill-prune" => e.prefill_prune = true,
-            "--online-predictor" => e.online_predictor = true,
+            "--tui" => a.tui = true,
+            "--cache-read-cost" | "--runahead" | "--prefill-prune" | "--online-predictor" => {
+                options.push(switch(&flag[2..].replace('-', "_")))
+            }
             _ => {
                 let Some(v) = args.get(i + 1) else { usage() };
                 i += 1;
                 match flag {
                     "-m" => {
-                        if a.models.is_empty() {
-                            e.model = v.clone();
+                        if one.is_some() {
+                            die("-m serves one model; several go in a --config file");
                         }
-                        a.models.push(v.clone());
+                        one = Some(ModelConfig::new(v));
                     }
-                    "--parent" => a.parent = Some(value(flag, v)),
-                    "--experts" => e.experts = Some(v.clone()),
-                    "--ctx" => e.ctx = value(flag, v),
-                    "--ced" => e.ced = ced_depth(v).unwrap_or_else(|| die("--ced takes off or 128 to 1048576 replay tokens")),
-                    "--cache" => e.cache_gb = value(flag, v),
-                    "--reserve" => e.reserve_gb = value(flag, v),
-                    "--cache-half-life" => e.cache_half_life = value(flag, v),
-                    "--substitute" => e.substitute = value(flag, v),
-                    "--draft" => e.draft = value(flag, v),
-                    "--lookup" => e.lookup = if v == "off" { 0 } else { value(flag, v) },
-                    "--draft-cache" => e.draft_cache = value(flag, v),
-                    "--predictor-state" => {
-                        if v.is_empty() {
-                            die("--predictor-state needs a nonempty path");
-                        }
-                        e.predictor_state = Some(v.clone());
-                    }
-                    "--kv-cache" => e.kv_gb = value(flag, v),
-                    "--batch" => e.batch = value(flag, v),
-                    "--serve" => a.port = Some(value(flag, v)),
+                    "--config" => file = Some(v.clone()),
+                    "--serve" => a.port = Some(v.parse().unwrap_or_else(|_| die(&format!("--serve: not a port: {v}")))),
                     "--host" => a.host = v.clone(),
                     "--api-key-file" => a.key_file = Some(v.clone()),
-                    "-t" | "--temperature" => {
-                        let t: f64 = value(flag, v);
-                        if !t.is_finite() || t < 0.0 {
-                            die("temperature must be finite and in [0, infinity)");
-                        }
-                        a.defaults.temperature = t;
-                        a.temperature = Some(t);
-                    }
-                    "--top-p" => {
-                        let p: f64 = value(flag, v);
-                        if !(0.0..=1.0).contains(&p) {
-                            die("top-p must be finite and in [0, 1]");
-                        }
-                        a.defaults.top_p = p;
-                        a.top_p = Some(p);
-                    }
-                    "--seed" => a.defaults.seed = Some(v.parse().unwrap_or_else(|_| die("--seed needs a nonnegative integer"))),
-                    "--think" => {
-                        let n: u32 = v.parse().ok().filter(|n| *n <= 100).unwrap_or_else(|| die("--think takes 0 (off) or 1 to 100"));
-                        a.defaults.thinking = n > 0;
-                        a.defaults.effort = if n > 0 { n } else { 75 };
-                    }
                     "--render" => a.render = Some(v.clone()),
                     "--tui-theme" => {
                         a.tui_colors = match v.as_str() {
@@ -209,87 +143,98 @@ fn parse(args: &[String]) -> Args {
                             _ => die("--tui-theme takes auto, light or dark"),
                         }
                     }
-                    _ => usage(),
+                    _ => {
+                        let name = match flag {
+                            "-t" => "temperature".to_string(),
+                            f if f.starts_with("--") => f[2..].replace('-', "_"),
+                            _ => usage(),
+                        };
+                        // numbers as numbers, the rest (off, paths, names) as text
+                        let value = serde_json::from_str::<Value>(v).ok().filter(Value::is_number).unwrap_or(Value::String(v.clone()));
+                        options.push((name, value));
+                    }
                 }
             }
         }
         i += 1;
     }
+    match (one, file) {
+        (Some(_), Some(_)) => die("-m and --config: give one model with -m, or several in the file"),
+        (Some(mut m), None) => {
+            for (name, v) in &options {
+                m.set(name, v).unwrap_or_else(|e| die(&format!("--{}: {e}", name.replace('_', "-"))));
+            }
+            a.models.push(m);
+        }
+        (None, Some(f)) => {
+            if let Some((name, _)) = options.first() {
+                die(&format!("--{}: with --config, each model's options are in the file", name.replace('_', "-")));
+            }
+            a.models = config::read(&f).unwrap_or_else(|e| die(&e));
+        }
+        (None, None) => {}
+    }
     a
 }
 
 #[test]
-fn prefill_and_draft_options_keep_the_sampling_defaults() {
-    let defaults = parse(&[]);
-    assert!(!defaults.engine.prefill_prune);
-    assert_eq!(defaults.engine.ced, 0);
-    assert_eq!(defaults.engine.lookup, 0);
-    let args = ["--prefill-prune", "--lookup", "15", "--draft", "2"];
-    let enabled = parse(&args.map(String::from));
-    assert!(enabled.engine.prefill_prune);
-    assert_eq!(enabled.engine.ced, 0);
-    assert_eq!(enabled.engine.lookup, 15);
-    assert_eq!(enabled.engine.draft, 2);
-    assert_eq!(enabled.defaults.temperature, 1.0);
-    assert_eq!(enabled.defaults.top_p, 1.0);
+fn one_model_takes_its_options_from_the_command_line() {
+    let a = parse(&["-m", "/m/d", "--prefill-prune", "--lookup", "15", "--draft", "2", "--ced", "off", "--serve", "8008", "--tui"].map(String::from));
+    let m = &a.models[0];
+    assert!(m.engine.prefill_prune);
+    assert_eq!((m.engine.lookup, m.engine.draft, m.engine.ced), (15, 2, 0));
+    assert_eq!((m.temperature, m.top_p, m.kv_gb, m.batch), (None, None, 8.0, 4));
+    assert_eq!((a.port, a.tui), (Some(8008), true));
+    let a = parse(&["-m", "/m/q", "-t", "0.6", "--top-k", "20", "--id", "qwen", "--kv-cache", "4"].map(String::from));
+    let m = &a.models[0];
+    assert_eq!((m.temperature, m.top_k, m.id.as_deref(), m.kv_gb), (Some(0.6), Some(20), Some("qwen"), 4.0));
 }
 
-#[test]
-fn runahead_is_explicit_and_preserves_sampling_defaults() {
-    assert!(!parse(&[]).engine.runahead);
-    let a = parse(&["--runahead".into(), "--batch".into(), "4".into()]);
-    assert!(a.engine.runahead);
-    assert_eq!(a.engine.batch, 4);
-    assert_eq!((a.defaults.temperature, a.defaults.top_p), (1.0, 1.0));
-    assert_eq!(a.engine.draft, 0);
-    assert_eq!(a.engine.substitute, 0.0);
+/// A served model: its name, its family's chat format and its settings.
+struct Served {
+    id: String,
+    name: String,
+    ctx: usize,
+    tokenizer: engine::Tokenizer,
+    format: Format,
+}
+
+enum Format {
+    DeepSeek(deepseek::Defaults),
+    Qwen(qwen::Settings),
 }
 
 /// What the handlers share.
 struct Shared {
-    key: [u8; 32],  // the API key's SHA-256
-    raw_key: String, // for the peers' servers
-    defaults: Defaults,
-    ctx: i64,
+    key: [u8; 32], // the API key's SHA-256
     started: u64,
     arrivals: AtomicU64,
-    /// This process's model: DeepSeek's, or a Qwen model's.
-    qwen: bool,
-    id: String,
-    /// The models other processes serve (peers.rs).
-    peers: Vec<peers::Peer>,
+    models: Vec<Served>,
 }
 
-/// Where a request goes: this process's model, or a peer's (its index).
-enum Route {
-    Local,
-    Peer(usize),
-}
-
-/// The model a request names: this process's when it names none, or names
-/// an unknown model while no other is served; an error when it names an
-/// unknown one among several.
-fn route(s: &Shared, body: &[u8]) -> Result<Route, Response> {
+/// The model a request names (by name, in any case): the only model when it
+/// names none, or names an unknown one while one model is served; an error
+/// when it names an unknown one among several.
+fn route(s: &Shared, body: &[u8]) -> Result<usize, Response> {
     #[derive(serde::Deserialize)]
     struct Named {
         model: Option<String>,
     }
-    let Some(name) = serde_json::from_slice::<Named>(body).ok().and_then(|n| n.model) else { return Ok(Route::Local) };
-    if name.eq_ignore_ascii_case(&s.id) {
-        return Ok(Route::Local);
+    let name = serde_json::from_slice::<Named>(body).ok().and_then(|n| n.model);
+    if let Some(name) = &name
+        && let Some(i) = s.models.iter().position(|m| name.eq_ignore_ascii_case(&m.id))
+    {
+        return Ok(i);
     }
-    if let Some(i) = s.peers.iter().position(|p| name.eq_ignore_ascii_case(&p.id)) {
-        return Ok(Route::Peer(i));
+    if s.models.len() == 1 {
+        return Ok(0);
     }
-    if s.peers.is_empty() {
-        return Ok(Route::Local);
-    }
-    let known: Vec<&str> = std::iter::once(s.id.as_str()).chain(s.peers.iter().map(|p| p.id.as_str())).collect();
-    Err(chat::error(
-        StatusCode::NOT_FOUND,
-        "invalid_request_error",
-        &format!("no model {name:?} here; the models are {}", known.join(", ")),
-    ))
+    let known: Vec<&str> = s.models.iter().map(|m| m.id.as_str()).collect();
+    let message = match name {
+        Some(name) => format!("no model {name:?} here; the models are {}", known.join(", ")),
+        None => format!("the request names no model; the models are {}", known.join(", ")),
+    };
+    Err(format::error(StatusCode::NOT_FOUND, "invalid_request_error", &message))
 }
 
 type App = State<Arc<Shared>>;
@@ -319,7 +264,7 @@ async fn authorize(State(s): App, ConnectInfo(peer): ConnectInfo<SocketAddr>, re
         request.uri().path(),
         if key.is_some() { "a wrong API key" } else { "no API key" }
     ));
-    chat::error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required (Authorization: Bearer KEY)")
+    format::error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required (Authorization: Bearer KEY)")
 }
 
 fn json(body: String) -> Response {
@@ -330,33 +275,49 @@ async fn health() -> Response {
     json(r#"{"status": "ok"}"#.into())
 }
 
-async fn models(State(s): App) -> Response {
-    let entry = |id: &str, name: &str, ctx: i64| {
-        serde_json::json!({
-            "id": id, "object": "model", "created": s.started, "owned_by": "myds4",
-            "name": name, "context_length": ctx, "max_model_len": ctx,
-            "max_output_tokens": ctx.min(chat::DEFAULT_MAX_TOKENS),
-        })
-    };
-    let local = if s.qwen { format!("{} (myds4)", s.id) } else { "DeepSeek V4.1 Flash (myds4)".into() };
-    let mut data = vec![entry(&s.id, &local, s.ctx)];
-    data.extend(s.peers.iter().map(|p| entry(&p.id, &p.name, p.ctx)));
-    json(serde_json::json!({"object": "list", "data": data}).to_string())
+/// A model's object as GET /v1/models lists it: OpenAI's fields, and the
+/// context's length as servers commonly add it.
+fn model_object(s: &Shared, m: &Served) -> Value {
+    json!({
+        "id": m.id, "object": "model", "created": s.started, "owned_by": "myds4",
+        "name": m.name, "context_length": m.ctx, "max_model_len": m.ctx,
+        "max_output_tokens": (m.ctx as i64).min(format::DEFAULT_MAX_TOKENS),
+    })
 }
 
-async fn status(State(s): App) -> Response {
-    if s.qwen { json(serde_json::json!({"model": s.id}).to_string()) } else { json(worker::status()) }
+async fn models(State(s): App) -> Response {
+    let data: Vec<Value> = s.models.iter().map(|m| model_object(&s, m)).collect();
+    json(json!({"object": "list", "data": data}).to_string())
+}
+
+/// GET /v1/models/{id}: the model's object, and its live status under
+/// "status" (what it is doing, its requests, KV prefix cache, counters,
+/// expert cache and the process's memory).
+async fn model(State(s): App, Path(id): Path<String>) -> Response {
+    let Some(i) = s.models.iter().position(|m| id.eq_ignore_ascii_case(&m.id)) else {
+        return format::error(StatusCode::NOT_FOUND, "invalid_request_error", &format!("no model {id:?} here"));
+    };
+    let mut v = model_object(&s, &s.models[i]);
+    v["status"] = worker::status(i);
+    json(v.to_string())
 }
 
 /// An error answered before the response starts, and its line in the log.
-fn refused(peer: &str, e: chat::Error) -> Response {
+fn refused(peer: &str, e: format::Error) -> Response {
     engine::log(&format!("{peer}: {}: {}", e.status.as_u16(), e.message));
     let kind = match e.status {
         StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
         StatusCode::BAD_REQUEST | StatusCode::REQUEST_TIMEOUT | StatusCode::PAYLOAD_TOO_LARGE => "invalid_request_error",
         _ => "server_error",
     };
-    chat::error(e.status, kind, &e.message)
+    format::error(e.status, kind, &e.message)
+}
+
+fn submitted(r: worker::Request) -> Result<(worker::Cancel, tokio::sync::mpsc::UnboundedReceiver<worker::Event>), format::Error> {
+    worker::submit(r).map_err(|e| match e {
+        worker::SubmitError::Busy(m) => format::Error { status: StatusCode::TOO_MANY_REQUESTS, message: m },
+        worker::SubmitError::Invalid(m) => format::Error { status: StatusCode::BAD_REQUEST, message: m },
+    })
 }
 
 async fn completions(State(s): App, ConnectInfo(peer): ConnectInfo<SocketAddr>, body: Body) -> Response {
@@ -367,90 +328,71 @@ async fn completions(State(s): App, ConnectInfo(peer): ConnectInfo<SocketAddr>, 
     };
     let arrival = s.arrivals.fetch_add(1, Ordering::Relaxed) + 1;
     engine::log(&format!("http {arrival}: arrived from {peer}, {} body bytes", body.len()));
-    match route(&s, &body) {
+    let i = match route(&s, &body) {
+        Ok(i) => i,
         Err(response) => return response,
-        Ok(Route::Peer(i)) => {
-            engine::log(&format!("http {arrival}: to {}", s.peers[i].id));
-            return peers::forward(&s.peers[i], "POST", "/v1/chat/completions", &s.raw_key, body.into()).await;
+    };
+    // Rendering and tokenization take a while for long prompts.
+    let (from, shared) = (peer.clone(), s.clone());
+    let queued = tokio::task::spawn_blocking(move || match &shared.models[i].format {
+        Format::DeepSeek(d) => {
+            let p = deepseek::prepare(&body, d, shared.models[i].tokenizer)?;
+            let note = format!(
+                "http {arrival} from {from}: {} messages, {} tools, {}; {}",
+                p.messages,
+                p.tools,
+                if p.stream { "streamed" } else { "one response" },
+                p.thinking()
+            );
+            let (cancel, rx) = submitted(p.engine_request(i, note)?)?;
+            Ok::<_, format::Error>((Prepared::DeepSeek(p), cancel, rx))
         }
-        Ok(Route::Local) => {}
-    }
-    if s.qwen {
-        return qwen_completions(arrival, peer, body.to_vec()).await;
-    }
-    let defaults = s.defaults.clone();
-    // Rendering and the engine's tokenization take a while for long prompts.
-    let from = peer.clone();
-    let queued = tokio::task::spawn_blocking(move || {
-        let p = chat::prepare(&body, &defaults)?;
-        let note = format!(
-            "http {arrival} from {from}: {} messages, {} tools, {}; {}",
-            p.messages,
-            p.tools,
-            if p.stream { "streamed" } else { "one response" },
-            p.thinking()
-        );
-        match worker::submit(&p.engine_request(&note)) {
-            Ok((cancel, rx)) => Ok((p, cancel, rx)),
-            Err(worker::SubmitError::Busy(m)) => Err(chat::Error { status: StatusCode::TOO_MANY_REQUESTS, message: m }),
-            Err(worker::SubmitError::Invalid(m)) => Err(chat::Error { status: StatusCode::BAD_REQUEST, message: m }),
+        Format::Qwen(q) => {
+            let mut p = qwen::prepare(&body, &format!("http {arrival} from {from}"), q, i)?;
+            let request = std::mem::replace(
+                &mut p.request,
+                worker::Request { model: i, prompt: Vec::new(), images: Vec::new(), sampling: q.sampling, max_tokens: 0, note: String::new() },
+            );
+            let (cancel, rx) = submitted(request)?;
+            Ok((Prepared::Qwen(p), cancel, rx))
         }
     })
     .await;
-    let (p, cancel, rx) = match queued {
-        Ok(Ok(queued)) => queued,
-        Ok(Err(e)) => return refused(&peer, e),
-        Err(e) => return chat::error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", &e.to_string()),
-    };
-    if p.stream { chat::stream(p, cancel, rx) } else { chat::whole(p, cancel, rx).await }
-}
-
-/// A request for this process's Qwen model.
-async fn qwen_completions(arrival: u64, peer: String, body: Vec<u8>) -> Response {
-    let from = peer.clone();
-    let queued = tokio::task::spawn_blocking(move || {
-        let p = qwen::prepare(&body, &format!("http {arrival} from {from}"))?;
-        let (p, request) = split(p);
-        match qwen::worker::submit(request) {
-            Ok((cancel, rx)) => Ok((p, cancel, rx)),
-            Err(qwen::worker::SubmitError::Busy(m)) => Err(chat::Error { status: StatusCode::TOO_MANY_REQUESTS, message: m }),
-            Err(qwen::worker::SubmitError::Invalid(m)) => Err(chat::Error { status: StatusCode::BAD_REQUEST, message: m }),
+    match queued {
+        Ok(Ok((Prepared::DeepSeek(p), cancel, rx))) => {
+            if p.stream { deepseek::stream(p, cancel, rx) } else { deepseek::whole(p, cancel, rx).await }
         }
-    })
-    .await;
-    let (p, cancel, rx) = match queued {
-        Ok(Ok(queued)) => queued,
-        Ok(Err(e)) => return refused(&peer, e),
-        Err(e) => return chat::error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", &e.to_string()),
-    };
-    if p.stream { qwen::stream(p, cancel, rx) } else { qwen::whole(p, cancel, rx).await }
+        Ok(Ok((Prepared::Qwen(p), cancel, rx))) => {
+            if p.stream { qwen::stream(p, cancel, rx) } else { qwen::whole(p, cancel, rx).await }
+        }
+        Ok(Err(e)) => refused(&peer, e),
+        Err(e) => format::error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", &e.to_string()),
+    }
 }
 
-/// The prepared request's worker part, and the rest for its response.
-fn split(mut p: qwen::Prepared) -> (qwen::Prepared, qwen::worker::Request) {
-    let empty = qwen::worker::Request { prompt: Vec::new(), max_tokens: 0, sampling: p.request.sampling, note: String::new() };
-    let request = std::mem::replace(&mut p.request, empty);
-    (p, request)
+enum Prepared {
+    DeepSeek(deepseek::Prepared),
+    Qwen(qwen::Prepared),
 }
 
 async fn not_found() -> Response {
-    chat::error(StatusCode::NOT_FOUND, "invalid_request_error", "no such endpoint")
+    format::error(StatusCode::NOT_FOUND, "invalid_request_error", "no such endpoint")
 }
 
 async fn use_get() -> Response {
-    chat::error(StatusCode::METHOD_NOT_ALLOWED, "invalid_request_error", "use GET")
+    format::error(StatusCode::METHOD_NOT_ALLOWED, "invalid_request_error", "use GET")
 }
 
 async fn use_post() -> Response {
-    chat::error(StatusCode::METHOD_NOT_ALLOWED, "invalid_request_error", "use POST")
+    format::error(StatusCode::METHOD_NOT_ALLOWED, "invalid_request_error", "use POST")
 }
 
 fn main() {
     let a = parse(&std::env::args().skip(1).collect::<Vec<_>>());
     if let Some(file) = &a.render {
-        exit(chat::render_file(file));
+        exit(deepseek::render_file(file));
     }
-    let (Some(port), false) = (a.port, a.engine.model.is_empty()) else { usage() };
+    let (Some(port), false) = (a.port, a.models.is_empty()) else { usage() };
     let key = match &a.key_file {
         Some(f) => std::fs::read_to_string(f).unwrap_or_else(|_| die(&format!("cannot open {f}"))),
         None => std::env::var("MYDS4_API_KEY").unwrap_or_default(),
@@ -464,117 +406,91 @@ fn main() {
     } else {
         a.host.parse().unwrap_or_else(|_| die(&format!("--host takes an IPv4 address: {}", a.host)))
     };
-    // The port is taken before the model loads, so that a busy port fails at once.
+    // The port is taken before the models load, so that a busy port fails at once.
     let listener = std::net::TcpListener::bind((host, port))
         .unwrap_or_else(|e| die(&format!("cannot listen on {host}:{port}: {e}")));
     listener.set_nonblocking(true).unwrap_or_else(|e| die(&format!("cannot configure the listening socket: {e}")));
 
-    // The other models' servers load beside this one's model.
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut peer_list = Vec::new();
-    for (i, dir) in a.models.iter().enumerate().skip(1) {
-        let peer_port = port.checked_add(i as u16).unwrap_or_else(|| die("no port left for another model"));
-        let (id, name, ctx) = if qwen::is_qwen(dir) {
-            let id = qwen::model_id(dir);
-            (id.clone(), format!("{id} (myds4)"), qwen::context(dir, a.engine.ctx as usize) as i64)
-        } else {
-            (MODEL_ID.to_string(), "DeepSeek V4.1 Flash (myds4)".to_string(), a.engine.ctx as i64)
-        };
-        if let Err(e) = peers::spawn(&args, dir, &id, peer_port, key) {
-            die(&e);
+    // Each model's family, name and context.
+    let mut served = Vec::new();
+    let mut families = Vec::new();
+    for m in &a.models {
+        let dir = &m.engine.model;
+        let family = Family::of(dir).unwrap_or_else(|e| die(&e));
+        let mut e = m.engine.clone();
+        let id = m.id.clone().unwrap_or_else(|| match family {
+            Family::DeepSeek => deepseek::MODEL_ID.into(),
+            Family::Qwen => qwen::model_id(dir),
+        });
+        if family == Family::Qwen {
+            e.ctx = qwen::context(dir, e.ctx as usize) as i32;
         }
-        engine::log(&format!("{id}: its own server at 127.0.0.1:{peer_port}, for requests that name it"));
-        peer_list.push(peers::Peer { id, name, port: peer_port, ctx });
+        if served.iter().any(|s: &worker::Served| s.id.eq_ignore_ascii_case(&id)) {
+            die(&format!("two models named {id}: give one an id"));
+        }
+        served.push(worker::Served { id, engine: e, batch: m.batch, kv_gb: m.kv_gb });
+        families.push(family);
     }
-
-    let mut config = a.engine;
-    let is_qwen = qwen::is_qwen(&config.model);
     // The live view takes the log from the start; until it is on the screen,
     // the lines go to stderr as well.
-    let tui = a.tui && std::io::stderr().is_terminal() && !is_qwen;
-    if tui {
-        config.on_log = Some(view::on_log);
-        config.on_die = Some(view::on_die);
+    let tui = a.tui && std::io::stderr().is_terminal();
+    let (on_log, on_die): (Option<extern "C" fn(*const std::ffi::c_char)>, Option<extern "C" fn()>) =
+        if tui { (Some(view::on_log), Some(view::on_die)) } else { (None, None) };
+    if !worker::start(served.clone(), on_log, on_die) {
+        exit(2);
     }
-    let (id, ctx) = if is_qwen {
-        let ctx = qwen::context(&config.model, config.ctx as usize);
-        let model = qwen::load(&config.model, ctx, a.temperature, a.top_p).unwrap_or_else(|e| die(&e));
-        let q = qwen::worker::Config {
-            dir: config.model.clone(),
-            batch: config.batch.max(1) as usize,
-            kv_bytes: (config.kv_gb * (1u64 << 30) as f64) as u64,
-            ctx,
+    let loaded = worker::models();
+    let mut served_models = Vec::new();
+    for ((m, s), family) in a.models.iter().zip(&served).zip(&families) {
+        let (ctx, id) = (s.engine.ctx as usize, s.id.clone());
+        let format = match family {
+            Family::DeepSeek => Format::DeepSeek(deepseek::Defaults {
+                id: id.clone(),
+                temperature: m.temperature.unwrap_or(1.0),
+                top_p: m.top_p.unwrap_or(1.0),
+                seed: m.seed,
+                thinking: m.think != Some(0),
+                effort: m.think.filter(|&n| n > 0).unwrap_or(75),
+            }),
+            Family::Qwen => {
+                let mut sampling = qwen::sampling(&s.engine.model, m.temperature, m.top_p, m.top_k);
+                sampling.seed = m.seed;
+                let i = served_models.len();
+                Format::Qwen(qwen::Settings { id: id.clone(), ctx, tokenizer: loaded[i].1.tokenizer(), sampling })
+            }
         };
-        if !qwen::worker::start(&q) {
-            exit(2);
-        }
-        if a.tui {
-            engine::log("--tui: the live view shows DeepSeek's engine; the log stays on stderr");
-        }
-        (model.id.clone(), ctx)
-    } else {
-        if !worker::start(&config) {
-            exit(2);
-        }
-        (MODEL_ID.to_string(), config.ctx as usize)
-    };
-    let mut title = format!(
-        "myds4 · {host}:{port} · {MODEL_ID} · {} experts",
-        if config.experts.is_some() { "GGUF" } else { "MXFP4" }
-    );
-    if config.substitute > 0.0 {
-        title += &format!(" · --substitute {}", config.substitute);
+        let name = match family {
+            Family::DeepSeek => "DeepSeek V4.1 Flash (myds4)".to_string(),
+            Family::Qwen => format!("{id} (myds4)"),
+        };
+        engine::log(&format!(
+            "serving {id} at http://{host}:{port}/v1 (context {ctx} tokens{}{})",
+            if s.engine.experts.is_some() { ", GGUF experts" } else { "" },
+            if loaded[served_models.len()].1.draft_block() > 0 { ", drafts" } else { "" }
+        ));
+        served_models.push(Served { id, name, ctx, tokenizer: loaded[served_models.len()].1.tokenizer(), format });
     }
-    if config.draft > 0 {
-        title += &format!(" · --draft {}", config.draft);
-    }
-    for p in &peer_list {
-        title += &format!(" · {}", p.id);
-    }
+    let title = format!("myds4 · {host}:{port} · {}", served_models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>().join(" · "));
     let live = if tui { view::start(title, a.tui_colors) } else { None };
-    if a.tui && !is_qwen && live.is_none() {
+    if a.tui && live.is_none() {
         engine::log("--tui: stderr is not a terminal; the log stays on stderr");
     }
     if !host.is_loopback() {
         engine::log(&format!("warning: plain HTTP on {host}: keys and conversations cross the network unencrypted"));
     }
-    if is_qwen {
-        engine::log(&format!("serving {id} at http://{host}:{port}/v1 (context {ctx} tokens; Qwen3.8 engine)"));
-    } else {
-        engine::log(&format!(
-            "serving {MODEL_ID} at http://{host}:{port}/v1 (context {} tokens{}{}; Rust server on deepseek-recipe)",
-            config.ctx,
-            if config.experts.is_some() { ", GGUF experts" } else { "" },
-            if config.draft > 0 { ", drafts" } else { "" }
-        ));
-        let d = &a.defaults;
-        engine::log(&format!(
-            "request defaults: temperature {}, top_p {}, thinking {}, effort {}, max_tokens {}",
-            d.temperature,
-            d.top_p,
-            if d.thinking { "on" } else { "off" },
-            d.effort,
-            chat::DEFAULT_MAX_TOKENS.min(config.ctx as i64)
-        ));
-    }
     let shared = Arc::new(Shared {
         key: Sha256::digest(key.as_bytes()).into(),
-        raw_key: key.to_string(),
-        defaults: a.defaults.clone(),
-        ctx: ctx as i64,
         started: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |t| t.as_secs()),
         arrivals: AtomicU64::new(0),
-        qwen: is_qwen,
-        id,
-        peers: peer_list,
+        models: served_models,
     });
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/health", get(health))
         .route("/v1/models", get(models).fallback(use_get))
         .route("/models", get(models).fallback(use_get))
-        .route("/v1/status", get(status).fallback(use_get))
-        .route("/status", get(status).fallback(use_get))
+        .route("/v1/models/{id}", get(model).fallback(use_get))
+        .route("/models/{id}", get(model).fallback(use_get))
         .route("/v1/chat/completions", post(completions).fallback(use_post))
         .route("/chat/completions", post(completions).fallback(use_post))
         .fallback(not_found)
@@ -590,22 +506,14 @@ fn main() {
         // The engine owns the stop (SIGINT, SIGTERM, the live view's q through
         // request_stop): the server stops accepting, and the engine ends every
         // open response.
-        // A peer's server ends with the server it serves for.
-        let parent = a.parent;
         let stopped = async move {
-            while !engine::stopping() && parent.is_none_or(peers::alive) {
-                tokio::time::sleep(Duration::from_millis(250)).await;
+            while !engine::stopping() {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
-            peers::signal(); // the streams forwarded from them end with them
         };
         http::serve(listener, app, stopped, http::LIMITS).await;
     });
-    if is_qwen {
-        qwen::worker::stop();
-    } else {
-        worker::stop();
-    }
-    peers::stop();
+    worker::stop();
     if let Some(live) = live {
         live.finish();
     }

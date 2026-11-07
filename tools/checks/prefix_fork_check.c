@@ -33,6 +33,7 @@
 #include <math.h>
 
 #include "../../src/model/deepseek.c"
+static Tokenizer *tk;  // the checkpoint's tokenizer
 
 // How much further from the cold prefill a replay over decoded rows may be
 // than the conversation continued at the fork, in dB per kind of tensor; and
@@ -224,7 +225,7 @@ static int *read_text(const char *path, int rendered, int *count) {
   t[size] = 0;
   fclose(f);
   int *p = xmalloc(((size_t)size + 2) * sizeof *p);
-  *count = rendered ? tok_encode_chat(t, p, (int)size + 2) : tok_encode(t, p, (int)size + 2);
+  *count = rendered ? tok_encode_chat(tk, t, p, (int)size + 2) : tok_encode(tk, t, p, (int)size + 2);
   free(t);
   return p;
 }
@@ -470,7 +471,7 @@ static void build(const int *prompt, int n) {
       "\n\nTool result:\n$ make -s server-check\ntest result: ok. 23 passed; 0 failed\n$ git status --short\n"
       " M src/model/deepseek.c\n M src/engine/myds4.h\n?? tools/checks/prefix_fork_check.c\n"
       "The build is clean. Summarize what changed and what is left to check, in two sentences.\n";
-  int extra[1024], ne = tok_encode(result, extra, 1024);
+  int extra[1024], ne = tok_encode(tk, result, extra, 1024);
   conv = xmalloc((size_t)(n + REPLY1 + ne + REPLY2) * sizeof *conv);
   memcpy(conv, prompt, (size_t)n * sizeof *conv);
   source = deepseek_state_new();
@@ -687,7 +688,7 @@ static int suffix_len;       // --suffix N: the first N tokens of the suffix onl
 
 // The forks' divergent suffix: a fixed question, or its first --suffix tokens.
 static int fork_suffix(int *suffix, int max) {
-  int ns = tok_encode(" Ignore the rest and answer in five words: what is this about?", suffix, max);
+  int ns = tok_encode(tk, " Ignore the rest and answer in five words: what is this about?", suffix, max);
   return suffix_len > 0 && suffix_len < ns ? suffix_len : ns;
 }
 
@@ -740,7 +741,7 @@ int main(int argc, char **argv) {
     else die("invalid check argument: %s", argv[i]);
   }
   if (!text || !mode) die("--text FILE and --measure or --fork is required");
-  tok_load(argv[1]);
+  tk = tok_open(argv[1], deepseek_ops.image_token);
   int count, *tokens = read_text(text, rendered, &count);
   if (limit > 0 && count > limit) count = limit;
   deepseek_load(argv[1], &o);

@@ -13,10 +13,34 @@
 typedef struct ModelState ModelState;        // one sequence: a family's own state
 typedef struct ModelSnapshot ModelSnapshot;  // a state's rolling part at one position
 
+// A model's counters since it loaded, for the server's status. The expert
+// cache's (io.c) belong to a model with routed experts (experts_per_row > 0).
+typedef struct {
+  uint64_t decode_rows, prefill_rows;  // rows of decoding and prompt passes
+  double decode_seconds, decode_gpu_seconds;
+  int prefill_layer, prefill_rows_now;  // the prompt pass running: its layer (0: none) and rows
+  int layers, experts_per_row;          // 0 without routed experts
+  uint64_t dense_bytes;                 // the weights always resident
+  CacheStats decode, prefill;           // the expert cache's, of decoded rows and of prompt rows
+} ModelCounters;
+
+// The last prefill's plan: its chunks, the rows it ran (from its first row),
+// the rows its later layers ran, and whether approximate or pruned prefill
+// applied (DeepSeek's CED and dependency pruning).
+typedef struct {
+  int chunks, tokens, decoder_tokens, ced_applied, prune_applied, prefix_tokens;
+} ModelPlan;
+
 typedef struct {
   const char *family;             // the family's name, for the log
   const char *const *model_types; // config.json model_type values it runs; null-terminated
+  const char *image_token;        // the spelling of its image token (IMAGE_MARK's), or null
+  // Why the options do not suit the family (an option it has no use for), or
+  // null; before load.
+  const char *(*refuse)(const Options *o);
   void (*load)(const char *dir, const Options *o);
+  void (*counters)(ModelCounters *c);
+  void (*plan)(ModelPlan *p);  // the last prefill's, when the family plans its own; or null
   // Limits after loading: the vocabulary; rows of different states one
   // decoding pass takes; rows one verify pass takes (the token and its
   // drafts); the drafts per pass the model makes itself (Options.draft, at
@@ -28,6 +52,11 @@ typedef struct {
   int (*draft_block)(void);
   int (*rewind)(void);
   int (*stop)(int token);  // whether a sampled token ends a reply
+  // The most rows one prefill call should take, so that other requests'
+  // decoding passes can run between a long prompt's calls (each call from
+  // where the last ended); 0: the whole prompt in one call (a family that
+  // plans its prefill over the whole prompt).
+  int (*prefill_rows)(void);
 
   ModelState *(*state_new)(void);
   void (*state_free)(ModelState *s);
@@ -78,6 +107,9 @@ typedef struct {
   // feature rows, and the images that the next prefill's image positions take.
   void (*image)(Image *im);
   void (*images)(const Image *im, int n);
+  // The experts row `row` of the latest decoding pass chose and where each
+  // was (myds4_routes); null without routed experts.
+  int (*routes)(int row, uint16_t *id, uint8_t *from);
   // One user turn in the model's chat template, for the CLI: `images` image
   // places, then the prompt, with thinking at effort `think` (1 to 100) or
   // off (0). Null when the CLI cannot render this model's chat.

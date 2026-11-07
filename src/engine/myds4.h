@@ -67,6 +67,7 @@ void shutdown_request(void); // a stop, as SIGINT and SIGTERM request one
 typedef struct {
   double temp, top_p;
   unsigned short seed[3];
+  int top_k;  // 0: every token
 } Sampler;
 int sampler_valid(const Sampler *s);
 void sampler_seed(Sampler *s, uint64_t seed);
@@ -281,23 +282,28 @@ extern int expert_spans[CACHE_LAYERS];  // spans per expert of the layer, 0: not
 typedef struct { uint64_t p[3]; float weight, pad; } ExpertRef;
 static_assert(sizeof(ExpertRef) == 32, "Metal expert record layout");
 
-// ---- tok.c ----
-void tok_load(const char *dir);
-int tok_encode(const char *text, int *out, int max);
-// A rendered chat prompt: IMAGE_MARK, an image part's place, becomes the
-// image token, and the placeholder's text <｜deepseek_image｜> (in a file a
-// tool read, say) is text.
-int tok_encode_chat(const char *text, int *out, int max);
+// ---- tok.c: a checkpoint's tokenizer, one per model; any thread ----
+typedef struct Tokenizer Tokenizer;
+// The tokenizer of dir/tokenizer.json, with `image` (or null) the spelling of
+// the model's image token; a pipeline it does not run ends the process.
+Tokenizer *tok_open(const char *dir, const char *image);
+int tok_vocab(const Tokenizer *t);  // its highest id plus one
+// The ids of len bytes of text (NUL bytes included), at most max of them:
+// TOK_TEXT, text alone, without the added tokens' spellings (a message's
+// text); TOK_ADDED, text in which the added tokens' spellings are those
+// tokens; TOK_PROMPT, a rendered chat prompt: as TOK_ADDED, and IMAGE_MARK,
+// an image part's place, becomes the image token, whose own spelling (in a
+// file a tool read, say) is text. The three below take a C string.
+enum { TOK_TEXT, TOK_ADDED, TOK_PROMPT };
+int tok_encode_bytes(Tokenizer *t, const char *text, size_t len, int mode, int *out, int max);
+int tok_encode_text(Tokenizer *t, const char *text, int *out, int max);
+int tok_encode(Tokenizer *t, const char *text, int *out, int max);
+int tok_encode_chat(Tokenizer *t, const char *text, int *out, int max);
 #define IMAGE_MARK "\xff"  // no valid UTF-8 text holds this byte
-const char *tok_piece(int id, int *len);
-int tok_added(int id);  // one of tokenizer.json's added tokens (the special tokens among them)
-int tok_find(const char *special);              // its id; a spelling that is none ends the process
-int tok_special(const char *text, size_t len);  // the id of an added token's spelling, -1 for none
-// Engram hashing (data/engram.bin): multipliers [2][4], primes [2][3][8],
-// offsets [2][24], the compressed pad id and token map.
-extern const int32_t *engram_map;
-extern const int64_t *engram_mult, *engram_primes, *engram_offsets;
-int engram_pad(void);
+const char *tok_piece(const Tokenizer *t, int id, int *len);
+int tok_added(const Tokenizer *t, int id);  // one of tokenizer.json's added tokens: 2 a special one, 1 another; 0
+int tok_find(const Tokenizer *t, const char *special);              // its id; a spelling that is none ends the process
+int tok_special(const Tokenizer *t, const char *text, size_t len);  // the id of an added token's spelling, -1 for none
 
 // ---- vision.c: images for the vision encoder (inference/image_processor.py) ----
 #define IMAGE_TOKEN 129264  // <｜deepseek_image｜>

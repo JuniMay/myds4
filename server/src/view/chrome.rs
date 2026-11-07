@@ -74,6 +74,8 @@ pub struct Answer {
 
 /// What the person chose in the view.
 pub struct Ui {
+    /// The model the view shows (an index of the worker's models).
+    pub model: usize,
     pub tab: Tab,
     pub node: Option<NodeKey>,
     pub text: Option<Text>,
@@ -94,6 +96,7 @@ pub struct Ui {
 impl Default for Ui {
     fn default() -> Ui {
         Ui {
+            model: 0,
             tab: Tab::Overview,
             node: None,
             text: None,

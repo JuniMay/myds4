@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+static Tokenizer *tk;  // the checkpoint's tokenizer
 
 // A pre-token longer than 1,024 bytes must tokenize as the checkpoint's
 // tokenizer.json does in the reference implementation (Hugging Face tokenizers
@@ -12,7 +13,7 @@
 static int failures;
 
 static void check(const char *name, const char *text, const int *want, int nwant) {
-  int max = 8192, *ids = xmalloc(max * sizeof *ids), n = tok_encode(text, ids, max), first = -1;
+  int max = 8192, *ids = xmalloc(max * sizeof *ids), n = tok_encode(tk, text, ids, max), first = -1;
   for (int i = 0; i < n && i < nwant && first < 0; i++)
     if (ids[i] != want[i]) first = i;
   if (first < 0 && n != nwant) first = n < nwant ? n : nwant;
@@ -37,7 +38,7 @@ static char *repeat(const char *s, int n) {
 int main(int argc, char **argv) {
   if (argc != 2) die("usage: tokenizer-long-check CHECKPOINT");
   alarm(20);
-  tok_load(argv[1]);
+  tk = tok_open(argv[1], 0);
   int *want = xmalloc(1024 * sizeof *want);
 
   // 400 CJK characters, one 1,200-byte piece: byte 1,024 falls inside the

@@ -5,7 +5,7 @@
 #include "myds4.h"
 
 int sampler_valid(const Sampler *s) {
-  return isfinite(s->temp) && s->temp >= 0 && isfinite(s->top_p) && s->top_p >= 0 && s->top_p <= 1;
+  return isfinite(s->temp) && s->temp >= 0 && isfinite(s->top_p) && s->top_p >= 0 && s->top_p <= 1 && s->top_k >= 0;
 }
 
 void sampler_seed(Sampler *s, uint64_t seed) {
@@ -41,11 +41,51 @@ static int by_probability(const void *a, const void *b) {
   return (i > j) - (i < j);
 }
 
+// Whether token a ranks before token b: the higher logit, then the lower id.
+static int ranks_before(const float *logits, int a, int b) {
+  return logits[a] > logits[b] || (logits[a] == logits[b] && a < b);
+}
+
+// From the top_k highest-ranked tokens at the temperature, cut to the top_p
+// nucleus of their own distribution in rank order (top-k, then top-p, as the
+// reference samplers apply them).
+static int sample_top_k(const float *logits, int count, Sampler *s, int best) {
+  int k = s->top_k, n = 0;
+  for (int i = 0; i < count; i++) {  // one pass, each kept token inserted in rank order
+    if (n == k && !ranks_before(logits, i, order[k - 1])) continue;
+    int at = n < k ? n++ : k - 1;
+    for (; at > 0 && ranks_before(logits, i, order[at - 1]); at--) order[at] = order[at - 1];
+    order[at] = i;
+  }
+  double sum = 0;
+  for (int i = 0; i < n; i++) {
+    int t = order[i];
+    probability[t] = logits[best] == INFINITY ? (logits[t] == INFINITY ? 1 : 0)
+                                              : exp(((double)logits[t] - logits[best]) / s->temp);
+    sum += probability[t];
+  }
+  double kept = 0, threshold = s->top_p * sum;
+  int m = 0;
+  do kept += probability[order[m++]];
+  while (m < n && kept < threshold);
+  double r = erand48(s->seed) * kept;
+  int last = best;
+  for (int i = 0; i < m; i++) {
+    int token = order[i];
+    if (probability[token] == 0) continue;
+    last = token;
+    if (r < probability[token]) return token;
+    r -= probability[token];
+  }
+  return last;
+}
+
 int sample_token(const float *logits, int count, Sampler *s) {
-  if (!sampler_valid(s)) die("temperature must be finite and nonnegative; top-p must be in [0, 1]");
+  if (!sampler_valid(s)) die("temperature must be finite and nonnegative; top-p must be in [0, 1]; top-k nonnegative");
   int best = sample_argmax(logits, count);
   if (s->temp == 0) return best;
   make_room(count);
+  if (s->top_k > 0 && s->top_k < count) return sample_top_k(logits, count, s, best);
   double sum = 0;
   for (int i = 0; i < count; i++) {
     double p =

@@ -230,7 +230,7 @@ int main(int argc, char **argv) {
     ops->bench();
     return complete();
   }
-  tok_load(dir);
+  Tokenizer *tk = tok_open(dir, ops->image_token);
   int *tokens = xmalloc((size_t)o.ctx * sizeof *tokens), n = 0;
   if (ids) {
     const char *list = *ids == '@' ? read_file(ids + 1, 0) : ids, *sep = ", \t\r\n";
@@ -246,8 +246,8 @@ int main(int argc, char **argv) {
     if (raw) snprintf(text, len, "%s", prompt);
     else if (ops->chat) ops->chat(text, len, prompt, nimg, think);
     else die("-p and -f: this model's chat template is not in the CLI; use --raw or --tokens");
-    n = raw == 1 ? tok_encode(text, tokens, o.ctx)
-            : tok_encode_chat(text, tokens, o.ctx); // --raw: the placeholders place images
+    n = raw == 1 ? tok_encode(tk, text, tokens, o.ctx)
+            : tok_encode_chat(tk, text, tokens, o.ctx); // --raw: the placeholders place images
   }
   Image ims[16] = {0};
   if (nimg) { // each placeholder becomes its image's span
@@ -438,7 +438,7 @@ int main(int argc, char **argv) {
     if (current_cache > cache_max) cache_max = current_cache;
     int i = 0;
     for (; i <= a && !ops->stop(rows[i]); i++, gen++) {
-      const char *s = tok_piece(rows[i], &len);
+      const char *s = tok_piece(tk, rows[i], &len);
       fwrite(s, 1, len, stdout);
     }
     fflush(stdout);

@@ -20,6 +20,7 @@ fn main() {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
     println!("cargo:rustc-link-lib=objc");
+    println!("cargo:rustc-link-lib=icucore"); // the tokenizer's regexes and NFC
     // libjpeg-turbo, found through pkg-config as the Makefile finds it.
     let libs = Command::new("pkg-config")
         .args(["--libs", "libjpeg"])
@@ -35,7 +36,7 @@ fn main() {
     }
 
     // Cargo scans a directory's whole tree for changes.
-    for path in ["Makefile", "src", "data/engram.bin", "data/unicode.bin"] {
+    for path in ["Makefile", "src", "data/engram.bin"] {
         println!("cargo:rerun-if-changed={}", root.join(path).display());
     }
 }

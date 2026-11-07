@@ -8,7 +8,7 @@ resident on the GPU. It is one model family of the engine:
 kernels are in `src/kernels/` (`rows.metal`, `products.metal`,
 `deltanet.metal`, `gqa.metal`), compiled into the one library with
 DeepSeek's. `build/myds4 -m DIR` runs it; the server serves it alone or
-beside DeepSeek ([the server](server.md#several-models)). Qwen3.8-Flash-Next
+beside DeepSeek ([the server](server.md#models)). Qwen3.8-Flash-Next
 (`qwen4_exp`) is not supported.
 
 ## The model
@@ -59,7 +59,7 @@ A snapshot (`qwen_snap_take`, 157 MB) holds the recurrent part and the last
 hidden at the state's position. A DeltaNet state cannot go back, so the
 server resumes a prompt in place (the state the prompt extends), from a
 snapshot (with the source's keys before it, `qwen_state_copy`), or from
-nothing; see [the server](server.md#qwen38-models).
+nothing; see [the server](server.md#chat-formats).
 
 ## Passes
 
@@ -156,8 +156,10 @@ arithmetic and cache traffic than the weights' reads.
 
 ## Checks and the reference
 
-`build/myds4 -m DIR` takes the prompt as token ids (`--tokens ID,ID,...` or
-`--tokens @FILE`, commas, spaces or newlines between them):
+`build/myds4 -m DIR` takes the prompt as text (`-p` or `-f`, as one user
+turn of the checkpoint's chat template, thinking off unless `--think` is 1
+to 100; `--raw` for the text as is) or as token ids (`--tokens ID,ID,...`
+or `--tokens @FILE`, commas, spaces or newlines between them). The checks:
 
 | Option | Effect |
 | --- | --- |
@@ -191,14 +193,14 @@ to BF16 and attention's operands to FP16.
 
 - Text only: the checkpoint's vision tower is not loaded, and requests with
   images are refused.
-- The CLI takes Qwen prompts as token ids: the engine's tokenizer decodes
-  Qwen's tokens but encodes text only for DeepSeek's pre-tokenizer (the
-  server tokenizes Qwen requests itself).
+- The CLI's chat turn is one user message with thinking on (`--think` 1-100)
+  or off (0), without tools or a system message.
 - The MTP head drafts one token; drafts are used while one request decodes
-  (see [the server](server.md#qwen38-models)).
+  (see [the server](server.md#chat-formats)).
 - While it serves, the model's weights stay resident on the GPU (20 GB, plus
-  the states and snapshots): beside DeepSeek, its expert cache maps fewer
-  slots (see [the server](server.md#several-models)). After 60 s without
+  the states and snapshots). Beside it, DeepSeek's expert cache held fewer
+  slots than its `cache` allows (see [the server](server.md#models)). After
+  60 s without
   requests, the server takes the model's buffers out of the GPU's residency
   set (`qwen_reside`; they stay in memory), and puts them back before the
   next pass: that took no measurable time, and the first reply after it

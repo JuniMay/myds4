@@ -75,6 +75,11 @@ pub enum Phase {
 
 #[derive(Deserialize, Default)]
 pub struct Snapshot {
+    /// The model shown, and how many the server serves.
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    models: usize,
     uptime_seconds: f64,
     phase: Phase,
     phase_seconds: f64,
@@ -559,6 +564,14 @@ fn state(s: &Snapshot, h: &History) -> Line<'static> {
 /// A whole screen: the chrome and the tab that `ui` shows. The clickable
 /// places drawn go to `ui.hits`.
 fn draw_screen(buf: &mut Buffer, s: &Snapshot, h: &History, ui: &mut Ui, title: &str, log: &[String]) {
+    // with several models, the model shown and how to show the next
+    let shown;
+    let title = if s.models > 1 {
+        shown = format!("{title} · showing {} (n: next)", s.model);
+        shown.as_str()
+    } else {
+        title
+    };
     ui.hits.clear();
     let area = buf.area;
     let inner = chrome::draw(buf, area, title, state(s, h), ui);
@@ -600,6 +613,8 @@ enum Asked {
     Redraw,
     /// Turn the mouse's reports on or off.
     Mouse(bool),
+    /// Another model: its history starts again.
+    Model,
     Quit,
     Nothing,
 }
@@ -612,7 +627,7 @@ fn choose(ui: &mut Ui, s: &Snapshot, i: usize, open: bool) {
     if (open || ui.text.is_some()) && (changed || ui.text.is_none()) {
         ui.scroll = 0;
         ui.text = Some(Text { session: n.via, start: n.start, end: n.end, answer: None });
-        crate::worker::ask_text(n.via, n.start as usize, n.end as usize);
+        crate::worker::ask_text(ui.model, n.via, n.start as usize, n.end as usize);
     }
 }
 
@@ -620,8 +635,8 @@ fn choose(ui: &mut Ui, s: &Snapshot, i: usize, open: bool) {
 /// text, if it answers the question asked last. Returns whether it did.
 fn take_text(ui: &mut Ui, a: crate::worker::NodeText) -> bool {
     match &mut ui.text {
-        Some(t) if t.answer.is_none() && (t.session, t.start, t.end) == (a.session, a.start as u64, a.end as u64) => {
-            t.answer = Some(Answer { runs: engine::text(&a.ids), tokens: a.ids.len(), ..Answer::default() });
+        Some(t) if t.answer.is_none() && a.model == ui.model && (t.session, t.start, t.end) == (a.session, a.start as u64, a.end as u64) => {
+            t.answer = Some(Answer { runs: crate::worker::text(a.model, &a.ids), tokens: a.ids.len(), ..Answer::default() });
             true
         }
         _ => false,
@@ -679,6 +694,11 @@ fn key(code: KeyCode, ui: &mut Ui, s: &Snapshot, h: &History) -> Asked {
         KeyCode::Char('m' | 'M') => {
             ui.mouse = !ui.mouse;
             return Asked::Mouse(ui.mouse);
+        }
+        KeyCode::Char('n' | 'N') if s.models > 1 => {
+            // the next model: its own requests, tree and counters
+            *ui = Ui { model: (ui.model + 1) % s.models, tab: ui.tab, mouse: ui.mouse, ..Ui::default() };
+            return Asked::Model;
         }
         KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down if ui.tab == Tab::Kv => {
             let m = match code {
@@ -814,7 +834,7 @@ fn run(screen: &mut Terminal<CrosstermBackend<Stderr>>, title: &str, keys: bool,
         if Instant::now() >= next {
             // The snapshot before the screen's lock: an engine failing while
             // it holds what the snapshot needs can still restore the terminal.
-            if let Ok(s) = serde_json::from_str::<Snapshot>(&crate::worker::view()) {
+            if let Ok(s) = serde_json::from_str::<Snapshot>(&crate::worker::view(ui.model)) {
                 history.observe(&s, started.elapsed().as_secs_f64());
                 snapshot = s;
                 redraw = true;
@@ -823,7 +843,7 @@ fn run(screen: &mut Terminal<CrosstermBackend<Stderr>>, title: &str, keys: bool,
             next = Instant::now() + Duration::from_millis(500);
         }
         if ui.text.as_ref().is_some_and(|t| t.answer.is_none())
-            && let Some(a) = crate::worker::text_answer()
+            && let Some(a) = crate::worker::text_answer(ui.model)
         {
             redraw |= take_text(&mut ui, a);
         }
@@ -851,6 +871,12 @@ fn run(screen: &mut Terminal<CrosstermBackend<Stderr>>, title: &str, keys: bool,
                 if mouse_reports(on).is_ok() {
                     MOUSE.store(on, Ordering::Release);
                 }
+                redraw = true;
+            }
+            Asked::Model => {
+                // the other model's snapshot at once, its history from now
+                history = History::default();
+                next = Instant::now();
                 redraw = true;
             }
             Asked::Redraw => redraw = true,
@@ -1030,7 +1056,7 @@ mod tests {
         let asked = Text { session: 3, start: 3000, end: 41234, answer: None };
         assert_eq!(ui.text, Some(asked.clone()));
         // the answer shows; another node's does not
-        assert!(!take_text(&mut ui, crate::worker::NodeText { session: 1, start: 9000, end: 9500, ids: Vec::new() }));
+        assert!(!take_text(&mut ui, crate::worker::NodeText { model: 0, session: 1, start: 9000, end: 9500, ids: Vec::new() }));
         assert_eq!(ui.text, Some(asked));
         // the session decodes on before the answer comes: its node grows, and
         // stays chosen with the text asked for
@@ -1039,7 +1065,7 @@ mod tests {
         assert_eq!(ui.node.and_then(|k| kv::find(&grown.tree, k)), Some(1));
         // (without a tokenizer here, the answer's tokens become no text: the
         // runs drawn are set after it)
-        assert!(take_text(&mut ui, crate::worker::NodeText { session: 3, start: 3000, end: 41234, ids: Vec::new() }));
+        assert!(take_text(&mut ui, crate::worker::NodeText { model: 0, session: 3, start: 3000, end: 41234, ids: Vec::new() }));
         let runs = vec![("<｜User｜>".to_string(), true), ("Hi there".to_string(), false)];
         ui.text.as_mut().expect("the text").answer = Some(Answer { runs, tokens: 38234, ..Answer::default() });
         let mut b = Buffer::empty(Rect::new(0, 0, 160, 46));

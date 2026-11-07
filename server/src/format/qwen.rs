@@ -1,17 +1,11 @@
-//! Qwen3.8 models (qwen3_5 text; docs/qwen.md): OpenAI Chat Completions
-//! requests rendered with the checkpoint's chat template, run by the Qwen
-//! worker, and answered as the DeepSeek path answers (`reasoning_content`,
-//! `content`, `tool_calls`, the usage with the reused prompt tokens).
-
-pub mod engine;
-mod icu;
-mod protocol;
-mod template;
-mod tokenizer;
-pub mod worker;
+//! Qwen3.8's chat format (qwen3_5; docs/qwen.md): Chat Completions requests
+//! rendered with the checkpoint's chat template into the model's prompt
+//! tokens, and the worker's events answered as DeepSeek's format answers
+//! (`reasoning_content`, `content`, `tool_calls`, the usage with the reused
+//! prompt tokens), the reply's reasoning and XML tool calls read by
+//! qwen_protocol.rs.
 
 use std::path::Path;
-use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -20,32 +14,23 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use protocol::{Decoder, Piece};
-use template::{Call, Message, Options};
-use tokenizer::{Tokenizer, Utf8Stream};
-use worker::{Event, Finish, Sampling};
+use super::qwen_protocol::{Decoder, Piece};
+use super::qwen_template::{self as template, Call, Message, Options};
+use super::{Error, bad, error, error_json, response_id};
+use crate::engine::Tokenizer;
+use crate::worker::{self, Event, Finish, Sampling};
 
-pub use crate::chat::{Error, error};
-
-/// The checkpoint's request defaults (generation_config.json) and the model's id.
-pub struct Model {
+/// A served Qwen model's request defaults (the server's configuration, then
+/// generation_config.json), its name, context and tokenizer.
+pub struct Settings {
     pub id: String,
     pub ctx: usize,
-    tokenizer: Tokenizer,
-    sampling: Sampling,
+    pub tokenizer: Tokenizer,
+    pub sampling: Sampling,
 }
 
-static MODEL: OnceLock<Model> = OnceLock::new();
-
-/// Whether `dir` holds a model this module serves (config.json's model_type).
-pub fn is_qwen(dir: &str) -> bool {
-    let Ok(text) = std::fs::read(Path::new(dir).join("config.json")) else { return false };
-    let Ok(config) = serde_json::from_slice::<Value>(&text) else { return false };
-    let text = config.get("text_config").unwrap_or(&config);
-    text.get("model_type").and_then(Value::as_str) == Some("qwen3_5_text")
-}
-
-/// The context a model serves: --ctx, at most its max_position_embeddings.
+/// The context a model serves: the configured one, at most its
+/// max_position_embeddings.
 pub fn context(dir: &str, ctx: usize) -> usize {
     let config: Value = std::fs::read(Path::new(dir).join("config.json"))
         .ok()
@@ -56,39 +41,27 @@ pub fn context(dir: &str, ctx: usize) -> usize {
     ctx.min(most)
 }
 
-/// A model's id: its directory's name, in lower case.
+/// A model's default name: its directory's name, in lower case.
 pub fn model_id(dir: &str) -> String {
     Path::new(dir.trim_end_matches('/')).file_name().map_or("qwen".into(), |n| n.to_string_lossy().to_lowercase())
 }
 
-/// Loads the tokenizer and the defaults; the worker loads the weights.
-/// `sampling` holds the server's flags where they were given.
-pub fn load(dir: &str, ctx: usize, temperature: Option<f64>, top_p: Option<f64>) -> Result<&'static Model, String> {
-    let tokenizer = Tokenizer::load(Path::new(dir))?;
+/// The defaults of requests that set no sampling: the configured values where
+/// given, else the checkpoint's generation_config.json.
+pub fn sampling(dir: &str, temperature: Option<f64>, top_p: Option<f64>, top_k: Option<u32>) -> Sampling {
     let generation: Value = std::fs::read(Path::new(dir).join("generation_config.json"))
         .ok()
         .and_then(|t| serde_json::from_slice(&t).ok())
         .unwrap_or(Value::Null);
     let num = |k: &str, d: f64| generation.get(k).and_then(Value::as_f64).unwrap_or(d);
-    let sampling = Sampling {
+    Sampling {
         temperature: temperature.unwrap_or(num("temperature", 1.0)),
         top_p: top_p.unwrap_or(num("top_p", 1.0)),
-        top_k: num("top_k", 0.0) as usize,
+        top_k: top_k.unwrap_or(num("top_k", 0.0) as u32),
         seed: None,
-    };
-    let model = Model { id: model_id(dir), ctx, tokenizer, sampling };
-    Ok(MODEL.get_or_init(|| model))
+    }
 }
 
-pub fn model() -> &'static Model {
-    MODEL.get().expect("the Qwen model is loaded")
-}
-
-fn bad(message: impl Into<String>) -> Error {
-    Error { status: StatusCode::BAD_REQUEST, message: message.into() }
-}
-
-/// A message's text: a string, or the text of its parts (images refused).
 fn text_of(content: Option<&Value>) -> Result<String, Error> {
     match content {
         None | Some(Value::Null) => Ok(String::new()),
@@ -206,6 +179,7 @@ fn by_number(n: f64) -> (bool, &'static str) {
 /// A request ready for the worker, and what its response needs.
 pub struct Prepared {
     pub request: worker::Request,
+    tokenizer: Tokenizer,
     pub stream: bool,
     pub usage_in_stream: bool,
     pub thinking: bool,
@@ -214,8 +188,8 @@ pub struct Prepared {
     pub model: String,
 }
 
-pub fn prepare(body: &[u8], note: &str) -> Result<Prepared, Error> {
-    let m = model();
+/// A request's body as the request of the worker's model `slot` (`m`: its settings).
+pub fn prepare(body: &[u8], note: &str, m: &Settings, slot: usize) -> Result<Prepared, Error> {
     let root: Map<String, Value> = serde_json::from_slice(body).map_err(|e| bad(format!("the body is not a JSON object: {e}")))?;
     let list = root.get("messages").and_then(Value::as_array).ok_or(bad("messages must be an array"))?;
     let msgs = messages(list)?;
@@ -232,7 +206,7 @@ pub fn prepare(body: &[u8], note: &str) -> Result<Prepared, Error> {
     let sampling = Sampling {
         temperature: num("temperature").unwrap_or(m.sampling.temperature),
         top_p: num("top_p").unwrap_or(m.sampling.top_p),
-        top_k: int("top_k").map_or(m.sampling.top_k, |v| v as usize),
+        top_k: int("top_k").map_or(m.sampling.top_k, |v| v as u32),
         seed: int("seed"),
     };
     let stop = match root.get("stop") {
@@ -252,8 +226,10 @@ pub fn prepare(body: &[u8], note: &str) -> Result<Prepared, Error> {
         if stream { "streamed" } else { "one response" },
         if on { effort } else { "off" }
     );
+    let prompt: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     Ok(Prepared {
-        request: worker::Request { prompt, max_tokens, sampling, note },
+        request: worker::Request { model: slot, prompt, images: Vec::new(), sampling, max_tokens: max_tokens as i64, note },
+        tokenizer: m.tokenizer,
         stream,
         usage_in_stream,
         thinking: on,
@@ -263,11 +239,6 @@ pub fn prepare(body: &[u8], note: &str) -> Result<Prepared, Error> {
     })
 }
 
-fn response_id() -> String {
-    use rand::Rng;
-    let s: String = rand::rng().sample_iter(&rand::distr::Alphanumeric).take(24).map(char::from).collect();
-    format!("chatcmpl-{s}")
-}
 
 fn call_id() -> String {
     use rand::Rng;
@@ -306,10 +277,11 @@ impl Reply {
         }
     }
 
-    fn token(&mut self, id: u32) -> Vec<Piece> {
+    /// A token of the reply, its text from the model's tokenizer `tk`.
+    fn token(&mut self, tk: &Tokenizer, id: u32) -> Vec<Piece> {
         self.tokens += 1;
-        let t = model().tokenizer.token_bytes(id);
-        let text = if model().tokenizer.is_special(id) { String::new() } else { self.utf8.push(t) };
+        let t = tk.piece(id as i32);
+        let text = if tk.marked_special(id as i32) { String::new() } else { self.utf8.push(t) };
         self.text(&text)
     }
 
@@ -389,6 +361,7 @@ fn delta_of(p: Piece, calls: &mut usize) -> Value {
 /// A streamed response: server-sent events, a comment every 15 s while the
 /// request waits.
 pub fn stream(p: Prepared, cancel: worker::Cancel, mut rx: UnboundedReceiver<Event>) -> Response {
+    let tokenizer = p.tokenizer;
     let body = async_stream::stream! {
         let _cancel = cancel;
         let id = response_id();
@@ -415,7 +388,7 @@ pub fn stream(p: Prepared, cancel: worker::Cancel, mut rx: UnboundedReceiver<Eve
             };
             match event {
                 Event::Refused(m) => {
-                    yield Ok(format!("data: {}\n\ndata: [DONE]\n\n", crate::chat::error_json("invalid_request_error", &m)));
+                    yield Ok(format!("data: {}\n\ndata: [DONE]\n\n", error_json("invalid_request_error", &m)));
                     return;
                 }
                 Event::Started { prompt, reused } => {
@@ -426,16 +399,21 @@ pub fn stream(p: Prepared, cancel: worker::Cancel, mut rx: UnboundedReceiver<Eve
                         yield Ok(chunk(json!({"role": "assistant", "content": ""}), None, None));
                     }
                 }
-                Event::Token(t) => {
-                    for piece in reply.token(t) {
-                        yield Ok(chunk(delta_of(piece, &mut calls), None, None));
+                Event::Tokens(ts) => {
+                    for t in ts {
+                        for piece in reply.token(&tokenizer, t) {
+                            yield Ok(chunk(delta_of(piece, &mut calls), None, None));
+                        }
+                        if reply.stopped {
+                            break;
+                        }
                     }
                     if reply.stopped {
                         break;  // dropping the receiver cancels the request
                     }
                 }
                 Event::Done { finish: Finish::Shutdown } => {
-                    yield Ok(format!("data: {}\n\n", crate::chat::error_json("server_error", "the server is stopping")));
+                    yield Ok(format!("data: {}\n\n", error_json("server_error", "the server is stopping")));
                     return;
                 }
                 Event::Done { finish } => {
@@ -465,6 +443,7 @@ pub fn stream(p: Prepared, cancel: worker::Cancel, mut rx: UnboundedReceiver<Eve
 
 /// A response that is not streamed: one chat.completion.
 pub async fn whole(p: Prepared, cancel: worker::Cancel, mut rx: UnboundedReceiver<Event>) -> Response {
+    let tokenizer = p.tokenizer;
     let mut reply = Reply::new(&p);
     let (mut content, mut reasoning, mut tool_calls) = (String::new(), String::new(), Vec::new());
     let mut take = |pieces: Vec<Piece>, tool_calls: &mut Vec<Value>| {
@@ -482,8 +461,13 @@ pub async fn whole(p: Prepared, cancel: worker::Cancel, mut rx: UnboundedReceive
             None => return error(StatusCode::SERVICE_UNAVAILABLE, "server_error", "the request ended without an answer"),
             Some(Event::Refused(m)) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", &m),
             Some(Event::Started { prompt, reused }) => (reply.prompt, reply.reused) = (prompt, reused),
-            Some(Event::Token(t)) => {
-                take(reply.token(t), &mut tool_calls);
+            Some(Event::Tokens(ts)) => {
+                for t in ts {
+                    take(reply.token(&tokenizer, t), &mut tool_calls);
+                    if reply.stopped {
+                        break;
+                    }
+                }
                 if reply.stopped {
                     break Finish::Stop;
                 }
@@ -513,10 +497,6 @@ pub async fn whole(p: Prepared, cancel: worker::Cancel, mut rx: UnboundedReceive
 mod tests {
     use super::*;
 
-    fn fixture_dir() -> Option<String> {
-        std::env::var("MYDS4_QWEN").ok().filter(|d| Path::new(d).join("tokenizer.json").exists())
-    }
-
     fn reply_with_stops(stop: &[&str]) -> Reply {
         Reply {
             utf8: Utf8Stream::default(),
@@ -528,6 +508,17 @@ mod tests {
             reused: 0,
             tokens: 0,
         }
+    }
+
+    #[test]
+    fn utf8_stream_waits_for_whole_characters() {
+        let mut s = Utf8Stream::default();
+        assert_eq!(s.push(&[b'a', 0xf0]), "a");
+        assert_eq!(s.push(&[0x9f, 0x99]), "");
+        assert_eq!(s.push(&[0x82, b'b']), "🙂b");
+        assert_eq!(s.finish(), "");
+        assert_eq!(s.push(&[0xff, 0xe2]), "\u{FFFD}");
+        assert_eq!(s.finish(), "\u{FFFD}");
     }
 
     fn texts(pieces: Vec<Piece>) -> String {
@@ -606,7 +597,7 @@ mod tests {
     /// fixtures, made with the checkpoint's chat_template.jinja).
     #[test]
     fn renders_as_the_reference_template() {
-        let cases: Vec<Value> = serde_json::from_str(include_str!("fixtures/reference_chats.json")).unwrap();
+        let cases: Vec<Value> = serde_json::from_str(include_str!("fixtures/qwen_chats.json")).unwrap();
         for (i, case) in cases.iter().enumerate() {
             let msgs = messages(case["messages"].as_array().unwrap()).unwrap();
             let on = case["enable_thinking"].as_bool().unwrap_or(true);
@@ -622,7 +613,7 @@ mod tests {
     /// responses, thinking off, and the low and medium efforts.
     #[test]
     fn renders_tools_as_the_checkpoint_template() {
-        let cases: Vec<Value> = serde_json::from_str(include_str!("fixtures/reference_tool_chats.json")).unwrap();
+        let cases: Vec<Value> = serde_json::from_str(include_str!("fixtures/qwen_tool_chats.json")).unwrap();
         for (i, case) in cases.iter().enumerate() {
             let msgs = messages(case["messages"].as_array().unwrap()).unwrap();
             let tools = case["tools"].as_array().cloned().unwrap_or_default();
@@ -632,26 +623,46 @@ mod tests {
             assert_eq!(got, case["rendered"].as_str().unwrap(), "case {i}");
         }
     }
+}
 
-    /// The reference tokenizer's ids for texts (the same fixtures' tokens),
-    /// with the checkpoint's tokenizer.json from MYDS4_QWEN.
-    #[test]
-    fn tokenizes_as_the_reference_tokenizer() {
-        let Some(dir) = fixture_dir() else {
-            eprintln!("MYDS4_QWEN is not set to a Qwen3.8 checkpoint: skipped");
-            return;
-        };
-        let t = Tokenizer::load(Path::new(&dir)).unwrap();
-        let cases: Value = serde_json::from_str(include_str!("fixtures/reference_tokens.json")).unwrap();
-        let mut n = 0;
-        for case in cases.as_array().into_iter().flatten() {
-            let (Some(text), Some(ids)) = (case["text"].as_str(), case["ids"].as_array()) else { continue };
-            let want: Vec<u32> = ids.iter().map(|v| v.as_u64().unwrap() as u32).collect();
-            let mut got = Vec::new();
-            t.encode_with_added(text, &mut got).unwrap();
-            assert_eq!(got, want, "text {text:?}");
-            n += 1;
+/// Bytes to text as tokens arrive: an incomplete UTF-8 sequence waits for
+/// its next token.
+#[derive(Default)]
+pub struct Utf8Stream {
+    pending: Vec<u8>,
+}
+
+impl Utf8Stream {
+    pub fn push(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(text) => {
+                    out.push_str(text);
+                    self.pending.clear();
+                    break;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    out.push_str(std::str::from_utf8(&self.pending[..valid]).expect("a valid prefix"));
+                    self.pending.drain(..valid);
+                    match e.error_len() {
+                        Some(n) => {
+                            out.push('\u{FFFD}');
+                            self.pending.drain(..n);
+                        }
+                        None => break,
+                    }
+                }
+            }
         }
-        assert!(n > 0);
+        out
+    }
+
+    pub fn finish(&mut self) -> String {
+        let rest = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        rest
     }
 }

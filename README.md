@@ -6,9 +6,10 @@ weights (8 GiB) stay in memory; the routed experts, from the checkpoint (MXFP4,
 289 GB) or from a smaller GGUF build, are read from the SSD into a cache whose
 size follows the memory the rest of the system leaves free. The host is C, the
 GPU kernels are Metal. It runs prompts from the command line and serves the
-OpenAI Chat Completions API, for example to DeepSeek Harness. The server can
-also serve Qwen3.8-27B (NVIDIA's NVFP4 build, resident on the GPU, with MTP
-drafts), alone or beside DeepSeek, each request going to the model it names.
+OpenAI Chat Completions API, for example to DeepSeek Harness. It also runs
+Qwen3.8-27B (NVIDIA's NVFP4 build, resident on the GPU, with MTP drafts)
+through the same engine, and the server serves several models in one process,
+each request going to the model it names.
 
 myds4 is inspired by [ds4](https://github.com/antirez/ds4) and mlx-stream.
 
@@ -17,12 +18,12 @@ myds4 is inspired by [ds4](https://github.com/antirez/ds4) and mlx-stream.
 - [Design](docs/design.md): data flow, numerics, the expert cache and memory
   policy, decoding, prefill and images.
 - [Performance](docs/performance.md): the machine's limits and measured results.
-- [The server](docs/server.md): the HTTP server, in Rust on DeepSeek's
-  `deepseek-recipe` crates over the C engine: its C ABI, its live view,
-  where its prompts differ from `encoding.py`, and several models side by
-  side.
-- [Qwen3.8 models](docs/qwen.md): the Qwen3.8-27B engine, its passes, MTP
-  drafts and speed, and its check CLI.
+- [The server](docs/server.md): the HTTP server, in Rust over the C engine:
+  its models and their chat formats (DeepSeek's on DeepSeek's
+  `deepseek-recipe` crates), its C ABI, its live view, and where its prompts
+  differ from `encoding.py`.
+- [Qwen3.8 models](docs/qwen.md): the Qwen3.8-27B model, its passes, MTP
+  drafts and speed, and its checks against Hugging Face's reference.
 - [Removed experiments](docs/experiments.md): the studies that were
   measured and removed, how each worked and what it showed.
 
