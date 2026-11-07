@@ -155,10 +155,10 @@ int myds4_idle(void) {
   return cache_slots();
 }
 
-int myds4_max_rows(void) { return BLOCK + 1; }
+int myds4_max_rows(void) { return BATCH_ROWS; }
 int myds4_draft_block(void) { return opt.draft; }
 int myds4_max_verify(void) { return VERIFY_DRAFTS + 1; }
-int myds4_rewind(void) { return opt.lookup > BLOCK ? opt.lookup : BLOCK; }
+int myds4_rewind(void) { return model_rewind(); }
 int myds4_vocab(void) { return VOCAB; }
 
 // ---- attention states and snapshots ----
@@ -216,7 +216,7 @@ const float *myds4_step(int32_t token, int pos) {
 }
 
 const float *myds4_rows(myds4_state **states, const int32_t *tokens, const int32_t *pos, int m) {
-  if (m < 1 || m > BLOCK + 1 || !in_vocabulary(tokens, m, 0)) return 0;
+  if (m < 1 || m > BATCH_ROWS || !in_vocabulary(tokens, m, 0)) return 0;
   for (int r = 0; r < m; r++)
     if (pos[r] < 0 || pos[r] >= opt.ctx) return 0;
   return model_forward_rows(states, tokens, pos, m);

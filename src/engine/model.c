@@ -53,12 +53,19 @@ static uint64_t runahead_group_count, runahead_group_rows;
 static int runahead_route_only;
 static uint64_t runahead_route_only_rows;
 static int verifying;
-static int replay_margin(void) { return opt.lookup > BLOCK ? opt.lookup : BLOCK; }
+// The rewind margin (model_rewind): REWIND, or the most rows a verify pass
+// writes after its token, when --draft or --lookup asks for more.
+static int replay_margin(void) {
+  int m = REWIND;
+  if (opt.draft > m) m = opt.draft;
+  if (opt.lookup > m) m = opt.lookup;
+  return m;
+}
 // A prompt's rows run the prefill kernels however many rows a batch has, so
 // that a row's result does not depend on where the prefill that computes it
 // starts: decoded rows (one, or a verify pass's) run the decode kernels.
 static int prompt_pass;
-static int small_rows(int m) { return !prompt_pass && (m <= BLOCK + 1 || (verifying && m <= VERIFY_DRAFTS + 1)); }
+static int small_rows(int m) { return !prompt_pass && (m <= BATCH_ROWS || (verifying && m <= VERIFY_DRAFTS + 1)); }
 static int prefill_prune_active, prefill_prune_end;
 
 static uint32_t ced_first;
@@ -87,13 +94,18 @@ static void ced_check_routes(int layer, int row, int rows, const int *routes);
 #endif
 
 #define MB 2048     // rows of a prompt batch
+#define KERNEL_ROWS 6  // the most rows the one-row kernels' multi-row forms (products, the head) take at once
 #define TARGET 37   // the first of the layers whose attention input the draft reads
-// Rows a pass writes for rejected drafts (at most BLOCK, after the accepted
-// ones) must not overwrite rows later positions read: a layer's window keys
-// are a ring of RING rows (row p % RING), and a KV source keeps the
-// compressor rows of its last PENDING positions (row p % PENDING).
+// A layer's window keys are a ring of RING rows (row p % RING), and a KV
+// source keeps the compressor rows of its last PENDING positions (row p %
+// PENDING). Beyond the window the ring keeps the rewind margin's rows, so
+// that the rows a verify pass writes after the tokens it keeps (rejected
+// drafts or proposals) do not overwrite rows later positions read, and so
+// that a state can continue up to the margin before its end. A ratio-2
+// compressor that continues at a position reads the two rows before it:
+// PENDING exceeds the margin by at least two.
 #define RING (WINDOW + replay_margin())
-#define PENDING (replay_margin() > BLOCK ? 32 : 8)
+#define PENDING (replay_margin() + 2 > 16 ? 32 : 16)
 #define PREDICT 16  // experts predicted per row for the next layer
 #define ATT_ROWS (WINDOW + IDX_TOPK)  // the most rows a decoded row attends
 #define FEW (VERIFY_DRAFTS + 1)  // maximum target verification rows
@@ -371,9 +383,10 @@ static int is_in(int l, const int *set, int n) {
 static void request_capacity(int rows) {
   if (Q.obj) work_capacity(rows);
   // Small forward passes overwrite these rows and do not read the prompt's
-  // workspace. Keep room for every verification row without reallocating
+  // workspace. Keep room for every verification row (the token and up to the
+  // rewind margin's drafts) and every batched row without reallocating
   // between single-token and draft passes.
-  int small = replay_margin() + 1;
+  int small = replay_margin() + 1 > BATCH_ROWS ? replay_margin() + 1 : BATCH_ROWS;
   if (rows <= small) rows = small;
   if (rows <= request_rows && !(rows == small && request_rows > small)) return;
   gpu_sync();
@@ -649,11 +662,11 @@ static void products(int count, const Prod *p, int m, const Buf *in, size_t in_o
     for (int j = 0; j < count; j++) linear(p[j].w, m, in, in_off, lda, p[j].out, p[j].off, p[j].ldy, round);
     return;
   }
-  // Keep the scalar-equivalent kernels' six-row register bound. Each
+  // Keep the scalar-equivalent kernels' register bound (KERNEL_ROWS). Each
   // segment retains the same per-row product and accumulation order.
-  if (m > BLOCK + 1) {
-    for (int first = 0; first < m; first += BLOCK + 1) {
-      int rows = m - first < BLOCK + 1 ? m - first : BLOCK + 1;
+  if (m > KERNEL_ROWS) {
+    for (int first = 0; first < m; first += KERNEL_ROWS) {
+      int rows = m - first < KERNEL_ROWS ? m - first : KERNEL_ROWS;
       Prod part[3];
       for (int j = 0; j < count; j++) {
         part[j] = p[j];
@@ -717,8 +730,8 @@ static void head_out(int m, const Buf *y) {
     linear(&head, m, &X, 0, DIM, y, 0, VOCAB, 0);
     return;
   }
-  for (int first = 0; first < m; first += BLOCK + 1) {
-    uint32_t n = m - first < BLOCK + 1 ? m - first : BLOCK + 1;
+  for (int first = 0; first < m; first += KERNEL_ROWS) {
+    uint32_t n = m - first < KERNEL_ROWS ? m - first : KERNEL_ROWS;
     gpu_kern(n == 1 ? K_gg_head1 : K_gg_head6);
     gpu_buf(0, &head_q6, 0), gpu_buf(1, &X, (size_t)first * DIM * 4);
     gpu_buf(2, y, (size_t)first * VOCAB * 4), gpu_bytes(3, &n, 4);
@@ -1888,6 +1901,8 @@ static void replay_starts(int k) {
   }
 }
 
+int model_rewind(void) { return replay_margin(); }
+
 int model_replay_rows(int k) {
   if (k <= 0) return 0;
   if (opt.ced) return k < RING ? k : RING;  // a bounded replay: the last ring's positions, in every layer
@@ -2814,7 +2829,7 @@ void model_state_use(State *s) {
 #include "../experimental/runahead.c"
 
 const float *model_forward_rows(State **st, const int *tokens, const int *pos, int m) {
-  if (m < 1 || m > BLOCK + 1) die("%d rows of sequences at once: 1 to %d", m, BLOCK + 1);
+  if (m < 1 || m > BATCH_ROWS) die("%d rows of sequences at once: 1 to %d", m, BATCH_ROWS);
   for (int r = 0; r < m; r++) {
     if (pos[r] >= opt.ctx) die("context full (%d tokens)", opt.ctx);
     if (pos[r] + 1 > st[r]->cap) resize(st[r], grown(st[r]->cap, pos[r] + 1), pos[r]);

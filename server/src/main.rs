@@ -48,7 +48,7 @@ const USAGE: &str = "usage: myds4-server -m MODEL --serve PORT [options]
   --seed N        the seed of requests that set none (default: random for each)
   --think N       thinking effort 1-100 of requests that set none; 0 turns thinking off (default 75)
   --ctx N         context capacity in tokens, at most 1048576 (default 1048576)
-  --ced off|N     approximate prefill: replay N decoder tokens, 128-1048576 (default off), plus the verification rewind margin
+  --ced off|N     approximate prefill: replay N decoder tokens, 128-1048576 (default off), plus the rewind margin (8)
   --prefill-prune  skip decoder batches outside required history; CED and substitution must be off (default off)
   --cache GB      expert cache budget (default: from available memory)
   --reserve GB    memory the expert cache leaves to other programs, 2-1024 (default 10)

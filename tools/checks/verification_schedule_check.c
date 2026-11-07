@@ -29,8 +29,11 @@ static void expect(const char *name, int ok) {
 
 int main(void) {
   opt.lookup = 0;
-  expect("ordinary decoding keeps its original rings", RING == 133 && PENDING == 8);
-  opt.lookup = 15;
+  // the window and the rewind margin; the compressor two rows more at least
+  expect("ordinary decoding keeps the window and the rewind margin", RING == WINDOW + REWIND && PENDING >= REWIND + 2);
+  opt.draft = BLOCK;
+  expect("DSpark's drafts fit within the rewind margin", RING == WINDOW + REWIND);
+  opt.draft = 0, opt.lookup = 15;
   expect("wide verification retains overwritten local history", RING == 143 && PENDING >= 17);
   K_mvm_bf16 = 101;
   K_mm_bf16 = 102;

@@ -1952,8 +1952,8 @@ The controls show substantial timing variation under desktop activity, and
 each joint setting has one measurement. This is a cold-prefill comparison,
 not a decoding or task-completion benchmark.
 
-Production `--ced 128` and `--ced 512` retain 133 and 517 decoder rows,
-including the server's five-row rewind margin. Their final logits differ
+With the five-row rewind margin of these runs, `--ced 128` and `--ced 512` retained 133 and 517 decoder rows
+(the margin is now 8: 136 and 520). Their final logits differ
 from full prefill. The numbers above therefore do not establish equal
 quality. Relative to joint CED-off prefill, 128 gives 1.49x on MXFP4 and
 1.67x on IQ2; 512 gives 1.06x and 1.46x in these individual runs.
@@ -1968,8 +1968,8 @@ final logits, prefix snapshots, resumed execution and draft windows.
 Compact CED matched its full-shape mask at depths 128 and 512. These tests
 exposed and now cover candidate-mask row offsets beyond 16,384 positions;
 candidate masks are retained per prompt row across attention batches.
-The prefill state check also covers all 133 retained local rows, including
-the server's five-row rewind margin. These are implementation checks, not
+The prefill state check also covered all 133 retained local rows, including
+the five-row rewind margin of that time. These are implementation checks, not
 task-quality scores.
 
 ## Pending expert reads

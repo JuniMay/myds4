@@ -135,7 +135,7 @@ tokenizer may be called from any thread. Its parts:
   `myds4_log(line)` writes a line to the log with the time.
 - **Limits.** The rows of different states one step takes (6), DSpark's
   drafts per pass (`--draft`), the rows of one verify pass (16), the
-  positions a state can continue before its end (`max(5, lookup_depth)`) and
+  positions a state can continue before its end (`max(8, lookup_depth)`) and
   the vocabulary.
 - **States and snapshots.** `myds4_state_new`, `myds4_state_free`,
   `myds4_state_bytes`, `myds4_state_use`, `myds4_reset`;
@@ -151,7 +151,7 @@ tokenizer may be called from any thread. Its parts:
   With `replay`, the state holds only the copied rows before `from`, and the
   prefill starts earlier to rebuild the rolling rows at `from`. Without
   `--ced` the replay is exact: each layer starts where its window needs.
-  With `--ced` it is bounded: every layer starts a ring before `from` (133
+  With `--ced` it is bounded: every layer starts a ring before `from` (136
   positions with the default `--lookup`), the windows of the rows it
   computes stop there, and the
   copied compressed rows and index keys stay as they are. A `capture`
@@ -195,12 +195,12 @@ queue order can differ. The two identifiers in the log expose that timing.
 
 `--ced off|N` controls approximate decoder replay in the server and the
 CLI. `off` is the default. N is 128 to 1,048,576; the engine retains N plus
-`max(5, lookup_depth)` rewind rows. Shorter inputs run full prefill. CED preserves full-context
+`max(8, lookup_depth)` rewind rows. Shorter inputs run full prefill. CED preserves full-context
 encoder/global KV work and changes the later decoder's local state, so it
 can change generated output. It does not shorten decoding's layer stack.
 With CED the KV prefix cache's replay is bounded: it computes a ring's
-positions before the resume point again (133 with the default `--lookup`,
-`128 + max(5, lookup_depth)` in general) with their windows stopping there,
+positions before the resume point again (136 with the default `--lookup`,
+`128 + max(8, lookup_depth)` in general) with their windows stopping there,
 so a cache hit is approximate too ([The KV prefix
 cache](design.md#the-kv-prefix-cache)). `myds4_config.ced` is 0 for off.
 
@@ -292,7 +292,11 @@ The KV prefix cache's decisions are tested without a model in
 `server/src/kv.rs`: the longest match across busy and idle states, the
 choice between continuing in place, a snapshot and a replay (and the
 replay's cost, exact or bounded), the same prompt again, truncation in
-place, the branch point a fork leaves (after a replay, or past a snapshot
+place, a prompt that parts within the rewind margin before a snapshot (a
+thinking turn's next turn), the stale rows that take a state's rewind room
+(a short prompt continued before a state's end, a verify pass's rows after
+its kept tokens) and the rows that give it back, the branch point a fork
+leaves (after a replay, or past a snapshot
 it resumed from), the refusal before any eviction, the eviction order and
 the state bound; and the budget's other steps: a retry of a saved prompt at
 a full budget, a decoding state charged its growth before it grows (idle
@@ -464,9 +468,9 @@ not call them: prompts and output use the engine's tokenizer.
 | --- | --- |
 | `.venv/bin/python tools/reference/check.py encoding CHECKPOINT` | The server's prompts (`build/myds4-server --render FILE`) against `encoding.py` on the test cases and the generated conversations ([above](#prompts-compared-with-encodingpy)). |
 | `make server-check` (`MYDS4_CHECKPOINT=CHECKPOINT` for the tokenizer test) | The compatibility steps, a numeric effort in the prompt, the worker's events through recipe's processor with the checkpoint's tokenizer (reasoning, content, finish, usage), the KV prefix cache's decisions (`server/src/kv.rs`), and the live view's tabs on a test terminal: the title and the tabs first, every line within the terminal's width at sizes from 220 x 60 down to 12 x 4, each tab's parts, the keys and clicks that choose tabs, nodes and requests, a node's text answered while its session grows and a chosen node kept through a fork that splits it, the last minute's samples (the counters' differences, arrivals, routed rows of the snapshot's size, the SSD's rate from the reads as they complete, a prefill's rate with no sample between two prefills), the throughput's windows and its since-start figures from counters counted together, per-request speeds, the colors (the terminal's answer for its background, light and dark, the 256 colors) and the quit keys; and the connections' limits on a local socket, with short timeouts: 503 beyond the connection limit, 431, a late head, 408 and 413, and a client that leaves or stops reading ending its request. No model is loaded; without `MYDS4_CHECKPOINT` the tokenizer test is skipped. With `MYDS4_EXPERTS` (a GGUF file) set too, it also runs the fork tests through HTTP (next row). |
-| `MYDS4_CHECKPOINT=CHECKPOINT MYDS4_EXPERTS=GGUF cargo test --release --manifest-path server/Cargo.toml --target-dir build/cargo --test prefix_fork -- --nocapture` | The fork test through HTTP (`server/tests/prefix_fork.rs`, about 12 minutes, one model process at a time): a conversation with a long system prompt and user turn decodes, and 20 forks of it, cut in the system prompt or the user turn and continued differently, must each reuse at least the prefix they share with it less what an exact replay there computes again, and no more than that prefix, and must give the tokens that a server starting without a cache gives. With `--ced 128` the same forks must each reuse at least the shared prefix less 133 tokens; their tokens are printed. A fork after an image (a 32 x 32 PNG the test builds) must give the cold server's tokens. Two tests check the budget with a tight `--kv-cache` set from what a first server reports: a retry of a saved prompt must fit a cache filled to within 2 MiB of its limit, and a generation that takes its state past 16,384 positions must free an idle state before its state grows and keep the cache within its limit in every status sample. `MYDS4_SERVER` and `MYDS4_CLI` pick the binaries (default `build/myds4-server` and `build/myds4`). |
+| `MYDS4_CHECKPOINT=CHECKPOINT MYDS4_EXPERTS=GGUF cargo test --release --manifest-path server/Cargo.toml --target-dir build/cargo --test prefix_fork -- --nocapture` | The fork test through HTTP (`server/tests/prefix_fork.rs`, about 12 minutes, one model process at a time): a conversation with a long system prompt and user turn decodes, and 20 forks of it, cut in the system prompt or the user turn and continued differently, must each reuse at least the prefix they share with it less what an exact replay there computes again, and no more than that prefix, and must give the tokens that a server starting without a cache gives. With `--ced 128` the same forks must each reuse at least the shared prefix less 136 tokens; their tokens are printed. A thinking turn's next turn, which shares all of the turn's prompt but its last token (`<think>` there, `</think>` in the next turn's history), must reuse that shared prefix and compute only its new tokens (`last_prefill.tokens` in `/v1/status`), with and without `--ced 128`, and without `--ced` give the cold server's tokens. A fork after an image (a 32 x 32 PNG the test builds) must give the cold server's tokens. Two tests check the budget with a tight `--kv-cache` set from what a first server reports: a retry of a saved prompt must fit a cache filled to within 2 MiB of its limit, and a generation that takes its state past 16,384 positions must free an idle state before its state grows and keep the cache within its limit in every status sample. `MYDS4_SERVER` and `MYDS4_CLI` pick the binaries (default `build/myds4-server` and `build/myds4`). |
 | `MYDS4_CHECKPOINT=CHECKPOINT MYDS4_EXPERTS=GGUF cargo test --release --manifest-path server/Cargo.toml --target-dir build/cargo --test live_view -- --nocapture` | The live view with a model (`server/tests/live_view.rs`, about 40 s, one model process): the server runs with `--tui` in a pseudo-terminal of 160 x 46 cells that answers the view's question for its background as a dark terminal would. While a request decodes, the test presses the tabs' keys and rebuilds the screen from the output: the dark colors, the expert map's request at four experts a cell, the KV tree, a node's text, the last minute and the log must be drawn, the mouse taken and given back, and the server must exit with status 0 after `q`. `MYDS4_SERVER` picks the server (default `build/myds4-server`). |
-| `build/prefix-fork-check CHECKPOINT --text FILE [--rendered] [--limit N] [--experts GGUF] [--draft N] [--cache GB] [--ced N] --fork [--random N] [--at P]... [--prompt-only] [--suffix N]` | The fork test in the engine (`tools/checks/prefix_fork_check.c`): a conversation (the text's prompt, or its first `--limit` tokens, then a decoded reply, a tool-like result and a second decoded reply) forked at 24 position classes and N random positions (default 16). Where the history before a fork came from prompts, the exact replay and the latest snapshot must give a cold prefill's bytes in the logits, every state tensor and the next 16 greedy tokens; where it holds decoded rows, the snapshot resume must give the bytes of the conversation computed again as it ran, and the replay must be about as close to the cold prefill as that conversation is. Each fork's branch-point snapshot, resumed over that fork's rows, must give the fork's own bytes. With `--ced N` the replay is bounded: it must keep the copied compressed rows and index keys byte for byte and give finite logits, and each fork's distance from the cold prefill is printed. `--measure` prints how far decoding a reply and prefilling it differ. |
+| `build/prefix-fork-check CHECKPOINT --text FILE [--rendered] [--limit N] [--experts GGUF] [--draft N] [--cache GB] [--ced N] --fork [--random N] [--at P]... [--prompt-only] [--suffix N]` | The fork test in the engine (`tools/checks/prefix_fork_check.c`): a conversation (the text's prompt, or its first `--limit` tokens, then a decoded reply, a tool-like result and a second decoded reply) forked at 26 position classes and N random positions (default 16). Where the history before a fork came from prompts, the exact replay, the latest snapshot and the first snapshot after the fork within the rewind margin (continued at the fork) must give a cold prefill's bytes in the logits, every state tensor and the next 16 greedy tokens; where it holds decoded rows, both snapshot resumes must give the bytes of the conversation computed again as it ran, and the replay must be about as close to the cold prefill as that conversation is. Each fork's branch-point snapshot, resumed over that fork's rows, must give the fork's own bytes. Without `--ced` it also checks the KV cache's stale-row count: a state with 3 stale rows (a short prompt continued before a state's end, or a verify pass of 4 rows that keeps 1 token), resumed within the room the cache gives it, and the state 3 tokens later, resumed the whole margin before its end, must give the cold prefill's bytes; resumes past the room are printed. With `--ced N` the replay is bounded: it must keep the copied compressed rows and index keys byte for byte and give finite logits, and each fork's distance from the cold prefill is printed. `--measure` prints how far decoding a reply and prefilling it differ. |
 
 On 2026-11-04 (the UD-IQ2_XXS experts, `--cache 40`, `--kv-cache 8`) the
 server, with the worker in Rust, reused 0 of a new prompt's 54 tokens, 54 of
@@ -507,6 +511,36 @@ before its own state grew past 16,384 positions: none of the 29 status
 samples taken while it decoded past them still held the idle state, and no
 sample exceeded the limit. The HTTP fork tests passed again (674 s) with
 the same reuse.
+
+On 2026-11-06 (the UD-IQ2_XXS experts, `--cache 40`), a thinking turn's
+next turn shared 5,163 of its 5,186 tokens with the turn's prompt. Before
+the cache resumed from a snapshot within its rewind room, that turn
+reused 5,163 tokens by a replay and computed 5,110 rows without `--ced`
+(an exact replay: about 5,087 earlier rows again) and 156 with `--ced
+128` (a bounded one). Since then it resumes from the turn's prompt-end
+snapshot one position back and computes 23 rows either way. Without `--ced`
+its tokens equal the cold server's. The engine's fork test on the first
+3,000 tokens of `docs/design.md` (`--limit 3000 --fork --random 0`) passed:
+23 forks, 0 failures. The snapshot after a fork within the rewind margin,
+continued at the fork, gave the cold prefill's bytes at 1 and 5 positions
+before the prompt's end and at the reply's first position. Over decoded
+history, continuing 1 position back, it gave the bytes of the conversation
+continued there. With 3 stale rows (a short prompt continued before a
+state's end, or a verify pass of 4 rows that kept 1 token), a resume 2
+positions before the state's end gave the cold prefill's bytes. A resume 5
+positions before it, which the cache gave before it counted stale rows,
+differed in 867,679 and 863,467 bytes, and the next 16 tokens differed. 3
+tokens decoded at the end gave the state back its whole margin: a resume 5
+positions before it gave the cold prefill's bytes.
+
+`tools/bench/turn_bench.py` timed the same kind of conversation through
+the server (thinking on, greedy, `--cache 40`, without `--ced`, four
+alternating runs, 2026-11-06). Its second turn, 8,891 tokens, shared 7,745
+with the first. With the earlier build (`61cdf61`, which replays at the
+shared prefix and predates the prefill eviction fix) it prefilled 6,233
+rows and gave its first token after 10.64 and 10.77 s. With the snapshot
+resume it prefilled 1,146 rows and gave it after 7.31 s both times. All
+four runs gave the same replies.
 
 The runs below were made with the scheduler in the engine's C code, before
 it moved to `server/src/worker.rs`.

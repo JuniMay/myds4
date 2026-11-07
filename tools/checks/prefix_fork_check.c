@@ -1,20 +1,28 @@
 // The fork test's engine part (docs/server.md, the KV prefix cache). A
 // conversation is forked at many positions, by each way the cache resumes
-// there: an exact replay at the fork, and the latest snapshot at or before it.
-// - Where the history before the fork came from prompts, both must give what
+// there: an exact replay at the fork, the latest snapshot at or before it,
+// and the first snapshot after it within the rewind margin, continued at the
+// fork.
+// - Where the history before the fork came from prompts, each must give what
 //   a cold prefill of the fork's prompt gives: the same bytes in the logits,
 //   in every state tensor and in the next 16 greedy tokens.
 // - Where it holds decoded rows, a cold prefill differs from them by design:
-//   decoding and prefilling round differently. A snapshot resume must give
-//   the same bytes as the conversation itself, computed again as it was (its
-//   replies decoded, its prompts prefilled) up to the snapshot and then
-//   prefilled. A replay recomputes the rows near the fork with the prefill
-//   kernels, so it matches neither; it must be about as close to the cold
-//   prefill as the conversation continued at the fork is: for each kind of
-//   state tensor and the logits, an SNR at most MARGIN_DB dB lower (see near()).
+//   decoding and prefilling round differently. A snapshot resume (from
+//   before or after the fork) must give the same bytes as the conversation
+//   itself, computed again as it was (its replies decoded, its prompts
+//   prefilled) up to the snapshot or the fork and then prefilled. A replay
+//   recomputes the rows near the fork with the prefill kernels, so it
+//   matches neither; it must be about as close to the cold prefill as the
+//   conversation continued at the fork is: for each kind of state tensor and
+//   the logits, an SNR at most MARGIN_DB dB lower (see near()).
 // - Each fork captures the rolling rows at its branch point, as the server
 //   does: a later fork there, resumed from that snapshot over the first
 //   fork's rows, must give the first fork's bytes.
+// - The rewind room (server/src/kv.rs): a state with stale rows (rows of a
+//   short prompt continued before a state's end, or a verify pass's rows
+//   after the token it keeps), resumed within the room the cache gives it,
+//   must give the cold prefill's bytes; past that room, the difference is
+//   printed.
 // With --ced N, forks are approximate by design (docs/usage.md): the replay
 // is bounded to the last ring's positions. It must keep the source's
 // compressed rows and index keys that positions before the fork completed,
@@ -409,6 +417,19 @@ static Outcome resume(const int *f, int n, int k, int p) {
   return o;
 }
 
+// The cache's resume from the source's snapshot at s, up to the rewind
+// margin after p: the source's global rows before p, the snapshot restored,
+// and the state continued at p.
+static Outcome rewound(const int *f, int n, int k, int p) {
+  State *q = fresh();
+  model_state_copy(q, source, p);
+  model_state_use(q);
+  model_snapshot_restore(q, saved[k].snap);
+  Outcome o = finish(model_prefill(f, n, p, 0, -1, 0), n);
+  done_with(q);
+  return o;
+}
+
 // The conversation itself continued at b (b > prompt1): its history from the
 // first prompt's end computed again as build() computed it (the first reply
 // decoded, the tool result prefilled, the second reply decoded) up to b, then
@@ -570,9 +591,95 @@ static void check_fork(int p, const int *suffix, int ns) {
     }
     drop(&q.t);
   }
+  // the rewound snapshot method: the first snapshot after p within the
+  // rewind margin, continued at p (a thinking turn's next turn, from its
+  // prompt end one position back); its rings hold every row the
+  // continuation reads, so it gives what the snapshot method gives
+  int j = -1;
+  for (int i = 0; i < nsaved; i++)
+    if (saved[i].pos > p && saved[i].pos <= p + replay_margin() && (j < 0 || saved[i].pos < saved[j].pos)) j = i;
+  if (j >= 0) {
+    Outcome q = rewound(f, n, j, p);
+    const Outcome *ref = decoded ? &o : &c;
+    const char *what = decoded ? "the conversation continued there" : "the cold prefill";
+    size_t bad = differ_state(&q.t, &ref->t, n);
+    printf("  snapshot at %d continued %d positions before it, against %s: %zu bytes differ, next tokens %s\n",
+           saved[j].pos, saved[j].pos - p, what, bad, same_next(&q, ref) ? "equal" : "DIFFERENT");
+    if (bad) explain(&ref->t, &q.t, n);
+    if (bad || !same_next(&q, ref)) fail("the snapshot at %d continued at %d differs from %s", saved[j].pos, p, what);
+    drop(&q.t);
+  }
   if (decoded) drop(&o.t);
   drop(&c.t), drop(&r.t);
   free(f);
+}
+
+// The cache's rewind room (server/src/kv.rs): a state continues up to the
+// rewind margin less its stale rows before its end, the margin's rows that
+// rows written past where it then continued replaced. A resume at k from a
+// snapshot x of the state `rows` (prompt rows before k): within the room it
+// must give the cold prefill's bytes; past it, the difference is printed.
+static void room_resume(Snapshot *x, const State *rows, int k, const int *suffix, int ns, int within, const char *what) {
+  int n = k + ns, *f = xmalloc((size_t)n * sizeof *f);
+  memcpy(f, conv, (size_t)k * sizeof *f);
+  memcpy(f + k, suffix, (size_t)ns * sizeof *f);
+  State *q = fresh();
+  model_state_copy(q, rows, k);
+  model_state_use(q);
+  model_snapshot_restore(q, x);
+  Outcome o = finish(model_prefill(f, n, k, 0, -1, 0), n);
+  done_with(q);
+  Outcome c = cold(f, n);
+  size_t bad = differ_state(&o.t, &c.t, n);
+  printf("  %s, continued %d positions before it (%s the room): %zu bytes differ from the cold prefill, next tokens %s\n",
+         what, model_snapshot_pos(x) - k, within ? "within" : "past", bad, same_next(&o, &c) ? "equal" : "DIFFERENT");
+  if (within && (bad || !same_next(&o, &c))) fail("%s continued at %d, within its room, differs from the cold prefill", what, k);
+  drop(&o.t), drop(&c.t);
+  free(f);
+}
+
+// Two ways a state gets stale rows, each from the first prompt's end (a
+// snapshot without stale rows), and the room the cache gives it then.
+static void check_room(const int *suffix, int ns) {
+  int R = replay_margin(), k = 0;
+  while (saved[k].pos != prompt1) k++;
+  printf("rewind room (margin %d):\n", R);
+  // 1. The state decodes 3 tokens, then continues one position before the
+  //    prompt's end for a prompt that ends there: its rows of the 3 decoded
+  //    positions stay, 3 stale rows. 3 tokens decoded at its end replace them.
+  State *s = fresh();
+  model_state_copy(s, source, prompt1);
+  model_state_use(s);
+  model_snapshot_restore(s, saved[k].snap);
+  for (int i = 0; i < 3; i++) model_forward(conv + prompt1 + i, 1, prompt1 + i);
+  int *g = xmalloc((size_t)prompt1 * sizeof *g);
+  memcpy(g, conv, (size_t)prompt1 * sizeof *g);
+  g[prompt1 - 1] = suffix[0];
+  model_prefill(g, prompt1, prompt1 - 1, 0, -1, 0);
+  Snapshot *x = model_snapshot(s, prompt1, 0);
+  for (int i = 0; i < 3; i++) model_forward(conv + prompt1 + i, 1, prompt1 + i);
+  Snapshot *y = model_snapshot(s, prompt1 + 3, 0);
+  model_state_use(source);
+  room_resume(x, s, prompt1 - (R - 3), suffix, ns, 1, "a short prompt's end, 3 stale rows");
+  room_resume(x, s, prompt1 - R, suffix, ns, 0, "a short prompt's end, 3 stale rows");
+  room_resume(y, s, prompt1 + 3 - R, suffix, ns, 1, "3 tokens later, no stale rows");
+  model_snapshot_free(x), model_snapshot_free(y);
+  model_state_free(s);
+  free(g);
+  // 2. A verify pass of 4 rows keeps 1 token: its 3 rows after it took the
+  //    places of the margin's 3 oldest rows.
+  State *v = fresh();
+  model_state_copy(v, source, prompt1);
+  model_state_use(v);
+  model_snapshot_restore(v, saved[k].snap);
+  model_verify(conv + prompt1, 4, prompt1);
+  model_accept(conv + prompt1, 1, prompt1);
+  Snapshot *z = model_snapshot(v, prompt1 + 1, 0);
+  model_state_use(source);
+  room_resume(z, v, prompt1 + 1 - (R - 3), suffix, ns, 1, "a verify pass keeping 1 of 4 rows, 3 stale rows");
+  room_resume(z, v, prompt1 + 1 - R, suffix, ns, 0, "a verify pass keeping 1 of 4 rows, 3 stale rows");
+  model_snapshot_free(z);
+  model_state_free(v);
 }
 
 static int only[64], nonly;  // --at P: these fork positions only
@@ -587,13 +694,15 @@ static int fork_suffix(int *suffix, int max) {
 static int fork_test(const int *prompt, int n, int randoms) {
   build(prompt, n);
   int suffix[64], ns = fork_suffix(suffix, 64);
+  if (!opt.ced && !prompt_only) check_room(suffix, ns);
   if (nonly) {
     for (int i = 0; i < nonly; i++)
       if (only[i] > 0 && only[i] <= nconv) check_fork(only[i], suffix, ns);
     printf("%d forks, %d failures\n", nonly, failures);
     return failures != 0;
   }
-  int classes[] = {1, 2, 100, MB - 1, MB, MB + 1, 2 * MB - 1, 2 * MB, 2 * MB + 1, prompt1 / 2, prompt1 - 1, prompt1,
+  int classes[] = {1, 2, 100, MB - 1, MB, MB + 1, 2 * MB - 1, 2 * MB, 2 * MB + 1, prompt1 / 2,
+                   prompt1 - replay_margin() - 1, prompt1 - replay_margin(), prompt1 - 1, prompt1,
                    prompt1 + 1, prompt1 + REPLY1 / 2, reply1 - 1, reply1, reply1 + 1, (reply1 + prompt2) / 2, prompt2 - 1,
                    prompt2, prompt2 + 1, prompt2 + REPLY2 / 2, reply2 - 1, reply2};
   int positions[64], np = 0;

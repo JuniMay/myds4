@@ -77,9 +77,9 @@ int myds4_idle(void);
 void myds4_log(const char *line);
 
 // The model's limits: rows of different states that myds4_rows takes at
-// once, DSpark's drafts per pass, the most rows one verify pass takes, the
-// rows a state can rewind (max(DSpark's block, --lookup)), and the
-// vocabulary.
+// once (6), DSpark's drafts per pass, the most rows one verify pass takes,
+// the rows a state can rewind (the rewind margin: 8, or --draft's or
+// --lookup's drafts per pass when more), and the vocabulary.
 int myds4_max_rows(void);
 int myds4_draft_block(void);
 int myds4_max_verify(void);
@@ -107,7 +107,14 @@ void myds4_reset(void);  // the state in use, empty
 // overwrite (window rings, compressor rows, draft rings) and the Engram
 // history. A state continues at the position of a snapshot restored into it,
 // or up to myds4_rewind() positions before it, after the global rows before
-// that position were copied into it from the snapshot's own state.
+// that position were copied into it from the snapshot's own state. Its rings
+// hold myds4_rewind() positions' rows before each window for that. A row
+// written past where the state then continues takes the place of one of
+// them, the oldest: a verify pass's rows after the tokens myds4_accept keeps,
+// and a state's rows after the end of a prompt that continued it before
+// them. Each row written at the state's end replaces one again. A state (and
+// a snapshot of it) continues at most myds4_rewind() less these stale rows
+// before its position; the caller counts them (server/src/kv.rs).
 typedef struct Snapshot myds4_snapshot;
 // s's rolling rows now, as at pos, and with with_logits the logits the last
 // prefill or step returned (those pos's token is sampled from).
@@ -132,7 +139,7 @@ typedef struct {
 // replay is exact: the prefill starts earlier, each layer where its window
 // needs. With --ced it is bounded and approximate, as DeepInfer's encoder SWA
 // bounded replay: every layer computes again the ring's positions before from
-// (133, with --lookup more), its windows cut off at the first of them, and
+// (136, with a wider --lookup more), its windows cut off at the first of them, and
 // the copied global rows of groups completed before from stay as they are.
 // With capture >= 0 (and captured not null), *captured gets the rolling rows
 // at that position as a snapshot taken during the prefill: a replay's branch
@@ -146,8 +153,8 @@ typedef struct {
 const float *myds4_prefill(const int32_t *tokens, int n, int from, int replay, int capture,
                            myds4_snapshot **captured, myds4_prefill_info *info);
 // What a replay at k costs beyond the prompt's new rows: the rows before k it
-// computes again, per layer on average (exact: about 2,610 for long prefixes,
-// at most k; bounded, with --ced: the ring's 133, at most k); and the first
+// computes again, per layer on average (exact: about 2,613 for long prefixes,
+// at most k; bounded, with --ced: the ring's 136, at most k); and the first
 // position it computes again, from which the prompt's images must be encoded
 // (myds4_images_encode). From the worker's thread.
 int myds4_replay_rows(int k);

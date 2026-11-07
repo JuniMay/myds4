@@ -228,7 +228,7 @@ decoding, up to 2048 rows of a prompt. Per layer:
    scores weight them), the shared expert, the routed experts, and the sum
    in expert order, as the reference adds them.
 
-The window keys of a layer live in a ring of `128 + max(5, lookup_depth)`
+The window keys of a layer live in a ring of `128 + max(8, lookup_depth)`
 rows: the window plus positions a speculative pass may write for rejected
 drafts. A prompt batch works on a window buffer filled from the ring and
 written back. A KV source keeps 8 compressor rows normally and 32 for
@@ -244,7 +244,7 @@ expert prefetches; shorter retained batches use selective prefetching.
 
 Ordinary builds expose `--ced off|N`, default off, through the CLI and both
 servers. They retain N decoder rows plus the verification rewind margin
-(`max(5, lookup_depth)`), and apply replay
+(`max(8, lookup_depth)`), and apply replay
 only when the new input is longer than that sum. The replay boundary is
 chosen across the whole forward call, including multi-chunk prompts. They
 preserve all encoder/global KV work and prime DSpark only from computed
@@ -688,8 +688,8 @@ before a slot is reused. Bounded pools fetch the native draft selections
 even when backbone substitution is enabled.
 
 Rejected rows leave no local attention state that a resumed position reads.
-The window ring retains `128 + max(5, lookup_depth)` rows. Compressor state
-retains eight rows for native DSpark widths and 32 for wider context-copy
+The window ring retains `128 + max(8, lookup_depth)` rows. Compressor state
+retains 16 rows for the default margin and 32 for wider context-copy
 verification. Compressed and index rows are rewritten before use, the
 Engram history is rebuilt from the kept tokens, and the draft's windows
 receive only the kept positions.
@@ -746,7 +746,7 @@ It also checks that frequent short endings cannot hide a matching long suffix.
 The model verifies up to sixteen rows, including the current token. Dense
 products split these into groups of at most six to preserve the existing
 scalar-equivalent arithmetic; routed experts request the union across all
-rows. The local KV ring has `128 + max(5, lookup_depth)` rows. Wider lookup
+rows. The local KV ring has `128 + max(8, lookup_depth)` rows. Wider lookup
 uses 32 compressor-state rows so rejected drafts cannot overwrite state
 needed to resume. DSpark retains its own five-position architecture.
 
@@ -800,7 +800,7 @@ plus candidate masks), so a prompt longer
 than 16,384 tokens runs as passes of 16,384, each reading the experts again.
 Request buffers for residual streams, mixing coefficients, selections,
 candidate masks, image flags and Engram rows grow with the prompt. The first
-small forward pass afterward reduces them to `max(5, lookup_depth) + 1`
+small forward pass afterward reduces them to `max(8, lookup_depth) + 1`
 rows. It waits for submitted GPU work before releasing buffers.
 Changing the number of rows within that small-batch capacity requires no
 reallocation. Candidate masks reserve only these request rows; their width
@@ -875,7 +875,7 @@ carry information between token positions only through their causal
 128-token local windows. A change can move at most 127 positions forward
 per layer. Token-local operations do not extend that distance.
 
-The plan conservatively retains `2668 + max(5, lookup_depth)` positions
+The plan conservatively retains `2668 + max(8, lookup_depth)` positions
 before the final state and before a capture's position (a fork's branch
 point). It rounds the starts down and the capture's end up to the original 2,048-row matrix
 batch boundaries, merges overlapping regions, and skips whole batches
@@ -1413,15 +1413,16 @@ windows and the Engram history. The compressed rows and index keys take
 a forward pass needs more, up to `--ctx` (3.13 GiB at 1,048,576), keeping
 the rows it holds; a reset gives the room back. The KV prefix cache charges
 a state these bytes (`myds4_state_bytes`), its snapshots apart. The layers use one state at a
-time. A ring holds its layer's last `128 + max(5, lookup_depth)` positions.
-The compressor keeps 8 rows normally and 32 for wider lookup, so a state
-can continue at its position or up to `max(5, lookup_depth)` positions
-before it. The compressed rows and index keys of a position are never
+time. A ring holds its layer's last `128 + max(8, lookup_depth)` positions.
+The compressor keeps 16 rows normally and 32 for wider lookup, so a state
+can continue at its position or up to `max(8, lookup_depth)` positions
+before it (its rewind room), while its rings still hold those positions'
+rows: see the rewind room below. The compressed rows and index keys of a position are never
 rewritten once later positions ran, so another state can copy a state's
 rows before its position (`myds4_state_copy`), also while a request still
 decodes in it. The rows that later positions overwrite (the rings, the
 compressor rows, the draft rings and the Engram history) are kept apart as
-snapshots of 5.3 MiB each without `--draft` (5,578,764 bytes), plus 0.5 MB
+snapshots of 5.6 MiB each without `--draft` (5,832,716 bytes), plus 0.5 MB
 of logits at a prompt's end (`myds4_snapshot_take`). A snapshot and its own state's rows before its
 position together give the state at that position.
 
@@ -1464,27 +1465,43 @@ whatever roles its tokens belong to, and picks the cheapest way to resume
 there, counted in prefilled tokens. Without `--ced` every way is exact:
 
 - **In place** (logged `kept`): an idle state that the prompt extends,
-  whole or from up to `max(5, lookup_depth)` positions before its end,
-  continues without a copy; its rows past the resume point and the
-  snapshots past it are dropped. A state that a request decodes in is
-  never continued in place.
+  whole or from up to its rewind room before its end, continues without a
+  copy; its rows past the resume point and the snapshots past it are
+  dropped. A state that a request decodes in is never continued in place.
 - **Snapshot** (`saved` for the same prompt again, else `forked`): a new
-  state copies the source's rows before one of its snapshots at `b <= k`,
-  restores the snapshot and prefills from `b`. When `b` is the prompt's
-  length, the snapshot's logits are the prompt's and nothing is prefilled,
-  so a retry decodes as the first try did.
+  state copies the source's rows before a position `b <= k`, restores one
+  of its snapshots at `b` or up to the snapshot's rewind room after `b`, and
+  prefills from `b`. When `b` is the prompt's length, the snapshot is there,
+  its logits are the prompt's and nothing is prefilled, so a retry decodes
+  as the first try did. A thinking prompt ends with `<think>`, and the next
+  turn renders that reply with `</think>` there: the next turn parts one
+  position before the prompt-end snapshot and resumes from it this way,
+  with nothing to replay.
 - **Replay** (`forked`): a new state copies the source's rows before `k` and
   prefills from `k` with an exact replay (`myds4_prefill` with replay set).
-  Layer 39 starts its window 133 positions before `k` (128 plus the rewind
+  Layer 39 starts its window 136 positions before `k` (128 plus the rewind
   margin), and each layer below starts 127 positions earlier, about 5,100
   positions before `k` at layer 0: a layer's window keys come from the layer
   below's output there, which is right only a window after that layer's
   first row. So each layer rebuilds its rolling rows at `k` from the copied
   rows with the arithmetic of a cold prefill; the replay captures them as
-  the new state's branch-point snapshot. It costs about 2,610 rows per layer
+  the new state's branch-point snapshot. It costs about 2,613 rows per layer
   beyond the prompt's new tokens for long prefixes, and never more than
   `k` (`myds4_replay_rows`).
 - **Cold** (`new`): nothing is shared; a new state prefills from position 0.
+
+The rewind room is `max(8, lookup_depth)` less the state's or snapshot's
+stale rows: the margin's rows that rows written past where the state then
+continued replaced. A ring is written at `p % ring` for position `p`, so
+such a row takes the place of the margin's oldest row. A verify pass's rows
+after the tokens it keeps (rejected drafts, or rows after the end token)
+make as many stale rows as there are of them, unless more are stale
+already. A prompt that continues a state before its end and stops short of
+that end leaves one stale row for each old row after the prompt's end. Each
+row written at a state's end replaces one. The cache counts them for every
+state and snapshot (`stale` in `server/src/kv.rs`). Without the count, a
+later resume within the margin would read a replaced row in every layer's
+window, and its output would differ from a cold prefill's.
 
 Ties go to the plan earlier in the list. A response's usage reports as
 `prompt_cache_hit_tokens` (and `cached_tokens`) the prompt tokens whose rows
@@ -1494,13 +1511,14 @@ resuming there is cheaper, and the report is `b`; that fork captures its
 branch point at `k` on the way.
 
 With `--ced`, prefill is approximate already (CED prefill), and the replay
-is bounded instead: every layer starts a ring before `k` (133 positions,
+is bounded instead: every layer starts a ring before `k` (136 positions,
 more with a wider `--lookup`), and the attention windows of the rows it
 computes stop there. The compressed rows and index keys before `k` stay the
 ones the new state copied; only the rolling rows at `k` are computed again,
 from the copied global rows and the window that the replay covers, so they
 differ from a cold prefill's. The replay costs at most a ring's rows
-(`myds4_replay_rows`), so a snapshot wins only within a ring below `k`. A
+(`myds4_replay_rows`), so a snapshot wins only within a ring below `k`, or
+within its rewind room after `k`, as at a thinking turn's prompt end. A
 branch point's capture holds the encoder layers only (layers 0 through 20)
 when layers 21 through 39 have not computed a ring before it in that
 prefill: unless it lies at least a ring inside the retained decoder suffix.
@@ -1540,18 +1558,26 @@ checks a retry at a full budget and a growing generation through HTTP.
 
 The fork test checks this. `tools/checks/prefix_fork_check.c` forks a
 conversation (a prompt, a decoded reply, a tool-like result, a second
-decoded reply) at 24 position classes and 16 random positions, resumes each
-fork by replay and from the latest snapshot, and compares the results with
-a cold prefill and with the conversation continued at the fork. Each fork
-also resumes once more from the branch-point snapshot it captured, which
-must give its own bytes. With `--ced N` it checks that a bounded replay
+decoded reply) at 26 position classes and 16 random positions, resumes each
+fork by replay, from the latest snapshot and from the first snapshot after
+it within the rewind margin, and compares the results with a cold prefill
+and with the conversation continued at the fork. Each fork also resumes
+once more from the branch-point snapshot it captured, which must give its
+own bytes. It checks the stale-row count against the engine: a state with
+3 stale rows (a short prompt continued before a state's end, or a verify
+pass of 4 rows that keeps 1 token), resumed within the room the cache gives
+it, must give the cold prefill's bytes, and so must one 3 tokens later with
+the full margin; a resume past the room is printed. With `--ced N` it checks that a bounded replay
 keeps the copied compressed rows and index keys byte for byte and gives
 finite logits, and prints how far each fork lies from the cold prefill.
 `server/tests/prefix_fork.rs` forks a conversation through HTTP while it
 still decodes. Each fork must reuse at least its shared prefix less a
 replay's cost, and no more than the prefix, and must give the tokens of a
 server that starts without a cache; with `--ced 128` the reuse must be at
-least the shared prefix less 133 ([Checks](usage.md#checks-and-diagnostics)).
+least the shared prefix less 136 ([Checks](usage.md#checks-and-diagnostics)).
+A thinking turn's next turn must reuse all but the turn's last prompt token
+and compute only its new tokens, with and without `--ced 128`, and without
+`--ced` give the cold server's tokens.
 
 ### The live view
 

@@ -41,15 +41,16 @@ fn one_model() -> std::sync::MutexGuard<'static, ()> {
 
 /// At least the rows that an exact replay at k computes again, on average per
 /// layer (the cache's cost of a replay, myds4_replay_rows): layer 39 starts a
-/// ring (133 positions with the default --lookup) before k, and each layer
-/// below at most 128 positions earlier (127, plus a ratio-2 compressor's pair).
+/// ring (136 positions: the window and the rewind margin of 8, with the
+/// default --lookup) before k, and each layer below at most 128 positions
+/// earlier (127, plus a ratio-2 compressor's pair).
 fn replay_rows(k: usize) -> usize {
-    (0..40).map(|j| k.min(134 + 128 * j)).sum::<usize>().div_ceil(40)
+    (0..40).map(|j| k.min(137 + 128 * j)).sum::<usize>().div_ceil(40)
 }
 
 /// What a bounded replay at k computes again (--ced): a ring's positions.
 fn bounded_rows(k: usize) -> usize {
-    k.min(133)
+    k.min(136)
 }
 
 struct Setup {
@@ -165,8 +166,14 @@ impl Drop for Server {
 // ---- the prompts' tokens, through the server's renderer and the CLI's tokenizer ----
 
 fn tokens(s: &Setup, messages: &Value) -> Vec<i64> {
+    rendered_tokens(s, messages, false)
+}
+
+/// The prompt's tokens, with thinking on or off.
+fn rendered_tokens(s: &Setup, messages: &Value, thinking: bool) -> Vec<i64> {
     let case = std::env::temp_dir().join(format!("myds4-fork-{}.json", std::process::id()));
-    std::fs::write(&case, json!({"messages": messages}).to_string()).expect("a render case");
+    let mode = if thinking { "thinking" } else { "chat" };
+    std::fs::write(&case, json!({"messages": messages, "thinking_mode": mode}).to_string()).expect("a render case");
     let rendered = Command::new(&s.server).arg("--render").arg(&case).output().expect("render");
     let _ = std::fs::remove_file(&case);
     assert!(rendered.status.success(), "render: {}", String::from_utf8_lossy(&rendered.stderr));
@@ -185,8 +192,12 @@ fn common(a: &[i64], b: &[i64]) -> usize {
 }
 
 fn request(messages: &Value, max_tokens: u32) -> Value {
+    body(messages, max_tokens, false)
+}
+
+fn body(messages: &Value, max_tokens: u32, thinking: bool) -> Value {
     json!({"model": "deepseek-v4.1-flash", "messages": messages, "max_tokens": max_tokens, "temperature": 0,
-           "thinking": false, "stream": false})
+           "thinking": thinking, "stream": false})
 }
 
 fn hit(answer: &Value) -> i64 {
@@ -195,6 +206,21 @@ fn hit(answer: &Value) -> i64 {
 
 fn content(answer: &Value) -> String {
     answer["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string()
+}
+
+/// The reply's reasoning and its content.
+fn reply(answer: &Value) -> String {
+    let m = &answer["choices"][0]["message"];
+    format!("{}|{}", m["reasoning_content"].as_str().unwrap_or(""), m["content"].as_str().unwrap_or(""))
+}
+
+/// The rows the server's last prefill computed (/v1/status): the prompt's
+/// new tokens, and with a replay also the earlier rows it computed again.
+fn last_prefill(server: &Server) -> i64 {
+    let (status, answer) = server.get("/v1/status");
+    assert_eq!(status, 200, "GET /v1/status");
+    let v: Value = serde_json::from_slice(&answer).expect("the status's JSON");
+    v["last_prefill"]["tokens"].as_i64().unwrap_or(-1)
 }
 
 /// The conversation's text, from the repository's own documents: a long
@@ -318,6 +344,55 @@ fn ced_forks_reuse_the_shared_prefix_less_a_ring() {
         println!("{}: {:?}", f.what, f.text);
     }
     assert!(wrong.is_empty(), "forks that reused too little:\n{}", wrong.join("\n"));
+}
+
+/// A thinking prompt ends with <think>. The next turn renders that reply
+/// with </think> there, so it shares all of the prompt but its last token.
+/// It resumes from the turn's prompt-end snapshot one position back, without
+/// computing any earlier rows again, with --ced too; without --ced it gives
+/// the tokens that a server starting without a cache gives.
+#[test]
+fn a_thinking_turn_s_next_turn_resumes_one_position_before_its_prompt_end() {
+    let Some(s) = setup() else {
+        eprintln!("skipped: set MYDS4_CHECKPOINT and MYDS4_EXPERTS");
+        return;
+    };
+    let _one = one_model();
+    let (system, user) = texts();
+    let first = json!([{"role": "system", "content": system}, {"role": "user", "content": user}]);
+    let second = json!([{"role": "system", "content": system}, {"role": "user", "content": user},
+                        {"role": "assistant", "content": "It describes how the server is started and checked."},
+                        {"role": "user", "content": "Which of those options change the output?"}]);
+    let (a, b) = (rendered_tokens(&s, &first, true), rendered_tokens(&s, &second, true));
+    let shared = common(&a, &b);
+    assert_eq!(shared, a.len() - 1, "the next turn parts at the first turn's last token");
+    let mut wrong = Vec::new();
+    for extra in [&[][..], &["--ced", "128"][..]] {
+        let what = if extra.is_empty() { "without --ced" } else { "with --ced 128" };
+        let server = Server::start(&s, extra);
+        server.chat(&body(&first, 16, true));
+        let answer = server.chat(&body(&second, 16, true));
+        let (reused, computed) = (hit(&answer), last_prefill(&server));
+        println!("{what}: the next turn shares {shared} of its {} tokens, reused {reused}, computed {computed} rows",
+                 b.len());
+        if answer["usage"]["prompt_tokens"].as_i64() != Some(b.len() as i64) {
+            wrong.push(format!("{what}: the server's prompt has {} tokens, the test's {}", answer["usage"]["prompt_tokens"], b.len()));
+        }
+        if reused != shared as i64 || computed != (b.len() - shared) as i64 {
+            wrong.push(format!("{what}: reused {reused} and computed {computed} rows; {shared} and {} expected", b.len() - shared));
+        }
+        if extra.is_empty() {
+            let text = reply(&answer);
+            drop(server);
+            let cold = Server::start(&s, &[]);
+            let reference = reply(&cold.chat(&body(&second, 16, true)));
+            println!("{what}: tokens {}", if text == reference { "equal to the cold server's" } else { "DIFFERENT from the cold server's" });
+            if text != reference {
+                wrong.push(format!("{what}: {text:?} against the cold server's {reference:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "the next thinking turn:\n{}", wrong.join("\n"));
 }
 
 // ---- an image in the shared prefix ----

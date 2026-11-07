@@ -94,14 +94,14 @@ so one runs at a time: a second waits for the first's lock.
 
 The server and the CLI accept `--ced off|N` for approximate decoder replay
 during prefill, with `off` as the default. For example, `--ced 128` retains
-128 decoder tokens plus `max(5, lookup_depth)` rewind rows. This can change output; see the
+128 decoder tokens plus `max(8, lookup_depth)` rewind rows. This can change output; see the
 [option and cache behavior](docs/usage.md) and the
 [measured comparisons](docs/performance.md#joint-prefill-and-server-ced).
 The server's KV prefix cache resumes each prompt at the longest prefix it
 shares with any conversation the server holds, at any position. Without
 `--ced` it is exact: over rows that came from prompts, the result is byte
 for byte that of prefilling the whole prompt. With `--ced` it recomputes
-the last shared ring of positions (133 with the default `--lookup`) with
+the last shared ring of positions (136 with the default `--lookup`) with
 their windows stopping there, which is approximate, as CED is
 ([design](docs/design.md#the-kv-prefix-cache)).
 Arrival and prefill logs show request counts, queue depth and actual chunks

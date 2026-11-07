@@ -18,7 +18,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--experts") && i + 1 < argc) o.experts = argv[++i];
     else die("invalid runahead check option");
   }
-  if (count < 2 || count > BLOCK + 1) die("runahead check needs 2 to 6 requests");
+  if (count < 2 || count > BATCH_ROWS) die("runahead check needs 2 to %d requests", BATCH_ROWS);
   alarm(600);
   tok_load(argv[1]);
   model_load(argv[1], &o);

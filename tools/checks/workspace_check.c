@@ -60,17 +60,19 @@ int main(void) {
   pending = 1;
   request_capacity(1);
   size_t decode_bytes = live_bytes;
-  expect("decoding retains only the small-batch row capacity", request_rows == BLOCK + 1);
+  // a verify pass's rows (the token and the rewind margin's), or batched rows
+  size_t small = replay_margin() + 1 > BATCH_ROWS ? replay_margin() + 1 : BATCH_ROWS;
+  expect("decoding retains only the small-batch row capacity", request_rows == (int)small);
   expect("prompt allocation is released", decode_bytes < prompt_bytes);
   expect("submitted work completes before prompt buffers are freed", !pending && !unsafe_frees);
-  expect("residual storage fits every verification row", HS.size == (size_t)(BLOCK + 1) * HC * DIM * STREAM_BYTES);
-  expect("candidate masks retain only the rows being served", CAND.size == (size_t)(BLOCK + 1) * cand_words * sizeof(uint32_t));
-  expect("query workspace releases unused prompt rows", Q.size == (size_t)(BLOCK + 1) * HEADS * HEAD_DIM * sizeof(float));
+  expect("residual storage fits every verification row", HS.size == small * HC * DIM * STREAM_BYTES);
+  expect("candidate masks retain only the rows being served", CAND.size == small * cand_words * sizeof(uint32_t));
+  expect("query workspace releases unused prompt rows", Q.size == small * HEADS * HEAD_DIM * sizeof(float));
   expect("attention output workspace releases unused prompt rows", O.size == Q.size);
   expect("matrix input staging also fits the draft history projection", XB.size >= 128u * 3 * DIM * 2);
   expect("new residual storage is cleared", HS.ptr[0] == 0 && HS.ptr[HS.size - 1] == 0);
   int before = allocations;
-  for (int m = 1; m <= BLOCK + 1; m++) request_capacity(m);
+  for (int m = 1; m <= (int)small; m++) request_capacity(m);
   expect("switching among decode batch sizes does not reallocate", allocations == before);
   pending = 1;
   request_capacity(32);

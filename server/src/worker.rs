@@ -750,6 +750,7 @@ impl Worker {
         }
         let max_new = (job.max_tokens.max(1) as usize).min(self.ctx - n);
         let plan = self.cache.plan(&prompt, self.limits);
+        let origin = self.cache.origin(&plan, n);
         let capture = plan.capture(n);
         // The state at the prompt's end and its first token, and the
         // snapshots the plan takes.
@@ -804,14 +805,14 @@ impl Worker {
                 self.cache.touch(source, at);
                 self.used.insert(source, Instant::now());
                 self.use_state(id);
-                if let Plan::Snapshot { .. } = plan {
-                    engine::snapshot_restore(st, self.snaps[&(source, at)]);
+                if let Plan::Snapshot { snap, .. } = plan {
+                    engine::snapshot_restore(st, self.snaps[&(source, snap)]);
                 }
                 id
             }
         };
         let bytes = engine::state_bytes(self.states[&id], n + 1);
-        let dropped = self.cache.start(id, &prompt, from, bytes);
+        let dropped = self.cache.start(id, &prompt, from, bytes, kv::stale_at(origin, n));
         for s in dropped {
             self.free_snap(id, s.pos);
         }
@@ -867,11 +868,13 @@ impl Worker {
                 && !captured.is_null()
             {
                 self.snaps.insert((id, at), captured);
-                self.cache.add_snap(id, Snap { pos: at, kind: Kind::Branch, bytes: engine::snapshot_bytes(false) });
+                let stale = kv::stale_at(origin, at);
+                self.cache.add_snap(id, Snap { pos: at, kind: Kind::Branch, bytes: engine::snapshot_bytes(false), stale });
             }
             let x = engine::snapshot_take(self.states[&id], n, true);
             self.snaps.insert((id, n), x);
-            self.cache.add_snap(id, Snap { pos: n, kind: Kind::PromptEnd, bytes: engine::snapshot_bytes(true) });
+            let stale = kv::stale_at(origin, n);
+            self.cache.add_snap(id, Snap { pos: n, kind: Kind::PromptEnd, bytes: engine::snapshot_bytes(true), stale });
             (lg, info)
         };
         drop(images);
@@ -1013,10 +1016,12 @@ impl Worker {
         };
         g.job.last(Event::Done { finish: why });
         // The generation's end, for forks there, when the cache keeps it.
+        let stale = self.cache.entries[&g.state].stale;
         let end = self.cache.snap(g.state, g.pos).is_none().then(|| Snap {
             pos: g.pos,
             kind: Kind::GenerationEnd,
             bytes: engine::snapshot_bytes(false),
+            stale,
         });
         let (take, (snaps, states)) = self.cache.end(g.state, engine::state_bytes(self.states[&g.state], g.pos), end);
         self.free(g.state, snaps, states);
@@ -1119,12 +1124,16 @@ impl Worker {
                 l.feedback(k, a);
                 g.lookup_accepted += a;
             }
+            let mut kept = 0;
             for &t in &rows[..=a] {
                 if g.ended {
                     break;
                 }
                 Self::emit(&mut self.cache, g, t, eos, think_end);
+                kept += 1;
             }
+            // the pass's rows after the kept tokens took places in the rings
+            self.cache.rejected(g.state, rows.len() - kept);
             g.t = next;
             return;
         }

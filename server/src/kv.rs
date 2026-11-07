@@ -8,20 +8,34 @@
 //! against every state, busy or idle, and picks the cheapest way to resume at
 //! the longest shared prefix `k` (every way exact without --ced):
 //!
-//! - **In place**: an idle state that the prompt extends, whole or up to the
-//!   engine's rewind margin before its end, continues without a copy.
-//! - **Snapshot**: a new state copies a source's rows before a snapshot's
-//!   position `b <= k`, restores the snapshot and prefills from `b`; the
-//!   prefill captures the rolling rows at `k` when `b < k` (a branch snapshot).
+//! - **In place**: an idle state that the prompt extends, whole or up to its
+//!   rewind room before its end, continues without a copy.
+//! - **Snapshot**: a new state copies a source's rows before a position
+//!   `b <= k`, restores a snapshot at `b` or up to the snapshot's rewind room
+//!   after `b`, and prefills from `b`; the prefill captures the rolling rows at
+//!   `k` when `b < k` (a branch snapshot). A thinking prompt ends with
+//!   `<think>`, and the next turn renders that reply with `</think>` there:
+//!   it parts one position before the prompt-end snapshot and resumes from it.
 //! - **Replay**: a new state copies a source's rows before `k` and prefills
 //!   from `k` with the engine's replay (exact, or bounded to a ring under
 //!   --ced), which rebuilds the rolling rows at `k` (and gives them as a
 //!   branch snapshot).
 //! - **Cold**: nothing is shared; a new state prefills from 0.
 //!
+//! **Rewind room.** Each layer's window ring holds, before the window, the
+//! rows of a margin of positions (myds4_rewind), so that a state can continue
+//! up to that many positions before its end. A row written past where the
+//! state then continues takes the place of one of the margin's oldest rows: a
+//! verify pass's rows after the tokens it keeps, and a state's old rows after
+//! the end of a prompt that continued it before them. The cache counts these
+//! stale rows of each state and snapshot ([`Entry::stale`]); each row written
+//! at a state's end replaces one. A resume continues at most the margin less
+//! the stale rows before a state's end or a snapshot's position.
+//!
 //! The worker carries out the plan with engine calls and reports back what it
-//! made ([`Cache::add`], [`Cache::add_snap`], [`Cache::push`]). The cache owns no
-//! engine handles, so its tests need no model.
+//! made ([`Cache::add`], [`Cache::add_snap`], [`Cache::push`],
+//! [`Cache::rejected`]). The cache owns no engine handles, so its tests need
+//! no model.
 
 use std::collections::BTreeMap;
 
@@ -45,6 +59,8 @@ pub struct Snap {
     pub pos: usize,
     pub kind: Kind,
     pub bytes: u64,
+    /// Its rings' stale rows at `pos` (see [`Entry::stale`]).
+    pub stale: usize,
 }
 
 impl Snap {
@@ -65,6 +81,10 @@ pub struct Entry {
     pub used: u64,
     /// The bytes its rows take (myds4_state_bytes), the snapshots apart.
     pub bytes: u64,
+    /// The rows of its rings' rewind margin that later rows replaced (see
+    /// the module documentation): it continues up to the margin less these
+    /// positions before its end.
+    pub stale: usize,
     pub snaps: Vec<Snap>,
     /// Its number in the log and the live view.
     pub number: u64,
@@ -80,13 +100,14 @@ pub enum Plan {
     /// The idle state itself continues at `from`: with `from` equal to the
     /// prompt's length, from its prompt-end snapshot there (no prefill).
     InPlace { state: Id, from: usize },
-    /// A new state: the source's rows before `at`, its snapshot at `at`, then
-    /// a prefill from `at` (none when `at` is the prompt's length: the
-    /// snapshot's logits are the prompt's). `branch` is where the prompt
-    /// parts from every state (the longest prefix it shares with one), at or
-    /// after `at`: the prefill captures the rolling rows there when it lies
-    /// between `at` and the prompt's end, so a later fork there resumes at once.
-    Snapshot { source: Id, at: usize, branch: usize },
+    /// A new state: the source's rows before `at`, its snapshot at `snap`
+    /// (`at`, or up to the snapshot's rewind room after it), then a prefill
+    /// from `at` (none when `at` is the prompt's length: the snapshot's
+    /// logits are the prompt's). `branch` is where the prompt parts from
+    /// every state (the longest prefix it shares with one), at or after `at`:
+    /// the prefill captures the rolling rows there when it lies between `at`
+    /// and the prompt's end, so a later fork there resumes at once.
+    Snapshot { source: Id, snap: usize, at: usize, branch: usize },
     /// A new state: the source's rows before `at`, then a replay at `at` (exact,
     /// or bounded with --ced), which captures the rolling rows there.
     Replay { source: Id, at: usize },
@@ -148,15 +169,24 @@ impl Plan {
 /// The engine's limits and costs that plans depend on.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
-    /// The positions a state can continue before its end (myds4_rewind).
+    /// The positions a state can continue before its end or a snapshot's
+    /// position while its rings hold their rows (myds4_rewind), its stale
+    /// rows apart.
     pub rewind: usize,
     /// Whether a replay is available.
     pub replay: bool,
     /// What a replay at k costs beyond its own new tokens, in prefilled
     /// tokens: the rows before k each layer computes again, on average
-    /// (myds4_replay_rows: exact, at most k, about 2,610 for long prefixes;
-    /// bounded with --ced, the ring's 133).
+    /// (myds4_replay_rows: exact, at most k, about 2,613 for long prefixes;
+    /// bounded with --ced, the ring's 136).
     pub replay_cost: fn(usize) -> usize,
+}
+
+/// The stale rows at `pos` of rows continued from `origin` (its position and
+/// its stale rows, [`Cache::origin`]): the origin's, less one for each row
+/// written after it, and one more for each of its old rows after `pos`.
+pub fn stale_at(origin: (usize, usize), pos: usize) -> usize {
+    (origin.1 + origin.0).saturating_sub(pos)
 }
 
 /// The positions two token sequences share from the start.
@@ -232,12 +262,16 @@ impl Cache {
             if k == 0 {
                 continue;
             }
-            if !e.busy && k + limits.rewind >= e.tokens.len() {
+            let room = |stale: usize| limits.rewind.saturating_sub(stale);
+            if !e.busy && e.tokens.len() <= k + room(e.stale) {
                 consider(n - k, 0, Plan::InPlace { state: id, from: k });
             }
             for s in &e.snaps {
-                if s.pos <= k && (s.pos < n || s.logits()) {
-                    consider(n - s.pos, 1, Plan::Snapshot { source: id, at: s.pos, branch: 0 });
+                // at its position, or before it within its room; without a
+                // prefill, only at the prompt's end with its logits
+                let at = s.pos.min(k);
+                if s.pos <= k + room(s.stale) && (at < n || (s.pos == n && s.logits())) {
+                    consider(n - at, 1, Plan::Snapshot { source: id, snap: s.pos, at, branch: 0 });
                 }
             }
             if limits.replay && k < n {
@@ -245,8 +279,24 @@ impl Cache {
             }
         }
         match best.2 {
-            Plan::Snapshot { source, at, .. } => Plan::Snapshot { source, at, branch: branch.max(at) },
+            Plan::Snapshot { source, snap, at, .. } => Plan::Snapshot { source, snap, at, branch: branch.max(at) },
             plan => plan,
+        }
+    }
+
+    /// Where a prefill on `plan` for a prompt of `n` tokens starts: the
+    /// position of the rows it continues (a state's end, a snapshot's
+    /// position, a replay's resume point, which it rebuilds whole, or 0) and
+    /// their stale rows. [`stale_at`] gives the stale rows at a later position.
+    pub fn origin(&self, plan: &Plan, n: usize) -> (usize, usize) {
+        let stale = |id: Id, pos: usize| self.snap(id, pos).expect("the plan's snapshot").stale;
+        match *plan {
+            Plan::Cold => (0, 0),
+            Plan::Replay { at, .. } => (at, 0),
+            Plan::Snapshot { source, snap, .. } => (snap, stale(source, snap)),
+            // the same prompt again: its prompt-end snapshot is restored into it
+            Plan::InPlace { state, from } if from == n => (n, stale(state, n)),
+            Plan::InPlace { state, .. } => (self.entries[&state].tokens.len(), self.entries[&state].stale),
         }
     }
 
@@ -258,21 +308,32 @@ impl Cache {
         let used = self.tick();
         self.entries.insert(
             id,
-            Entry { tokens: Vec::new(), busy: true, used, bytes, snaps: Vec::new(), number: self.numbers, hits: Vec::new() },
+            Entry {
+                tokens: Vec::new(),
+                busy: true,
+                used,
+                bytes,
+                stale: 0,
+                snaps: Vec::new(),
+                number: self.numbers,
+                hits: Vec::new(),
+            },
         );
         id
     }
 
     /// A request starts in `id` (just added, or continued in place) at `from`:
     /// it is busy and holds the prompt (its rows before `from` copied or its
-    /// own, the others prefilled). Its rows after `from` are overwritten, so
-    /// the snapshots past `from` are dropped: returned for the worker to free.
-    pub fn start(&mut self, id: Id, p: &[i32], from: usize, bytes: u64) -> Vec<Snap> {
+    /// own, the others prefilled), with `stale` stale rows at the prompt's
+    /// end. Its rows after `from` are overwritten, so the snapshots past
+    /// `from` are dropped: returned for the worker to free.
+    pub fn start(&mut self, id: Id, p: &[i32], from: usize, bytes: u64, stale: usize) -> Vec<Snap> {
         let used = self.tick();
         let e = self.entries.get_mut(&id).expect("a live state");
         e.busy = true;
         e.used = used;
         e.bytes = bytes;
+        e.stale = stale;
         e.tokens.clear();
         e.tokens.extend_from_slice(p);
         let (keep, dropped): (Vec<Snap>, Vec<Snap>) = e.snaps.drain(..).partition(|s| s.pos <= from);
@@ -304,10 +365,21 @@ impl Cache {
         self.entries.get(&id)?.snaps.iter().find(|s| s.pos == pos).copied()
     }
 
-    /// A decoded token's rows are in the state.
+    /// A decoded token's rows are in the state, written at its end: they
+    /// replace one stale row.
     pub fn push(&mut self, id: Id, token: i32) {
         if let Some(e) = self.entries.get_mut(&id) {
             e.tokens.push(token);
+            e.stale = e.stale.saturating_sub(1);
+        }
+    }
+
+    /// A pass wrote `rows` rows past the state's end, after the tokens it
+    /// kept (rejected drafts, or rows after the end token): they took the
+    /// places of the margin's oldest rows, where the stale rows already are.
+    pub fn rejected(&mut self, id: Id, rows: usize) {
+        if let Some(e) = self.entries.get_mut(&id) {
+            e.stale = e.stale.max(rows);
         }
     }
 
@@ -537,8 +609,9 @@ impl Cache {
 mod tests {
     use super::*;
 
-    /// myds4_replay_rows of the model: 40 layers, layer 39 back a ring of 133
-    /// rows, each layer below a window of 127 more.
+    /// A replay's cost in the shape of myds4_replay_rows, for a rewind margin
+    /// of 5 as in LIMITS: 40 layers, layer 39 back a ring of 133 rows, each
+    /// layer below a window of 127 more.
     fn replay_rows(k: usize) -> usize {
         (0..40).map(|j| k.min(133 + 127 * j)).sum::<usize>().div_ceil(40)
     }
@@ -553,9 +626,9 @@ mod tests {
     /// A state holding `tokens`, idle, with snapshots at `snaps` (prompt ends).
     fn state(c: &mut Cache, tokens: &[i32], snaps: &[usize]) -> Id {
         let id = c.add(1 << 20);
-        c.start(id, tokens, 0, 1 << 20);
+        c.start(id, tokens, 0, 1 << 20, 0);
         for &pos in snaps {
-            c.add_snap(id, Snap { pos, kind: Kind::PromptEnd, bytes: SNAP });
+            c.add_snap(id, Snap { pos, kind: Kind::PromptEnd, bytes: SNAP, stale: 0 });
         }
         c.finish(id, 1 << 20);
         id
@@ -592,13 +665,13 @@ mod tests {
         let mut near = seq(0..19500);
         near.push(-1);
         // snapshot at 19000: 501 tokens; replay at 19500: 1 + 2600
-        assert_eq!(c.plan(&near, LIMITS), Plan::Snapshot { source: s, at: 19000, branch: 19500 });
+        assert_eq!(c.plan(&near, LIMITS), Plan::Snapshot { source: s, snap: 19000, at: 19000, branch: 19500 });
         let mut far = seq(0..15000);
         far.push(-1);
         // snapshot at 9000: 6001 tokens; replay at 15000: 1 + 2600
         assert_eq!(c.plan(&far, LIMITS), Plan::Replay { source: s, at: 15000 });
         // without the replay (--ced), the snapshot
-        assert_eq!(c.plan(&far, Limits { replay: false, ..LIMITS }), Plan::Snapshot { source: s, at: 9000, branch: 15000 });
+        assert_eq!(c.plan(&far, Limits { replay: false, ..LIMITS }), Plan::Snapshot { source: s, snap: 9000, at: 9000, branch: 15000 });
     }
 
     #[test]
@@ -611,7 +684,7 @@ mod tests {
             c.push(s, 100000 + t);
         }
         let plan = c.plan(&p, LIMITS);
-        assert_eq!(plan, Plan::Snapshot { source: s, at: 4000, branch: 4000 });
+        assert_eq!(plan, Plan::Snapshot { source: s, snap: 4000, at: 4000, branch: 4000 });
         assert_eq!(plan.reused(), 4000);
         assert_eq!(plan.kind(p.len()), "saved");
         // without logits there, its last token runs again
@@ -636,6 +709,104 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_that_parts_just_before_a_snapshot_resumes_from_it() {
+        // A thinking prompt ends with <think>, and the next turn's history
+        // has </think> there: the next turn parts from the state one position
+        // before its prompt-end snapshot, which still holds that position's rows.
+        let mut c = Cache::new(u64::MAX, 256);
+        let p = seq(0..4000);
+        let s = state(&mut c, &p, &[4000]);
+        for t in 0..300 {
+            c.push(s, 100000 + t); // its reply, past the rewind margin
+        }
+        let next = [&p[..3999], &seq(-60..0)[..]].concat();
+        let plan = c.plan(&next, LIMITS);
+        assert_eq!(plan, Plan::Snapshot { source: s, snap: 4000, at: 3999, branch: 3999 });
+        assert_eq!((plan.reused(), plan.capture(next.len()), plan.kind(next.len())), (3999, None, "forked"));
+        // the new state's rings hold all of the margin at its prompt's end
+        assert_eq!(stale_at(c.origin(&plan, next.len()), next.len()), 0);
+        // also with the bounded replay (--ced), which recomputes a ring
+        let ced = Limits { replay_cost: |k| k.min(133), ..LIMITS };
+        assert_eq!(c.plan(&next, ced), plan);
+        // the rewind margin's edge: 5 positions before it, not 6
+        let edge = [&p[..3995], &seq(-60..0)[..]].concat();
+        assert_eq!(c.plan(&edge, LIMITS), Plan::Snapshot { source: s, snap: 4000, at: 3995, branch: 3995 });
+        let past = [&p[..3994], &seq(-60..0)[..]].concat();
+        assert_eq!(c.plan(&past, LIMITS), Plan::Replay { source: s, at: 3994 });
+        // a prompt that ends before the snapshot: its rows after the prompt's
+        // end stay in the new state's rings, 2 stale rows
+        let short = [&p[..3997], &[-1][..]].concat();
+        let plan = c.plan(&short, LIMITS);
+        assert_eq!(plan, Plan::Snapshot { source: s, snap: 4000, at: 3997, branch: 3997 });
+        assert_eq!(stale_at(c.origin(&plan, short.len()), short.len()), 2);
+        // the same prompt again resumes at its prompt end, not before it
+        assert_eq!(c.plan(&p, LIMITS), Plan::Snapshot { source: s, snap: 4000, at: 4000, branch: 4000 });
+    }
+
+    #[test]
+    fn rows_a_verify_pass_writes_past_its_kept_tokens_take_a_state_s_room() {
+        let mut c = Cache::new(u64::MAX, 256);
+        let p = seq(0..4000);
+        let s = state(&mut c, &p, &[]);
+        // a pass of 6 rows that keeps 2 tokens: its 4 rows after them took the
+        // places of the margin's 4 oldest rows, which leaves 1 position of room
+        c.push(s, 100000);
+        c.push(s, 100001);
+        c.rejected(s, 4);
+        assert_eq!(c.entries[&s].stale, 4);
+        // its end is 4002: a resume 2 positions before it would read a stale row
+        let two = [&p[..], &seq(-90..-60)[..]].concat();
+        assert_eq!(c.plan(&two, LIMITS), Plan::Replay { source: s, at: 4000 });
+        let one = [&p[..], &[100000][..], &seq(-90..-60)[..]].concat();
+        assert_eq!(c.plan(&one, LIMITS), Plan::InPlace { state: s, from: 4001 });
+        // the generation-end snapshot carries them; the same snapshot without
+        // stale rows would serve the resume 2 positions before it
+        c.add_snap(s, Snap { pos: 4002, kind: Kind::GenerationEnd, bytes: SNAP, stale: 4 });
+        assert_eq!(c.plan(&two, LIMITS), Plan::Replay { source: s, at: 4000 });
+        c.add_snap(s, Snap { pos: 4002, kind: Kind::GenerationEnd, bytes: SNAP, stale: 0 });
+        assert_eq!(c.plan(&two, LIMITS), Plan::Snapshot { source: s, snap: 4002, at: 4000, branch: 4000 });
+        // a second pass that keeps 1 token and writes 1 row after it: the
+        // stale rows already hold the oldest places
+        c.push(s, 100002);
+        c.rejected(s, 1);
+        assert_eq!(c.entries[&s].stale, 3);
+        // tokens written at its end give the room back
+        for t in 0..3 {
+            c.push(s, 100003 + t);
+        }
+        assert_eq!(c.entries[&s].stale, 0);
+        let again = [&p[..], &[100000, 100001, 100002, 100003][..], &seq(-90..-60)[..]].concat();
+        assert_eq!(c.plan(&again, LIMITS), Plan::InPlace { state: s, from: 4004 });
+    }
+
+    #[test]
+    fn a_prompt_that_stops_short_of_a_rewound_state_s_end_takes_its_room() {
+        // A state that continues before its end, for a prompt that ends before
+        // that end, keeps the old rows after the prompt's end in its rings: the
+        // rows of 4000..4002 replaced those of the margin's oldest positions,
+        // 3867..3869. A resume 5 positions before its new end would read them.
+        let mut c = Cache::new(u64::MAX, 256);
+        let p = seq(0..4000);
+        let s = state(&mut c, &p, &[4000]);
+        for t in 0..3 {
+            c.push(s, 100000 + t); // ends at 4003
+        }
+        let mut retry = p.clone();
+        *retry.last_mut().unwrap() = -7; // parts at 3999, ends at 4000
+        let plan = c.plan(&retry, LIMITS);
+        assert_eq!(plan, Plan::InPlace { state: s, from: 3999 });
+        let stale = stale_at(c.origin(&plan, retry.len()), retry.len());
+        assert_eq!(stale, 3);
+        c.start(s, &retry, 3999, 1 << 20, stale);
+        c.finish(s, 1 << 20);
+        let again = [&retry[..3995], &seq(-90..-60)[..]].concat();
+        assert_ne!(c.plan(&again, LIMITS), Plan::InPlace { state: s, from: 3995 });
+        // 2 positions before its end, within what its rings still hold
+        let near = [&retry[..3998], &seq(-90..-60)[..]].concat();
+        assert_eq!(c.plan(&near, LIMITS), Plan::InPlace { state: s, from: 3998 });
+    }
+
+    #[test]
     fn a_prompt_inside_a_longer_state_reuses_it_at_any_length() {
         assert_eq!(replay_rows(20000), 2610);
         assert_eq!((replay_rows(1999), replay_rows(100)), (1633, 100));
@@ -653,26 +824,26 @@ mod tests {
     fn a_fork_resumed_from_an_earlier_snapshot_carries_its_own_branch_point() {
         let mut c = Cache::new(u64::MAX, 256);
         let s = state(&mut c, &seq(0..6000), &[]);
-        c.add_snap(s, Snap { pos: 4125, kind: Kind::Branch, bytes: SNAP }); // an earlier fork's
+        c.add_snap(s, Snap { pos: 4125, kind: Kind::Branch, bytes: SNAP, stale: 0 }); // an earlier fork's
         let mut p = seq(0..4262);
         p.extend(-20..0);
         // 137 tokens from the snapshot cost less than a replay at 4,262 (~2,610 rows)
-        assert_eq!(c.plan(&p, LIMITS), Plan::Snapshot { source: s, at: 4125, branch: 4262 });
+        assert_eq!(c.plan(&p, LIMITS), Plan::Snapshot { source: s, snap: 4125, at: 4125, branch: 4262 });
     }
 
     #[test]
     fn under_ced_the_bounded_replay_wins_past_a_ring() {
-        // myds4_replay_rows under --ced: the ring, 133 positions
+        // the bounded replay's cost under --ced with LIMITS' margin of 5: the ring, 133 positions
         let ced = Limits { replay_cost: |k| k.min(133), ..LIMITS };
         let mut c = Cache::new(u64::MAX, 256);
         let s = state(&mut c, &seq(0..6000), &[]);
-        c.add_snap(s, Snap { pos: 4125, kind: Kind::Branch, bytes: SNAP });
+        c.add_snap(s, Snap { pos: 4125, kind: Kind::Branch, bytes: SNAP, stale: 0 });
         let mut far = seq(0..4262);
         far.extend(-20..0);
         assert_eq!(c.plan(&far, ced), Plan::Replay { source: s, at: 4262 });
         let mut near = seq(0..4200);
         near.extend(-20..0);
-        assert_eq!(c.plan(&near, ced), Plan::Snapshot { source: s, at: 4125, branch: 4200 });
+        assert_eq!(c.plan(&near, ced), Plan::Snapshot { source: s, snap: 4125, at: 4125, branch: 4200 });
     }
 
     #[test]
@@ -690,7 +861,7 @@ mod tests {
         let mut p = seq(0..998);
         p.extend(7000..7050);
         assert_eq!(c.plan(&p, LIMITS), Plan::InPlace { state: s, from: 998 });
-        let dropped = c.start(s, &p, 998, 1 << 20);
+        let dropped = c.start(s, &p, 998, 1 << 20, 0);
         assert_eq!(dropped.iter().map(|x| x.pos).collect::<Vec<_>>(), vec![1000]);
         let e = &c.entries[&s];
         assert_eq!(e.tokens, p);
@@ -709,14 +880,14 @@ mod tests {
         let Plan::Replay { source, at } = c.plan(&p, LIMITS) else { panic!("a replay") };
         assert_eq!((source, at), (s, 5000));
         let new = c.add(1 << 20);
-        c.start(new, &p, at, 1 << 20);
-        c.add_snap(new, Snap { pos: at, kind: Kind::Branch, bytes: SNAP });
+        c.start(new, &p, at, 1 << 20, 0);
+        c.add_snap(new, Snap { pos: at, kind: Kind::Branch, bytes: SNAP, stale: 0 });
         c.touch(source, at);
         c.finish(new, 1 << 20);
         // the next fork at the same point resumes from that snapshot
         let mut q = seq(0..5000);
         q.extend(-90..-60);
-        assert_eq!(c.plan(&q, LIMITS), Plan::Snapshot { source: new, at: 5000, branch: 5000 });
+        assert_eq!(c.plan(&q, LIMITS), Plan::Snapshot { source: new, snap: 5000, at: 5000, branch: 5000 });
     }
 
     #[test]
@@ -738,7 +909,7 @@ mod tests {
         let mut c = Cache::new(u64::MAX, 256);
         let old = state(&mut c, &seq(0..100), &[50, 100]); // 50 is spare: 100 is its last prompt end
         let new = state(&mut c, &seq(200..300), &[300 - 200]);
-        c.entries.get_mut(&new).unwrap().snaps.push(Snap { pos: 40, kind: Kind::GenerationEnd, bytes: SNAP });
+        c.entries.get_mut(&new).unwrap().snaps.push(Snap { pos: 40, kind: Kind::GenerationEnd, bytes: SNAP, stale: 0 });
         let total = c.bytes();
         c.limit = total;
         // one snapshot's room: the oldest state's spare snapshot
@@ -777,9 +948,9 @@ mod tests {
     fn a_decoding_state_is_charged_its_growth_before_it_grows_and_others_go_first() {
         let mut c = Cache::new(u64::MAX, 256);
         let old = state(&mut c, &seq(0..10), &[10]);
-        c.add_snap(old, Snap { pos: 5, kind: Kind::GenerationEnd, bytes: SNAP }); // spare
+        c.add_snap(old, Snap { pos: 5, kind: Kind::GenerationEnd, bytes: SNAP, stale: 0 }); // spare
         let busy = state(&mut c, &seq(20..30), &[]);
-        c.start(busy, &seq(20..30), 10, 1 << 20); // decoding
+        c.start(busy, &seq(20..30), 10, 1 << 20, 0); // decoding
         c.limit = c.bytes();
         // one snapshot's growth: the spare snapshot goes, before the growth
         let (snaps, states) = c.grow(busy, (1 << 20) + SNAP);
@@ -804,8 +975,8 @@ mod tests {
         let idle = state(&mut c, &seq(0..10), &[]);
         let a = state(&mut c, &seq(20..30), &[]);
         let b = state(&mut c, &seq(40..50), &[]);
-        c.start(a, &seq(20..30), 10, 1 << 20);
-        c.start(b, &seq(40..50), 10, 1 << 20);
+        c.start(a, &seq(20..30), 10, 1 << 20, 0);
+        c.start(b, &seq(40..50), 10, 1 << 20, 0);
         c.limit = c.bytes(); // 3 MiB
         // 3 MiB more: only the idle state (1 MiB) can go; the busy ones stay
         let (_, states) = c.grow(a, 4 << 20);
@@ -817,11 +988,11 @@ mod tests {
 
     #[test]
     fn a_generation_end_snapshot_is_kept_only_within_the_limit() {
-        let end = Snap { pos: 10, kind: Kind::GenerationEnd, bytes: SNAP };
+        let end = Snap { pos: 10, kind: Kind::GenerationEnd, bytes: SNAP, stale: 0 };
         // the cache full, nothing else to free: the snapshot is not taken
         let mut c = Cache::new(u64::MAX, 256);
         let s = state(&mut c, &seq(0..10), &[]);
-        c.start(s, &seq(0..10), 10, 1 << 20);
+        c.start(s, &seq(0..10), 10, 1 << 20, 0);
         c.limit = c.bytes();
         let (take, _) = c.end(s, 1 << 20, Some(end));
         assert!(!take);
@@ -831,7 +1002,7 @@ mod tests {
         let mut d = Cache::new(u64::MAX, 256);
         let old = state(&mut d, &seq(100..110), &[]);
         let t = state(&mut d, &seq(0..10), &[]);
-        d.start(t, &seq(0..10), 10, 1 << 20);
+        d.start(t, &seq(0..10), 10, 1 << 20, 0);
         d.limit = d.bytes() + SNAP - (1 << 20);
         let (take, (_, states)) = d.end(t, 1 << 20, Some(end));
         assert!(take);

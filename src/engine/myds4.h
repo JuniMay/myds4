@@ -19,6 +19,13 @@ enum {
   // layers (37 to 39); the drafted rows after the first are the NOISE token.
   DRAFTS = 3, DRAFT_EXPERTS = 128, DRAFT_TOPK = 3, BLOCK = 5, NOISE = 128799,
   VERIFY_DRAFTS = 15,  // target verification capacity, independent of DSpark
+  // The positions a state can continue before its end or a snapshot's
+  // position, for the KV prefix cache's resumes: each layer's window ring
+  // keeps this many rows beyond its window. The rewind margin is at least
+  // this, and at least the drafts or --lookup proposals that a verify pass
+  // writes after the token (model_rewind).
+  REWIND = 8,
+  BATCH_ROWS = 6,  // rows of different sequences that one decode pass takes (model_forward_rows, --batch)
   DRAFT_CACHE_MIN = BLOCK * DRAFT_TOPK,  // one stage's largest union of native selections
   CACHE_LAYERS = LAYERS + DRAFTS,  // the expert cache's layers: the backbone's, then the stages'
 };
@@ -380,7 +387,7 @@ size_t model_state_bytes(const State *s, int positions);  // s (null: a new stat
 void model_state_use(State *s);
 // The rows of the state in use that later positions overwrite, saved in the
 // state and restored (a rewind point, for the CLI's checks); a restored state
-// continues at the saved position or up to BLOCK positions before it.
+// continues at the saved position or up to model_rewind() positions before it.
 void model_state_save(void);
 void model_state_restore(void);
 // For the server's KV prefix cache. A snapshot holds a state's rolling part
@@ -415,9 +422,13 @@ void model_state_copy(State *dst, const State *src, int positions);
 // 0-20 only (extent 20).
 const float *model_prefill(const int *tokens, int n, int from, int replay, int capture, Snapshot **captured);
 // What a replay at k computes again before k, per layer on average (rounded
-// up): with --ced off at most k, about 2,610 for long prefixes; with --ced
-// the ring (133 positions, at most k).
+// up): with --ced off at most k, about 2,613 for long prefixes; with --ced
+// the ring (WINDOW plus the rewind margin, 136 positions; at most k).
 int model_replay_rows(int k);
+// The rewind margin: the positions beyond its window that each layer's ring
+// keeps, and so how far a state can continue before its end. REWIND, or more
+// with --draft or --lookup: a verify pass writes their rows after the token.
+int model_rewind(void);
 // The first position a replay at k computes again (layer 0's), from which its
 // prompt's images must be encoded.
 int model_replay_start(int k);
@@ -425,13 +436,13 @@ int model_replay_start(int k);
 // each, layer by layer) and where each one was (0 in memory, 1 read ahead,
 // 2 late, 3 substituted, 4 from the SSD); 0 when the row did not run in it.
 int model_routes(int row, uint16_t *id, uint8_t *from);
-// One token for each of m sequences at once (m <= BLOCK + 1, no drafts):
+// One token for each of m sequences at once (m <= BATCH_ROWS, no drafts):
 // row r is tokens[r] at position pos[r] of state st[r], every position before
 // it having run. Each row is computed as model_forward computes a token
 // alone. Returns the m rows' logits.
 const float *model_forward_rows(State **st, const int *tokens, const int *pos, int m);
 // Continues the state in use at pos, given the tokens before it: at most
-// BLOCK positions before the last one that ran, or after a reset at 0.
+// model_rewind() positions before the last one that ran, or after a reset at 0.
 void model_seek(const int *tokens, int pos);
 // The vision encoder (inference/vision.py ViT and Aligner): the image's
 // feature rows into im->rows. Weights load on first use.
