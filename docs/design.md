@@ -1988,26 +1988,87 @@ least the shared prefix less 133 ([Checks](usage.md#checks)).
 ### The live view
 
 `--tui` gives stderr's alternate screen to a thread of the server
-(`server/src/view.rs`, on ratatui and its crossterm backend) that every
-0.5 s takes the worker's snapshot (`worker::view`, as JSON) and draws the
-frame from it. The engine writes the log's lines to the server's `on_log`,
-which keeps the last 256 in a ring that the frame shows; the lines logged
-before the view is on the screen (while the model loads) also go to
-stderr. The snapshot takes the queue's lock for the number of waiting
-requests and the status lock for the requests, the totals and the cache's
-states and tree, which the worker publishes there after each prefill and
-request end and once a second while it decodes; it reads the engine's
-counters directly (`myds4_stats_get`), so a long prefill's progress shows
-while it runs.
+(`server/src/view.rs` and its tabs in `server/src/view/`, on ratatui and its
+crossterm backend). Every 0.5 s it takes the worker's snapshot
+(`worker::view`, as JSON) and keeps a sample of it; it draws the tab shown
+with each snapshot, and at once after a key or a click that changes
+something or when the answer to its question for a node's text comes. Input
+that changes nothing draws nothing.
+The engine writes the log's lines to the server's `on_log`, which keeps the
+last 256 in a ring that the view shows; the lines logged before the view is
+on the screen (while the model loads) also go to stderr. The snapshot takes
+the queue's lock for the number of waiting requests and the status lock for
+the requests, the totals and the cache's states and tree, which the worker
+publishes there after each prefill and request end and once a second while
+it decodes; it reads the engine's counters directly (`myds4_stats_get`), so
+a long prefill's progress shows while it runs. The snapshot's JSON is built
+under the status lock and written out as text after it. The tabs are
+described in [Usage](usage.md#live-view).
 
-The prefix tree covers the 24 most recently used states. Depth first, a
-node is the run of positions, from its parent's end, that all states of
-its group share (compared 1,024 tokens at a time), and the states that go
-on past it form groups by their token at its end. The frame shows at most
-40 nodes. Each state keeps the positions up to which its last 32 reuses ran
+**The last minute.** The view keeps 120 samples, one per snapshot, in its
+own memory only: nothing is written to files or sent anywhere, and the
+samples are gone when the view ends. A sample holds its time, the phase and
+the engine's counters; each decoding request's tokens/s (over its last ten
+snapshots); the requests that came since the sample before (numbers above
+any seen); and, from the differences of the counters since the sample
+before: while a prefill runs, the prompt rows computed per second; the
+SSD's read rate; the decoded rows' hit rate; the GPU's busy share of the
+decode steps' time; and the wait for reads per decoded row. The prompt rows
+computed are the rows the engine counted (a chunk's when it ends) plus the
+running chunk's rows times the share of its layers done, a count that only
+grows, across chunks and between prefills. The read rate comes from the
+count of every expert byte read, which grows as each read completes: the
+prefill's own counter takes a chunk's reads only when the chunk ends.
+
+The Overview's throughput takes each figure's mean over the last 10 samples
+and over all of them, of the samples taken while it applies: decoding, a
+prefill, or either for the SSD's reads. Its "since start" figures come from
+counters taken together: the tokens generated (by the requests that ended
+and those decoding, counted when the worker updates its status) over the
+decode steps' time; and the prompt rows and expert bytes the engine had
+counted when the latest prefill ended, over the prefills' time the worker
+adds up then. A long prefill's chunks therefore join those figures when it
+ends.
+
+**The prefix tree** covers the 24 most recently used states. Depth first, a
+node is the run of positions, from its parent's end, that all states of its
+group share (compared 1,024 tokens at a time), and the states that go on
+past it form groups by their token at its end. The tree holds at most 40
+nodes. Each state keeps the positions up to which its last 32 reuses ran
 (requests that continued it or resumed from a copy of it); a node counts
 those that reach past its start, so a system prompt that many
-conversations share collects the hits of all of them.
+conversations share collects the hits of all of them. A node also names a
+state through it (`via`, the one used last), whose tokens hold its text.
+The KV cache tab draws the nodes along the positions: a node's first child
+goes on in its row and the others take the rows below its earlier subtrees.
+The view knows the chosen node by a state through it (`via`) and its first
+position. In each new tree it finds, on that state's path (from the state's
+own node up), the node that holds the position, so the choice survives a
+node that grows while its state decodes, a fork that splits it and an
+eviction that merges it, while the state is in the tree.
+
+**A node's text.** The view does not hold tokens; the KV prefix cache does,
+on the worker's thread. The view posts its question, a state's number and
+positions, beside the queue (`worker::ask_text`, which wakes an idle
+worker); the worker answers between its steps with the tokens, at most
+65,536. The view takes the answer that matches its question
+(`worker::text_answer`) and turns the tokens into text on its own thread,
+since the tokenizer serves any thread (`engine::text`): each token's bytes
+(`myds4_piece`), the special tokens (the tokenizer's added ones,
+`myds4_added`) marked for the accent color, and an image's run of keys as
+"[image]". It wraps the text into lines once for the panel's width.
+
+**The expert map's rows.** `routed_rows` reads each decoded row's router
+result on the CPU anyway, to count its experts by where they are; for the
+model's own layers in decode steps (not prefill, not the draft's stages) it
+also keeps each row's experts and their places, with the step that chose
+them (`model_routes`, `myds4_routes`). That is a copy of numbers already
+read: decoding computes nothing more for it. With each snapshot the view
+asks for the rows (`worker::ask_routes`, a flag). After its next decode step
+the worker copies each decoding request's row of that step (row 0 of a step
+or a verify pass, a state's row of `myds4_rows`) into the status, and the
+next snapshot takes them, so the view gets each row once; without the view,
+nothing asks and nothing is copied. The view draws a request's last 12.
 
 The counters cost a few hundred additions per decoded token. A decoding
 step adds the cache's statistics during the step to `decode_stats`, with its
@@ -2015,9 +2076,9 @@ rows, GPU time and wall time; a prefill adds them to `prefill_stats`. The
 cache counts each expert once per layer and step for all rows, so
 `routed_rows` also counts every row's selections, each by where its expert
 is when the layer requests it (`cache_where`: in memory, read ahead, read
-ahead and still being read, only on the SSD) or as a substitute. The frame
-keeps 21 snapshots of the decoding statistics and shows the differences
-over the last 10 s. Memory comes from `host_statistics64` (free,
+ahead and still being read, only on the SSD) or as a substitute. The
+Overview's experts per token are the differences of the decoding counters
+over the last 21 samples (10 s). Memory comes from `host_statistics64` (free,
 file-backed, wired and compressor pages), `vm.vm_page_filecache_min`,
 `vm.swapusage`, the accelerator's "In use system memory" (the GPU-resident
 memory of all processes), and the cache's own counts. While the GPU idles,
@@ -2027,21 +2088,38 @@ GiB, and wired memory fell from 56 to 8 GiB. The driver releases them until
 the GPU runs again, so the view splits the resident memory into experts,
 weights and the rest only while it holds them all.
 
-A frame is a list of lines, at most one per row, that ratatui draws in
-place, so no line break scrolls the title off the screen; a line too long
-for the terminal ends after its last whole figure, with "…". `make
-server-check` draws frames from a fixed snapshot on ratatui's test terminal
-and checks that the title comes first, that every line fits the width and
-that the log fills the rows below the tree.
+**Colors.** The view draws in 24-bit color from one of two palettes, for a
+light or a dark background. When it starts, before it reads keys, it asks
+the terminal for its background (OSC 11; only when stdin is the terminal,
+where the answer comes) and waits up to 0.2 s for the
+answer on stdin: it takes the light palette for a bright background and the
+dark one for a dark background, and tints (the selected node's, the last
+minute's decoding phase) blend toward the background's own color. Without
+an answer it takes the light palette; `--tui-theme light` or `dark` chooses
+one without asking. When `COLORTERM` does not say the terminal shows 24-bit
+color, each color becomes the nearest of the 256 standard ones.
+
+A screen is drawn into ratatui's buffer from the chrome (the title and the
+state, the tabs, the keys) and the tab; lines too long for the terminal end
+after their last whole figure, with "…". The drawing also records the
+places a click acts on: the tabs, the KV tree's nodes and the expert map's
+requests. `make server-check` draws every tab from a fixed snapshot and a
+generated minute on ratatui's test terminal at sizes from 220 x 60 to 12 x
+4 and checks their parts, the keys and clicks, and the samples;
+`server/tests/live_view.rs` runs the server with a model in a
+pseudo-terminal.
 
 While the view runs, the terminal is in raw mode, which neither echoes nor
-buffers input and delivers Ctrl-C as a key, and the cursor is hidden. The
-view's thread waits for its next frame by polling the keys: `q`, or Ctrl-C,
-requests the stop that SIGINT requests (`myds4_request_stop`) and logs "q:
-stopping after the current step"; the server stops accepting within a
-second. SIGINT and SIGTERM request that stop too. When the server ends,
-before a fatal error's message (the engine's `on_die`, or the server's own)
-and after a panic, the view leaves the alternate screen, restores the
+buffers input and delivers Ctrl-C as a key, the cursor is hidden, and the
+terminal reports the mouse's clicks and wheel (modes 1000 and 1006, without
+the pointer's moves; `m` turns that off, so that the terminal can select
+text). The view's thread waits for its next snapshot
+by polling the keys and the mouse: `q`, or Ctrl-C, requests the stop that
+SIGINT requests (`myds4_request_stop`) and logs "q: stopping after the
+current step"; the server stops accepting within a second. SIGINT and
+SIGTERM request that stop too. When the server ends, before a fatal error's
+message (the engine's `on_die`, or the server's own) and after a panic, the
+view stops the mouse's reports, leaves the alternate screen, restores the
 terminal and writes the log lines that stderr has not shown yet, the last 30
 at most. A frame being drawn finishes first. The view takes the snapshot
 before the screen's lock, so an engine that fails while it holds the status

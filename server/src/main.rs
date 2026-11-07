@@ -41,6 +41,8 @@ const USAGE: &str = "usage: myds4-server -m MODEL --serve PORT [options]
   --batch N       requests decoding together at most, 1 to 6 (default 4)
   --tui           a live view in the terminal (requests, speed, experts, memory, the KV cache) instead of the
                   log on stderr; q stops the server, and the last log lines print on exit
+  --tui-theme T   the live view's colors: auto (default: by the terminal's background, light without an
+                  answer), light or dark
   -t T, --temperature T  the temperature of requests that set none (default 1; 0 is greedy)
   --top-p P       the top_p of requests that set none, 0 to 1 (default 1)
   --seed N        the seed of requests that set none (default: random for each)
@@ -104,6 +106,7 @@ struct Args {
     defaults: Defaults,
     render: Option<String>,
     tui: bool,
+    tui_colors: view::Colors,
 }
 
 fn parse(args: &[String]) -> Args {
@@ -115,6 +118,7 @@ fn parse(args: &[String]) -> Args {
         defaults: Defaults { temperature: 1.0, top_p: 1.0, seed: None, thinking: true, effort: 75 },
         render: None,
         tui: false,
+        tui_colors: view::Colors::Auto,
     };
     let mut i = 0;
     while i < args.len() {
@@ -180,6 +184,14 @@ fn parse(args: &[String]) -> Args {
                         a.defaults.effort = if n > 0 { n } else { 75 };
                     }
                     "--render" => a.render = Some(v.clone()),
+                    "--tui-theme" => {
+                        a.tui_colors = match v.as_str() {
+                            "auto" => view::Colors::Auto,
+                            "light" => view::Colors::Light,
+                            "dark" => view::Colors::Dark,
+                            _ => die("--tui-theme takes auto, light or dark"),
+                        }
+                    }
                     _ => usage(),
                 }
             }
@@ -384,7 +396,7 @@ fn main() {
     if config.draft > 0 {
         title += &format!(" · --draft {}", config.draft);
     }
-    let live = if tui { view::start(title) } else { None };
+    let live = if tui { view::start(title, a.tui_colors) } else { None };
     if a.tui && live.is_none() {
         engine::log("--tui: stderr is not a terminal; the log stays on stderr");
     }

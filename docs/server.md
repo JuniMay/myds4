@@ -18,7 +18,7 @@ serves `POST /v1/chat/completions`, streamed or as one response,
 | Requests: the compatibility steps, recipe's Chat Completions conversion, sampling settings, images from `data:` URLs | Rust | `server/src/chat.rs` |
 | Prompts: recipe's V4.1 rendering | Rust | `server/src/chat.rs` |
 | Output: recipe's stream processor (reasoning, content, tool calls, usage) and its Chat Completions chunks | Rust | `server/src/chat.rs` |
-| The live view (`--tui`): the terminal, the statistics windows, the frame, on ratatui | Rust | `server/src/view.rs` |
+| The live view (`--tui`): the terminal, the keys and the mouse, the statistics windows and the tabs, on ratatui; in `view/`: the chrome, the colors, the last minute's samples and each tab (Overview, KV cache, Experts, Last minute) | Rust | `server/src/view.rs`, `server/src/view/` |
 | The worker: the queue, scheduling and batching, drafts, events, cancellation, the status and the live view's snapshot | Rust | `server/src/worker.rs` |
 | The KV prefix cache: which attention states and snapshots to keep, and how a prompt resumes from them | Rust | `server/src/kv.rs` |
 | The engine's ABI in Rust: declarations and thin wrappers | Rust | `server/src/engine.rs` |
@@ -37,8 +37,15 @@ serves `POST /v1/chat/completions`, streamed or as one response,
   shared and one attention state is in use at a time. While no request runs,
   it lets the expert cache resize every second (`myds4_idle`).
 - **The live view's thread** (`--tui`): twice a second it takes the worker's
-  snapshot (`worker::view`), draws the frame on stderr's alternate screen and
-  reads the keys.
+  snapshot (`worker::view`) and keeps a sample of it for the last minute; it
+  draws the tab shown on stderr's alternate screen, and again at once after a
+  key or a click that changes it. A KV node's text is a question to the
+  worker (`worker::ask_text`), which answers between its steps with the
+  tokens the KV prefix cache holds (`worker::text_answer`); the view turns
+  them into text. With each snapshot the view asks for the decoding
+  requests' routed rows (`worker::ask_routes`); the worker copies them
+  (`myds4_routes`) after its next decode step, and the next snapshot takes
+  them.
 - **Tokio's threads** run HTTP: reading requests, converting, rendering and
   tokenizing them, submitting them to the worker, and turning the worker's
   events into response chunks.
@@ -165,7 +172,11 @@ tokenizer may be called from any thread. Its parts:
   prefill reaches).
 - **Statistics.** `myds4_stats_get` fills the expert cache's counters, the
   decoded and prompt rows' statistics, the running prefill's progress and
-  memory, which the status and the live view show.
+  memory, which the status and the live view show. `myds4_routes(row, ...)`
+  gives the experts that a row of the latest decode step chose in each layer
+  and where each one was, for the live view's expert map: the engine keeps
+  them when it counts each row's experts by where they are, a copy of
+  numbers the CPU has already, so decoding computes nothing more.
 - **Tokenizer.** `myds4_tokenizer(dir)` loads the checkpoint's tokenizer
   without the model; `myds4_tokenize`, `myds4_piece` (a token's bytes),
   `myds4_added` (whether a token is one of the tokenizer's added tokens) and
@@ -449,8 +460,9 @@ not call them: prompts and output use the engine's tokenizer.
 | Command | What it checks |
 | --- | --- |
 | `.venv/bin/python tools/reference/check.py encoding CHECKPOINT` | The server's prompts (`build/myds4-server --render FILE`) against `encoding.py` on the test cases and the generated conversations ([above](#prompts-compared-with-encodingpy)). |
-| `make server-check` (`MYDS4_CHECKPOINT=CHECKPOINT` for the tokenizer test) | The compatibility steps, a numeric effort in the prompt, the worker's events through recipe's processor with the checkpoint's tokenizer (reasoning, content, finish, usage), the KV prefix cache's decisions (`server/src/kv.rs`), and the live view's frames on a test terminal: the title first, every line within the terminal's width, the log below the states' tree, per-request speeds and the quit keys; and the connections' limits on a local socket, with short timeouts: 503 beyond the connection limit, 431, a late head, 408 and 413, and a client that leaves or stops reading ending its request. No model is loaded; without `MYDS4_CHECKPOINT` the tokenizer test is skipped. With `MYDS4_EXPERTS` (a GGUF file) set too, it also runs the fork tests through HTTP (next row). |
+| `make server-check` (`MYDS4_CHECKPOINT=CHECKPOINT` for the tokenizer test) | The compatibility steps, a numeric effort in the prompt, the worker's events through recipe's processor with the checkpoint's tokenizer (reasoning, content, finish, usage), the KV prefix cache's decisions (`server/src/kv.rs`), and the live view's tabs on a test terminal: the title and the tabs first, every line within the terminal's width at sizes from 220 x 60 down to 12 x 4, each tab's parts, the keys and clicks that choose tabs, nodes and requests, a node's text answered while its session grows and a chosen node kept through a fork that splits it, the last minute's samples (the counters' differences, arrivals, routed rows of the snapshot's size, the SSD's rate from the reads as they complete, a prefill's rate with no sample between two prefills), the throughput's windows and its since-start figures from counters counted together, per-request speeds, the colors (the terminal's answer for its background, light and dark, the 256 colors) and the quit keys; and the connections' limits on a local socket, with short timeouts: 503 beyond the connection limit, 431, a late head, 408 and 413, and a client that leaves or stops reading ending its request. No model is loaded; without `MYDS4_CHECKPOINT` the tokenizer test is skipped. With `MYDS4_EXPERTS` (a GGUF file) set too, it also runs the fork tests through HTTP (next row). |
 | `MYDS4_CHECKPOINT=CHECKPOINT MYDS4_EXPERTS=GGUF cargo test --release --manifest-path server/Cargo.toml --target-dir build/cargo --test prefix_fork -- --nocapture` | The fork test through HTTP (`server/tests/prefix_fork.rs`, about 12 minutes, one model process at a time): a conversation with a long system prompt and user turn decodes, and 20 forks of it, cut in the system prompt or the user turn and continued differently, must each reuse at least the prefix they share with it less what an exact replay there computes again, and no more than that prefix, and must give the tokens that a server starting without a cache gives. With `--ced 128` the same forks must each reuse at least the shared prefix less 133 tokens; their tokens are printed. A fork after an image (a 32 x 32 PNG the test builds) must give the cold server's tokens. Two tests check the budget with a tight `--kv-cache` set from what a first server reports: a retry of a saved prompt must fit a cache filled to within 2 MiB of its limit, and a generation that takes its state past 16,384 positions must free an idle state before its state grows and keep the cache within its limit in every status sample. `MYDS4_SERVER` and `MYDS4_CLI` pick the binaries (default `build/myds4-server` and `build/myds4`). |
+| `MYDS4_CHECKPOINT=CHECKPOINT MYDS4_EXPERTS=GGUF cargo test --release --manifest-path server/Cargo.toml --target-dir build/cargo --test live_view -- --nocapture` | The live view with a model (`server/tests/live_view.rs`, about 40 s, one model process): the server runs with `--tui` in a pseudo-terminal of 160 x 46 cells that answers the view's question for its background as a dark terminal would. While a request decodes, the test presses the tabs' keys and rebuilds the screen from the output: the dark colors, the expert map's request at four experts a cell, the KV tree, a node's text, the last minute and the log must be drawn, the mouse taken and given back, and the server must exit with status 0 after `q`. `MYDS4_SERVER` picks the server (default `build/myds4-server`). |
 | `build/prefix-fork-check CHECKPOINT --text FILE [--rendered] [--limit N] [--experts GGUF] [--draft N] [--cache GB] [--ced N] --fork [--random N] [--at P]... [--prompt-only] [--suffix N]` | The fork test in the engine (`tools/checks/prefix_fork_check.c`): a conversation (the text's prompt, or its first `--limit` tokens, then a decoded reply, a tool-like result and a second decoded reply) forked at 24 position classes and N random positions (default 16). Where the history before a fork came from prompts, the exact replay and the latest snapshot must give a cold prefill's bytes in the logits, every state tensor and the next 16 greedy tokens; where it holds decoded rows, the snapshot resume must give the bytes of the conversation computed again as it ran, and the replay must be about as close to the cold prefill as that conversation is. Each fork's branch-point snapshot, resumed over that fork's rows, must give the fork's own bytes. With `--ced N` the replay is bounded: it must keep the copied compressed rows and index keys byte for byte and give finite logits, and each fork's distance from the cold prefill is printed. `--measure` prints how far decoding a reply and prefilling it differ. |
 
 On 2026-11-04 (the UD-IQ2_XXS experts, `--cache 40`, `--kv-cache 8`) the

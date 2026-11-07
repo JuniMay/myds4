@@ -113,7 +113,8 @@ The [README](../README.md#run) shows how to create a key file and start the serv
 | `--think N` | The thinking default: 1–100 enables thinking at that effort; 0 disables it. Without this option, the server enables thinking at effort 75. Request fields take precedence. |
 | `--batch N` | Requests decoded together at most, 1 to 6 (default 4). Overlapping requests share forward passes. Aggregate throughput depends on expert-cache contention and the workload (see [Performance](performance.md#concurrent-requests)). A request alone runs the same at any N. |
 | `--runahead` | Let ready concurrent requests advance while other requests' expert reads run. Groups ready requests at the same layer and enables `--expert-batch`. Applies with two or more decoding requests; off by default. Requires no `--draft`, `--online-predictor`, `--gpu-route` or `--substitute`. Context lookup remains available for a request running alone. |
-| `--tui` | A live view on the terminal in place of the log (see below); the `q` key stops the server as Ctrl-C does. |
+| `--tui` | A live view on the terminal in place of the log, in five tabs (see below); the `q` key stops the server as Ctrl-C does. |
+| `--tui-theme auto\|light\|dark` | The live view's colors: by the terminal's background color, which the view asks the terminal for (`auto`, the default; light colors when it does not answer), or the light or dark ones. |
 | `--render FILE` | Print the prompt of a JSON test case of the checkpoint's `encoding/tests` (or a request's messages, tools, thinking mode and effort) as the server renders it, and exit; for `tools/reference/check.py encoding`. |
 
 Endpoints:
@@ -224,58 +225,113 @@ refused or unauthorized requests. It never shows keys or conversation text.
 ### Live view
 
 With `--tui`, when stderr is a terminal, the server shows a live view there
-in place of the log, redrawn twice a second on the terminal's alternate
-screen (ratatui on its crossterm backend, from the worker's snapshot,
-`worker::view`). The lines logged while the model loads stay on the normal
-screen; the view starts once the model is loaded. It writes nothing to
-files. Ctrl-C, SIGTERM or the `q` key stops the server after its current
-step, about a second when idle; the terminal comes back with the last 30 log
-lines. `q` also works in terminals that keep Ctrl-C for themselves. Without
-a keyboard (no terminal to read keys from), the view draws and the signals
-still stop the server. Figures are shown as dim labels before
-bright numbers; a line too long for the terminal ends after its last whole
-figure, with "…". A token here is one position that a decoding step
-computes: a request's next token, or a draft being verified. The view has
-five parts:
+in place of the log, on the terminal's alternate screen (ratatui on its
+crossterm backend, from the worker's snapshot, `worker::view`, twice a
+second). The lines logged while the model loads stay on the normal screen;
+the view starts once the model is loaded. Ctrl-C, SIGTERM or the `q` key
+stops the server after its current step, about a second when idle; the
+terminal comes back with the last 30 log lines. `q` also works in terminals
+that keep Ctrl-C for themselves. Without a keyboard (no terminal to read
+keys from), the view draws and the signals still stop the server.
 
-- **Now:** idle, prefilling (a gauge of the layers done), or decoding. For
-  each request: its state's number, prompt and reused tokens, generated tokens and
-  speed. A sparkline shows the total speed over the last 10 s (20 s on
-  terminals wider than 100 columns).
-- **Experts per token**, over the last 10 s (since start when nothing
-  decoded in that time). A bar and a table split each token's 240 expert
-  selections (40 layers of 6) by where the expert was, per token and as a
-  share: in memory, read ahead in time, read ahead but still being read
-  (late), a substitute for one not in memory (`--substitute`), or read from
-  the SSD on demand. The hit rate counts the model's own choices found in
-  memory (the first three); "with substitutes" adds the substitutes. Layers
-  the GPU routes (`--gpu-route`) are not counted. The "per token" line: the
-  SSD's bytes and rate, the wait for reads, the GPU's time and busy share,
-  reads ahead started and cancelled, and slots mapped for the GPU again
-  ("remapped") when there are any. The "prompts" line covers all prompts
-  since start: tokens, selections substituted per token, the share of the
-  experts their batches used that were in memory (a batch reads each expert
-  once for all its rows), and bytes read.
-- **Memory:** a row each with a gauge, the main figure and its parts.
-  **GPU:** the driver's resident memory (all apps) against the GPU's limit,
-  split into myds4's mapped experts, its weights and the rest while the GPU
-  works; while it idles, the driver releases them ("idle; resident when
-  busy"). **RAM:** myds4's footprint against the Mac's memory, split into
-  its experts and the rest, and the expert slots against the cache's
-  current limit and its largest. **SSD:** the experts only on the SSD (their
-  bytes and count), evictions and slots given back for memory. **Mac:**
-  memory in use against the total (excluding file cache), available memory
-  (including file cache),
-  pressure, file cache, wired memory and swap; below it the compressor, the
-  kernel's file-cache target (diagnostic only) and swap-outs since the view started.
-- **KV cache:** the states the KV prefix cache keeps and their memory, the
-  share of the finished requests' prompt tokens that it supplied, the
-  requests by how they resumed (new, continued in place, from a saved prompt
-  end, forked), and the states' prefix tree. A node is a run of positions
-  that all its states share. `●` marks where a state ends, with its number,
-  decoding or idle time, last prompt end and memory. A node's hits count the
-  requests whose reused rows reach into it.
-- **Log:** the latest log lines.
+The view writes nothing to files. What its tabs show of the last minute
+(one sample per snapshot, 120 of them) stays in the view's memory and is
+gone when it ends.
+
+The first row holds the server's address and model, and at the right its
+state: idle, prefill (with its layer) or decoding (with the total tokens/s),
+and the uptime. The second row holds the tabs; the last row, the keys of the
+tab shown. The digits `1` to `5`, Tab and Shift-Tab, or a click choose a tab.
+The view takes the mouse's clicks and scrolling; `m` gives the mouse back to
+the terminal, so that it can select text, and takes it again.
+
+Colors: the view asks the terminal for its background color (OSC 11) when it
+starts, if stdin is the terminal. It draws with colors for a light or a dark background by that
+color's brightness, and blends its tints toward that color. Without an answer it takes
+the light colors. `--tui-theme light` or `dark` chooses them without asking.
+A terminal that does not say it shows 24-bit color (`COLORTERM=truecolor` or
+`24bit`; Terminal.app does not) gets the nearest of its 256 colors.
+
+Figures are shown as labels before numbers; a line too long for the
+terminal ends after its last whole figure, with "…". A token here is one
+position that a decoding step computes: a request's next token, or a draft
+being verified; the decoding speeds count the tokens generated. The tabs:
+
+1. **Overview:**
+   - **Now:** idle, prefill (a gauge of the layers done), or decoding. For
+     each request: its state's number, prompt and reused tokens, generated
+     tokens and speed. A sparkline shows the total speed over the last 10 s
+     (20 s on terminals wider than 100 columns).
+   - **Throughput:** decoding (tokens/s), prefill (prompt tokens/s), the
+     SSD's reads (GB/s), the hit rate, the GPU's busy share of the decode
+     steps' time, and the wait for reads per decoded token, each over the
+     last 5 s, the last minute and since the start, with the last minute as
+     a sparkline; then the requests served and their prompt, reused and
+     generated tokens. The last 5 s and the last minute average the samples
+     taken while a figure applies: while decoding, while prefilling, or
+     either for the SSD's reads. Since the start, decoding is the tokens
+     generated per second of decoding; prefill and the SSD's reads count the
+     prefills that ended, so a long prefill joins them when it ends.
+   - **Experts per token**, over the last 10 s (since start when nothing
+     decoded in that time). A bar and a table split each token's 240 expert
+     selections (40 layers of 6) by where the expert was, per token and as
+     a share: in memory, read ahead in time, read ahead but still being read
+     (late), a substitute for one not in memory (`--substitute`), or read
+     from the SSD on demand. The hit rate counts the model's own choices
+     found in memory (the first three); "with substitutes" adds the
+     substitutes. Layers the GPU routes (`--gpu-route`) are not counted.
+     The "per token" line: the SSD's bytes and rate, the wait for reads, the
+     GPU's time and busy share, reads ahead started and cancelled, and slots
+     mapped for the GPU again ("remapped") when there are any. The
+     "prompts" line covers all prompts since start: tokens, selections
+     substituted per token, the share of the experts their batches used that
+     were in memory (a batch reads each expert once for all its rows), and
+     bytes read.
+   - **Memory:** a row each with a gauge, the main figure and its parts.
+     **GPU:** the driver's resident memory (all apps) against the GPU's
+     limit, split into myds4's mapped experts, its weights and the rest
+     while the GPU works; while it idles, the driver releases them ("idle;
+     resident when busy"). **RAM:** myds4's footprint against the Mac's
+     memory, split into its experts and the rest, and the expert slots
+     against the cache's current limit and its largest. **SSD:** the experts
+     only on the SSD (their bytes and count), evictions and slots given back
+     for memory. **Mac:** memory in use against the total (excluding file
+     cache), available memory (including file cache), pressure, file cache,
+     wired memory and swap; below it the compressor, the kernel's file-cache
+     target (diagnostic only) and swap-outs since the view started.
+   - **Log:** the latest log lines that fit.
+2. **KV cache:** the states the KV prefix cache keeps and their memory, the
+   share of the finished requests' prompt tokens that it supplied, the
+   requests by how they resumed (new, continued in place, from a saved
+   prompt end, forked), and the states' prefix tree along the token
+   positions. A node is a run of positions that all its states share; its
+   first child goes on in its row, the others fork below it, at any depth. A
+   heavy line in the accent color means a state through it decodes; gray
+   lines are paler the longer their states have idled. `●` marks where a
+   state ends, with its number, its request while it decodes or its idle
+   time, its positions and memory; `◆` marks its last saved prompt end. ←→
+   moves along a row and ↑↓ between rows; ⏎ or a click opens the chosen
+   node's text in a panel at the right (a shared node shows the text of the
+   state through it used last; at most its first 65,536 tokens, the
+   tokenizer's special tokens in the accent color), PgUp, PgDn and the
+   mouse's wheel scroll it, Home and End go to its start and end, and esc
+   closes it. The text is the one the node held when it opened. The chosen
+   node stays chosen while it grows, a fork splits it or an eviction merges
+   it, as long as the state through it stays in the tree. A node's hits
+   count the requests whose reused rows reach into it.
+3. **Experts:** a decoding request's experts in each of the 40 layers, as a
+   map of the 384 experts, two to a cell where the terminal has 217 columns
+   or more, else four. It shows the experts of its last 12 sampled tokens
+   (the view samples one token every 0.5 s, not every token), each in the
+   color of where it was when last chosen. A bar at the right
+   of each layer splits those tokens' 72 experts by where they were, with
+   the count read from the SSD. `[` and `]` or a click choose the request.
+4. **Last minute:** one column per snapshot of the last minute: the phase,
+   with `▼` where a request arrived; the requests' tokens/s, stacked in
+   their colors; the SSD's read rate; the decoded rows' hit rate, from 80%;
+   and each request's prefill, then its decoding.
+5. **Log:** the latest log lines; ↑↓, PgUp, PgDn and the wheel scroll
+   back, Home goes to the oldest and End to the newest.
 
 ### DeepSeek Harness
 
@@ -316,7 +372,7 @@ The app stores the key in its own credential file (`~/.dsh/.credentials.yaml`).
 | `build/runahead-model-check CHECKPOINT --signal --long --requests 2` | Event-based scheduling against ordinary concurrent decoding: all logits, local state, global KV and the caller's active-state identity. Add `--experts GGUF` for a quantized expert pack. |
 | `build/causal-signal-check CHECKPOINT --draft --long` | All 16 verification rows and five rollback lengths against serial decoding, including the next DSpark drafts. |
 | `.venv/bin/python tools/reference/check.py encoding CHECKPOINT` | The server's prompts (`build/myds4-server --render`; `MYDS4_RENDER` names another renderer) of the checkpoint's `encoding/tests` cases 1, 2, 3 and 5, and of 1,200 generated conversations (tools, tool calls and results, reasoning, system messages at the start and mid-conversation, content parts, escapes, both thinking modes, every effort form) and 600 with image parts in user turns and tool results (the placeholders' places and the images' order), against `encoding/encoding.py`, byte for byte. The server's renderer differs from `encoding.py` in known places ([Prompts compared with encoding.py](server.md#prompts-compared-with-encodingpy)), so the check reports the equal counts and exits with status 1. |
-| `make server-check` | The server's tests without a model: the compatibility steps, a numeric effort in the prompt, the KV prefix cache's decisions, the live view's frames on a test terminal (the title first, every line within the terminal's width, the log below the states' tree, the quit keys), the connections' limits (503, 431, a late head, 408, 413, a client that leaves or stops reading), and, with `MYDS4_CHECKPOINT=CHECKPOINT`, its output path through deepseek-recipe's stream processor with the checkpoint's tokenizer. With `MYDS4_EXPERTS=GGUF` set too, the fork tests through HTTP run as well (about 12 minutes; see [The server](server.md#checks)). |
+| `make server-check` | The server's tests without a model: the compatibility steps, a numeric effort in the prompt, the KV prefix cache's decisions, the live view's tabs on a test terminal (the title and the tabs first, every line within the terminal's width at sizes from 220 x 60 down to 12 x 4, each tab's parts, the keys and clicks that choose tabs, nodes and requests, a node's text as it arrives, the last minute's samples, the colors for a light or a dark background and without 24-bit color, the quit keys), the connections' limits (503, 431, a late head, 408, 413, a client that leaves or stops reading), and, with `MYDS4_CHECKPOINT=CHECKPOINT`, its output path through deepseek-recipe's stream processor with the checkpoint's tokenizer. With `MYDS4_EXPERTS=GGUF` set too, the fork tests through HTTP and the live view's test in a pseudo-terminal run as well (about 13 minutes; see [The server](server.md#checks)). |
 | `build/prefix-fork-check CHECKPOINT --text FILE [--rendered] [--limit N] [--experts GGUF] [--ced N] --fork [--random N]` | The fork test in the engine: a conversation forked at many positions, each resume method against a cold prefill and the conversation itself, and each fork's branch-point snapshot against the fork; with `--ced N`, the bounded replay's kept rows and its distance from the cold prefill (see [The server](server.md#checks)). About half an hour with a model. |
 | `.venv/bin/python tools/reference/check.py vision CHECKPOINT IMAGE [BINARY...]` | The image's feature rows (`--vision-fd`) against `inference/image_processor.py` and `vision.py` (ViT and Aligner in BF16 on the CPU): their SNR, overall and per row. With BINARY, each of those builds instead of `build/myds4`, against one reference. Needs `pillow`. |
 | `.venv/bin/python tools/reference/check.py model CHECKPOINT [CACHE]` | Every layer's streams, the routing and the logits of 20 decoded positions against DeepSeek's `inference/model.py` on the CPU (about 12 minutes, up to 55 GB of memory; `CACHE` keeps the reference's results in a file for reruns). The reference reads the checkpoint through the page cache, which then holds tens of GB of it: myds4 counts reclaimable file pages as available, and its expert reads may come from the page cache instead of the SSD. |

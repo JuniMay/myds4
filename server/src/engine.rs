@@ -192,6 +192,7 @@ unsafe extern "C" {
     fn myds4_images_encode(x: *mut RawImages, from: c_int) -> c_int;
     fn myds4_images_close(x: *mut RawImages);
     fn myds4_stats_get(s: *mut Stats);
+    fn myds4_routes(row: c_int, experts: *mut u16, sources: *mut u8) -> c_int;
     #[cfg(test)]
     fn myds4_tokenizer(dir: *const c_char) -> c_int;
     fn myds4_tokenize(text: *const c_char, len: usize, chat: c_int, out: *mut i32, max: c_int) -> c_int;
@@ -505,6 +506,16 @@ pub fn stats() -> Stats {
     s
 }
 
+/// The experts row `row` of the latest decode step chose, `per_row` of them
+/// (6 per layer, layer by layer), and where each one was (myds4_routes); None
+/// when the row did not run every layer in that step. From the worker's
+/// thread.
+pub fn routes(row: usize, per_row: usize) -> Option<(Vec<u16>, Vec<u8>)> {
+    let (mut experts, mut sources) = (vec![0u16; per_row], vec![0u8; per_row]);
+    // Safety: the engine writes layers * 6 entries, per_row of them (experts_per_row).
+    (unsafe { myds4_routes(row as c_int, experts.as_mut_ptr(), sources.as_mut_ptr()) } != 0).then_some((experts, sources))
+}
+
 // ---- the tokenizer, from any thread ----
 
 /// Loads the checkpoint's tokenizer without the model.
@@ -538,6 +549,46 @@ pub fn special(text: &str) -> Option<i32> {
     (id >= 0).then_some(id)
 }
 
+/// A token's bytes; none for an unknown id.
+fn piece(id: i32) -> &'static [u8] {
+    let mut n = 0usize;
+    // Safety: myds4_piece gives a token's bytes, length 0 for an unknown id;
+    // the tokenizer and its bytes stay loaded while the process runs.
+    let p = unsafe { myds4_piece(id, &mut n) };
+    if p.is_null() || n == 0 { &[] } else { unsafe { std::slice::from_raw_parts(p.cast::<u8>(), n) } }
+}
+
+/// The text of token ids, for the live view, in runs: the special tokens
+/// (the tokenizer's added tokens) each alone and marked true, the text
+/// between them, and one "[image]" for each run of an image's key (the
+/// negative ids of [`Images::expand`]).
+pub fn text(ids: &[i32]) -> Vec<(String, bool)> {
+    let mut runs = Vec::new();
+    let mut bytes = Vec::new();
+    let flush = |bytes: &mut Vec<u8>, runs: &mut Vec<(String, bool)>| {
+        if !bytes.is_empty() {
+            runs.push((String::from_utf8_lossy(bytes).into_owned(), false));
+            bytes.clear();
+        }
+    };
+    let mut last = 0i32;
+    for &id in ids {
+        if id < 0 {
+            if id != last {
+                bytes.extend_from_slice(b"[image]");
+            }
+        } else if unsafe { myds4_added(id) } != 0 {
+            flush(&mut bytes, &mut runs);
+            runs.push((String::from_utf8_lossy(piece(id)).into_owned(), true));
+        } else {
+            bytes.extend_from_slice(piece(id));
+        }
+        last = id;
+    }
+    flush(&mut bytes, &mut runs);
+    runs
+}
+
 /// The engine's tokenizer for recipe's stream processor: a token's text is
 /// its bytes, and the special tokens are the tokenizer's added tokens.
 pub struct Tokenizer;
@@ -549,9 +600,7 @@ impl StreamTokenizer for Tokenizer {
             if skip_special_tokens && self.is_special_token(id) {
                 continue;
             }
-            let mut n = 0usize;
-            let p = unsafe { myds4_piece(id as i32, &mut n) };
-            bytes.extend_from_slice(unsafe { std::slice::from_raw_parts(p.cast::<u8>(), n) });
+            bytes.extend_from_slice(piece(id as i32));
         }
         // An unfinished character at the end becomes U+FFFD, so the processor
         // waits for the token that finishes it.

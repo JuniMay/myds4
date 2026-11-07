@@ -327,6 +327,8 @@ static myds4_cache_counts counts(const CacheStats *c) {
                               .row_ssd = c->row_ssd, .read_s = c->read_s};
 }
 
+int myds4_routes(int row, uint16_t *experts, uint8_t *sources) { return model_routes(row, experts, sources); }
+
 void myds4_stats_get(myds4_stats *s) {
   MemInfo m;
   mem_info(&m);

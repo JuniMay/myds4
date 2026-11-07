@@ -16,6 +16,8 @@ deepseek-recipe-encoding = "=0.2.0"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["server", "server-graceful", "service", "tokio"] }
+# The live view asks the terminal for its background (poll and read on stdin).
+libc = "0.2"
 rand = "0.9"
 # The live view (--tui): ratatui on its crossterm backend; the engine's
 # snapshot is JSON.

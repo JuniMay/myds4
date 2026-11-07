@@ -473,6 +473,10 @@ int model_replay_rows(int k);
 // The first position a replay at k computes again (layer 0's), from which its
 // prompt's images must be encoded.
 int model_replay_start(int k);
+// The experts row `row` of the latest decode step chose in each layer (TOPK
+// each, layer by layer) and where each one was (0 in memory, 1 read ahead,
+// 2 late, 3 substituted, 4 from the SSD); 0 when the row did not run in it.
+int model_routes(int row, uint16_t *id, uint8_t *from);
 // One token for each of m sequences at once (m <= BLOCK + 1, no drafts):
 // row r is tokens[r] at position pos[r] of state st[r], every position before
 // it having run. Each row is computed as model_forward computes a token

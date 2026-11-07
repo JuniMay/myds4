@@ -129,6 +129,40 @@ struct Queue {
     jobs: VecDeque<Job>,
     closed: bool,
     numbers: u64,
+    /// The live view's question for a node's text: a state's number and
+    /// positions start..end ([`ask_text`]).
+    text: Option<(u64, usize, usize)>,
+}
+
+/// The tokens of a state's positions start..end, for the live view's text of
+/// a node: at most [`TEXT_TOKENS`] of them from start, none once the state
+/// is gone. The view turns them into text (engine::text, from any thread).
+pub struct NodeText {
+    pub session: u64,
+    pub start: usize,
+    pub end: usize,
+    pub ids: Vec<i32>,
+}
+
+/// The tokens a node's text holds at most.
+const TEXT_TOKENS: usize = 65_536;
+
+/// A decoding request's routed row of one decode step: the experts its token
+/// chose in each layer and where each one was (myds4_routes).
+struct Route {
+    request: u64,
+    experts: Vec<u16>,
+    sources: Vec<u8>,
+}
+
+/// Whether the live view asked for the decoding requests' routed rows: it
+/// asks with each snapshot, the worker copies them after its next decode
+/// step, and the next snapshot takes them, so the view gets each row once.
+static ROUTES: AtomicBool = AtomicBool::new(false);
+
+/// The live view asks for the routed rows of the next decode step.
+pub fn ask_routes() {
+    ROUTES.store(true, Ordering::Relaxed);
 }
 
 #[derive(Clone, Copy, Default)]
@@ -138,6 +172,13 @@ struct LiveReq {
     prompt: usize,
     reused: usize,
     generated: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Prefilled {
+    rows: u64,
+    bytes: u64,
+    seconds: f64,
 }
 
 /// What the worker is doing and has done, for /v1/status and the live view.
@@ -156,6 +197,18 @@ struct Status {
     generated_tokens: u64,
     kinds: [u64; 4], // new, continued, saved, forked
     prefill: PrefillInfo,
+    /// The ended prefills: their time, and the engine's prompt rows and their
+    /// expert bytes when the latest ended. The engine counts those at each
+    /// chunk's end; taken together, their ratios hold while a long
+    /// prefill's chunks go on.
+    prefilled: Prefilled,
+    /// The tokens generated since the start: by the requests that ended and
+    /// by those decoding.
+    decoded: u64,
+    /// The worker's answer to the live view's question for a node's text.
+    text: Option<NodeText>,
+    /// The decoding requests' latest routed rows, for the live view.
+    routes: Vec<Route>,
     /// The cache's states (number, tokens, last use), its tree, bytes and limit.
     states: Vec<(u64, usize, Instant)>,
     tree: Vec<(kv::Node, Instant)>,
@@ -207,6 +260,10 @@ pub fn start(c: &engine::Config) -> bool {
             generated_tokens: 0,
             kinds: [0; 4],
             prefill: PrefillInfo::default(),
+            prefilled: Prefilled::default(),
+            decoded: 0,
+            text: None,
+            routes: Vec::new(),
             states: Vec::new(),
             tree: Vec::new(),
             kv_bytes: 0,
@@ -260,6 +317,22 @@ pub fn request_stop() {
         let _q = lock(&s.queue);
         s.wake.notify_all();
     }
+}
+
+/// The live view asks for the text of state `session`'s positions start..end;
+/// the worker answers between its steps ([`text_answer`]). A new question
+/// replaces one not answered yet.
+pub fn ask_text(session: u64, start: usize, end: usize) {
+    if let Some(s) = SHARED.lock().unwrap().clone() {
+        lock(&s.queue).text = Some((session, start, end));
+        s.wake.notify_all();
+    }
+}
+
+/// The worker's answer to the latest [`ask_text`], once.
+pub fn text_answer() -> Option<NodeText> {
+    let s = SHARED.lock().unwrap().clone()?;
+    lock(&s.status).text.take()
 }
 
 /// Requests the stop, waits for the worker to end every request, save the
@@ -373,26 +446,34 @@ pub fn view() -> String {
     let s = shared();
     let waiting = lock(&s.queue).jobs.len();
     let c = engine::stats();
-    let st = lock(&s.status);
+    let mut st = lock(&s.status);
     let now = Instant::now();
+    // the routed rows copied since the snapshot before, each in one snapshot
+    let routes = std::mem::take(&mut st.routes);
     let requests: Vec<Value> = st
         .live
         .iter()
-        .map(|r| json!({"number": r.number, "session": r.session, "prompt": r.prompt, "reused": r.reused, "generated": r.generated}))
+        .map(|r| {
+            let mut v = json!({"number": r.number, "session": r.session, "prompt": r.prompt, "reused": r.reused, "generated": r.generated});
+            if let Some(x) = routes.iter().find(|x| x.request == r.number) {
+                v["route"] = json!({"experts": x.experts, "sources": x.sources});
+            }
+            v
+        })
         .collect();
     let tree: Vec<Value> = st
         .tree
         .iter()
         .map(|(x, used)| {
             json!({"lines": x.lines, "start": x.start, "end": x.end, "sessions": x.states, "hits": x.hits,
-                   "session": x.number, "busy": x.busy, "saved": x.saved,
+                   "session": x.number, "via": x.via, "busy": x.busy, "saved": x.saved,
                    "idle_seconds": if x.number != 0 { round((now - *used).as_secs_f64(), 1) } else { 0.0 },
                    "gib": round(x.bytes as f64 / GIB, 3)})
         })
         .collect();
     let (d, p) = (&c.decode, &c.prefill);
     let pinned = c.cache_bytes.saturating_sub(c.slots.max(0) as u64 * c.slot_bytes);
-    json!({
+    let v = json!({
         "uptime_seconds": round(s.started.elapsed().as_secs_f64(), 0), "phase": st.phase,
         "phase_seconds": round((now - st.since).as_secs_f64(), 1), "waiting": waiting, "requests": requests,
         "layers": c.layers, "experts_per_row": c.experts_per_row,
@@ -402,22 +483,29 @@ pub fn view() -> String {
         "kinds": {"new": st.kinds[0], "continued": st.kinds[1], "saved": st.kinds[2], "forked": st.kinds[3]},
         "sessions": st.states.len(), "kv_gib": round(st.kv_bytes as f64 / GIB, 3), "kv_limit_gib": round(s.kv_limit, 3),
         "tree": tree,
-        "decode": {"rows": c.decode_rows, "seconds": round(c.decode_seconds, 3), "gpu_seconds": round(c.decode_gpu_seconds, 3),
+        "decode": {"rows": c.decode_rows, "tokens": st.decoded, "seconds": round(c.decode_seconds, 3),
+                   "gpu_seconds": round(c.decode_gpu_seconds, 3),
                    "in_memory": d.row_own, "read_ahead": d.row_ahead, "late": d.row_late, "substituted": d.row_sub,
                    "from_ssd": d.row_ssd, "bytes": d.bytes, "read_wait_seconds": round(d.read_s, 3),
                    "prefetches": d.prefetches, "cancelled": d.cancelled, "remaps": d.remaps},
         "prompts": {"rows": c.prefill_rows, "hits": p.hits, "prefetch_hits": p.prefetch_hits, "misses": p.misses,
                     "substituted": p.substituted, "bytes": p.bytes},
+        "prefilled": {"rows": st.prefilled.rows, "bytes": st.prefilled.bytes, "seconds": round(st.prefilled.seconds, 3)},
         "cache": {"slots": c.slots, "mapped": c.mapped, "cap": c.cap, "max_slots": c.max_slots, "slot_bytes": c.slot_bytes,
                   "experts": c.experts, "uncached": c.uncached, "uncached_bytes": c.uncached_bytes,
-                  "evictions": c.cache.evictions, "given_back": c.cache.given_back},
+                  "evictions": c.cache.evictions, "given_back": c.cache.given_back,
+                  // every expert byte read, counted as each read completes (the
+                  // prefill's own counter takes a chunk's reads when it ends)
+                  "read_bytes": c.cache.bytes},
         "memory": {"footprint": c.footprint, "dense": c.dense_bytes, "pinned": pinned, "gpu_in_use": c.gpu_in_use,
                    "gpu_limit": if c.gpu_limit == i64::MAX { Value::Null } else { json!(c.gpu_limit) },
                    "total": c.total, "free": c.free, "file": c.file, "file_kept": c.file_kept, "wired": c.wired,
                    "compressor": c.compressor, "compressed": c.compressed, "swap_used": c.swap_used,
                    "swapouts": c.swapouts, "pressure": c.pressure},
-    })
-    .to_string()
+    });
+    // the decode steps take the status's lock; the text is written without it
+    drop(st);
+    v.to_string()
 }
 
 // ---- the worker ----
@@ -469,6 +557,8 @@ struct Worker {
     think_end: i32,
     shown: usize,
     published: Instant,
+    /// The experts a decoded row holds: the live view's routed rows.
+    per_row: usize,
 }
 
 impl Worker {
@@ -499,6 +589,7 @@ impl Worker {
             think_end: special("</think>"),
             shown: 0,
             published: Instant::now(),
+            per_row: engine::stats().experts_per_row.max(0) as usize,
             cfg,
             s,
         }
@@ -514,6 +605,15 @@ impl Worker {
         if let Some(x) = self.snaps.remove(&(id, pos)) {
             engine::snapshot_free(x);
         }
+    }
+
+    /// The tokens of state `session`'s positions start..end, for the live
+    /// view: at most TEXT_TOKENS from start, none if the state is gone.
+    fn node_text(&self, session: u64, start: usize, end: usize) -> NodeText {
+        let tokens = self.cache.entries.values().find(|e| e.number == session).map_or(&[][..], |e| &e.tokens[..]);
+        let to = end.min(tokens.len());
+        let from = start.min(to);
+        NodeText { session, start, end, ids: tokens[from..to.min(from + TEXT_TOKENS)].to_vec() }
     }
 
     /// Before a pass that makes the busy state `id` hold `positions`: the
@@ -587,6 +687,7 @@ impl Worker {
         }
         st.phase = phase;
         st.active = self.gens.len();
+        st.decoded = st.generated_tokens + self.gens.iter().map(|g| g.generated as u64).sum::<u64>();
         let first = self.gens.first();
         (st.request, st.prompt, st.reused, st.generated) = match (prefilling, first) {
             (Some((id, _, n, from)), _) => (id, n, from, 0),
@@ -778,7 +879,8 @@ impl Worker {
         drop(images);
         let t1 = Instant::now();
         let dt = (t1 - t0).as_secs_f64();
-        let read = (engine::stats().cache.bytes - c0.bytes) as f64 / 1e9;
+        let c1 = engine::stats();
+        let read = (c1.cache.bytes - c0.bytes) as f64 / 1e9;
         let replayed = if matches!(plan, Plan::Replay { .. }) {
             format!(
                 "; {} replay at {from}: up to {} earlier rows computed again",
@@ -802,6 +904,10 @@ impl Worker {
         {
             let mut st = lock(&self.s.status);
             st.prefill = info;
+            if from < n {
+                st.prefilled.seconds += dt;
+            }
+            (st.prefilled.rows, st.prefilled.bytes) = (c1.prefill_rows, c1.prefill.bytes);
             st.kinds[match kind {
                 "new" => 0,
                 "kept" => 1,
@@ -1040,6 +1146,19 @@ impl Worker {
         }
     }
 
+    /// The decoding requests' routed rows of the latest step, for the live
+    /// view: row r is gens[r]'s (myds4_rows runs them in that order; alone, a
+    /// request's token is row 0). A few kilobytes, twice a second.
+    fn copy_routes(&self) {
+        let routes: Vec<Route> = self
+            .gens
+            .iter()
+            .enumerate()
+            .filter_map(|(r, g)| engine::routes(r, self.per_row).map(|(experts, sources)| Route { request: g.job.id, experts, sources }))
+            .collect();
+        lock(&self.s.status).routes = routes;
+    }
+
     /// Admits waiting requests while the batch has room (prefilling each while
     /// the others wait), ends the generations that are done, and advances the
     /// others by a token. While no request runs, the expert cache gives slots
@@ -1049,7 +1168,7 @@ impl Worker {
         let s = self.s.clone();
         while !engine::stopping() {
             let mut q = lock(&s.queue);
-            while q.jobs.is_empty() && self.gens.is_empty() && !engine::stopping() {
+            while q.jobs.is_empty() && q.text.is_none() && self.gens.is_empty() && !engine::stopping() {
                 let (guard, timeout) = s.wake.wait_timeout(q, Duration::from_secs(1)).unwrap_or_else(|e| e.into_inner());
                 q = guard;
                 if timeout.timed_out() && q.jobs.is_empty() {
@@ -1058,6 +1177,7 @@ impl Worker {
                     q = lock(&s.queue);
                 }
             }
+            let question = q.text.take();
             let mut admit = Vec::new();
             while self.gens.len() + admit.len() < self.batch && !engine::stopping() {
                 let Some(job) = q.jobs.pop_front() else { break };
@@ -1072,6 +1192,10 @@ impl Worker {
                 ));
             }
             drop(q);
+            if let Some((session, start, end)) = question {
+                let answer = self.node_text(session, start, end);
+                lock(&s.status).text = Some(answer);
+            }
             for job in admit {
                 if engine::stopping() {
                     self.end_waiting(job, Finish::Shutdown);
@@ -1107,6 +1231,9 @@ impl Worker {
                 break;
             }
             self.advance();
+            if ROUTES.swap(false, Ordering::Relaxed) {
+                self.copy_routes();
+            }
             for g in &mut self.gens {
                 if !g.out.is_empty() {
                     let _ = g.job.tx.send(Event::Tokens(std::mem::take(&mut g.out)));

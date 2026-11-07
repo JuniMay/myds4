@@ -1681,6 +1681,23 @@ static void read_ahead_rows(int m, int l, const int *pr, int ahead, int inflight
 #include "../experimental/expert_waves.c"
 #endif
 
+// The experts each decoded row chose in the model's layers, where each one
+// was (0 in memory, 1 read ahead, 2 late, 3 substituted, 4 from the SSD) and
+// the decode step that chose them, for the live view (model_routes). The
+// router's results are on the CPU already: recording them is a copy.
+static uint16_t route_id[FEW][LAYERS][TOPK];
+static uint8_t route_from[FEW][LAYERS][TOPK];
+static uint64_t route_step[FEW][LAYERS], route_steps;
+
+int model_routes(int row, uint16_t *id, uint8_t *from) {
+  if (row < 0 || row >= FEW || !route_steps) return 0;
+  for (int l = 0; l < LAYERS; l++)
+    if (route_step[row][l] != route_steps) return 0;  // the row did not run every layer in the latest step
+  memcpy(id, route_id[row], sizeof route_id[row]);
+  memcpy(from, route_from[row], sizeof route_from[row]);
+  return 1;
+}
+
 // The routed experts of m <= FEW rows (RT), each as decoding runs it. While
 // some are still being read, those in memory run first, their down products
 // as parts (see moe_parts), in the command buffer open now, which is committed
@@ -1709,6 +1726,7 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
   cache_observe_routes(&observed, rt, m, 16, 1);
   uint64_t *tally[] = {&cache_stats.row_ssd, &cache_stats.row_own, &cache_stats.row_ahead, &cache_stats.row_late,
                        &cache_stats.row_sub};
+  int record = !prompt_pass && l < LAYERS;  // the model's own layers, in decode steps
   for (int r = 0; r < m; r++)
     for (int k = 0; k < TOPK; k++) { // each row's selections, by where their experts are now
       int e = rt[r * 16 + k];
@@ -1716,7 +1734,12 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
 #ifdef MYDS4_VERIFY_ROW_CREDIT
       uses[e]++;
 #endif
-      (*tally[approx && e != chosen[r * TOPK + k] ? 4 : cache_where(l, e)])++;
+      int where = approx && e != chosen[r * TOPK + k] ? 4 : cache_where(l, e);
+      (*tally[where])++;
+      if (record && b->row + r < FEW) {  // tally's order (from the SSD first) to route_from's
+        route_id[b->row + r][l][k] = (uint16_t)e, route_from[b->row + r][l][k] = (uint8_t)((where + 4) % 5);
+        route_step[b->row + r][l] = route_steps;
+      }
     }
   for (int e = 0; e < EXPERTS; e++)
     if (used[e]) need[nn++] = e;
@@ -2234,6 +2257,7 @@ static void wait_front_signal(uint64_t value) {
 static void step_rows(const int *tokens, int m, int pos) {
   for (int i = 0; i < m; i++)
     if (tokens[i] < 0) die("an image's token outside a prompt's batch (position %d)", pos + i);
+  route_steps++;
   if (!nrows && pos + m > opt.ctx) die("context full (%d tokens)", opt.ctx);
   if (!nrows) reserve(pos + m, pos);
   request_capacity(m);

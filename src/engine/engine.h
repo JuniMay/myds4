@@ -229,6 +229,14 @@ typedef struct {
   int layers, experts_per_row;
 } myds4_stats;
 void myds4_stats_get(myds4_stats *s);
+// For the live view: the experts that row `row` of the latest decode step
+// (myds4_step: row 0; myds4_rows: the row of each state; myds4_verify: row 0
+// is the token, the others its drafts) chose in each layer, 6 per layer,
+// layer by layer (layers * 6 ids), and where each one was: 0 in memory, 1 read
+// ahead, 2 late, 3 substituted, 4 from the SSD. Returns 0, and leaves both
+// unset, when the row did not run every layer in that step. From the worker's
+// thread, after the step.
+int myds4_routes(int row, uint16_t *experts, uint8_t *sources);
 
 // ---- the checkpoint's tokenizer (tokenizer.json), from any thread ----
 

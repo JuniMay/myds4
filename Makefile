@@ -657,26 +657,30 @@ build/libmyds4-prefetch-study.a: $(filter-out build/lib/engine/model.o build/lib
 	ar rcs $@ $^
 
 # The Rust server. Its target directory is build/cargo, as server/.cargo/config.toml
-# sets it for cargo run inside server/.
+# sets it for cargo run inside server/. A new executable replaces the old one by a
+# rename: a server still running keeps its own file, which macOS can kill it for
+# rewriting in place.
 CARGO ?= cargo
-build/myds4-server: build/libmyds4.a server/Cargo.toml server/Cargo.lock server/build.rs $(wildcard server/src/*.rs)
+# The crate's inputs: its manifest, lock file, build script and every source file at any depth.
+SERVER_INPUTS := server/Cargo.toml server/Cargo.lock server/build.rs $(shell find server/src -name '*.rs')
+build/myds4-server: build/libmyds4.a $(SERVER_INPUTS)
 	$(CARGO) build --release --locked --manifest-path server/Cargo.toml --target-dir build/cargo
-	cp build/cargo/release/myds4-server $@
+	cp build/cargo/release/myds4-server $@.new && mv -f $@.new $@
 
 server: build/myds4-server
 
 # Shares Cargo's dependency cache; build normal and study executables sequentially.
-build/myds4-server-prefetch-study: build/libmyds4-prefetch-study.a server/Cargo.toml server/Cargo.lock server/build.rs $(wildcard server/src/*.rs)
+build/myds4-server-prefetch-study: build/libmyds4-prefetch-study.a $(SERVER_INPUTS)
 	MYDS4_ENGINE_VARIANT=prefetch-study $(CARGO) build --release --locked --manifest-path server/Cargo.toml --target-dir build/cargo
-	cp build/cargo/release/myds4-server $@
+	cp build/cargo/release/myds4-server $@.new && mv -f $@.new $@
 
-build/myds4-server-prefetch-demote: build/libmyds4-prefetch-demote.a server/Cargo.toml server/Cargo.lock server/build.rs $(wildcard server/src/*.rs)
+build/myds4-server-prefetch-demote: build/libmyds4-prefetch-demote.a $(SERVER_INPUTS)
 	MYDS4_ENGINE_VARIANT=prefetch-demote $(CARGO) build --release --locked --manifest-path server/Cargo.toml --target-dir build/cargo
-	cp build/cargo/release/myds4-server $@
+	cp build/cargo/release/myds4-server $@.new && mv -f $@.new $@
 
-build/myds4-server-expert-waves: build/libmyds4-expert-waves.a server/Cargo.toml server/Cargo.lock server/build.rs $(wildcard server/src/*.rs)
+build/myds4-server-expert-waves: build/libmyds4-expert-waves.a $(SERVER_INPUTS)
 	MYDS4_ENGINE_VARIANT=expert-waves $(CARGO) build --release --locked --manifest-path server/Cargo.toml --target-dir build/cargo
-	cp build/cargo/release/myds4-server $@
+	cp build/cargo/release/myds4-server $@.new && mv -f $@.new $@
 
 build/batch-prefetch-check: tools/checks/batch_prefetch_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
 	@mkdir -p build

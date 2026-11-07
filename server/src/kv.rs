@@ -457,6 +457,9 @@ pub struct Node {
     pub hits: usize,
     /// The state ending here (its number), 0 for a shared prefix.
     pub number: u64,
+    /// A state through it, the one used last (its number): its tokens hold
+    /// the node's text.
+    pub via: u64,
     pub busy: bool,
     /// Its last prompt-end snapshot's position, -1 for none.
     pub saved: i64,
@@ -495,6 +498,7 @@ impl Cache {
                 states: set.len(),
                 hits: set.iter().map(|e| e.hits.iter().filter(|&&h| h > from).count()).sum(),
                 number: 0,
+                via: set.iter().max_by_key(|e| e.used).map_or(0, |e| e.number),
                 busy: false,
                 saved: -1,
                 used: 0,
@@ -860,5 +864,9 @@ mod tests {
         let ends: Vec<(usize, u64)> = t[1..].iter().map(|x| (x.end, x.number)).collect();
         assert!(ends.contains(&(120, c.entries[&na].number)) && ends.contains(&(150, c.entries[&nb].number)));
         assert!(t[1].lines.starts_with("├─") && t[2].lines.starts_with("└─"));
+        // a shared node's text is that of the state through it used last; an
+        // end's is its own
+        assert_eq!(t[0].via, c.entries[&nb].number);
+        assert!(t[1..].iter().all(|x| x.via == x.number));
     }
 }

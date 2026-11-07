@@ -81,7 +81,10 @@ build/myds4-server -m "$CHECKPOINT" --experts "$EXPERTS" --cache 56 \
 ```
 
 It serves `http://127.0.0.1:8008/v1`, uses the router's selected experts, samples at temperature
-1 and top-p 1, and shows a live view that the `q` key stops. In DeepSeek
+1 and top-p 1, and shows a live view that the `q` key stops: tabs for the
+throughput, the KV prefix cache's tree with each node's text, each decoding
+request's experts by layer, the last minute and the log ([live
+view](docs/usage.md#live-view)). In DeepSeek
 Harness, add a provider with **Custom model API**, that base URL, the OpenAI
 Chat Completions protocol and the key file's contents (see
 [Usage](docs/usage.md#deepseek-harness)). Each run takes most of the memory,
