@@ -128,34 +128,6 @@ int main(void) {
                        : "common four-token endings do not hide a matching long suffix",
            p.count == 15 && p.matched == 16 && p.source == 16 && p.tokens[0] == 1000);
   }
-  context_lookup_reset(s);
-  int at = 0;
-  for (int repeat = 0; repeat < 2; repeat++) {
-    for (int i = 0; i < 4; i++) tokens[at++] = 100 + i;
-    for (int i = 0; i < 4; i++) tokens[at++] = 200 + i;
-    tokens[at++] = 900 + repeat;
-  }
-  for (int i = 0; i < 4; i++) tokens[at++] = 100 + i;
-  context_lookup_append(s, tokens, at);
-  p = context_lookup_propose_consensus(s, 15);
-  expect("two agreeing short matches supply four candidates", p.count == 4 && p.matched == 4 && p.tokens[3] == 203);
-  expect("consensus respects the caller's remaining space", context_lookup_propose_consensus(s, 2).count == 2);
-  context_lookup_reset(s);
-  tokens[15] = 999;
-  context_lookup_append(s, tokens, at);
-  expect("consensus stops at the first disagreement", context_lookup_propose_consensus(s, 15).count == 2);
-  context_lookup_reset(s);
-  tokens[13] = 888;
-  context_lookup_append(s, tokens, at);
-  expect("a tied first token produces no consensus draft", !context_lookup_propose_consensus(s, 15).count);
-  context_lookup_reset(s);
-  n = pair(tokens, 4);
-  context_lookup_append(s, tokens, n);
-  expect("one short occurrence is insufficient for consensus", !context_lookup_propose_consensus(s, 15).count);
-  context_lookup_reset(s);
-  n = pair(tokens, 12);
-  context_lookup_append(s, tokens, n);
-  expect("consensus policy retains a long exact match", context_lookup_propose_consensus(s, 15).count == 15);
   context_lookup_free(s);
   fprintf(stderr, "context lookup: %d/%d CPU checks passed\n", checks - failures, checks);
   return failures != 0;

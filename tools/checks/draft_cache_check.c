@@ -125,7 +125,7 @@ int main(void) {
   expect("other stage is untouched", cache_slot(LAYERS + 1, 16), 0);
   expect("backbone slot is untouched", where[0][100], 0);
   int skip = 120;
-  cache_prefetch(LAYERS, &skip, 1, 1, 6);
+  cache_prefetch(LAYERS, &skip, 1, 6);
   expect("bounded draft prefetch is disabled", cache_slot(LAYERS, skip), 0);
 
   int pending = where[LAYERS][2];

@@ -16,8 +16,7 @@
 // as [4*m,6]; it does not mean six coefficients per stream. Batches above
 // 128 rows are omitted, as are main layers outside 0,1,4,8,12,20,28,35.
 // Kind 9 layers 40..42 are stage inputs. Layer 43 is final DHS and DMF for
-// all computed rows: five by default, or only requested rows for stage 42
-// and final layer 43 with --draft-trim. Kind 10, also layer 43, contains FP32
+// all five computed rows. Kind 10, also layer 43, contains FP32
 // head inputs for only the requested draft rows. These final records require
 // MYDS4_PROBE_STREAMS and follow the existing synchronization AFTER the head;
 // their timestamps do not establish availability before head execution.

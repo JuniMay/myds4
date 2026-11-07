@@ -17,9 +17,6 @@ void context_lookup_free(ContextLookup *lookup);
 void context_lookup_reset(ContextLookup *lookup);
 int context_lookup_append(ContextLookup *lookup, const int32_t *tokens, int count);
 ContextDraft context_lookup_propose(const ContextLookup *lookup, int max_drafts);
-// Experimental fallback: up to four tokens supported by at least two
-// prior occurrences and 80% of the matching four-token suffixes.
-ContextDraft context_lookup_propose_consensus(const ContextLookup *lookup, int max_drafts);
 // Record the actual offered count and the prefix accepted by the target.
 // An empty proposal does not count as failed verification.
 int context_lookup_feedback(ContextLookup *lookup, int offered, int accepted);

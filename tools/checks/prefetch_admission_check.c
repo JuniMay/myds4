@@ -52,7 +52,7 @@ int main(void) {
   CHECK(atomic_load(&demand) == CURRENT);
   CHECK(atomic_load(&prefetching) == CURRENT); // Promotion has not freed admissions.
   CHECK(cache_stats.prefetch_hits == CURRENT && cache_stats.late == CURRENT);
-  cache_prefetch(2, &future, 1, 1, CURRENT);
+  cache_prefetch(2, &future, 1, CURRENT);
   CHECK(where[2][future] == -1 && cache_stats.prefetches == 0);
 
   dispatch_resume(deferred);
@@ -62,10 +62,10 @@ int main(void) {
   CHECK(where[2][future] == -1); // Free capacity does not retry the skipped forecast.
   CHECK(cache_stats.bytes == (uint64_t)CURRENT * 16384);
 
-  cache_prefetch(2, &future, 1, 1, CURRENT); // Offer exactly the same candidate again.
+  cache_prefetch(2, &future, 1, CURRENT); // Offer exactly the same candidate again.
   CHECK(where[2][future] == CURRENT && atomic_load(&prefetching) == 1);
   CHECK(cache_stats.prefetches == 1);
-  cache_prefetch(2, &future, 1, 1, CURRENT);
+  cache_prefetch(2, &future, 1, CURRENT);
   CHECK(cache_stats.prefetches == 1 && atomic_load(&prefetching) == 1);
   for (int i = 0; i < CURRENT; i++) CHECK(where[0][i] == i && cache_ready(0, i));
   cancel(CURRENT);

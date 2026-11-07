@@ -10,14 +10,10 @@ static size_t differences(const void *a, const void *b, size_t bytes) {
 
 int main(int argc, char **argv) {
   if (argc < 2) die("usage: runahead-model-check CHECKPOINT [--long] [--requests N] [--experts GGUF]");
-  int count = 4, length = 257, mode = 1;
+  int count = 4, length = 257;
   Options o = {.ctx = 32768, .budget_gb = 20, .reserve_gb = 4, .quiet = 1, .dump_fd = -1, .routes_fd = -1};
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--long")) length = 16521;
-    else if (!strcmp(argv[i], "--signal")) mode = 2;
-    else if (!strcmp(argv[i], "--grouped")) mode = 3;
-    else if (!strcmp(argv[i], "--grouped-after-wait")) mode = 4;
-    else if (!strcmp(argv[i], "--batch-head")) mode = 5;
     else if (!strcmp(argv[i], "--requests") && i + 1 < argc) count = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--experts") && i + 1 < argc) o.experts = argv[++i];
     else die("invalid runahead check option");
@@ -63,7 +59,7 @@ int main(int argc, char **argv) {
     model_snapshot_free(prefix[r]);
     positions[r] -= STEPS;
   }
-  runahead_enabled = mode;
+  runahead_enabled = 1;
   size_t logit_diff = 0, local_diff = 0, global_diff = 0;
   int nonfinite = 0, active_changed = 0;
   for (int step = 0; step < STEPS; step++) {
@@ -88,14 +84,10 @@ int main(int argc, char **argv) {
       }
     free(local[r]);
   }
-  printf("{\"runahead_check\":{\"mode\":%d,\"requests\":%d,\"minimum_prompt_tokens\":%d,\"steps\":%d,\"logit_bytes_differ\":%zu,"
-         "\"local_bytes_differ\":%zu,\"global_bytes_differ\":%zu,\"nonfinite\":%d,\"active_state_changes\":%d,\"ready_groups\":%llu,"
-         "\"groups_after_wait\":%llu,\"head_batches\":%llu,\"head_rows\":%llu}}\n",
-         mode, count, length, STEPS, logit_diff, local_diff, global_diff, nonfinite, active_changed,
-         (unsigned long long)runahead_group_count, (unsigned long long)runahead_after_wait_groups,
-         (unsigned long long)runahead_head_batches, (unsigned long long)runahead_head_rows);
+  printf("{\"runahead_check\":{\"requests\":%d,\"minimum_prompt_tokens\":%d,\"steps\":%d,\"logit_bytes_differ\":%zu,"
+         "\"local_bytes_differ\":%zu,\"global_bytes_differ\":%zu,\"nonfinite\":%d,\"active_state_changes\":%d,\"ready_groups\":%llu}}\n",
+         count, length, STEPS, logit_diff, local_diff, global_diff, nonfinite, active_changed,
+         (unsigned long long)runahead_group_count);
   free(reference), free(prompt);
-  return logit_diff || local_diff || global_diff || nonfinite || active_changed ||
-         (mode >= 3 && !runahead_group_count) || (mode == 4 && !runahead_after_wait_groups) ||
-         (mode == 5 && (runahead_head_batches != STEPS || runahead_head_rows != (uint64_t)STEPS * count));
+  return logit_diff || local_diff || global_diff || nonfinite || active_changed || !runahead_group_count;
 }

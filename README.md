@@ -18,6 +18,8 @@ myds4 is inspired by [ds4](https://github.com/antirez/ds4) and mlx-stream.
 - [The server](docs/server.md): the HTTP server, in Rust on DeepSeek's
   `deepseek-recipe` crates over the C engine: its C ABI, its live view, and
   where its prompts differ from `encoding.py`.
+- [Removed experiments](docs/experiments.md): the studies that were
+  measured and removed, how each worked and what it showed.
 
 ## Requirements
 
@@ -120,10 +122,10 @@ but slows the measured long DSH continuation; see
 [context-copy measurements](docs/performance.md#context-copy-drafting).
 
 The server's `--runahead` option lets ready requests advance while other
-requests wait for expert reads. It groups ready requests at the same layer
-and enables shared expert loads. It applies when at least two requests are
-decoding; a request alone keeps ordinary decoding. Omit DSpark, substitution,
-GPU routing and the online predictor when using it. The option is off by
+requests wait for expert reads. It groups ready requests at the same layer;
+each request loads its own experts. It applies when at least two requests
+are decoding; a request alone keeps ordinary decoding. Omit DSpark,
+substitution and the online predictor when using it. The option is off by
 default. See the [server comparison](docs/performance.md#http-runahead-comparison)
 for measured throughput and its limits.
 

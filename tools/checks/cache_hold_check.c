@@ -1,7 +1,4 @@
 // Reservations must prevent reuse across independently advancing GPU jobs.
-#ifndef MYDS4_RUNAHEAD
-#define MYDS4_RUNAHEAD
-#endif
 #include "../../src/engine/io.c"
 
 int main(void) {

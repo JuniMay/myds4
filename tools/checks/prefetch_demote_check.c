@@ -1,4 +1,5 @@
-// Actual routing may discard only wholly unstarted, unused forecasts.
+// Demotion keeps every read; a newer prediction (cache_refine) discards only
+// wholly unstarted forecasts it excludes.
 // Deferred demand callbacks and a manually claimed piece keep ownership
 // transitions deterministic. No reader threads, GPU buffers or files are made.
 #include <dispatch/dispatch.h>
@@ -9,7 +10,6 @@
 #include <unistd.h>
 
 static dispatch_queue_t deferred;
-#define MYDS4_PREFETCH_DEMOTE_CANCEL
 #define dispatch_get_global_queue(qos, flags) deferred
 #include "../../src/engine/io.c"
 #undef dispatch_get_global_queue
@@ -125,17 +125,35 @@ int main(void) {
   int fd = open("/dev/zero", O_RDONLY);
   if (fd < 0) return 1;
   deferred = dispatch_queue_create("myds4.check.prefetch-demote", DISPATCH_QUEUE_SERIAL);
-  for (int prefill = 0; prefill <= 1; prefill++) {
+  for (int prefill = 0; prefill <= 1; prefill++) {  // demotion cancels nothing, in either pass
     setup(fd, prefill);
+    uint32_t before[QMAX];
+    int count = snapshot(before), admissions = atomic_load(&prefetching);
+    uint64_t bytes = cache_stats.bytes, cancelled = cache_stats.cancelled;
+    cache_demote(LAYER);
+    expect("demotion keeps the selected pending expert", where[LAYER][0] == 0 && fixture[0].loading);
+    expect("demotion keeps unused reads queued, no longer protected", where[LAYER][1] == 1 && where[LAYER][4] == 6 &&
+           fixture[1].loading && fixture[6].loading && !fixture[1].prefetched && !fixture[6].prefetched);
+    expect("other layers remain forecast entries", where[LAYER + 1][0] == 3 && fixture[3].prefetched &&
+           where[LAYER - 1][0] == 4 && fixture[4].prefetched);
+    expect("demotion performs no I/O and changes no queue", cache_stats.bytes == bytes && same_queue(before, count) &&
+           atomic_load(&prefetching) == admissions && cache_stats.cancelled == cancelled);
+    teardown();
+  }
+
+  // A newer prediction (cache_refine) cancels the unstarted forecasts it
+  // excludes: here experts 1 and 4 (slots 1 and 6), not 0, 2 or 3.
+  const int newer[3] = {0, 2, 3};
+  setup(fd, 0);
+  {
     uint32_t before[QMAX], expected[QMAX];
     int count = snapshot(before), kept = 0;
     for (int k = 0; k < count; k++)
-      if (prefill || ((before[k] >> 4) != 1 && (before[k] >> 4) != 6)) expected[kept++] = before[k];
+      if ((before[k] >> 4) != 1 && (before[k] >> 4) != 6) expected[kept++] = before[k];
     int admissions = atomic_load(&prefetching);
     uint64_t bytes = cache_stats.bytes, cancelled = cache_stats.cancelled;
     uint8_t *selected_buffer = fixture[0].b.ptr, *partial_buffer = fixture[2].b.ptr, *reuse_buffer = fixture[1].b.ptr;
-    cache_demote(LAYER);
-
+    cache_refine(LAYER, newer, 3);
     expect("selected pending expert stays protected", where[LAYER][0] == 0 && fixture[0].b.ptr == selected_buffer &&
            fixture[0].loading && !fixture[0].prefetched && atomic_load(&fixture[0].unfinished) == 2);
     expect("partially started forecast can still finish", where[LAYER][2] == 2 && fixture[2].b.ptr == partial_buffer &&
@@ -144,27 +162,22 @@ int main(void) {
     expect("already ready expert remains cached", where[LAYER][3] == 5 && !slot_reading(5));
     expect("other layers remain forecast entries", where[LAYER + 1][0] == 3 && fixture[3].prefetched &&
            where[LAYER - 1][0] == 4 && fixture[4].prefetched);
-    expect("demotion performs no I/O", cache_stats.bytes == bytes);
+    expect("refinement performs no I/O", cache_stats.bytes == bytes);
     expect("remaining queue keeps FIFO order across wrap", same_queue(expected, kept));
-    expect("only canceled admissions are released", atomic_load(&prefetching) == admissions - (prefill ? 0 : 2));
-    expect("cancellations counted once", cache_stats.cancelled == cancelled + (prefill ? 0 : 2));
-    if (prefill) {
-      expect("prefill leaves unused reads queued", where[LAYER][1] == 1 && where[LAYER][4] == 6 &&
-             fixture[1].loading && fixture[6].loading && !fixture[1].prefetched && !fixture[6].prefetched);
-    } else {
-      expect("wholly unstarted unused entries are empty", where[LAYER][1] == -1 && where[LAYER][4] == -1 &&
-             fixture[1].expert == -1 && fixture[6].expert == -1 && !slot_reading(1) && !slot_reading(6));
-      cache_demote(LAYER);
-      expect("repeated demotion is idempotent", same_queue(expected, kept) && cache_stats.cancelled == cancelled + 2);
-      int incoming = 0;
-      cache_prefetch(LAYER + 2, &incoming, 1, 1, 100);
-      expect("empty slot can be reused without allocation", where[LAYER + 2][0] == 1 && fixture[1].b.ptr == reuse_buffer);
-      expected[kept++] = 0x10, expected[kept++] = 0x11;
-      expect("reused slot has only its new queue references", same_queue(expected, kept));
-      expect("reuse does not displace selected or partial data", where[LAYER][0] == 0 && where[LAYER][2] == 2);
-    }
-    teardown();
+    expect("only canceled admissions are released", atomic_load(&prefetching) == admissions - 2);
+    expect("cancellations counted once", cache_stats.cancelled == cancelled + 2);
+    expect("wholly unstarted excluded entries are empty", where[LAYER][1] == -1 && where[LAYER][4] == -1 &&
+           fixture[1].expert == -1 && fixture[6].expert == -1 && !slot_reading(1) && !slot_reading(6));
+    cache_refine(LAYER, newer, 3);
+    expect("repeated refinement is idempotent", same_queue(expected, kept) && cache_stats.cancelled == cancelled + 2);
+    int incoming = 0;
+    cache_prefetch(LAYER + 2, &incoming, 1, 100);
+    expect("empty slot can be reused without allocation", where[LAYER + 2][0] == 1 && fixture[1].b.ptr == reuse_buffer);
+    expected[kept++] = 0x10, expected[kept++] = 0x11;
+    expect("reused slot has only its new queue references", same_queue(expected, kept));
+    expect("reuse does not displace selected or partial data", where[LAYER][0] == 0 && where[LAYER][2] == 2);
   }
+  teardown();
 
   setup(fd, 0);
   int keep = 1;
@@ -177,18 +190,16 @@ int main(void) {
          where[LAYER][2] == 2 && atomic_load(&fixture[2].taken[0]) && !atomic_load(&fixture[2].taken[1]));
   teardown();
 
-#ifdef MYDS4_RUNAHEAD
   setup(fd, 0);
   fixture[1].holds = 1;
   fixture[5].prefetched = 1;
-  cache_demote(LAYER);
+  cache_refine(LAYER, newer, 3);
   expect("held forecast keeps its pending buffer", where[LAYER][1] == 1 && fixture[1].holds == 1 &&
          fixture[1].loading && !atomic_load(&fixture[1].taken[0]) && !atomic_load(&fixture[1].taken[1]));
   expect("held forecast does not protect an unrelated unused entry", where[LAYER][4] == -1 &&
          fixture[6].expert == -1 && !slot_reading(6));
   expect("completed forecast remains available", where[LAYER][3] == 5 && !slot_reading(5));
   teardown();
-#endif
   dispatch_release(deferred);
   close(fd);
   printf("prefetch demotion: %d/%d CPU checks passed\n", checks - failures, checks);

@@ -5,17 +5,33 @@
 The C sources are in four folders:
 
 - `src/engine/`: the engine. `build/libmyds4.a`, which the server links,
-  holds these files and `src/experimental/online_predictor.c`.
+  holds these files and `src/experimental/online_predictor.c` and
+  `context_lookup.c`.
 - `src/cli/`: the command line (`main.c`) for generation, the checks and the
   benchmarks. `build/myds4` holds it, the engine's files without `engine.c`,
-  and the online predictor.
+  the online predictor and context lookup.
 - `src/kernels/`: the Metal kernels, which `src/engine/model.c` embeds.
-- `src/experimental/`: opt-in predictor research code. `build/myds4` links the
-  online predictor, which runs only with `--online-predictor`; only
-  `build/myds4-predict-lab` links the predictor lab.
+- `src/experimental/`: optional features and one study. `build/myds4` and
+  the server include the online predictor, context lookup, the
+  prefill-pruning plan and runahead (an option of the server), each off
+  unless its option is given; only the causal verification study builds
+  compile `causal_verify.c` (see
+  [Concurrent scheduling](#concurrent-scheduling-and-causal-verification)).
 
 The Makefile adds `-Isrc/engine`, so C files in every folder include the
 engine's headers by name.
+
+Two kinds of study build remain beside the ordinary ones. The causal
+verification builds are a study under evaluation (see
+[Concurrent scheduling](#concurrent-scheduling-and-causal-verification)).
+`build/myds4-predict-probe` (`make predict-probe`, switch
+`MYDS4_PREDICT_PROBE`, capture code in `tools/experimental/predict_probe.c`)
+is a diagnostic capture tool: it writes records of the routing, the
+predictions, DSpark's stages and the cache to the file descriptor that
+`MYDS4_PROBE_FD` names, normally a pipe, and `tools/analysis/expert_probe.py`
+reads them. Its writes are synchronous and change the timing, so it is not
+for speed measurements. Studies that were measured and removed are recorded
+in [Removed experiments](experiments.md).
 
 | File | Contents |
 | --- | --- |
@@ -26,24 +42,24 @@ engine's headers by name.
 | `src/engine/util.c` | Errors, strings, a JSON parser for the model's own files, the safetensors index, GGUF headers. |
 | `src/engine/vision.c` | Images: decoding, the reference's grid, Pillow's resize and padding, the vision encoder's patches and RoPE angles, an image's span of tokens. |
 | `src/engine/sample.c` | Shared temperature/top-p sampling and DSpark prefix verification. |
+| `src/engine/myds4.h` | The engine's shared declarations: the model's shape, the options, and the GPU, cache, tokenizer and model interfaces. |
 | `src/experimental/context_lookup.c`, `src/experimental/context_lookup.h` | Bounded CPU history matching for the CLI and server's context-copy drafts. |
-| `src/experimental/expert_waves.c` | Experimental execution of completed experts while other selected experts are still loading; included by `model.c`. |
-| `src/experimental/expert_compact.h`, `src/experimental/expert_compact.metal` | Compact partial native expert batches while retaining original result indices and reduction order. |
-| `src/experimental/urgent_io_diagnostic.h` | Optional software timestamps for urgent reads, selected-expert arrival and blocked promotion. |
+| `src/experimental/prefill_prune.h` | The dependency plan of `--prefill-prune`. |
+| `src/experimental/runahead.c` | `--runahead`'s scheduler for concurrent requests; included by `model.c`. |
+| `src/experimental/causal_verify.c` | The causal verification study; included by `model.c` only in its study builds. |
 | `src/engine/engine.c`, `src/engine/engine.h` | The engine behind a C ABI for the server: loading, attention states and their snapshots, prefill (with a replay: exact, or bounded under `--ced`, and a capture position), decoding, drafts, sampling, context-copy drafts, images, statistics, the tokenizer and the log. Requests, their scheduling and the KV prefix cache are the server's (see [The server](server.md)). |
 | `src/kernels/kernels.metal` | The GPU kernels. |
 | `src/kernels/gguf.metal`, `src/kernels/gguf_grids.metal` | The kernels for routed experts in GGUF codes (`--experts`), and their codebook grids, generated from llama.cpp's `ggml-common.h` (MIT License). |
 | `src/kernels/vision.metal` | The vision encoder's kernels. |
 | `src/cli/main.c` | Command line, chat template, sampling, statistics, `--check-prefill`, `--perplexity`. |
 | `src/experimental/online_predictor.c`, `src/experimental/online_predictor_math.h` | Online CPU prefetch correction, owned forecast/label records, recursive least-squares updates and learner metrics. |
-| `src/experimental/predictor_lab.c`, `src/experimental/predictor_lab.h` | The predictor experiment build (see [Live predictor experiment build](#live-predictor-experiment-build)). |
 | `server/` | The server, in Rust on `deepseek-recipe`: HTTP, request conversion, prompts, output and the live view (`--tui`; see [The server](server.md)). |
-| `tools/checks/` | Regression checks: C programs that the Makefile builds (most need no model or GPU), and Python checks of the command line and the server. |
+| `tools/checks/` | Regression checks: C programs that the Makefile builds (most need no model or GPU), Python checks of the command line and the server, and `regression.sh`, which compares two CLI builds' outputs and decode speed. |
 | `tools/reference/` | `check.py`: myds4 against the checkpoint's references (tokenizer, the server's prompts, vision encoder, model), and checks of a running server. `gguf_decode_check.c`: IQ1_M decoding against llama.cpp's. |
-| `tools/bench/` | Serial benchmarks, and `gpu_guard.py`, the GPU, memory and power guard that they and the other model runners share. |
+| `tools/bench/` | Serial benchmarks: `benchmark_suite.py` (GSM8K, HumanEval and context prompts), `compare_bench.py` (a control against a candidate build), `ced_bench.py` (CED and DSpark studies), `session_bench.py` (concurrent requests through the server); and `gpu_guard.py`, the GPU, memory and power guard that they and the other model runners share. |
 | `tools/analysis/` | `cachesim.py`, the expert-cache simulator for routing traces, and `expert_probe.py`, the reader of `build/myds4-predict-probe` captures. |
 | `tools/data/` | `gen_data.py`, which generates the embedded tables in `data/` from the checkpoint. |
-| `tools/experimental/` | Checks and runners of the experimental code: the online predictor's checks, the predictor lab's checks and runner (`predictor_lab.py`), and the capture code of `build/myds4-predict-probe` (`predict_probe.c`). |
+| `tools/experimental/` | Checks and tools of the optional code: the online predictor's checks, the context-lookup replay (`context_lookup_replay.c`), and the capture code of `build/myds4-predict-probe` (`predict_probe.c`). |
 
 Metal is used from C: every message goes through `objc_msgSend` cast to the
 method's exact type, so the project has no Objective-C or C++ sources besides
@@ -261,10 +277,10 @@ products. The next layer's front was committed before that: the experts'
 command buffer was opened (enqueued) first, so it runs first, and the GPU
 starts the next layer as soon as the experts are done.
 
-A signal that a minute does not bring, whether waited for or spun on, means
-that a command buffer failed or the GPU stopped, and the results the CPU
-waits for are not there: the program ends with the failed buffer's error,
-or with the value that was not signaled.
+A signal that a minute does not bring means that a command buffer failed
+or the GPU stopped, and the results the CPU waits for are not there: the
+program ends with the failed buffer's error, or with the value that was
+not signaled.
 
 When some of the layer's experts are still being read (of the token's, or of
 any row of a verify pass or of several sequences), the others do not wait
@@ -341,7 +357,7 @@ full prefill.
 `--bench N` measures prefill and up to N generated tokens; zero times only
 prefill. `--ced off|N` uses production replay, including its verification rewind margin.
 The diagnostic `--compact --keep N` instead retains exactly N decoder rows.
-`--dspark N` enables 1–5 native drafts, 32 expert slots per stage and trimming.
+`--dspark N` enables 1–5 native drafts with 32 expert slots per stage.
 `--cache GIB`, `--reserve GIB` and `--experts GGUF` choose cache bounds and
 expert format. Sampling verification uses the main model's requested draws.
 
@@ -380,10 +396,14 @@ norm, in the dispatch that ends the attention's mix, and signals the CPU
 again before the attention.
 
 Each prediction first cancels the read-aheads for its layer that no reader
-has started and that are not among its top 6, then reads its top 3 that are
-not cached, while fewer than 6 read-aheads are reading. A read-ahead is not
-evicted before its layer's routing; after it, one the layer did not select
-keeps the score of its earlier selections (see the cache below).
+has started and that are not among its top 6 (refinement, `cache_refine`),
+then starts reading its top 3 that are not cached, in rank order, while
+fewer than 6 read-aheads per row are reading (`cache_prefetch`, which
+`cache_prefetch_from` calls with the prediction's name for the prefetch
+metrics). A read-ahead is not evicted before its layer's routing; after it,
+one the layer did not select keeps the score of its earlier selections
+(see the cache below), and its read continues: `cache_demote` only lifts
+its protection.
 
 Refinement first filters candidate slots without locking, then rechecks
 ownership and claims cancelled pieces under the reader queue's lock. It
@@ -391,8 +411,7 @@ skips the lock when there are no candidates. It removes every queued
 reference before completing cancelled groups and making their buffers
 reusable. Readers claim ownership under the same lock. A read that has
 started stays resident, so refinement does
-not wait for its I/O. Kept forecasts, held buffers and published GPU entries
-remain protected.
+not wait for its I/O. Kept forecasts and held buffers remain protected.
 
 The online CPU learner below corrects the one- and two-layer router
 forecasts when enabled. Cache-retention settings operate independently of
@@ -412,105 +431,6 @@ and the higher-scoring residents in place. A demand may wait for its victim's
 read to finish before reusing the buffer.
 
 
-### Experimental expert completion groups
-
-The `myds4-expert-waves` research build runs complete selected experts as
-their reads finish during ordinary single-row decoding. It waits for any
-remaining expert to complete, collects all currently ready experts, and
-submits their computation while other reads continue. Each group writes
-the experts' original partial-output positions. One final reduction sums
-them in the normal expert order.
-
-The next layer's front is encoded early but submitted after every expert
-group. Its deferred submission allows intermediate groups to enter the
-command queue first. Each layer has six separate descriptor regions, so
-the CPU does not overwrite descriptors used by an earlier group. This
-adds 60 KiB of scratch descriptors. Request batches, verification,
-substitution and profiling keep their existing execution paths. The
-normal engine does not enable this experiment.
-
-### Experimental partial-batch compaction and read scheduling
-
-The `myds4-expert-compact` build retains the ordinary two-batch schedule.
-For a partial native MXFP4 batch, it puts up to six original expert indices
-in the unused end of the existing 256-byte descriptor. The up kernel
-dispatches only active experts; the down kernel dispatches one SIMD group
-per active expert. Hidden values and partial products retain their original
-indices, and the final ordered reduction is unchanged. The all-ready fused
-and GGUF paths retain their ordinary kernels.
-
-The `myds4-io-window4-diagnostic`, `myds4-io-window8-diagnostic` and
-`myds4-io-window16-diagnostic` builds bound urgent read workers. Queued and
-active urgent pieces both suppress background reads. Each piece retains
-its existing destination and exactly one owner. The ordinary engine keeps
-unrestricted urgent submission. Diagnostic intervals describe software
-callbacks and selected-expert arrival, not hardware queue depth.
-
-`MYDS4_EARLY_DEMAND_PROMOTION` promotes all existing selected pending slots
-after protecting selected residents and before allocating missing slots.
-This lets those reads proceed while reclamation waits for a victim's
-already-started read. Hit attribution stays attached to the original slot;
-late attribution uses its pending status before promotion. The cache budget
-and victim-selection policy are unchanged. The normal build does not
-enable it.
-
-`myds4-late-preencode` encodes ordinary single-row late expert work before
-waiting for its data. Mixed batches use the separate late descriptor
-region. All-missing batches encode their ordinary fused work. Neither
-case submits the pending-data command until the required reads finish.
-Both reserved queue positions remain in place. The normal engine keeps
-the ordinary encoding order. Numerical and performance checks for these
-experiments are described in [Performance](performance.md).
-
-### Combined expert scheduling experiments
-
-Three research builds combine the single-session changes:
-
-| Build | Enabled changes |
-| --- | --- |
-| `myds4-combined` | Compact partial batches, earlier promotion of selected pending reads, and late pre-encoding. |
-| `myds4-combined-all` | The three changes above, a 16-reader urgent window, and 256/192 compiler thread limits for the ordinary native up/down pipelines. |
-| `myds4-combined-waves` | Progressive complete-expert groups, compact partial batches, and earlier promotion. |
-
-The ordinary engine already computes its initial ready experts while other
-selected experts are being read. Progressive groups additionally compute
-experts that become ready during that wait. Late pre-encoding overlaps CPU
-command preparation with reads; it does not execute a GPU command before
-its data is ready. The wave path returns before ordinary late pre-encoding,
-so the wave combination leaves that option out. Compiler limits in the
-all-five build apply to the ordinary pipelines; compact partial kernels
-retain their existing compiler settings.
-
-`combined-all-model-check` checks mixed and all-missing cases against the
-ordinary kernels and default compiler limits. `combined-waves-model-check`
-forces one expert per group to check the combined scheduling and compact
-kernels. Both retain the original expert slots and final summation order.
-
-### Experimental forecast segment
-
-The `myds4-prefetch-pool4` and `myds4-prefetch-pool8` research builds limit
-decode-mode forecasts to a probationary segment of up to four or eight
-existing expert-cache slots. Establishing the segment can displace that
-many main-cache entries; subsequent forecasts replace eligible entries
-inside the segment. The total expert-cache allocation is unchanged.
-
-Actual routing promotes a probationary expert by changing its membership
-and demoting an eligible main-cache entry. No weights or buffer addresses
-move. A demoted resident remains usable until its slot is replaced.
-Promotion does not wait for I/O. If no main victim is eligible, promotion
-is deferred; required reads can reclaim a segment slot when necessary.
-Current selections, held entries, published GPU data and protected
-forecasts keep their existing protections. Prompt-pass requests reclaim
-membership, and memory-pressure release removes freed slots from the
-segment count. Small batches using decode-mode eviction can also use the
-segment during prefill.
-
-The `prefetch_pool` record reports the limit, current and peak membership,
-admissions, declined forecasts, promotions, deferred promotions and main
-entries displaced while establishing the segment. Promotions include
-previously demoted residents and are not a measure of useful prefetches.
-The normal engine retains its existing policy.
-
 ### Online CPU predictor
 
 The normal engine links the online predictor and Accelerate for single-thread
@@ -518,9 +438,8 @@ CPU math. `--online-predictor` enables a new in-memory learner.
 `--predictor-state FILE` enables persistence and restores a compatible file
 when present. With neither flag, the learner stays inactive. The main model
 runs on Metal. The predictor works with exact and substitute routing, DSpark,
-GPU routing, server requests, images, GGUF experts,
-profiling and diagnostic modes. Those modes retain their existing constraints
-and execution paths.
+server requests, images, GGUF experts, profiling and diagnostic modes.
+Those modes retain their existing constraints and execution paths.
 
 There are 77 independent source/target heads: 39 one-layer and 38 two-layer
 forecasts. A head receives 768 features: the normalized forecast logits and
@@ -570,11 +489,7 @@ or restore learner state.
 The engine passes the number of forecast horizons actually computed.
 Multirow substitution computes only the one-layer forecast, so the learner
 does not inspect or train on stale two-layer scratch. CPU substitution saves
-native expert IDs before replacing selections. GPU routing likewise uses
-native `RT` labels rather than substituted `RU` selections. It copies features
-before submitting the next layer, which reuses the forecast/router buffers,
-and updates after submission. The GPU-resident route remains active; missing
-experts use its existing CPU repair path.
+native expert IDs before replacing selections.
 
 The correction supplies only the candidate lists consumed by the existing
 one- and two-layer prefetch scheduler. It does not overwrite the main router's
@@ -684,7 +599,7 @@ CPU validation is available independently of model execution:
 | Check | Scope |
 | --- | --- |
 | `make build/online-predictor-unit`, then `build/online-predictor-unit` | 43 module checks: math, record ownership, native labels, available horizons, causal updates, changed row counts, reset, freeze boundaries and windows. |
-| `.venv/bin/python -B tools/checks/online_predictor_cli_check.py` | 41 CLI checks of boolean enable, state paths, removed options, compatible modes and existing constraints, before model loading. Includes empty and nonempty profiler values and the `--reserve` range. |
+| `.venv/bin/python -B tools/checks/online_predictor_cli_check.py` | 48 CLI checks of boolean enable, state paths, removed options, compatible modes and existing constraints, before model loading. Includes empty and nonempty profiler values and the `--reserve` range. |
 | `make build/online-predictor-state-check`, then `build/online-predictor-state-check` | 42 CPU checks of round-trip and continued-learning identity, file validation, binding mismatch, unsafe paths and atomic-save failures. Temporary files are removed. |
 | `make shutdown-check` | 8 CPU checks of signal handling and safe-boundary shutdown notification. |
 | `make build/online-predictor-check`, then `build/online-predictor-check --rank 64 --pairs 77 --milliseconds 20` | 20 shared-math checks with 20,000 dead/repeated-feature update rows, followed by a bounded CPU microbenchmark. |
@@ -692,181 +607,6 @@ CPU validation is available independently of model execution:
 The cache checks listed under [read completion](#read-completion-and-cache-counters)
 cover their own implementation behavior. Numerical and performance evidence
 from model runs belongs in [Performance](performance.md).
-
-### Live predictor experiment build
-
-`make build/myds4-predict-lab` builds the optional experiment module in
-`src/experimental/predictor_lab.c`. The ordinary executable does not link this
-module. `tools/experimental/predictor_lab.py` runs serial CLI controls and
-experiments with bounded output held in RAM. It does not save traces, model
-output or learned weights. The runner stops on changed output, process failure,
-cache shrinkage or swap. Compression is recorded without a compression-specific limit. A repeat control measures timing drift
-across a trial.
-
-Before every run, the runner requires three quiet GPU/memory samples. It
-checks process names for other model, IREE, kernel-probe and substantial Python
-workloads, requires GPU device activity at most 20%, resident GPU memory at
-most 8 GiB, and available memory at least the requested cache plus 14 GiB
-for runtime allocations and the selected reserve. Large model runs require AC power. It waits
-up to `--gpu-wait` seconds, default
-900, without loading the model. The existing inference lock remains in use.
-During inference it checks for other compute processes and new swap-outs. On interference it sends SIGINT only to its own child and discards
-that run. It never stops another agent's job. These checks are conservative
-observations, not an exclusive GPU reservation; short activity between polls
-can escape detection. Guard snapshots accompany new trial records.
-
-The runner uses two DSpark drafts, 32 slots per draft stage, temperature 1,
-top-p 1, seed 12,345, thinking effort 75 and context capacity 8,192. Its
-default 512-token trials use a 28 GiB total expert-cache budget. It accepts
-checkpoint and GGUF paths as arguments. The scheduler fixture and an original
-scheduling-reasoning prompt provide distinct workloads; generated code is
-never executed. Existing online correction is enabled unless
-`--native-router-only` selects the engine's uncorrected router forecasts.
-
-`--phase shadow` gathers signals from actual inference and fits ten
-predictors on the same observations. It issues no additional reads. Its
-timing includes all ten learners and is not a deployable throughput result.
-`--phase live` enables one variant's reads in the actual cache. Its decode
-time includes collection, prediction, training and cache scheduling.
-
-Each joint predictor has a fixed projection from 584 features to 127 ReLU
-features plus a constant. Recursive least squares learns a shared
-128-by-15,360 output matrix for all 40 backbone routers. Rank is configurable
-from 16 to 256; each model uses its configured rank instead of 128. Every
-forward pass predicts all verification rows before consuming any of that
-pass's labels. Updates occur after all 40 layer labels have been copied.
-The first 16 passes train without scoring or additional read admissions.
-Rejected verification rows are included, because the verifier computes them.
-`--feature-gain` sets the norm of the nonconstant latent features; the default
-is one. The constant remains one. This changes the strength of regularization
-relative to the features and is recorded with each new experiment.
-
-Input tensors are normalized and compressed into signed 64-value sketches.
-These experiments test compressed features, not unrestricted full-tensor
-neural encoders. Each named variant contains token embeddings and its named
-extra group; `all` contains all nine groups:
-
-| Variant | Additional input and availability |
-| --- | --- |
-| `embedding` | Current/proposed token embeddings from the engine's ordinary embedding read. |
-| `hidden` | Normalized FFN inputs from all three draft stages, at existing synchronization points. |
-| `streams` | All four residual streams at each draft stage's FFN input. |
-| `mix` | Draft FFN mixing coefficients, stream norms and pairwise correlations. |
-| `router` | All 128 router logits from each of the three draft stages. |
-| `attention` | Draft attention queries and projected attention outputs. |
-| `kv` | Four recency-bin summaries of the draft stages' cached window keys, at most 128 positions. These are derived from the last three backbone layers, not the whole model's compressed KV history. |
-| `history` | Decayed routing labels of accepted rows, with previous accepted length. |
-| `final` | The final normalized draft-head inputs and all four final residual streams. |
-
-Verification proposal row r uses draft generator row r-1. The seed row uses
-row zero as context and has an explicit seed flag. Position and row-offset
-features are shared by the variants. History updates use the last accepted
-row, excluding rejected rows from the history feature.
-
-With `--base none`, the learner fits native top-six indicator vectors.
-`--base embedding` or `--base draft` adds a router-informed forecast:
-token embeddings, or the draft head state with its normalization weights
-removed, are normalized with each target layer's FFN weights and projected
-through its router on the GPU. The seed uses its embedding in both modes.
-The learner then fits normalized routing-key residuals. These projections
-approximate future FFN inputs; they do not compute those future inputs
-exactly. Their GPU execution and synchronization are included in live timing.
-
-The `rank` admission policy offers each row's leading predictions. The
-`miss` policy ranks only uncached candidates, using the maximum score across
-rows, and uses the ordinary lowest-score victim from an eligible shortlist.
-The `bandit` policy learns fetch/abstain and eviction choices for that same
-uncached candidate pool. Plans start at verification entry and refill while
-the backbone advances, by default at distances two through eight. Existing
-one-/two-layer forecasts continue to refine unstarted reads. The experiment
-does not assume free I/O lead time before verification starts.
-
-`--long-range` selects a separate set of 68 source/target heads for four-
-and eight-layer backbone forecasts. The GPU projects the actual current
-backbone FFN input through each available target router before the routing
-signal. Each CPU head uses normalized forecast and current-router logits,
-a fixed ReLU projection and online RLS output correction. Its latent feature
-scaling follows the ordinary corrector; `--feature-gain` applies only to the
-joint DSpark model. Labels are copied at the target layer, and updates occur
-after that layer's expert commands are submitted. Source records are owned
-and checked against the current pass and row count.
-
-The eight-layer forecast can start a read. The four-layer forecast cancels
-unstarted reads outside its top-six union. One-/two-layer engine forecasts
-provide the later refinement. The first candidate can be admitted directly;
-lower four-layer candidates require support from the preceding eight-layer
-forecast. `--long-missing-first` skips cached candidates before selecting the
-first offered expert from each row's top six. The shared in-flight limit
-continues to apply. GPU projection, CPU fitting and admission costs are all
-included in live timing. The long-range experiment requires CPU routing.
-
-#### Cache-action controller
-
-`--policy native --native-router-only` tests action learning using the
-engine's existing residual and one-/two-layer forecast candidates. This mode
-does not allocate or execute the joint DSpark predictor or its extra GPU
-projections. `native-control` uses the same eligible victim shortlist without
-learned admission or victim ranking.
-`demand` disables optional backbone read admissions during decoded/verification
-passes. It keeps mandatory expert reads, draft-stage reads and prefill behavior.
-The engine still computes its native forecast tensors, so this is an admission
-ablation rather than a measurement of removing all forecasting computation.
-
-The controller is a contextual bandit with delayed feedback, not a
-multi-step Q-learning agent. It estimates fetch value and retention value
-with two 16-feature linear models fitted online by recursive least squares.
-Features include candidate score or rank, forecast distance, forecast source,
-pending prefetch count, expert bytes, prior routing frequency, resident age
-and cache retention score. It fetches when estimated benefit exceeds the
-selected victim's estimated retention cost; otherwise it abstains.
-
-When a full cache needs a victim, the engine supplies entries with the lowest
-ordinary retention scores: eight by default, or 1–128 with
-`--victim-candidates`. Pending reads, pinned slots,
-protected prefetches, current-layer experts in use and published GPU entries
-are excluded. The controller must return a member of that shortlist. Demand
-reads bypass its admission decisions. Exploration uses a separate random
-generator, with at most one exploratory decision per verification pass.
-
-Each admitted action has a unique ID attached to its slot. A later use gets
-credit only if that same admission still owns the expert. Reader callbacks
-accumulate its completed logical read bytes. At first use, its reward is the
-fraction of the transfer already complete, scaled by payload bytes per 20 MB.
-First use in a later pass discounts that value by one half per pass. Unused
-admissions receive a penalty of `--waste-cost` times their completed transfer
-cost, with a default of one half;
-an unread cancellation therefore receives no transferred-byte penalty.
-Reuse of an evicted victim during the remaining pass or either of the next
-two passes adds a cost scaled by that victim's payload. Updates wait for
-that observation window and for any still-owned read to finish. The bounded
-table holds 512 outstanding actions; a full table causes abstention.
-Unresolved final actions are not counted as settled outcomes. Empty slots
-take precedence over occupied victims, including during exploration.
-
-This reward is a read-progress/reuse proxy. It is not measured counterfactual
-wall time. Actual read bytes, first-use attribution, eviction effects
-and output throughput must therefore be evaluated separately. Neither a
-positive proxy reward nor routing recall establishes a speedup.
-
-The JSON `predictor_lab` report records mode, settings, scored rows, per-variant
-accuracy, missing-at-forecast coverage, CPU times and action outcomes.
-Missing-at-forecast coverage includes pending reads and is not a fresh-prefetch
-hit rate. CLI `decode_cache` records the minimum and maximum allocated cache
-bytes after forward passes and released-slot counts; the runner rejects any
-decode that did not retain the requested budget throughout.
-`prefetch_metrics` records actual admissions and first uses; issuer `draft`
-identifies the extra DSpark plan. Native action-controlled reads retain their
-original `pc`, `h1` or `h2` issuer. Existing residents receive no new-admission
-credit. The runner compares generated output within each quantization.
-
-`build/predictor-lab-check` checks signal wiring, causal updates, accepted-row
-history and delayed action learning without a model. `build/cache-action-check`
-checks victim eligibility, abstention, ownership and rejection of invalid
-choices without GPU execution. Live results belong in Performance; the
-experiment build is not a production speed recommendation.
-The lab updates accepted-row history once for each observed DSpark pass.
-Context-copy passes provide no DSpark features and do not reuse its previous
-labels. The ordinary online predictor can still observe their target rows.
 
 ### Approximate decoding and prefill
 
@@ -961,9 +701,8 @@ Engram history is rebuilt from the kept tokens, and the draft's windows
 receive only the kept positions.
 
 With exact expert routing, verification uses the main model's requested
-sampling distribution. Cache settings change which experts must be read; trimming changes
-which unused final-stage outputs are computed. Neither changes the routing
-rule. With backbone substitution, output depends on cache state and timing.
+sampling distribution. Cache settings change which experts must be read,
+not the routing rule. With backbone substitution, output depends on cache state and timing.
 Validation and measured performance are recorded in
 [Performance](performance.md#speculative-decoding). Prompts of up to six
 tokens use the same row kernels in prefill.
@@ -1026,33 +765,9 @@ throughput. The CLI prints exact lookup attempt, offered and accepted
 counts; the server logs them per request and exposes `lookup_depth` in
 status. Copy-heavy and reconstructed Harness timings are
 reported separately in [Performance](performance.md#context-copy-drafting).
-
-The experimental `build/myds4-consensus-lookup` keeps the longer-match
-path and adds a four-token fallback. It requires at least two earlier
-occurrences and 80% agreement on the whole proposed continuation. Each
-fallback supplies at most four tokens. Two failed verifications disable
-this fallback until a longer match succeeds. The ordinary build uses the
-long/short index without this consensus fallback.
-
-Frequency-based selection and adaptive speculation lengths are also studied
-in [SuffixDecoding](https://arxiv.org/html/2411.04975v3). This experiment
-verifies one linear chain using the engine's existing causal attention.
-CPU replay measures token agreement; live inference must establish whether
-that agreement saves enough expert reads and computation.
-
-The experimental `build/myds4-consensus-prefetch1` limits new prefetch
-admissions during verification to forecasts from its first row. Refinement
-still retains forecasts from every row, including the original offsets for
-the next two layers. Ordinary concurrent requests and substitution retain
-their existing policies. This experiment changes read admission only;
-every selected expert needed for verification is still loaded.
-
-The separate `build/myds4-consensus-row-credit` experiment adds cache
-priority for repeated uses of an expert within a verification batch.
-Reads remain deduplicated, and hit, miss and first-use counters retain
-their existing definitions. Priority counts all computed verification
-rows, including rows later rejected by sampling. The ordinary build does
-not apply this extra priority.
+A consensus fallback for short matches, and studies of verification's
+reads and cache credit built on it, were removed; see
+[Removed experiments](experiments.md#consensus-fallback-for-context-copy-drafts).
 
 ### Temperature and nucleus sampling
 
@@ -1102,8 +817,7 @@ outputs, matrix staging, routed-expert activations and index scores retain
 only the required small-batch capacity. A later prefill grows them again.
 Draft-history projection can temporarily require up to 128 rows, and image
 encoding reserves the full matrix staging capacity. Resizing waits for GPU
-completion and updates cache residency. Router tables retain separate slots
-for queued layers when GPU routing is enabled. FP32 logits, persistent KV,
+completion and updates cache residency. FP32 logits, persistent KV,
 draft history and snapshots have independent lifetimes.
 
 The index scores of a batch (a row of scores per row, as long as the
@@ -1177,8 +891,7 @@ The attention masks and numerical kernels remain unchanged.
 
 The CLI and server expose the plan through `--prefill-prune`, off by
 default. The engine's `myds4_config.prefill_prune` field selects the same
-path. `build/myds4-prefill-prune` enables it for diagnostic comparisons.
-The plan applies only with substitution and CED off and without full-row
+path. The plan applies only with substitution and CED off and without full-row
 logits or activation/route dumps. Validation
 (`tools/checks/prefill_prune_model_check.c`) compares logits, global and
 local state, a capture at a prefix, a resume from it and DSpark history, as well
@@ -1192,13 +905,12 @@ The server reports the configured `prefill_prune` flag and the last
 prefill's `prune_applied` flag separately; short prompts or incompatible
 diagnostics can leave pruning unused.
 
-The research builds `myds4-layer-prune` and `myds4-chunk32` respectively
-shrink the retained dependency interval with decoder depth and increase
-the outer chunk to 32,768 tokens. Both keep the original 2,048-row matrix
-batches. The normal build retains the fixed dependency interval and
-16,384-token outer chunks. The CLI's `decoder_row_layers` counter adds the
-rows actually executed across layers 21 through 39; `decoder_tokens`
-counts positions retained for the first of those layers.
+The CLI's `prefill_prune` JSON line reports the plan: `decoder_row_layers`
+adds the rows actually executed across layers 21 through 39, and
+`decoder_tokens` counts positions retained for the first of those layers.
+A dependency interval that shrinks with decoder depth and outer chunks of
+32,768 tokens were measured and removed; see
+[Removed experiments](experiments.md#layer-dependent-prune-interval-and-32k-outer-chunks).
 
 ## Images
 
@@ -1337,7 +1049,7 @@ about 0.1 ms of CPU time for a 12 MB slot and 0.15 ms for an 18.9 MB one
 1.4 ms to read the expert from the SSD. Between tokens,
 and in a prompt pass for the layers done, the mapped slots with the lowest
 scores leave the set until the rest fit; slots still being read or read
-ahead, and those of the layer being served or published, stay. Past the
+ahead, and those of the layer being served, stay. Past the
 limit (other processes may take GPU memory) the cache maps exactly the
 excess fewer, and it maps more again after 32 calm checks.
 
@@ -1353,13 +1065,6 @@ several tokens. These are forward-pass units, not emitted-token units. The
 growth ratio is computed at setup; occasional common rescaling keeps the
 stored history and resident scores within range.
 
-Two research builds change only the credits from large prompt batches.
-`myds4-prefill-frequency` credits an expert by its selection frequency over
-the batch; `myds4-prefill-tail-frequency` measures that frequency over the
-last 256 rows. Total credit per batch is six, independent of its row count.
-Both retain existing history and leave decoded-row credit, slot protection,
-reads and model arithmetic unchanged. They are not normal-engine settings.
-
 Decode eviction chooses the lowest score by default. With
 `--cache-read-cost`, off by default, the victim priority is the raw score
 times the expert's aligned read bytes divided by the fixed backbone slot
@@ -1372,9 +1077,9 @@ pressure, GPU unmapping priorities or the draft pools' replacement rule.
 Slots emptied by cancelled read-aheads go first. An empty entry is exempt
 from current-layer usage protection, even if it retains that layer's usage
 stamp. Held references still prevent reuse. Experts requested by the
-layer being served in the current pass, protected read-aheads, and experts
-whose addresses are still published for GPU routing cannot be victims.
-A recency list orders the slots for prompt passes and for giving slots back.
+layer being served in the current pass and protected read-aheads cannot be
+victims. A recency list orders the slots for prompt passes and for giving
+slots back.
 
 Every slot contributes to the process's memory footprint. Mapped slots
 are wired for the GPU; macOS may compress other slots in RAM. Compression
@@ -1472,14 +1177,12 @@ read fixtures use `/dev/zero`:
 | --- | ---: | --- |
 | `make cache-ready-check` | 45 | Completed/pending groups, readiness, late counts and consumer release. |
 | `make draft-cache-check` | 49 | Separate stage pools, native demand admission, replacement and protected groups. |
-| `make prefetch-metrics-check` | 56 | Fixed snapshots, first use, read origin, byte accounting, I/O timing and unsupported coverage. |
-| `make cache-policy-check` | 59 | Aging ratios, victim rules, aligned read costs, history, rescaling and reuse of refined empty slots. |
+| `make prefetch-metrics-check` | 54 | Fixed snapshots, first use, read origin, byte accounting and I/O timing. |
+| `make cache-policy-check` | 54 | Aging ratios, victim rules, aligned read costs, history, rescaling and reuse of refined empty slots. |
 | `make prefetch-queue-check` | 14 | Admission release on completion or cancellation, pending ownership and delayed notifications. |
 | `make prefetch-admission-check` | 19 | In-flight admission limits, promotion, repeated candidates and preservation of required data. |
-| `make prefetch-demote-check` | 40 | Unstarted cancellation, keep lists, queue compaction, protected buffers and prefill exclusion. |
+| `make prefetch-demote-check` | 37 | Demotion after routing, which cancels no read in decoding or prefill; refinement, which cancels only wholly unstarted forecasts it excludes, keeping the queue's order, the accounting and the reuse of emptied slots; held and partly read forecasts. |
 | `make prefetch-refine-race-check` | 8 | An actual reader winning ownership while refinement decides whether to cancel. |
-| `make expert-ready-check` | 10 | Waiting for any selected expert to finish, immediate readiness and consumer ownership of completed groups. |
-| `make prefetch-pool-check` | 42 | Four- and eight-slot segment bounds, promotion without moving buffers, protection, refinement and release. |
 | `make memory-available-check` | 11 | Reclaimable file pages, speculative-page accounting and independence from kernel cache targets. |
 | `make cache-memory-check` | 8 | Initial capacity, calm growth with compression, and responses to pressure and swapping. |
 
@@ -1627,72 +1330,77 @@ windows at its position (`draft_rows`), as decoding the sequence alone does,
 so a sequence that drafts alone again later finds its windows whole
 (`build/draft-rows-check` compares them byte for byte).
 
-### Concurrent scheduling experiments
+### Concurrent scheduling and causal verification
 
-The normal server exposes `--runahead` for grouped scheduling with two or
-more active requests. It uses mode 3 below and omits unused forecast
-projections during concurrent execution. It is off by default. Its startup
-validation excludes DSpark, substitution, GPU routing and online prediction;
-single-request decoding and context lookup retain their ordinary paths.
+The server's `--runahead`, off by default, lets ready requests advance
+while other requests' expert reads run (`src/experimental/runahead.c`). It
+applies to a step of two or more requests; a request alone keeps ordinary
+decoding, including context lookup. The engine refuses it together with
+DSpark, substitution, the online predictor or the routing and dump
+diagnostics.
 
-The separate `myds4-server-prefetch-study` build supports bounded scheduling
-experiments through environment variables. Without `--runahead`, the ordinary
-server uses its configured batch size and simultaneous rows.
+Each request is a job that advances through the layers on its own. A job
+keeps what it needs across a pause between layers: its activations, router
+output, candidate mask, index selection and Engram rows, and its
+CPU-written descriptors and embedding rows; shared GPU scratch follows
+command-queue order. After a job's layer front, the CPU waits for that
+front's routing signal, reads the job's selected experts and requests them
+with a reservation. During the step the engine reads only these selected
+experts: it leaves out the residual and next-layer forecast projections
+and starts no read-aheads. The scheduler runs a job whose experts are all
+in memory, at the earliest such layer. Jobs ready at the same layer run
+together: one command buffer runs each job's routed experts, each with its
+own weight loads, and then the group's next layer front runs as one batch
+in the small-batch kernels, which load each dense weight once for all
+rows. When no job is ready, the scheduler waits for the job at the
+earliest layer, the one with the fewest missing experts on a tie. Command
+buffers retire once per step.
 
-The HTTP mode of `tools/bench/session_bench.py` selects the public runahead
-option with schedule 0 or 3. Its direct-model mode supports schedules 0
-through 5 through `session-probe-runahead`.
-
-- `MYDS4_BATCH_PREFETCH_LIMIT=0..4` caps fresh admissions across concurrent
-  requests. One unit allows three new predictions with six reads in flight.
-  Prediction refinement still considers every row. Single-request decoding
-  and speculative verification keep their existing policy.
-- `MYDS4_BATCH_USAGE_CREDIT=1` counts each request's actual expert use in the
-  retention score. A shared expert already receives one credit from the
-  deduplicated demand request; this adds one for each additional consuming
-  row. It does not create extra reads or credit speculative rows.
-- `MYDS4_RUNAHEAD=1..5` allows requests to progress at different model layers.
-  Each request keeps the activations, router output, candidate mask, index
-  selection and Engram rows needed across a scheduling pause. Mode 1 waits
-  for each GPU job to finish. Mode 2 waits for routing events and retires
-  command buffers once per step. CPU-written descriptors and embedding
-  rows belong to each job; shared GPU scratch follows command-queue order.
-  A ready request runs its routed experts and the next layer's front while
-  other requests' reads continue. Mode 3 groups ready requests at the same
-  layer. Mode 4 also checks for such a group after a blocking read finishes,
-  so requests that became ready during that wait can run together. Mode 5
-  uses mode 3's grouping and batches the output head after all requests finish
-  their final experts. It retains each row's final streams and mixing weights
-  until that head pass, preserving output order.
-
-Runahead cache reservations include both resident experts and pending reads.
-Requests share an existing fetch when they need the same expert. Each job
-releases its references only after its GPU work finishes. Held entries are
-ineligible for eviction, and cache resizing requires that every job has
-finished. The scheduler prefers ready jobs at earlier layers; if none are
-ready, it waits for a job at the earliest layer, breaking ties by remaining
-misses. Modes 1 and 2 dispatch jobs individually; modes 3 through 5 use the
-existing batch kernels for ready groups. These modes fetch known experts
-without native speculative admission during the concurrent step.
-`session-probe-runahead` also omits the unused native forecast projections.
-The
+Reservations cover resident experts and pending reads; jobs that need the
+same expert share its read. Each job releases its references only after
+its GPU work finishes. Reserved entries cannot be evicted, and the cache
+resizes only between steps, when no job holds a slot. When the CLI or the
+server finishes, the `ready_groups` JSON line counts the groups and their
+rows, and `forecast_work` the row-layers that ran without forecast
+projections. The
 [Bevy paper](https://arxiv.org/html/2611.04794v1) describes the broader
-approach, including grouping ready requests at the same layer.
+approach, including grouping ready requests at the same layer. Other
+schedules, and sharing expert weight loads within a group, were measured
+and removed; see
+[Removed experiments](experiments.md#runahead-schedules-other-than-the-public-one).
 
-The concurrent runahead experiment requires DSpark, substitution, GPU
-routing and online prediction to be off. The separate causal-verification
-CLI builds schedule speculative rows within one session. Each row's next
-layer front waits for the preceding row to reach that layer; routed expert
-products can finish earlier and wait in a private residual buffer. The
-draft-input captures are assembled in token order for normal rollback and
-DSpark continuation. These builds still compute every proposed row before
-sampling decides which prefix to accept.
+Causal verification is a study under evaluation, not part of the ordinary
+builds. Its CLI builds, `build/myds4-causal-draft` (`MYDS4_CAUSAL_VERIFY`),
+`build/myds4-causal-signal-draft` (with `MYDS4_CAUSAL_SIGNALS`) and
+`build/myds4-causal-group-draft` (with `MYDS4_CAUSAL_GROUP` as well),
+schedule a verification pass's rows within one session as runahead
+schedules requests (`src/experimental/causal_verify.c`). Each row's next
+layer front waits for the preceding row to reach that layer, so each row
+sees its predecessor's keys; routed expert products can finish earlier and
+wait in a private residual buffer. The signal builds wait for routing
+signals instead of whole command buffers, and the group build runs
+consecutive ready rows at one layer together. Like runahead, the study
+reads only the selected experts and leaves out the forecast projections.
+The draft-input captures are assembled in token order for normal rollback
+and DSpark continuation. These builds still compute every proposed row
+before sampling decides which prefix to accept, and they refuse the online
+predictor, substitution and the routing and dump diagnostics.
+`build/causal-verify-check`, `build/causal-signal-check` and
+`build/causal-group-check` compare each build's verification rows and
+rollbacks with serial decoding. The study's performance with large caches
+is still to be measured; see
+[Performance](performance.md#causal-verification-at-a-20-gib-expert-cache-budget).
+Variants that stopped early, read with priorities or spun were removed (see
+[Removed experiments](experiments.md#early-rejection-priority-reads-and-spinning-in-causal-verification)).
 
-`tools/bench/session_bench.py` streams reconstructed Harness requests and
-compares returned text, reasoning and tool arguments. It records prefill,
-client latency, model execution counters, cache capacity and expert reads.
-It never executes generated tools. These are workload replays rather than
-an autonomous agent quality benchmark.
+`tools/bench/session_bench.py` compares server throughput on concurrent
+reconstructed Harness requests over HTTP. It starts one server at a time,
+with `--modes` giving each run's `--batch` (1, 2, 4 or 6; by default
+`1 2 1`) and `--runahead` one 0 or 1 per mode; `--run-binaries` names one
+server executable per mode. It compares returned text, reasoning and tool
+arguments, and records prefill, client latency, model execution counters,
+cache capacity and expert reads. It never executes generated tools. These
+are workload replays rather than an autonomous agent quality benchmark.
 
 ### Prompts
 
@@ -1865,7 +1573,7 @@ finite logits, and prints how far each fork lies from the cold prefill.
 still decodes. Each fork must reuse at least its shared prefix less a
 replay's cost, and no more than the prefix, and must give the tokens of a
 server that starts without a cache; with `--ced 128` the reuse must be at
-least the shared prefix less 133 ([Checks](usage.md#checks)).
+least the shared prefix less 133 ([Checks](usage.md#checks-and-diagnostics)).
 
 ### The live view
 

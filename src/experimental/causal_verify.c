@@ -1,8 +1,7 @@
 // Included after runahead.c. Verification rows share one causal KV state.
 // Each front waits for the preceding row's front at that layer. Routed
 // products can finish earlier and wait with their output in private HS.
-// Without a sampling frontier, every row is completed. With one, rows after
-// the first rejection or EOS may be cancelled before their remaining layers.
+// Every row runs all of its layers.
 typedef struct { RunJob job; Buf mainh; int products_done; } CausalJob;
 static CausalJob causal_jobs[FEW];
 static float *causal_logits;
@@ -18,22 +17,9 @@ static int causal_front_ready(int row) {
 
 static int causal_prefer(int row, int previous) {
   if (previous < 0) return 1;
-#ifdef MYDS4_CAUSAL_LEAD_FIRST
-  return row < previous;
-#else
   return causal_jobs[row].job.layer < causal_jobs[previous].job.layer;
-#endif
 }
 
-#ifdef MYDS4_CAUSAL_EARLY_STOP
-static int causal_decision(int count) {
-  if (!causal_frontier) return 0;
-  uint32_t ready = 0;
-  for (int r = 0; r < count; r++)
-    if (causal_jobs[r].job.layer == LAYERS) ready |= UINT32_C(1) << r;
-  return speculative_frontier_poll(causal_frontier, causal_logits, VOCAB, ready);
-}
-#endif
 
 static const float *causal_verify(const int *tokens, int count, int pos) {
 #ifdef MYDS4_CAUSAL_SIGNALS
@@ -43,11 +29,9 @@ static const float *causal_verify(const int *tokens, int count, int pos) {
 #endif
   if (!verifying || nrows || count < 2 || count > FEW || pos + count > opt.ctx)
     die("invalid causal verification batch");
-#ifdef MYDS4_RUNAHEAD_NO_FORECASTS
   // This scheduler requests only selected experts; it never reads PC/PR.
   // Keep the actual router while omitting those unused projections.
   runahead_route_only = 1;
-#endif
   reserve(pos + count, pos);
   request_capacity(count);
   Buf *live[RUN_BUFFERS] = {RUN_BUFFER_LIST};
@@ -86,29 +70,17 @@ static const float *causal_verify(const int *tokens, int count, int pos) {
     engram_read(0, rows, 1), engram_read(1, rows, 1);
     embed_read(tokens + r, 1, 0, pos + r);
     uint64_t signal = layer_front(&(Batch){1, pos + r, 0}, 0);
-    if (signals) run_wait_signal(signal);
+    if (signals) gpu_wait_signal(signal);
     else gpu_sync();
     run_issue(&job->job);
   }
   int remaining = count;
   while (remaining) {
-#ifdef MYDS4_CAUSAL_EARLY_STOP
-    if (causal_decision(count)) break;
-#endif
     int ready = -1, wait = -1;
-#ifndef MYDS4_CAUSAL_LEAD_FIRST
     int wait_misses = TOPK + 1;
-#endif
     for (int r = 0; r < count; r++) {
       CausalJob *job = &causal_jobs[r];
       if (job->job.layer == LAYERS) continue;
-#ifdef MYDS4_CAUSAL_PRIORITY_READS
-      if (causal_frontier && r == causal_frontier->sampled && !job->products_done && job->job.speculative) {
-        cache_promote_selected(job->job.layer, job->job.experts, TOPK);
-        job->job.speculative = 0;
-        early_stats.promoted_row_layers++;
-      }
-#endif
       if (job->products_done) {
         if (causal_front_ready(r) && causal_prefer(r, ready)) ready = r;
         continue;
@@ -116,12 +88,8 @@ static const float *causal_verify(const int *tokens, int count, int pos) {
       int missing = 0;
       for (int k = 0; k < TOPK; k++) missing += !cache_ready(job->job.layer, job->job.experts[k]);
       if (!missing && causal_prefer(r, ready)) ready = r;
-#ifdef MYDS4_CAUSAL_LEAD_FIRST
-      if (wait < 0) wait = r;
-#else
       if (wait < 0 || job->job.layer < causal_jobs[wait].job.layer ||
           (job->job.layer == causal_jobs[wait].job.layer && missing < wait_misses)) wait = r, wait_misses = missing;
-#endif
     }
     int r = ready >= 0 ? ready : wait;
     if (r < 0) die("causal verification cannot make progress");
@@ -165,7 +133,7 @@ static const float *causal_verify(const int *tokens, int count, int pos) {
       gpu_commit();
     }
     if (front) signal = layer_front(&(Batch){1, base->pos, 0}, base->layer + 1);
-    if (signals) run_wait_signal(signal);
+    if (signals) gpu_wait_signal(signal);
     else gpu_sync();
     if (products) cache_unhold(base->layer, base->experts, TOPK);
     if (last) {
@@ -178,24 +146,6 @@ static const float *causal_verify(const int *tokens, int count, int pos) {
     } else job->products_done = 1;
   }
   gpu_sync();
-#ifdef MYDS4_CAUSAL_EARLY_STOP
-  if (causal_frontier) {
-    if (!causal_decision(count)) die("completed verification has no sampling decision");
-    early_stats.sampled_rows += causal_frontier->sampled;
-    for (int r = 0; r < count; r++) {
-      CausalJob *job = &causal_jobs[r];
-      if (job->job.layer == LAYERS) {
-        early_stats.finished_rows++;
-      } else {
-        // Products that completed already released their reservation. A
-        // pending read keeps ownership of its buffer after the job lets go.
-        if (!job->products_done) cache_unhold(job->job.layer, job->job.experts, TOPK);
-        early_stats.cancelled_rows++;
-        early_stats.skipped_expert_row_layers += LAYERS - job->job.layer - job->products_done;
-      }
-    }
-  }
-#endif
   for (int k = 0; k < RUN_BUFFERS; k++) *live[k] = original[k];
   MAINH = original_mainh;
   if (opt.draft)
@@ -204,8 +154,6 @@ static const float *causal_verify(const int *tokens, int count, int pos) {
   cache_metrics_end();
   stats_add(&decode_stats, &before);
   decode_rows += count, decode_gpu_s += gpu_busy - gpu_before, decode_s += now() - began;
-#ifdef MYDS4_RUNAHEAD_NO_FORECASTS
   runahead_route_only = 0;
-#endif
   return causal_logits;
 }

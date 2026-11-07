@@ -23,9 +23,6 @@
 
 #include "myds4.h"
 #include "../experimental/prefill_prune.h"
-#ifdef MYDS4_PREDICT_LAB
-#include "../experimental/predictor_lab.h"
-#endif
 
 typedef struct { Buf w, s; int n, k, group; } Lin;  // s.obj is null for BF16 weights; group: rows
                                                   // per input slice (wo_a)
@@ -50,49 +47,12 @@ static Buf main_norm, draft_norm, markov_embed, markov_head;
 static Buf final_norm, cs_base, cs_comp;
 static Tensor embed_t;
 static Options opt;
-#ifdef MYDS4_EXPERT_WAVES
-static int expert_waves_enabled = 1, expert_waves_limit; // limit is used only by the numerical fixture
-#ifdef MYDS4_EXPERT_WAVE_CAP
-static const int expert_wave_cap = MYDS4_EXPERT_WAVE_CAP;
-#else
-static const int expert_wave_cap = 0;
-#endif
-static uint64_t expert_wave_layers, expert_wave_batches, expert_wave_waits;
-#endif
-#ifdef MYDS4_EXPERT_PHASED
-static int expert_phase_enabled = 1;
-static uint64_t expert_phase_layers, expert_phase_already_complete;
-#endif
-#ifdef MYDS4_INDEX_PRUNE
-static int K_index_score_full, K_index_topk_full;
-#endif
-#ifdef MYDS4_REJECTION_DRAFT
-#include "../experimental/speculative_sample.h"
-#endif
-#ifdef MYDS4_RUNAHEAD
 static int runahead_enabled;
 static uint64_t experimental_workspace_bytes;
 static uint64_t runahead_group_count, runahead_group_rows;
-#ifdef MYDS4_RUNAHEAD_NO_FORECASTS
 static int runahead_route_only;
 static uint64_t runahead_route_only_rows;
-#endif
-#endif
-#ifdef MYDS4_BATCH_PREFETCH_STUDY
-static int batch_prefetch_limit = -1;
-static int batch_usage_credit;
-#endif
 static int verifying;
-#ifdef MYDS4_CAUSAL_EARLY_STOP
-#if !defined(MYDS4_CAUSAL_VERIFY) || defined(MYDS4_REJECTION_DRAFT)
-#error "early cancellation needs causal verification and ordinary target sampling"
-#endif
-#include "../experimental/speculative_frontier.h"
-static SpeculativeFrontier *causal_frontier;
-static int causal_base_pos;
-static EarlyVerifyStats early_stats;
-EarlyVerifyStats model_early_stats(void) { return early_stats; }
-#endif
 static int replay_margin(void) { return opt.lookup > BLOCK ? opt.lookup : BLOCK; }
 // A prompt's rows run the prefill kernels however many rows a batch has, so
 // that a row's result does not depend on where the prefill that computes it
@@ -184,29 +144,9 @@ static Buf MAINH, MXA, MXN, MXQ, DHS, DMF, BLK, DSEL, DLOG, DTOK, DEROW;
 // The residual prediction's input row, and this layer's top experts it
 // predicts: KEEP when decoding (PC), PREDICT for the routes trace (PT).
 static Buf XP, PT, PC, GP;  // GP: predicted logits, so that GL keeps the router's
-#ifdef MYDS4_PREDICT_LAB
-static Buf LAB_GP;
-#endif
 // A decoded row's attention: scores, chunk maxima and chunk parts (see attend_one).
 static Buf ASC, AMAX, APART;
 static Buf PARTS;  // decoded rows' experts' down products, row r's at 8 DIM r, of expert e at 8 i + e
-#ifdef MYDS4_LATE_PREENCODE
-static int late_preencode_enabled = 1;
-static uint64_t late_preencode_mixed, late_preencode_missing;
-static void report_late_preencode(void) {
-  fprintf(stderr, "{\"late_preencode\":{\"mixed\":%llu,\"all_missing\":%llu}}\n",
-          (unsigned long long)late_preencode_mixed, (unsigned long long)late_preencode_missing);
-}
-#endif
-#ifdef MYDS4_EXPERT_COMPACT
-#include "../experimental/expert_compact.h"
-static int K_moe_up_active, K_moe_down_active, expert_compact_enabled = 1, expert_compact_force_split;
-static uint64_t expert_compact_calls, expert_compact_active;
-static void report_expert_compact(void) {
-  fprintf(stderr, "{\"expert_compact\":{\"batches\":%llu,\"active_experts\":%llu}}\n",
-          (unsigned long long)expert_compact_calls, (unsigned long long)expert_compact_active);
-}
-#endif
 
 static int K_mm_fp8, K_mm_bf16, K_mv_fp8, K_mv_bf16, K_mvm_fp8, K_mvm_bf16, K_mv_fp8_3, K_mv_bf16_3, K_mvm_fp8_3,
     K_mvm_bf16_3, K_moe_up, K_moe_down, K_moe_up_m, K_moe_down_m, K_gg_gather, K_act_quant_h, K_gather_mxfp4, K_act_quant_mxfp4,
@@ -507,39 +447,13 @@ static void predictor_identity(uint8_t result[32]) {
 }
 #pragma clang diagnostic pop
 
-#ifdef MYDS4_RUNAHEAD
 uint64_t model_ready_groups(void) { return runahead_group_count; }
-#endif
 
 void model_save_predictor(void) {
-#ifdef MYDS4_EXPERT_WAVES
-  fprintf(stderr, "{\"expert_waves\":{\"max_batches\":%d,\"layers\":%llu,\"batches\":%llu,\"completion_waits\":%llu}}\n",
-          expert_wave_cap,
-          (unsigned long long)expert_wave_layers, (unsigned long long)expert_wave_batches,
-          (unsigned long long)expert_wave_waits);
-#endif
-#ifdef MYDS4_EXPERT_PHASED
-  fprintf(stderr, "{\"expert_phases\":{\"layers\":%llu,\"already_complete_after_up_wait\":%llu}}\n",
-          (unsigned long long)expert_phase_layers, (unsigned long long)expert_phase_already_complete);
-#endif
-#ifdef MYDS4_CAUSAL_EARLY_STOP
-  fprintf(stderr, "{\"early_verify\":{\"calls\":%llu,\"attempted_rows\":%llu,\"finished_rows\":%llu,"
-          "\"sampled_rows\":%llu,\"cancelled_rows\":%llu,\"requested_row_layers\":%llu,\"skipped_expert_row_layers\":%llu,"
-          "\"background_row_layers\":%llu,\"promoted_row_layers\":%llu}}\n",
-          (unsigned long long)early_stats.calls, (unsigned long long)early_stats.attempted_rows,
-          (unsigned long long)early_stats.finished_rows, (unsigned long long)early_stats.sampled_rows,
-          (unsigned long long)early_stats.cancelled_rows, (unsigned long long)early_stats.requested_row_layers,
-          (unsigned long long)early_stats.skipped_expert_row_layers,
-          (unsigned long long)early_stats.background_row_layers, (unsigned long long)early_stats.promoted_row_layers);
-#endif
-#ifdef MYDS4_RUNAHEAD
   if (runahead_group_count)
     fprintf(stderr, "{\"ready_groups\":{\"groups\":%llu,\"rows\":%llu}}\n",
             (unsigned long long)runahead_group_count, (unsigned long long)runahead_group_rows);
-#ifdef MYDS4_RUNAHEAD_NO_FORECASTS
   fprintf(stderr, "{\"forecast_work\":{\"route_only_row_layers\":%llu}}\n", (unsigned long long)runahead_route_only_rows);
-#endif
-#endif
   if (!opt.predictor_state || !online_predictor_dirty()) return;
   char error[256];
   if (online_predictor_save(opt.predictor_state, error, sizeof error) < 0)
@@ -555,40 +469,11 @@ void model_load(const char *dir, const Options *options) {
   if (opt.online_predictor || opt.substitute > 0 || opt.dump_fd >= 0 || opt.routes_fd >= 0)
     die("causal verification study requires exact decoding without prediction diagnostics");
 #endif
-#ifdef MYDS4_RUNAHEAD
-  runahead_enabled = opt.runahead ? 3 : 0;
-#ifdef MYDS4_BATCH_PREFETCH_STUDY
-  const char *runahead = getenv("MYDS4_RUNAHEAD");
-  if (runahead) {
-    if (strcmp(runahead, "0") && strcmp(runahead, "1") && strcmp(runahead, "2") && strcmp(runahead, "3") &&
-        strcmp(runahead, "4") && strcmp(runahead, "5")) die("MYDS4_RUNAHEAD takes 0 to 5");
-    runahead_enabled = runahead[0] - '0';
-  }
-#endif
+  runahead_enabled = opt.runahead;
   if (runahead_enabled && (opt.draft || opt.online_predictor || opt.substitute > 0 ||
                           opt.dump_fd >= 0 || opt.routes_fd >= 0))
     die("runahead requires exact decoding without DSpark or online prediction");
   fprintf(stderr, "runahead: %s; concurrent requests only\n", runahead_enabled ? "on" : "off");
-#endif
-#ifdef MYDS4_BATCH_PREFETCH_STUDY
-  const char *budget = getenv("MYDS4_BATCH_PREFETCH_LIMIT");
-  if (budget) {
-    char *end;
-    long units = strtol(budget, &end, 10);
-    if (end == budget || *end || units < 0 || units > 4) die("MYDS4_BATCH_PREFETCH_LIMIT takes 0 to 4");
-    batch_prefetch_limit = (int)units;
-    fprintf(stderr, "batch prefetch study: units=%d; concurrent requests only\n", batch_prefetch_limit);
-  }
-  const char *credit = getenv("MYDS4_BATCH_USAGE_CREDIT");
-  if (credit) {
-    if (strcmp(credit, "0") && strcmp(credit, "1")) die("MYDS4_BATCH_USAGE_CREDIT takes 0 or 1");
-    batch_usage_credit = credit[0] == '1';
-    fprintf(stderr, "batch usage credit: enabled=%d; concurrent requests only\n", batch_usage_credit);
-  }
-#endif
-#ifdef MYDS4_PREFILL_PRUNE
-  opt.prefill_prune = 1; // Dedicated diagnostic build; ordinary builds use the option.
-#endif
   if (opt.lookup < 0 || opt.lookup > VERIFY_DRAFTS) die("--lookup takes off or 1 to %d drafts", VERIFY_DRAFTS);
   if (opt.ced && (opt.ced < WINDOW || opt.ced > 1 << 20)) die("--ced takes off or 128 to 1048576 replay tokens");
   if (opt.predictor_state) opt.online_predictor = 64;
@@ -601,49 +486,14 @@ void model_load(const char *dir, const Options *options) {
 #embed "../kernels/gguf.metal"
       , '\n',
 #embed "../kernels/vision.metal"
-#ifdef MYDS4_EXPERT_COMPACT
-      , '\n',
-#embed "../experimental/expert_compact.metal"
-#endif
-#ifdef MYDS4_INDEX_PRUNE
-      , '\n',
-#embed "../experimental/index_prune.metal"
-#endif
-#ifdef MYDS4_FP4_LOADS
-      , '\n',
-#embed "../experimental/mxfp4_loads.metal"
-#endif
   };
   gpu_init(source, sizeof source);
 #define K(name) K_##name = gpu_kernel(#name)
   K(mm_fp8), K(mm_bf16), K(mv_fp8), K(mv_bf16), K(mvm_fp8), K(mvm_bf16), K(mv_fp8_3), K(mv_bf16_3), K(mvm_fp8_3);
   K(mvm_bf16_3), K(moe_up), K(moe_down), K(moe_up_m), K(moe_down_m), K(gg_gather), K(act_quant_h);
   K(gather_mxfp4), K(act_quant_mxfp4);
-#ifdef MYDS4_LATE_PREENCODE
-  atexit(report_late_preencode);
-#endif
-#ifdef MYDS4_EXPERT_COMPACT
-  K(moe_up_active), K(moe_down_active);
-  atexit(report_expert_compact);
-#endif
-#if MYDS4_FP4_LOADS == 1
-  K_moe_up = gpu_kernel("moe_up_early"), K_moe_down = gpu_kernel("moe_down_early");
-#elif MYDS4_FP4_LOADS == 2
-  K_moe_up = gpu_kernel("moe_up_pipeline"), K_moe_down = gpu_kernel("moe_down_pipeline");
-#elif MYDS4_FP4_LOADS == 3
-  K_moe_up = gpu_kernel("moe_up_row"), K_moe_down = gpu_kernel("moe_down_row");
-#elif MYDS4_FP4_LOADS == 4
-  K_moe_up = gpu_kernel("moe_up_factor"), K_moe_down = gpu_kernel("moe_down_factor");
-#endif
   K(moe_combine), K(moe_parts), K(act_quant), K(embed), K(rmsnorm), K(hc_mix), K(hc_pre_norm), K(hc_post);
   K(swiglu), K(kv_window), K(compress), K(index_key), K(index_score), K(index_topk), K(attn_out);
-#ifdef MYDS4_INDEX_PRUNE
-  K_index_score_full = K_index_score, K_index_topk_full = K_index_topk;
-  K_index_score = gpu_kernel("index_score_pruned");
-#if MYDS4_INDEX_PRUNE >= 2
-  K_index_topk = gpu_kernel("index_topk_masked");
-#endif
-#endif
   K(attend_scores), K(attend_values), K(attend_combine);
   K(route), K(engram_rows), K(engram_gate), K(copy_rows), K(copy_keys), K(attend_m), K(hc_mean), K(markov), K(argmax);
   K(cand_topk), K(x_bf16), K(q_rope);
@@ -718,9 +568,6 @@ void model_load(const char *dir, const Options *options) {
   request_capacity(1);
   work_capacity(MB);
   size_t expert_tables = 2 * LAYERS * FEW + DRAFTS * BLOCK;
-#ifdef MYDS4_EXPERT_WAVES
-  expert_tables += LAYERS * TOPK; // each wave's descriptors stay immutable until its GPU work ends
-#endif
   ETAB = zeros(expert_tables * 256), logits = zeros((size_t)FEW * VOCAB * 4);
   PARTS = zeros(FEW * DIM * 8 * 4);
   XP = zeros(FEW * DIM * 4), PT = zeros(PREDICT * 4), PC = zeros(FEW * PREDICT * 4);
@@ -738,15 +585,6 @@ void model_load(const char *dir, const Options *options) {
     io_rows(embed_t.fd, embed_t.off, DIM * 2, noise, BLOCK - 1, DEROW.ptr + DIM * 2);
   }
   if (opt.experts) gguf_experts(opt.experts);
-#ifdef MYDS4_PREDICT_LAB
-  if (predictor_lab_enabled() && !opt.draft) die("the predictor lab requires DSpark drafts");
-  if (predictor_lab_long_enabled()) {
-    const float *biases[LAYERS];
-    for (int l = 0; l < LAYERS; l++) biases[l] = (const float *)L[l].gate_bias.ptr;
-    predictor_lab_long_init(biases);
-    LAB_GP = zeros(2 * FEW * EXPERTS * 4);
-  }
-#endif
   if (opt.online_predictor) {
     const float *biases[LAYERS];
     for (int l = 0; l < LAYERS; l++) biases[l] = (const float *)L[l].gate_bias.ptr;
@@ -1009,9 +847,7 @@ typedef struct { Win win; uint32_t first, comp_rows; } Att;
 // reading. The prediction one layer ahead, made a layer after the one two
 // ahead, first cancels that layer's read-aheads not yet started outside its
 // top KEEP.
-#ifndef MYDS4_PREFETCH_AHEAD
 #define MYDS4_PREFETCH_AHEAD 3
-#endif
 #define AHEAD MYDS4_PREFETCH_AHEAD
 #define KEEP 6
 #define INFLIGHT 6
@@ -1029,22 +865,10 @@ static void route_top(int m, const Routing *r, int count, int row);
 // rows read ahead only the next layer's (read_ahead_rows): reading ahead as
 // many as for single rows doubled its reads ahead and took 8% of the speed.
 static int native_forecasts(void) {
-#ifdef MYDS4_RUNAHEAD_NO_FORECASTS
   return !runahead_route_only;
-#else
-  return 1;
-#endif
 }
 
 static int full_ahead(int m) { return !prompt_pass && native_forecasts() && (m == 1 || (small_rows(m) && opt.substitute <= 0)); }
-
-static int forecast_rows(int rows) {
-#ifdef MYDS4_VERIFY_PREFETCH_ROWS
-  if (verifying && opt.substitute <= 0 && rows > MYDS4_VERIFY_PREFETCH_ROWS)
-    return MYDS4_VERIFY_PREFETCH_ROWS;
-#endif
-  return rows;
-}
 
 // Decoding (m <= FEW rows): layer l's top KEEP experts predicted from the
 // residual part of each row's FFN input (XP, see hc_mix), known before its
@@ -1186,16 +1010,9 @@ static void attend_rows(int l, int m, int pos, int r0, int srow) {
       // Layer 20 writes once; later indexers reuse the same prompt row,
       // even when decoder compaction starts partway through a batch.
       size_t cand_off = (size_t)(srow + t0) * cand_words * 4;
-#ifdef MYDS4_INDEX_PRUNE
-      gpu_kern(ix.cand ? K_index_score : K_index_score_full);
-#else
       gpu_kern(K_index_score);
-#endif
       gpu_buf(0, &QI, (size_t)(r0 + t0) * IDX_HEADS * IDX_DIM * 4), gpu_buf(1, &IW, (size_t)(r0 + t0) * IDX_HEADS * 4);
       gpu_buf(2, &src->keys, 0), gpu_buf(3, cs, 0), gpu_buf(4, &SC, 0), gpu_bytes(5, &ix, sizeof ix);
-#ifdef MYDS4_INDEX_PRUNE
-      if (ix.cand) gpu_buf(6, &CAND, cand_off);
-#endif
       gpu_go((seen + 255) / 256, rows, 1, 256, 1, 1);
       if (cand && l == CAND_LAYER) {
         Index cx = ix;
@@ -1204,11 +1021,7 @@ static void attend_rows(int l, int m, int pos, int r0, int srow) {
         gpu_buf(0, &SC, 0), gpu_buf(1, &CAND, cand_off), gpu_bytes(2, &cx, sizeof cx);
         gpu_go(rows, 1, 1, 1024, 1, 1);
       }
-#ifdef MYDS4_INDEX_PRUNE
-      gpu_kern(ix.cand ? K_index_topk : K_index_topk_full);
-#else
       gpu_kern(K_index_topk);
-#endif
       gpu_buf(0, &SC, 0), gpu_buf(1, &SEL, sel_off + (size_t)t0 * (IDX_TOPK + 1) * 4), gpu_bytes(2, &ix, sizeof ix);
       gpu_buf(3, &CAND, cand_off);
       gpu_go(rows, 1, 1, 1024, 1, 1);
@@ -1316,21 +1129,7 @@ static void ffn_front(const Batch *b, int l) {
   }
   products(n, p, m, &X, 0, DIM, 0);
   route_top(m, r, n, b->row);
-#ifdef MYDS4_RUNAHEAD_NO_FORECASTS
   if (!native_forecasts()) runahead_route_only_rows += m;
-#endif
-#ifdef MYDS4_PREDICT_LAB
-  if (predictor_lab_long_active()) {
-    Prod farther[2];
-    int count = 0;
-    for (int h = 0; h < 2; h++) {
-      int target = l + (h ? 8 : 4);
-      if (target < LAYERS)
-        farther[count++] = (Prod){&L[target].gate, &LAB_GP, (size_t)h * FEW * EXPERTS * 4, EXPERTS};
-    }
-    if (count) products(count, farther, m, &X, 0, DIM, 0);
-  }
-#endif
 }
 
 static void shared_expert(int m, const Layer *y) {
@@ -1425,21 +1224,6 @@ static void substitute_batch(int l, int m, int row) {
 // them; mf and hs: the row's offsets in MF and HS. With pm, only the experts
 // with entries run, and their down products go to PARTS (see moe_parts).
 static void experts_go(int l, int r, size_t eo, size_t mf, size_t hs, uint32_t pm) {
-#ifdef MYDS4_EXPERT_COMPACT
-  if (expert_compact_enabled && pm && !gk[l].up) {
-    int n = expert_active_slots((ExpertRef *)(ETAB.ptr + eo));
-    if (!n) return;
-    expert_compact_calls++, expert_compact_active += n;
-    gpu_kern(K_moe_up_active);
-    gpu_buf(0, &ETAB, eo), gpu_buf(1, &XQ, (size_t)r * DIM * 4), gpu_buf(2, &MH, (size_t)r * TOPK * INTER * 4);
-    gpu_go(INTER / 32, n, 1, 256, 1, 1);
-    gpu_kern(K_moe_down_active);
-    gpu_buf(0, &ETAB, eo), gpu_buf(1, &MH, (size_t)r * TOPK * INTER * 4);
-    gpu_buf(2, &PARTS, (size_t)r * DIM * 8 * 4);
-    gpu_go(DIM / 4, 1, 1, 32 * n, 1, 1);
-    return;
-  }
-#endif
   gpu_kern(gk[l].up ? gk[l].up : K_moe_up);
   gpu_buf(0, &ETAB, eo), gpu_buf(1, &XQ, (size_t)r * DIM * 4), gpu_buf(2, &MH, (size_t)r * TOPK * INTER * 4);
   gpu_go(INTER / 32, TOPK, 1, 256, 1, 1);
@@ -1498,84 +1282,21 @@ static size_t late_entries(int l, int r) { return (size_t)(LAYERS * FEW + DRAFTS
 // The read-aheads of m <= FEW decoded rows after layer l's routing, from
 // the predictions pr for the next two layers (see AHEAD; row r's at
 // r PREDICT and (m + r) PREDICT), while fewer than m INFLIGHT are reading.
-static int batch_budget_active(void) {
-#ifdef MYDS4_BATCH_PREFETCH_STUDY
-  return nrows > 1 && batch_prefetch_limit >= 0;
-#else
-  return 0;
-#endif
-}
-
-static int forecast_admission(int count) {
-#ifdef MYDS4_BATCH_PREFETCH_STUDY
-  if (batch_budget_active() && count > batch_prefetch_limit * AHEAD) return batch_prefetch_limit * AHEAD;
-#endif
-  return count;
-}
-
-static int forecast_inflight(int rows) {
-#ifdef MYDS4_BATCH_PREFETCH_STUDY
-  if (batch_budget_active()) return INFLIGHT * batch_prefetch_limit;
-#endif
-  return INFLIGHT * rows;
-}
-
-#ifdef MYDS4_BATCH_PREFETCH_STUDY
-static void credit_batch_uses(int layer, const int *routes, int rows) {
-  if (!batch_usage_credit || nrows < 2 || verifying) return;
-  uint8_t uses[EXPERTS] = {0};
-  for (int r = 0; r < rows; r++)
-    for (int k = 0; k < TOPK; k++) uses[routes[r * 16 + k]]++;
-  // cache_request already records one use of each distinct expert. Every
-  // concurrent row is real output work, so shared experts receive the rest.
-  for (int e = 0; e < EXPERTS; e++) if (uses[e] > 1) cache_repeat_credit(layer, e, uses[e] - 1);
-}
-#endif
-
 static void read_ahead(int l, int m, const int *pr) {
   int keep[FEW * KEEP], next[FEW * AHEAD], after[FEW * AHEAD], nk = 0, n = 0;
-  int admit_rows = forecast_rows(m);
   for (int r = 0; r < m; r++) {
     for (int k = 0; k < KEEP; k++) keep[nk++] = pr[r * PREDICT + k];
-    if (r < admit_rows)
-      for (int k = 0; k < AHEAD; k++) next[n] = pr[r * PREDICT + k], after[n++] = pr[(m + r) * PREDICT + k];
+    for (int k = 0; k < AHEAD; k++) next[n] = pr[r * PREDICT + k], after[n++] = pr[(m + r) * PREDICT + k];
   }
-  if (batch_budget_active()) {
-    int at = 0;
-    for (int k = 0; k < AHEAD; k++)
-      for (int r = 0; r < admit_rows; r++)
-        next[at] = pr[r * PREDICT + k], after[at++] = pr[(m + r) * PREDICT + k];
-  }
-  int admit = forecast_admission(n), inflight = forecast_inflight(admit_rows);
+  int inflight = INFLIGHT * m;
   if (l + 1 < LAYERS) cache_refine(l + 1, keep, nk);
-#ifdef MYDS4_H2_FIRST
-  if (l + 2 < LAYERS) cache_prefetch_from(l + 2, after, n, admit, inflight, PF_H2);
-  if (l + 1 < LAYERS) cache_prefetch_from(l + 1, next, n, admit, inflight, PF_H1);
-#else
-  if (l + 1 < LAYERS) cache_prefetch_from(l + 1, next, n, admit, inflight, PF_H1);
-  if (l + 2 < LAYERS) cache_prefetch_from(l + 2, after, n, admit, inflight, PF_H2);
-#endif
+  if (l + 1 < LAYERS) cache_prefetch_from(l + 1, next, n, inflight, PF_H1);
+  if (l + 2 < LAYERS) cache_prefetch_from(l + 2, after, n, inflight, PF_H2);
 }
 
 static void read_residual_ahead(int layer, const int *keep, int nkeep, const int *first, int nfirst, int inflight) {
-#ifdef MYDS4_VERIFY_PREFETCH_ROWS
-  int rows = forecast_rows(nkeep / KEEP);
-  if (nfirst > rows * AHEAD) nfirst = rows * AHEAD;
-  if (inflight > rows * INFLIGHT) inflight = rows * INFLIGHT;
-#endif
-  int interleaved[FEW * AHEAD];
-  if (batch_budget_active()) {
-    int rows = nkeep / KEEP;
-    inflight = forecast_inflight(rows);
-    if (rows > 0 && rows <= FEW && nfirst == rows * AHEAD) {
-      int at = 0;
-      for (int k = 0; k < AHEAD; k++)
-        for (int r = 0; r < rows; r++) interleaved[at++] = first[r * AHEAD + k];
-      first = interleaved;
-    }
-  }
   cache_refine(layer, keep, nkeep);
-  cache_prefetch_from(layer, first, nfirst, forecast_admission(nfirst), inflight, PF_PC);
+  cache_prefetch_from(layer, first, nfirst, inflight, PF_PC);
 }
 
 // A batch's read-aheads after layer l's routing: the next layer's experts
@@ -1590,13 +1311,9 @@ static void read_ahead_rows(int m, int l, const int *pr, int ahead, int inflight
     for (int k = 0; k < ahead; k++) want[pr[r * PREDICT + k]] = 1;
   for (int e = 0; e < EXPERTS; e++)
     if (want[e]) list[nl++] = e;
-  if (batch_budget_active()) inflight = forecast_inflight(m);
-  cache_prefetch_from(l + 1, list, nl, forecast_admission(nl), inflight, PF_H1);
+  cache_prefetch_from(l + 1, list, nl, inflight, PF_H1);
 }
 
-#ifdef MYDS4_EXPERT_WAVES
-#include "../experimental/expert_waves.c"
-#endif
 
 // The experts each decoded row chose in the model's layers, where each one
 // was (0 in memory, 1 read ahead, 2 late, 3 substituted, 4 from the SSD) and
@@ -1623,13 +1340,7 @@ int model_routes(int row, uint16_t *id, uint8_t *from) {
 static int routed_rows(const Batch *b, int l, int ahead, int inflight, int approx, void *rest) {
   int m = b->m, *rt = (int *)RT.ptr, need[EXPERTS], nn = 0, nready = 0, chosen[FEW * TOPK];
   float *rw = (float *)RT.ptr;
-#ifdef MYDS4_PREDICT_LAB
-  predictor_lab_routes(l, m, rt, (const float *)GL.ptr, (const float *)L[l].gate_bias.ptr);
-#endif
   char used[EXPERTS] = {0}, ready[EXPERTS] = {0};
-#ifdef MYDS4_VERIFY_ROW_CREDIT
-  uint8_t uses[EXPERTS] = {0};
-#endif
   CacheObservation observed;
   cache_observe_snapshot(l, &observed);
   cache_observe_routes(&observed, rt, m, 16, 0);
@@ -1648,9 +1359,6 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
     for (int k = 0; k < TOPK; k++) { // each row's selections, by where their experts are now
       int e = rt[r * 16 + k];
       used[e] = 1;
-#ifdef MYDS4_VERIFY_ROW_CREDIT
-      uses[e]++;
-#endif
       int where = approx && e != chosen[r * TOPK + k] ? 4 : cache_where(l, e);
       (*tally[where])++;
       if (record && b->row + r < FEW) {  // tally's order (from the SSD first) to route_from's
@@ -1663,13 +1371,6 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
   cache_stats.row_unique += nn;
   double t0 = now();
   int reading = cache_request(l, need, nn);  // this layer's reads first, then the predicted ones
-#ifdef MYDS4_BATCH_PREFETCH_STUDY
-  credit_batch_uses(l, rt, m);
-#endif
-#ifdef MYDS4_VERIFY_ROW_CREDIT
-  if (verifying && opt.substitute <= 0)
-    for (int i = 0; i < nn; i++) if (uses[need[i]] > 1) cache_repeat_credit(l, need[i], uses[need[i]] - 1);
-#endif
   cache_demote(l);
   if (reading) gpu_keep_clock(reading * 1e-3); // the GPU idles until they are in
   if (opt.online_predictor) {
@@ -1684,113 +1385,7 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
     if (full_ahead(m)) read_ahead(l, m, (const int *)PR.ptr);
     else read_ahead_rows(m, l, (const int *)PR.ptr, ahead, inflight);
   }
-#ifdef MYDS4_PREDICT_LAB
-  if (predictor_lab_long_active())
-    predictor_lab_long_forecast(l, m, (const float *)LAB_GP.ptr,
-                               (const float *)LAB_GP.ptr + FEW * EXPERTS, (const float *)GL.ptr);
-#endif
   for (int i = 0; i < nn; i++) nready += ready[need[i]] = cache_ready(l, need[i]);
-#ifdef MYDS4_EXPERT_WAVES
-  if (expert_waves_enabled && rest && m == 1 && !nrows && !verifying && !approx &&
-      (nready < nn || expert_waves_limit)) {
-    double setup = now() - t0, waited = 0;
-    int split = experts_as_ready(b, l, need, nn, rest, &waited);
-    phase_s[3] += setup, phase_s[2] += waited, phase_s[4] -= setup + waited;
-    return split;
-  }
-#endif
-#ifdef MYDS4_EXPERT_PHASED
-#ifdef MYDS4_EXPERT_PHASED_PREENCODE
-  if (expert_phase_enabled && rest && m == 1 && reading && nready < nn && !gk[l].up) {
-    size_t eo = (size_t)l * FEW * 256;
-    fill_entries(l, eo, rt, rw + 8, NULL, 0);
-    gpu_kern(K_moe_up);
-    gpu_buf(0, &ETAB, eo), gpu_buf(1, &XQ, 0), gpu_buf(2, &MH, 0);
-    gpu_go(INTER / 32, TOPK, 1, 256, 1, 1);
-    void *up = gpu_close();
-    gpu_encode(rest);
-    for (int i = 0; i < nn; i++) {
-      uint32_t at[3];
-      int fresh;
-      const Buf *slot = cache_get(l, need[i], at, &fresh);
-      if (fresh) gpu_use(slot);
-    }
-    uint32_t n = TOPK, parts = 0;
-    gpu_kern(K_moe_down);
-    gpu_buf(0, &ETAB, eo), gpu_buf(1, &MH, 0), gpu_buf(2, &SHO, 0);
-    gpu_buf(3, &MF, mf_off(b)), gpu_buf(4, &H1, 0), gpu_buf(5, &HS, hs_off(b)), gpu_bytes(6, &n, 4);
-    gpu_bytes(7, &parts, 4), gpu_buf(8, &PARTS, 0);
-    gpu_go(DIM / 4, 1, 1, 32 * TOPK, 1, 1);
-    double encode = now() - t0, tw = now();
-    cache_wait_up(l, need, nn);
-    double waited = now() - tw;
-    int down_pending = 0;
-    for (int i = 0; i < nn; i++) down_pending += !cache_ready(l, need[i]);
-    // Both commands are encoded before waiting. Each enters execution only
-    // after its input weights are ready; the caller commits the down command.
-    gpu_submit(up);
-    tw = now();
-    cache_wait(l, need, nn);
-    waited += now() - tw;
-    phase_s[3] += encode, phase_s[2] += waited, phase_s[4] -= now() - t0;
-    if (down_pending) expert_phase_layers++;
-    else expert_phase_already_complete++;
-    return 1;
-  }
-#else
-  if (expert_phase_enabled && rest && m == 1 && reading && !gk[l].up) {
-    double encode = now() - t0, tw = now();
-    cache_wait_up(l, need, nn);
-    double waited = now() - tw, te = now();
-    int down_pending = 0;
-    for (int i = 0; i < nn; i++) down_pending += !cache_ready(l, need[i]);
-    if (!down_pending) {
-      cache_wait(l, need, nn);
-      phase_s[3] += encode + now() - te, phase_s[2] += waited, phase_s[4] -= now() - t0;
-      encode_experts(l, 0, rt, rw + 8, mf_off(b), hs_off(b));
-      expert_phase_already_complete++;
-      return 0;
-    }
-    size_t eo = (size_t)l * FEW * 256;
-    fill_entries(l, eo, rt, rw + 8, NULL, 0);
-    gpu_kern(K_moe_up);
-    gpu_buf(0, &ETAB, eo), gpu_buf(1, &XQ, 0), gpu_buf(2, &MH, 0);
-    gpu_go(INTER / 32, TOPK, 1, 256, 1, 1);
-    gpu_commit(), gpu_encode(rest);
-    encode += now() - te;
-    tw = now();
-    cache_wait(l, need, nn);
-    waited += now() - tw;
-    phase_s[3] += encode, phase_s[2] += waited, phase_s[4] -= now() - t0;
-    // Fresh slots need residency declarations in this encoder too. Leave
-    // ETAB untouched while the preceding gate/up command may still read it.
-    for (int i = 0; i < nn; i++) {
-      uint32_t at[3];
-      int fresh;
-      const Buf *slot = cache_get(l, need[i], at, &fresh);
-      if (fresh) gpu_use(slot);
-    }
-    uint32_t n = TOPK, parts = 0;
-    gpu_kern(K_moe_down);
-    gpu_buf(0, &ETAB, eo), gpu_buf(1, &MH, 0), gpu_buf(2, &SHO, 0);
-    gpu_buf(3, &MF, mf_off(b)), gpu_buf(4, &H1, 0), gpu_buf(5, &HS, hs_off(b)), gpu_bytes(6, &n, 4);
-    gpu_bytes(7, &parts, 4), gpu_buf(8, &PARTS, 0);
-    gpu_go(DIM / 4, 1, 1, 32 * TOPK, 1, 1);
-    expert_phase_layers++;
-    return 1;
-  }
-#endif
-#endif
-#ifdef MYDS4_EXPERT_COMPACT
-  // Numerical fixture only: complete all reads before forcing two disjoint
-  // groups. Ordinary candidate runs retain the observed ready/late groups.
-  if (expert_compact_force_split && rest && m == 1 && !gk[l].up) {
-    cache_wait(l, need, nn);
-    nready = 0;
-    unsigned mask = expert_compact_force_split == 2 ? 0 : 1 + (unsigned)l % 62;
-    for (int k = 0; k < nn; k++) nready += ready[need[k]] = (mask >> k) & 1;
-  }
-#endif
   int split = rest && nready > 0 && nready < nn;
   for (int r = 0; split && r < m; r++) {
     size_t eo = (size_t)(l * FEW + r) * 256;
@@ -1798,26 +1393,6 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
     experts_go(l, r, eo, mf_off(b) + (size_t)r * MIX * 4, hs_off(b) + (size_t)r * HC * DIM * STREAM_BYTES, 1);
   }
   if (split) gpu_commit(), gpu_encode(rest);
-#ifdef MYDS4_LATE_PREENCODE
-  if (late_preencode_enabled && rest && m == 1 && nready < nn) {
-    size_t mf = mf_off(b), hs = hs_off(b);
-    if (split) {
-      fill_entries(l, late_entries(l, 0), rt, rw + 8, ready, 0);
-      experts_go(l, 0, late_entries(l, 0), mf, hs, 1);
-      experts_sum(0, mf, hs);
-      late_preencode_mixed++;
-    } else {
-      encode_experts(l, 0, rt, rw + 8, mf, hs);
-      late_preencode_missing++;
-    }
-    double t1 = now();
-    // Encoding does not submit this command buffer. The caller commits it
-    // only after these reads finish, preserving both reserved queue positions.
-    cache_wait(l, need, nn);
-    phase_s[3] += t1 - t0, phase_s[2] += now() - t1, phase_s[4] -= now() - t0;
-    return split;
-  }
-#endif
   double t1 = now();
   cache_wait(l, need, nn);
   phase_s[3] += t1 - t0, phase_s[2] += now() - t1, phase_s[4] -= now() - t0;
@@ -1860,9 +1435,6 @@ static void routed_batch(const Batch *b, int l, int ahead, int inflight, int app
   }
   double t0 = now();
   cache_request(l, need, nn);
-#ifdef MYDS4_PREFILL_CREDIT_ROWS
-  cache_prefill_credit(l, need, nn, rt, m, MYDS4_PREFILL_CREDIT_ROWS);
-#endif
   cache_demote(l);
   if (full_ahead(m)) read_ahead(l, m, (const int *)PR.ptr);
   else {
@@ -2031,14 +1603,8 @@ static void read_rows(void *ctx) {
 
 // Everything of layer l before its routed experts: the router signals the
 // returned value, then the shared expert runs while the CPU routes.
-#ifdef MYDS4_EXPERT_WAVES
-static uint64_t layer_front_command(const Batch *b, int l, void *command) {
-  if (command) gpu_encode(command);
-  else gpu_begin();
-#else
 static uint64_t layer_front(const Batch *b, int l) {
   gpu_begin();
-#endif
   if (l == 0) embed_encode(b->m, b->row);  // the rows embed_read read
   if (l == 1 || l == 14) {
     engram(b, l);
@@ -2054,27 +1620,11 @@ static uint64_t layer_front(const Batch *b, int l) {
   ffn_front(b, l);
   uint64_t v = gpu_signal();
   shared_expert(b->m, &L[l]);
-#ifdef MYDS4_EXPERT_WAVES
-  if (command) gpu_close();
-  else gpu_commit();
-#else
   gpu_commit();
-#endif
   return v;
 }
-#ifdef MYDS4_EXPERT_WAVES
-static uint64_t layer_front(const Batch *b, int l) { return layer_front_command(b, l, NULL); }
-#endif
 
 // m rows at positions pos..: one token, or a token and its drafts.
-static void wait_front_signal(uint64_t value) {
-#ifdef MYDS4_SPIN_ROUTER
-  gpu_spin_signal(value);
-#else
-  gpu_wait_signal(value);
-#endif
-}
-
 static void step_rows(const int *tokens, int m, int pos) {
   for (int i = 0; i < m; i++)
     if (tokens[i] < 0) die("an image's token outside a prompt's batch (position %d)", pos + i);
@@ -2096,67 +1646,24 @@ static void step_rows(const int *tokens, int m, int pos) {
   for (int e = 0; e < 2; e++) dispatch_group_enter(rr.read[e]);
   dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &rr, read_rows);
   embed_read(tokens, m, 0, pos);
-#ifdef MYDS4_PREDICT_LAB
-  predictor_lab_embeddings(m, (const uint16_t *)EROW.ptr);
-  if (predictor_lab_projection()) {
-    static Buf input, normalized, quantized, forecast;
-    if (!input.obj) {
-      input = zeros(FEW * DIM * 4), normalized = zeros(FEW * DIM * 4), quantized = zeros(FEW * DIM * 4);
-      forecast = zeros(LAYERS * FEW * EXPERTS * 4);
-    }
-    predictor_lab_projection_input(m, (const uint16_t *)EROW.ptr, (const float *)draft_norm.ptr, (float *)input.ptr);
-    gpu_begin();
-    for (int l = 0; l < LAYERS; l++) {
-      uint32_t dim = DIM;
-      gpu_kern(K_rmsnorm);
-      gpu_buf(0, &input, 0), gpu_buf(1, &L[l].ffn_norm, 0);
-      gpu_buf(2, &normalized, 0), gpu_buf(3, &quantized, 0), gpu_bytes(4, &dim, 4);
-      gpu_go(m, 1, 1, 1024, 1, 1);
-      linear(&L[l].gate, m, &normalized, 0, DIM, &forecast, (size_t)l * m * EXPERTS * 4, EXPERTS, 0);
-    }
-    gpu_commit(), gpu_sync();
-    for (int l = 0; l < LAYERS; l++)
-      predictor_lab_baseline(l, m, (const float *)forecast.ptr + (size_t)l * m * EXPERTS,
-                             (const float *)L[l].gate_bias.ptr);
-  }
-  predictor_lab_predict(m);
-#endif
   phase_s[0] += now() - ts;
   Batch b = {m, pos, 0};
   int ahead = opt.dump_fd < 0 && !gpu_profiling();
   // Pre-encode the next front while the current front runs. The ordinary
   // path reserves two earlier queue positions for experts. Completion
   // groups defer front submission until all expert groups are queued.
-#ifdef MYDS4_EXPERT_PHASED
-  cache_phase_reads(expert_phase_enabled && ahead && m == 1);
-#endif
   uint64_t sig = layer_front(&b, 0), next = 0;
   ts = now();
   cache_adapt();  // no slot is in use between tokens; layer 0's front uses none
-#ifdef MYDS4_PREDICT_LAB
-  predictor_lab_schedule(-1);
-#endif
   phase_s[5] += now() - ts;
-#ifdef MYDS4_EXPERT_WAVES
-  int waves = expert_waves_enabled && ahead && m == 1 && !nrows && !verifying && opt.substitute <= 0;
-#endif
   for (int l = 0; l < LAYERS; l++) {
-#ifdef MYDS4_EXPERT_WAVES
-    void *experts = gpu_open(), *rest = ahead ? (waves ? gpu_open_late() : gpu_open()) : NULL;
-    void *next_command = NULL;
-    if (ahead && l + 1 < LAYERS) {
-      if (waves) next_command = gpu_open_late(), next = layer_front_command(&b, l + 1, next_command);
-      else next = layer_front(&b, l + 1);
-    }
-#else
     void *experts = gpu_open(), *rest = ahead ? gpu_open() : 0;  // rest: see routed_rows
     if (ahead && l + 1 < LAYERS) next = layer_front(&b, l + 1);
-#endif
     double t0 = now();
     if (full_ahead(m)) {  // the residual's predictions, signaled before the attention
       int keep[FEW * KEEP], first[FEW * AHEAD], nk = 0, nf = 0;
       const int *pc = (const int *)PC.ptr;
-      wait_front_signal(sig - 1);
+      gpu_wait_signal(sig - 1);
       for (int r = 0; r < m; r++) {
         for (int k = 0; k < KEEP; k++) keep[nk++] = pc[r * PREDICT + k];
         for (int k = 0; k < AHEAD; k++) first[nf++] = pc[r * PREDICT + k];
@@ -2168,7 +1675,7 @@ static void step_rows(const int *tokens, int m, int pos) {
 #endif
       read_residual_ahead(l, keep, nk, first, nf, INFLIGHT * m);
     }
-    wait_front_signal(sig);
+    gpu_wait_signal(sig);
 #ifdef MYDS4_PREDICT_PROBE
     probe_target(1, pos, l, m, tokens, b.row);
 #endif
@@ -2192,16 +1699,10 @@ static void step_rows(const int *tokens, int m, int pos) {
     }
     gpu_commit();
     if (rest && !split) gpu_submit(rest);  // empty
-#ifdef MYDS4_EXPERT_WAVES
-    if (next_command) gpu_submit(next_command);
-#endif
     phase_s[4] += now() - t0;
     // Labels and source records are CPU-owned. Both expert buffers are now
     // committed, so independent, already-used heads can learn behind GPU work.
     if (opt.online_predictor) online_predictor_update(l);
-#ifdef MYDS4_PREDICT_LAB
-    predictor_lab_long_update(l);
-#endif
     if (!ahead) {
       gpu_sync();  // the streams after attention and after the FFN, then the routing
       if (opt.dump_fd >= 0 &&
@@ -2211,21 +1712,12 @@ static void step_rows(const int *tokens, int m, int pos) {
         die("dump failed");
       if (l + 1 < LAYERS) next = layer_front(&b, l + 1);
     }
-#ifdef MYDS4_PREDICT_LAB
-    predictor_lab_schedule(l);
-#endif
     sig = next;
   }
-#ifdef MYDS4_PREDICT_LAB
-  predictor_lab_end();
-#endif
   double ta = now();
   gpu_sync();
   phase_s[1] += now() - ta;
   for (int e = 0; e < 2; e++) dispatch_release(rr.read[e]);
-#ifdef MYDS4_EXPERT_PHASED
-  cache_phase_reads(0);
-#endif
 }
 
 // ---- prefill: many tokens, layer by layer ----
@@ -2274,9 +1766,7 @@ uint64_t model_workspace_bytes(void) {
   uint64_t bytes = HS.size + MF.size + SEL.size + CAND.size + IMG.size;
   for (int e = 0; e < 2; e++) bytes += EC[e].size + ES[e].size;
   for (size_t i = 0; i < sizeof work_buffers / sizeof *work_buffers; i++) bytes += work_buffers[i]->size;
-#ifdef MYDS4_RUNAHEAD
   bytes += experimental_workspace_bytes;
-#endif
   return bytes;
 }
 
@@ -2425,9 +1915,6 @@ static int decoder_begin(int n, int pos) {
 
 static PrefillPrune decoder_plan(int pos, int count, int layer) {
   int remaining = LAYERS - 21;
-#ifdef MYDS4_LAYER_PRUNE
-  remaining = layer < LAYERS ? LAYERS - layer - 1 : 0;
-#endif
   return prefill_prune_plan(pos, count, prefill_prune_end, prefix_capture.at,
                            remaining, WINDOW, replay_margin(), MB);
 }
@@ -2461,7 +1948,7 @@ static void prefill(const int *tokens, int n, int pos0) {
   if (n >= 256 && opt.substitute <= 0) {  // a large batch needs nearly every expert: read layer 0's, after the embedding's rows
     int all[EXPERTS];
     for (int e = 0; e < EXPERTS; e++) all[e] = e;
-    cache_prefetch_from(0, all, EXPERTS, EXPERTS, 2 * EXPERTS, PF_BULK);
+    cache_prefetch_from(0, all, EXPERTS, 2 * EXPERTS, PF_BULK);
   }
   for (int l = 0; l < LAYERS; l++) {
     if (prefill_prune_active && l > 20) plan = decoder_plan(pos0, n, l);
@@ -2556,9 +2043,7 @@ static void prefill(const int *tokens, int n, int pos0) {
 
 // A prefill pass keeps every row's streams, selections and Engram rows
 // (about 56 KB plus candidate masks): longer prompts use several passes.
-#ifndef MYDS4_PREFILL_CHUNK
 #define MYDS4_PREFILL_CHUNK 16384
-#endif
 #define CHUNK MYDS4_PREFILL_CHUNK
 static_assert(CHUNK >= MB && CHUNK <= 32768 && CHUNK % MB == 0, "bounded prefill chunk with unchanged matrix batches");
 static int prefill_chunk = CHUNK;
@@ -2842,11 +2327,6 @@ static void draft_stage(int d, int pos) {
   shared_expert(m, y);
   gpu_commit();
   gpu_sync();
-#ifdef MYDS4_PREDICT_LAB
-  predictor_lab_stage(d, m, (const float *)X.ptr, stream_floats(&H1, 0, (size_t)m * HC * DIM),
-                      (const float *)DMF.ptr, (const float *)GL.ptr,
-                      (const float *)Q.ptr, (const float *)AO.ptr, (const uint16_t *)y->ring.ptr);
-#endif
 #ifdef MYDS4_PREDICT_PROBE
   if (predict_probe_enabled()) {
     int selected[BLOCK * DRAFT_TOPK];
@@ -2911,17 +2391,13 @@ static void draft_stage(int d, int pos) {
 // token, then the previous draft) give the next draft, on the GPU. Every
 // stage computes all BLOCK rows, whose keys every query sees; the head and
 // bias use the first n rows, whose drafts are wanted.
-static void draft_generate(int token, int pos, int *drafts, int n, const Sampler *sampler,
-                           double *proposal_probabilities, Sampler *advanced) {
+void model_draft(int token, int pos, int *drafts, int n) {
   if (token < 0) die("a draft after an image's token (position %d)", pos);
   if (n < 1 || n > BLOCK) die("model_draft needs 1 to %d draft rows", BLOCK);
   work_capacity(BLOCK);
   double t0 = now();
   int64_t t = token;
   io_rows(embed_t.fd, embed_t.off, DIM * 2, &t, 1, DEROW.ptr);
-#ifdef MYDS4_PREDICT_LAB
-  predictor_lab_begin(pos, n, (const uint16_t *)DEROW.ptr);
-#endif
 #ifdef MYDS4_PREDICT_PROBE
   if (predict_probe_enabled()) {
     float seed[DIM];
@@ -2946,40 +2422,17 @@ static void draft_generate(int token, int pos, int *drafts, int n, const Sampler
   hc_pre_norm(n, &DHS, 0, &DMF, 0, &draft_norm);
   head_out(n, &DLOG);
   uint32_t v = VOCAB;
-  int coupled = sampler && (sampler->temp > 0 || proposal_probabilities);
-  Sampler proposal;
-  if (coupled) {
-    proposal = *sampler;
-    gpu_commit(), gpu_sync();
-  }
   for (int r = 0; r < n; r++) {
-    if (coupled) gpu_begin();
     gpu_kern(K_markov);
     gpu_buf(0, &markov_embed, 0), gpu_buf(1, &markov_head, 0), gpu_buf(2, &DTOK, r * 4);
     gpu_buf(3, &DLOG, (size_t)r * VOCAB * 4);
     gpu_go(VOCAB / 8, 1, 1, 256, 1, 1);
-    if (coupled) {
-      gpu_commit(), gpu_sync();
-#ifdef MYDS4_REJECTION_DRAFT
-      if (proposal_probabilities) {
-        double *q = proposal_probabilities + (size_t)r * VOCAB;
-        speculative_distribution((const float *)DLOG.ptr + (size_t)r * VOCAB, VOCAB, &proposal, q);
-        ((int *)DTOK.ptr)[r + 1] = speculative_draw(q, VOCAB, erand48(proposal.seed));
-      } else
-#endif
-      ((int *)DTOK.ptr)[r + 1] = sample_token((const float *)DLOG.ptr + (size_t)r * VOCAB, VOCAB, &proposal);
-    } else {
-      gpu_kern(K_argmax);
-      gpu_buf(0, &DLOG, (size_t)r * VOCAB * 4), gpu_buf(1, &DTOK, (r + 1) * 4), gpu_bytes(2, &v, 4);
-      gpu_go(1, 1, 1, 1024, 1, 1);
-    }
+    gpu_kern(K_argmax);
+    gpu_buf(0, &DLOG, (size_t)r * VOCAB * 4), gpu_buf(1, &DTOK, (r + 1) * 4), gpu_bytes(2, &v, 4);
+    gpu_go(1, 1, 1, 1024, 1, 1);
   }
-  if (!coupled) gpu_commit(), gpu_sync();
-  if (advanced && coupled) *advanced = proposal;
+  gpu_commit(), gpu_sync();
   memcpy(drafts, (int *)DTOK.ptr + 1, n * sizeof *drafts);
-#ifdef MYDS4_PREDICT_LAB
-  predictor_lab_final(n, stream_floats(&DHS, 0, (size_t)n * HC * DIM), (const float *)X.ptr);
-#endif
 #ifdef MYDS4_PREDICT_PROBE
   if (predict_probe_streams_enabled()) {
     // This snapshot is after the head, at the synchronization above. X
@@ -2994,22 +2447,6 @@ static void draft_generate(int token, int pos, int *drafts, int n, const Sampler
   phase_s[6] += now() - t0;
 }
 
-void model_draft(int token, int pos, int *drafts, int n) {
-  draft_generate(token, pos, drafts, n, NULL, NULL, NULL);
-}
-
-// Drafting peeks at future uniforms on a copy. Verification consumes the
-// original sampler and therefore keeps ordinary decoding's token sequence.
-void model_draft_coupled(int token, int pos, int *drafts, int n, const Sampler *sampler) {
-  draft_generate(token, pos, drafts, n, sampler, NULL, NULL);
-}
-
-#ifdef MYDS4_REJECTION_DRAFT
-void model_draft_sampled(int token, int pos, int *drafts, int n, Sampler *sampler, double *probabilities) {
-  if (!sampler || !probabilities) die("sampled draft needs a sampler and probability storage");
-  draft_generate(token, pos, drafts, n, sampler, probabilities, sampler);
-}
-#endif
 
 // A pass of the token at pos and its drafts. Rows after the accepted ones
 // leave nothing later positions read (see RING and PENDING), except the
@@ -3036,28 +2473,8 @@ const float *model_verify(const int *tokens, int m, int pos) {
   return (const float *)logits.ptr;
 }
 
-#ifdef MYDS4_CAUSAL_EARLY_STOP
-const float *model_verify_early(const int *tokens, int m, int pos, int eos,
-                                Sampler *sampler, int *next, int *accepted) {
-  SpeculativeFrontier f;
-  if (m < 2 || causal_frontier || !next || !accepted ||
-      !speculative_frontier_start(&f, tokens + 1, m - 1, eos, sampler))
-    die("invalid early verification request");
-  early_stats.calls++, early_stats.attempted_rows += m;
-  causal_base_pos = pos;
-  causal_frontier = &f;
-  const float *result = model_verify(tokens, m, pos);
-  causal_frontier = NULL;
-  if (!f.done) die("early verification returned without a target decision");
-  *sampler = f.sampler, *next = f.next, *accepted = f.accepted;
-  return result;
-}
-#endif
 
 void model_accept(const int *tokens, int n, int pos) {
-#ifdef MYDS4_PREDICT_LAB
-  predictor_lab_accept(n);
-#endif
 #ifdef MYDS4_PREDICT_PROBE
   predict_probe_emit(6, pos, -1, n, 0, 0, 0, 0, n, tokens);
 #endif
@@ -3408,9 +2825,7 @@ void model_state_use(State *s) {
   active = s;
 }
 
-#ifdef MYDS4_RUNAHEAD
 #include "../experimental/runahead.c"
-#endif
 #ifdef MYDS4_CAUSAL_VERIFY
 #include "../experimental/causal_verify.c"
 #endif
@@ -3423,9 +2838,7 @@ const float *model_forward_rows(State **st, const int *tokens, const int *pos, i
     row_state[r] = st[r], row_pos[r] = pos[r];
   }
   memcpy(active->history, history, sizeof history);
-#ifdef MYDS4_RUNAHEAD
   if (runahead_enabled && m > 1) return runahead_rows(st, tokens, pos, m);
-#endif
   nrows = m;
   step(tokens, m, pos[0]);
   nrows = 0;

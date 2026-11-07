@@ -129,7 +129,6 @@ uint64_t gpu_working_set(void);
 void *gpu_open(void);        // a command buffer that runs after those opened before
 void gpu_encode(void *cmd);  // encode into it until gpu_commit or the next gpu_encode
 void gpu_begin(void);        // gpu_encode(gpu_open())
-void *gpu_open_late(void);   // a command buffer that joins the queue when gpu_submit commits it
 void *gpu_close(void);       // ends the current command buffer's encoding without committing it
 void gpu_submit(void *cmd);
 void gpu_kern(int k);
@@ -143,15 +142,8 @@ uint64_t gpu_signal(void);  // ends the encoder, signals the returned value
 void gpu_keep_clock(double seconds);  // keeps the GPU's clock up for about that long
 void gpu_commit(void);
 void gpu_wait_signal(uint64_t v);
-void gpu_spin_signal(uint64_t v);  // gpu_wait_signal, spinning
 void gpu_sync(void);
 int gpu_threads(int k);  // max threads per threadgroup of a kernel
-#ifdef MYDS4_PIPELINE_LIMIT
-int gpu_kernel_limited(const char *name, unsigned limit);
-#endif
-#ifdef MYDS4_LATE_PREENCODE_CHECK
-int gpu_command_status(void);
-#endif
 int gpu_profiling(void);       // MYDS4_PROFILE set: dispatches run one at a time, timed
 void gpu_profile_reset(void);
 extern double gpu_busy;  // seconds the GPU spent on committed command buffers
@@ -224,40 +216,23 @@ void cache_load(int layer, const int *experts, int n);  // makes them resident
 // Starts making the experts resident. Returns how many had pending reads
 // when each was checked; prefetch lateness uses that same completion check.
 int cache_request(int layer, const int *experts, int n);
-#ifdef MYDS4_PREFILL_CREDIT_ROWS
-void cache_prefill_credit(int layer, const int *experts, int n, const int *routes, int rows, int tail_rows);
-#endif
-void cache_repeat_credit(int layer, int expert, int repeats); // extra row uses after one deduplicated request
 void cache_wait(int layer, const int *experts, int n);     // waits for their reads
-#ifdef MYDS4_EXPERT_WAVES
-void cache_wait_any(int layer, const int *experts, int n); // returns when any requested expert is complete
-#endif
-#ifdef MYDS4_EXPERT_PHASED
-void cache_phase_reads(int enabled);
-void cache_wait_up(int layer, const int *experts, int n);
-#endif
 int cache_slot(int layer, int expert);   // it has a slot: resident, or being read
-#ifdef MYDS4_RUNAHEAD
 int cache_hold(int layer, const int *experts, int n);
 void cache_unhold(int layer, const int *experts, int n);
-#ifdef MYDS4_CAUSAL_PRIORITY_READS
-int cache_hold_speculative(int layer, const int *experts, int n);
-void cache_promote_selected(int layer, const int *experts, int n);
-#endif
 uint64_t model_ready_groups(void);
-#endif
 int cache_ready(int layer, int expert);  // resident and read
 int cache_where(int layer, int expert);  // 0 only on the SSD, 1 in memory, 2 read ahead, 3 read ahead and still being read
-// Starts reading up to `admit` of n predicted experts that are not resident,
+// Starts reading the n predicted experts that are not resident, in order,
 // while fewer than `inflight` prefetches are reading.
-void cache_prefetch(int layer, const int *experts, int n, int admit, int inflight);
+void cache_prefetch(int layer, const int *experts, int n, int inflight);
 // Optional MYDS4_PREFETCH_METRICS=1 observation. Pass IDs identify forward
 // batches, not emitted tokens. Snapshot once before substitution, then observe
 // the exact and served row unions from that same snapshot on the model thread.
 // Only served routes consume first-use attribution. These hooks never change
-// routing or cache admission. GPU-route passes report unsupported coverage.
+// routing or cache admission.
 enum { PF_PREFILL, PF_DECODE, PF_PHASES };
-enum { PF_PC, PF_H1, PF_H2, PF_BULK, PF_OTHER, PF_DRAFT, PF_H4, PF_H8, PF_ISSUERS };
+enum { PF_PC, PF_H1, PF_H2, PF_BULK, PF_OTHER, PF_ISSUERS };
 enum { PF_EXISTING_READY, PF_FRESH_READY, PF_PENDING_PREFETCH, PF_PENDING_DEMAND, PF_ABSENT, PF_STATES };
 typedef struct {
   int active, layer, phase;
@@ -269,11 +244,8 @@ void cache_metrics_begin(int phase, int rows);
 void cache_metrics_end(void);
 void cache_observe_snapshot(int layer, CacheObservation *snapshot);
 void cache_observe_routes(const CacheObservation *snapshot, const int *ids, int rows, int stride, int served);
-void cache_prefetch_from(int layer, const int *experts, int n, int admit, int inflight, int issuer);
+void cache_prefetch_from(int layer, const int *experts, int n, int inflight, int issuer);
 void cache_metrics_report(FILE *out);
-#ifdef MYDS4_IO_DIAGNOSTICS
-void cache_io_diagnostic_decode(void);
-#endif
 // Cancels the read-aheads for the layer that no reader has started and that keep[0..n) does not name.
 void cache_refine(int layer, const int *keep, int n);
 void cache_demote(int layer);  // after its routing: the layer's unselected read-aheads are evicted first
@@ -392,25 +364,9 @@ ModelForwardInfo model_forward_info(void);
 // The DSpark draft for `token` at position pos, every position before it
 // having run (with Options.draft): the tokens it drafts for pos + 1 .. pos + BLOCK.
 void model_draft(int token, int pos, int *drafts, int n); // the first n of BLOCK drafts
-void model_draft_coupled(int token, int pos, int *drafts, int n, const Sampler *sampler); // experimental shared uniforms
-#ifdef MYDS4_REJECTION_DRAFT
-void model_draft_sampled(int token, int pos, int *drafts, int n, Sampler *sampler, double *probabilities);
-#endif
 // Speculative decoding: runs the token at pos and its drafts (m rows) and
 // returns each row's logits; model_accept keeps the first n of the rows.
 const float *model_verify(const int *tokens, int m, int pos);
-#ifdef MYDS4_CAUSAL_EARLY_STOP
-typedef struct {
-  uint64_t calls, attempted_rows, finished_rows, sampled_rows, cancelled_rows;
-  uint64_t requested_row_layers, skipped_expert_row_layers;
-  uint64_t background_row_layers, promoted_row_layers;
-} EarlyVerifyStats;
-EarlyVerifyStats model_early_stats(void);
-// Samples completed rows in order and stops after a rejection or EOS. Only
-// accepted + 1 leading logits rows are promised; model_accept follows.
-const float *model_verify_early(const int *tokens, int m, int pos, int eos,
-                                Sampler *sampler, int *next, int *accepted);
-#endif
 void model_accept(const int *tokens, int n, int pos);
 void model_bench(void);
 void model_reset(void);

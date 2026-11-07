@@ -8,8 +8,7 @@
 #include <unistd.h>
 
 int main(int argc, char **argv) {
-  int consensus = argc == 2 && !strcmp(argv[1], "--consensus");
-  if (argc > 1 && !consensus) return 2;
+  if (argc > 1) return 2;
   alarm(20);
   uint32_t shape[2];
   if (fread(shape, sizeof *shape, 2, stdin) != 2 || !shape[0] || !shape[1] ||
@@ -24,7 +23,7 @@ int main(int argc, char **argv) {
     if (!context_lookup_append(s, tokens + at, 1)) return 2;
     int room = (int)(total - at - 1);
     int limit = room < 15 ? room : 15;
-    ContextDraft p = consensus ? context_lookup_propose_consensus(s, limit) : context_lookup_propose(s, limit);
+    ContextDraft p = context_lookup_propose(s, limit);
     calls++, examined += p.examined;
     int kept = 0;
     while (kept < p.count && tokens[at + 1 + kept] == p.tokens[kept]) kept++;

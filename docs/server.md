@@ -112,7 +112,7 @@ it keeps reading the connection meanwhile; reads have no deadline then.
 ## The C ABI
 
 [`src/engine/engine.h`](../src/engine/engine.h) is the whole interface. Its
-version is `MYDS4_ABI = 6`. Callers must use the matching `myds4_config`
+version is `MYDS4_ABI = 7`. Callers must use the matching `myds4_config`
 layout and rebuild with the engine. The engine runs the model; everything
 about requests (their queue, scheduling, the KV prefix cache, the status
 and the live view's data) is the server's. Every function that runs the
@@ -223,7 +223,9 @@ own lookup history. Lookup is off by default.
 `--runahead` changes how two or more active requests share the model. Each
 request can advance to its next layer when its selected experts are ready.
 The scheduler groups ready requests at the same layer and prioritizes
-earlier layers. Reads use actual router selections; the concurrent path
+earlier layers; each request in a group runs its own experts, and the
+group shares the next layer's dense products. Reads use actual router
+selections; the concurrent path
 does not compute or issue the unused native expert forecasts. Cache entries
 remain reserved until every consuming job completes. Per-request sampling
 and selected experts are preserved. A request running alone follows ordinary
@@ -237,7 +239,8 @@ counters: computed rows, model wall time, main-queue GPU time, expert-read
 bytes and read-wait time. These times overlap and must not be added together.
 
 The HTTP comparison uses a short off/on/off sequence, not a general
-throughput guarantee. Its [recorded results](performance.md#http-runahead-comparison)
+throughput guarantee, and it ran while runahead still shared expert weight
+loads within a group. Its [recorded results](performance.md#http-runahead-comparison)
 include the memory budget, prompt reuse and output equality.
 
 Arrival logs carry an HTTP identifier, body size, and message/tool counts.
@@ -270,7 +273,9 @@ the final values from servers with different histories.
 
 The 2026-11-03 joint-prefill integration checks ran the server with a 20 GiB
 expert cache, a 4 GiB reserve, temperature/top-p 1 and seed 12345, the MXFP4
-experts, `--ced 128`, two drafts with 32 slots per stage and `--draft-trim`,
+experts, `--ced 128`, two drafts with 32 slots per stage and `--draft-trim`
+(an option since removed; see
+[Removed experiments](experiments.md#--draft-trim-trimming-the-final-dspark-stage)),
 and an image request. The checks cover simultaneous arrivals, queue and prefill-plan logs,
 system-prefix forks, identical seeded replies on retry, zero recomputation
 for that retry, and image embedding through the default vision path. They

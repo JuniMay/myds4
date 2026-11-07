@@ -1,41 +1,25 @@
 // Included by model.c after its state helpers. Each request retains the
 // buffers that survive a layer front, including CPU-written descriptors.
-// Shared GPU scratch follows command-queue order. The event-based variant
-// reads routing after its signal and retires command buffers once per step.
-// Requests can advance at different layers while SSD reads run in parallel.
-static void run_wait_signal(uint64_t value) {
-#ifdef MYDS4_RUNAHEAD_SPIN
-  gpu_spin_signal(value);
-#else
-  gpu_wait_signal(value);
-#endif
-}
-
+// Shared GPU scratch follows command-queue order. Routing is read after each
+// layer front's GPU signal, and command buffers retire once per step.
+// Requests can advance at different layers while SSD reads run in parallel;
+// ready requests at the same layer run together (run_group).
 enum { RUN_BUFFERS = 14 };
 #define RUN_BUFFER_LIST &HS, &MF, &SEL, &CAND, &XQ, &H1, &SHO, &RT, &EC[0], &EC[1], &ES[0], &ES[1], &ETAB, &EROW
 typedef struct {
   Buf saved[RUN_BUFFERS];
   State *state;
   int layer, pos, experts[TOPK];
-#ifdef MYDS4_CAUSAL_PRIORITY_READS
-  int speculative;
-#endif
 } RunJob;
 static RunJob run_jobs[FEW];
 static float *run_logits;
-static uint64_t runahead_after_wait_groups;
-static uint64_t runahead_head_batches, runahead_head_rows;
 
 static void run_bind(RunJob *job, Buf **live) {
-  if (runahead_enabled >= 2) bind(job->state);
-  else model_state_use(job->state);
+  bind(job->state);
   for (int k = 0; k < RUN_BUFFERS; k++) *live[k] = job->saved[k];
 }
 
 static void run_issue(RunJob *job) {
-#ifdef MYDS4_CAUSAL_EARLY_STOP
-  if (causal_frontier) early_stats.requested_row_layers++;
-#endif
   const int *rt = (const int *)RT.ptr;
   CacheObservation observation;
   cache_observe_snapshot(job->layer, &observation);
@@ -51,13 +35,6 @@ static void run_issue(RunJob *job) {
       int e = job->experts[k]; job->experts[k] = job->experts[k - 1], job->experts[k - 1] = e;
     }
   cache_stats.row_unique += TOPK;
-#ifdef MYDS4_CAUSAL_PRIORITY_READS
-  job->speculative = causal_frontier && job->pos > causal_base_pos + causal_frontier->sampled;
-  if (job->speculative) {
-    early_stats.background_row_layers++;
-    cache_hold_speculative(job->layer, job->experts, TOPK);
-  } else
-#endif
   cache_hold(job->layer, job->experts, TOPK);
   cache_demote(job->layer);
 }
@@ -92,19 +69,9 @@ static int run_group(RunJob **jobs, const int *ids, int count, Buf **live, const
   for (int r = 0; r < count; r++)
     experts_go(layer, r, entries + r * 256, (size_t)r * MIX * 4, (size_t)r * HC * DIM * STREAM_BYTES, 0);
   uint64_t signal;
-  int deferred_head = runahead_enabled == 5 && !captures;
   if (layer == LAYERS - 1) {
-    if (deferred_head) {
-      ncopy = 0;
-      for (int r = 0; r < count; r++) {
-        copies[ncopy++] = (GpuCopy){&HS, &jobs[r]->saved[0], r * bytes[0], 0, bytes[0]};
-        copies[ncopy++] = (GpuCopy){&MF, &jobs[r]->saved[1], r * bytes[1], 0, bytes[1]};
-      }
-      gpu_copies(copies, ncopy);
-    } else {
-      hc_pre_norm(count, &HS, 0, &MF, 0, &final_norm);
-      head_out(count, &logits);
-    }
+    hc_pre_norm(count, &HS, 0, &MF, 0, &final_norm);
+    head_out(count, &logits);
     signal = gpu_signal();
     gpu_commit();
   } else {
@@ -114,7 +81,7 @@ static int run_group(RunJob **jobs, const int *ids, int count, Buf **live, const
     signal = layer_front(&(Batch){count, jobs[0]->pos, 0}, layer + 1);
     nrows = 0;
   }
-  run_wait_signal(signal);
+  gpu_wait_signal(signal);
   if (layer != LAYERS - 1) {
     ncopy = 0;
     for (int r = 0; r < count; r++) {
@@ -132,9 +99,8 @@ static int run_group(RunJob **jobs, const int *ids, int count, Buf **live, const
     RunJob *job = jobs[r];
     cache_unhold(layer, job->experts, TOPK);
     job->layer++;
-    if (layer == LAYERS - 1) {
-      if (!deferred_head) memcpy(outputs + (size_t)ids[r] * VOCAB, logits.ptr + (size_t)r * VOCAB * 4, VOCAB * 4);
-    } else RT = job->saved[7], run_issue(job);
+    if (layer == LAYERS - 1) memcpy(outputs + (size_t)ids[r] * VOCAB, logits.ptr + (size_t)r * VOCAB * 4, VOCAB * 4);
+    else RT = job->saved[7], run_issue(job);
   }
   RT = original[7];
   return layer == LAYERS - 1 ? count : 0;
@@ -143,12 +109,9 @@ static int run_group(RunJob **jobs, const int *ids, int count, Buf **live, const
 static const float *runahead_rows(State **states, const int *tokens, const int *positions, int count) {
   if (nrows || verifying || count < 2 || count > FEW) die("invalid runahead batch");
   for (int r = 0; r < count; r++) if (tokens[r] < 0) die("runahead needs text decode tokens");
-#ifdef MYDS4_RUNAHEAD_NO_FORECASTS
   runahead_route_only = 1;
-#endif
   request_capacity(count);
   State *original_state = active;
-  int signals = runahead_enabled >= 2;
   Buf *live[RUN_BUFFERS] = {RUN_BUFFER_LIST};
   Buf original[RUN_BUFFERS];
   for (int k = 0; k < RUN_BUFFERS; k++) original[k] = *live[k];
@@ -181,9 +144,7 @@ static const float *runahead_rows(State **states, const int *tokens, const int *
     // Expert reads from preceding jobs remain in flight meanwhile.
     engram_read(0, rows, 1), engram_read(1, rows, 1);
     embed_read(tokens + r, 1, 0, job->pos);
-    uint64_t signal = layer_front(&(Batch){1, job->pos, 0}, 0);
-    if (signals) run_wait_signal(signal);
-    else gpu_sync();
+    gpu_wait_signal(layer_front(&(Batch){1, job->pos, 0}, 0));
     run_issue(job);
   }
   int remaining = count;
@@ -200,13 +161,7 @@ static const float *runahead_rows(State **states, const int *tokens, const int *
     }
     int r = ready >= 0 ? ready : wait;
     if (r < 0) die("runahead has no unfinished job");
-    int after_wait = 0;
-    if (runahead_enabled == 4 && ready < 0) {
-      gpu_keep_clock(.001);
-      cache_wait(run_jobs[r].layer, run_jobs[r].experts, TOPK);
-      ready = r, after_wait = 1;
-    }
-    if (runahead_enabled >= 3 && ready >= 0) {
+    if (ready >= 0) {
       int ids[FEW], group = 0;
       RunJob *jobs[FEW];
       for (int j = 0; j < count; j++) if (run_jobs[j].layer == run_jobs[ready].layer) {
@@ -215,7 +170,6 @@ static const float *runahead_rows(State **states, const int *tokens, const int *
         if (available) ids[group] = j, jobs[group++] = &run_jobs[j];
       }
       if (group > 1) {
-        runahead_after_wait_groups += after_wait;
         remaining -= run_group(jobs, ids, group, live, original, run_logits, NULL, NULL);
         continue;
       }
@@ -229,50 +183,25 @@ static const float *runahead_rows(State **states, const int *tokens, const int *
     gpu_begin();
     encode_experts(job->layer, 0, rt, (const float *)RT.ptr + 8, 0, 0);
     if (job->layer == LAYERS - 1) {
-      if (runahead_enabled != 5) {
-        hc_pre_norm(1, &HS, 0, &MF, 0, &final_norm);
-        head_out(1, &logits);
-      }
-      if (signals) signal = gpu_signal();
+      hc_pre_norm(1, &HS, 0, &MF, 0, &final_norm);
+      head_out(1, &logits);
+      signal = gpu_signal();
     }
     gpu_commit();
     if (job->layer + 1 < LAYERS) signal = layer_front(&(Batch){1, job->pos, 0}, job->layer + 1);
-    if (signals) run_wait_signal(signal);
-    else gpu_sync();
+    gpu_wait_signal(signal);
     cache_unhold(job->layer, job->experts, TOPK);
     if (++job->layer == LAYERS) {
-      if (runahead_enabled != 5) memcpy(run_logits + (size_t)r * VOCAB, logits.ptr, VOCAB * sizeof(float));
+      memcpy(run_logits + (size_t)r * VOCAB, logits.ptr, VOCAB * sizeof(float));
       remaining--;
     } else run_issue(job);
   }
-  if (runahead_enabled == 5) {
-    // Sampling begins only after all rows finish. Preserve each row's final
-    // streams and mixing weights, then read the output head once per batch.
-    for (int k = 0; k < RUN_BUFFERS; k++) *live[k] = original[k];
-    GpuCopy copies[2 * FEW];
-    size_t hs = HC * DIM * STREAM_BYTES, mf = MIX * sizeof(float);
-    for (int r = 0; r < count; r++) {
-      copies[2 * r] = (GpuCopy){&run_jobs[r].saved[0], &HS, 0, r * hs, hs};
-      copies[2 * r + 1] = (GpuCopy){&run_jobs[r].saved[1], &MF, 0, r * mf, mf};
-    }
-    gpu_begin();
-    gpu_copies(copies, 2 * count);
-    hc_pre_norm(count, &HS, 0, &MF, 0, &final_norm);
-    head_out(count, &logits);
-    gpu_commit();
-    runahead_head_batches++, runahead_head_rows += count;
-  }
   gpu_sync();
-  if (runahead_enabled == 5) memcpy(run_logits, logits.ptr, (size_t)count * VOCAB * sizeof(float));
-  if (!signals) memcpy(active->history, history, sizeof history);
   for (int k = 0; k < RUN_BUFFERS; k++) *live[k] = original[k];
-  if (signals) bind(original_state), memcpy(history, original_state->history, sizeof history);
-  else model_state_use(original_state);
+  bind(original_state), memcpy(history, original_state->history, sizeof history);
   cache_metrics_end();
   stats_add(&decode_stats, &before);
   decode_rows += count, decode_gpu_s += gpu_busy - gpu_before, decode_s += now() - began;
-#ifdef MYDS4_RUNAHEAD_NO_FORECASTS
   runahead_route_only = 0;
-#endif
   return run_logits;
 }

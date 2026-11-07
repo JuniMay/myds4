@@ -289,111 +289,13 @@ def parse_metrics(stderr):
     stderr = stderr.replace("\r", "\n")
     metrics = {}
     for line in stderr.splitlines():
-        if line.startswith('{"workspace":'):
-            try:
-                metrics["workspace"] = json.loads(line)["workspace"]
-            except (ValueError, KeyError, TypeError):
-                metrics["workspace_parse_error"] = True
-        if line.startswith('{"decode_cache":'):
-            try:
-                metrics["decode_cache"] = json.loads(line)["decode_cache"]
-            except (ValueError, KeyError, TypeError):
-                metrics["decode_cache_parse_error"] = True
-        if line.startswith('{"context_lookup":'):
-            try:
-                metrics["context_lookup"] = json.loads(line)["context_lookup"]
-            except (ValueError, KeyError, TypeError):
-                metrics["context_lookup_parse_error"] = True
-        if line.startswith('{"protocol_draft":'):
-            try:
-                metrics["protocol_draft"] = json.loads(line)["protocol_draft"]
-            except (ValueError, KeyError):
-                metrics["protocol_draft_parse_error"] = True
-        if line.startswith('{"rejection_sampling":'):
-            try:
-                metrics["rejection_sampling"] = json.loads(line)["rejection_sampling"]
-            except (ValueError, KeyError, TypeError):
-                metrics["rejection_sampling_parse_error"] = True
-        if line.startswith('{"ready_groups":'):
-            try:
-                metrics["ready_groups"] = json.loads(line)["ready_groups"]
-            except (ValueError, KeyError, TypeError):
-                metrics["ready_groups_parse_error"] = True
-        if line.startswith('{"forecast_work":'):
-            try:
-                metrics["forecast_work"] = json.loads(line)["forecast_work"]
-            except (ValueError, KeyError, TypeError):
-                metrics["forecast_work_parse_error"] = True
-        if line.startswith('{"expert_phases":'):
-            try:
-                metrics["expert_phases"] = json.loads(line)["expert_phases"]
-            except (ValueError, KeyError, TypeError):
-                metrics["expert_phases_parse_error"] = True
-        if line.startswith('{"prefetch_demote":'):
-            try:
-                metrics["prefetch_demote"] = json.loads(line)["prefetch_demote"]
-            except (ValueError, KeyError, TypeError):
-                metrics["prefetch_demote_parse_error"] = True
-        if line.startswith('{"expert_waves":'):
-            try:
-                metrics["expert_waves"] = json.loads(line)["expert_waves"]
-            except (ValueError, KeyError, TypeError):
-                metrics["expert_waves_parse_error"] = True
-        if line.startswith('{"expert_compact":'):
-            try:
-                metrics["expert_compact"] = json.loads(line)["expert_compact"]
-            except (ValueError, KeyError, TypeError):
-                metrics["expert_compact_parse_error"] = True
-        if line.startswith('{"late_preencode":'):
-            try:
-                metrics["late_preencode"] = json.loads(line)["late_preencode"]
-            except (ValueError, KeyError, TypeError):
-                metrics["late_preencode_parse_error"] = True
-        if line.startswith('{"urgent_window":'):
-            try:
-                metrics["urgent_window"] = json.loads(line)["urgent_window"]
-            except (ValueError, KeyError, TypeError):
-                metrics["urgent_window_parse_error"] = True
-        if line.startswith('{"pipeline_limit":'):
-            try:
-                metrics.setdefault("pipeline_limits", []).append(json.loads(line)["pipeline_limit"])
-            except (ValueError, KeyError, TypeError):
-                metrics["pipeline_limit_parse_error"] = True
-        if line.startswith('{"prefetch_pool":'):
-            try:
-                metrics["prefetch_pool"] = json.loads(line)["prefetch_pool"]
-            except (ValueError, KeyError, TypeError):
-                metrics["prefetch_pool_parse_error"] = True
-        if line.startswith('{"draft_expert_batch":'):
-            try:
-                metrics["draft_expert_batch"] = json.loads(line)["draft_expert_batch"]
-            except (ValueError, KeyError, TypeError):
-                metrics["draft_expert_batch_parse_error"] = True
-        if line.startswith('{"draft_cache_stages":'):
-            try:
-                metrics["draft_cache_stages"] = json.loads(line)["draft_cache_stages"]
-            except (ValueError, KeyError, TypeError):
-                metrics["draft_cache_stages_parse_error"] = True
-        if line.startswith('{"early_verify":'):
-            try:
-                metrics["early_verify"] = json.loads(line)["early_verify"]
-            except (ValueError, KeyError, TypeError):
-                metrics["early_verify_parse_error"] = True
-        if line.startswith('{"staged_draft":'):
-            try:
-                metrics["staged_draft"] = json.loads(line)["staged_draft"]
-            except (ValueError, KeyError):
-                metrics["staged_draft_parse_error"] = True
-        if line.startswith('{"prefill_prune":'):
-            try:
-                metrics["prefill_prune"] = json.loads(line)["prefill_prune"]
-            except (ValueError, KeyError, TypeError):
-                metrics["prefill_prune_parse_error"] = True
-        if line.startswith('{"decode_experts":'):
-            try:
-                metrics["decode_experts"] = json.loads(line)["decode_experts"]
-            except (ValueError, KeyError, TypeError):
-                metrics["decode_experts_parse_error"] = True
+        for key in ("workspace", "decode_cache", "context_lookup", "ready_groups", "forecast_work",
+                    "prefill_prune", "decode_experts"):
+            if line.startswith('{"%s":' % key):
+                try:
+                    metrics[key] = json.loads(line)[key]
+                except (ValueError, KeyError, TypeError):
+                    metrics[key + "_parse_error"] = True
         if line.startswith('{"online_predictor_window":'):
             try:
                 metrics.setdefault("online_predictor_windows", []).append(

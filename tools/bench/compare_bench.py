@@ -52,7 +52,7 @@ def workload(name):
     )
     if name == "cache-review":
         body = excerpt("src/engine/io.c", "// Prefetch reads:", "// During a prompt pass")
-        body += excerpt("src/engine/io.c", "int cache_request(", "const Buf *cache_table(")
+        body += excerpt("src/engine/io.c", "int cache_request(", "void cache_load(")
         body += excerpt("src/engine/io.c", "// After a decoded layer", "static void resize(")
         for path in ("tools/checks/prefetch_queue_check.c", "tools/checks/cache_policy_check.c", "src/engine/myds4.h", "src/engine/io.c"):
             body += excerpt(path)
@@ -157,11 +157,11 @@ def run(args, role, prompt, settings, expected, env):
     command += ["--rendered"] if args.harness_session else ["--think", "75"]
     drafts = draft_count(args, role)
     if drafts:
-        command += ["--draft", str(drafts), "--draft-cache", "32", "--draft-trim"]
+        command += ["--draft", str(drafts), "--draft-cache", "32"]
     command += shlex.split(args.control_args if role == "control" else args.candidate_args)
-    if args.quant == "iq2":
-        command += ["--experts", str(args.iq2)]
-    print("EXPERT_BATCH_START " + json.dumps({"role": role, **settings}), flush=True)
+    if args.quant != "mxfp4":
+        command += ["--experts", str(args.experts)]
+    print("COMPARE_START " + json.dumps({"role": role, **settings}), flush=True)
     began = time.monotonic()
     cpu_before = resource.getrusage(resource.RUSAGE_CHILDREN)
     p = guarded_process(command, env, args.timeout, guard["samples"][-1]["memory"], observe_graphics=True,
@@ -171,10 +171,6 @@ def run(args, role, prompt, settings, expected, env):
         raise RuntimeError("model output exceeded its bound")
     stderr = p.stderr.decode(errors="replace")
     metrics = parse_metrics(stderr)
-    grouping = None
-    for line in stderr.splitlines():
-        if line.startswith('{"expert_batch":'):
-            grouping = json.loads(line)["expert_batch"]
     digest = hashlib.sha256(p.stdout).hexdigest()
     think_close = p.stdout.find(b"</think>")
     output_shape = {"bytes": len(p.stdout), "think_close_seen": think_close >= 0,
@@ -190,21 +186,6 @@ def run(args, role, prompt, settings, expected, env):
              metrics.get("prefill", {}).get("tokens") == settings["prompt_tokens"] and
              cache.get("slots_released") == 0 and cache.get("min_bytes", 0) / 1024**3 >= args.cache - .05 and
              cache.get("min_bytes") == cache.get("max_bytes") and (expected is None or digest == expected))
-    if args.kind == "expert_batch" and role == "candidate" and not (grouping and grouping.get("calls", 0)):
-        valid = False
-    if args.kind == "expert_waves" and role == "candidate":
-        waves = metrics.get("expert_waves", {})
-        if not waves.get("layers") or waves.get("batches", 0) <= waves["layers"]:
-            valid = False
-    if args.kind == "expert_compact" and role == "candidate":
-        compact = metrics.get("expert_compact", {})
-        if not compact.get("batches") or not 0 < compact.get("active_experts", 0) <= compact["batches"] * 6:
-            valid = False
-    if args.kind == "prefetch_pool" and role == "candidate":
-        pool = metrics.get("prefetch_pool", {})
-        if (pool.get("limit") not in (4, 8) or not pool.get("admissions") or not pool.get("promotions") or
-                not 0 <= pool.get("members", -1) <= pool.get("peak_members", -1) <= pool["limit"]):
-            valid = False
     if copy_exact is False:
         valid = False
     correctness_valid = valid
@@ -219,7 +200,7 @@ def run(args, role, prompt, settings, expected, env):
         "output_sha256": digest, "output_matches_control": None if expected is None else digest == expected,
         "output_shape": output_shape,
         "copy_exact": copy_exact,
-        "metrics": metrics, "grouping": grouping, "guard": guard,
+        "metrics": metrics, "guard": guard,
         "memory_activity": p.memory_activity,
         "gpu_activity_during_run": p.gpu_activity_samples,
         "background_cpu_helpers": p.background_cpu_helpers,
@@ -240,11 +221,11 @@ def main():
     global SOURCE_REVISION
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--checkpoint", type=Path, required=True)
-    ap.add_argument("--iq2", type=Path)
-    ap.add_argument("--quant", choices=("mxfp4", "iq2"), default="mxfp4")
-    ap.add_argument("--kind", choices=("expert_batch", "expert_waves", "expert_compact", "prefetch_pool", "memory", "representation", "lookup", "draft", "prefill", "cache"), default="expert_batch")
+    ap.add_argument("--experts", type=Path, help="the GGUF expert file (any shard) for --quant iq2 or iq1")
+    ap.add_argument("--quant", choices=("mxfp4", "iq2", "iq1"), default="mxfp4")
+    ap.add_argument("--kind", choices=("memory", "representation", "lookup", "draft", "prefill", "cache"), default="draft")
     ap.add_argument("--control", type=Path, default=ROOT / "build/myds4")
-    ap.add_argument("--candidate", type=Path, default=ROOT / "build/myds4-expert-batch")
+    ap.add_argument("--candidate", type=Path, required=True)
     ap.add_argument("--control-args", default="", help="additional engine arguments, parsed without a shell")
     ap.add_argument("--candidate-args", default="", help="additional engine arguments, parsed without a shell")
     ap.add_argument("--workload", choices=("cache-review", "server-review", "copy-commands", "harness"), default="cache-review")
@@ -272,8 +253,8 @@ def main():
             args.input_tokens + args.tokens <= args.context <= 131072 and 16 <= args.cache <= 80 and 4 <= args.reserve <= 16 and
             5 <= args.gpu_wait <= 600 and 60 <= args.timeout <= 1800 and len(args.order) <= 6):
         ap.error("study configuration exceeds its limits")
-    if args.quant == "iq2" and args.iq2 is None:
-        ap.error("--quant iq2 needs --iq2")
+    if (args.quant != "mxfp4") != bool(args.experts):
+        ap.error("--quant iq2 and iq1 need --experts, and mxfp4 takes none")
     if (args.workload == "harness") != bool(args.harness_session) or (args.harness_session and not args.before_seq):
         ap.error("--workload harness needs --harness-session and --before-seq")
     args.control = args.control.resolve()
@@ -282,7 +263,7 @@ def main():
     _idle(ROOT / "build/myds4", env)
     prompt, count = make_prompt(args, env)
     settings = {"workload": args.workload, "prompt_tokens": count, "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
-                "checkpoint_name": args.checkpoint.name, "expert_file": args.iq2.name if args.quant == "iq2" else None,
+                "checkpoint_name": args.checkpoint.name, "expert_file": args.experts.name if args.experts else None,
                 "requested_tokens": args.tokens, "context": args.context, "cache_gib": args.cache,
                 "reserve_gib": args.reserve, "quant": args.quant,
                 "kind": args.kind, "control_binary": args.control.name, "candidate_binary": args.candidate.name,
@@ -293,12 +274,11 @@ def main():
                 "desktop_load": args.desktop,
                 "temperature": 1, "top_p": 1, "seed": 12345,
                 "think": args.harness_think if args.harness_session else 75, "draft": args.draft,
-                "draft_cache": 32 if args.draft else 0, "draft_trim": bool(args.draft), "online_predictor": False, "substitute": False}
+                "draft_cache": 32 if args.draft else 0, "online_predictor": False, "substitute": False}
     if args.control_draft is not None or args.candidate_draft is not None:
         by_role = {role: draft_count(args, role) for role in ("control", "candidate")}
-        settings.update(draft=None, draft_cache=None, draft_trim=None, draft_by_role=by_role,
-                        draft_cache_by_role={role: 32 if n else 0 for role, n in by_role.items()},
-                        draft_trim_by_role={role: bool(n) for role, n in by_role.items()})
+        settings.update(draft=None, draft_cache=None, draft_by_role=by_role,
+                        draft_cache_by_role={role: 32 if n else 0 for role, n in by_role.items()})
     if args.harness_session:
         settings.update(harness_session=args.harness_session.parent.name, before_seq=args.before_seq,
                         prompt_mode="reconstructed Harness request; recorded tool calls are not executed")
@@ -321,9 +301,9 @@ def main():
         if args.results:
             shown = {"role": role, "valid": record["valid"], "timing_valid": record["timing_valid"],
                      "output_matches_control": record["output_matches_control"], "copy_exact": record["copy_exact"],
-                     "metrics": record["metrics"], "grouping": record["grouping"],
+                     "metrics": record["metrics"],
                      "timing_exclusion": record["timing_exclusion"], "results": str(args.results)}
-        print("EXPERT_BATCH_RESULT " + json.dumps(shown), flush=True)
+        print("COMPARE_RESULT " + json.dumps(shown), flush=True)
         if not record["valid"]:
             raise RuntimeError("invalid comparison: check output identity, cache capacity and completed work")
         if expected is None:

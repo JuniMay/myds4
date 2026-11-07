@@ -5,12 +5,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-// A wait for a value the GPU never signals must end the program with the
-// reason after a minute: not return as if the GPU had written the results it
-// was waiting for (gpu_wait_signal), and not spin forever (gpu_spin_signal).
-// Two spawned copies of this program (Metal does not survive fork) wait at
-// once, one each way, and print "returned" if their wait returns. Takes a
-// minute. Uses the GPU for nothing but the waits: no model, no kernels run.
+// A wait for a value the GPU never signals (gpu_wait_signal) must end the
+// program with the reason after a minute, not return as if the GPU had
+// written the results it was waiting for. A spawned copy of this program
+// (Metal does not survive fork) waits, and prints "returned" if its wait
+// returns. Takes a minute. Uses the GPU for nothing but the wait: no model,
+// no kernels run.
 
 extern char **environ;
 
@@ -45,20 +45,18 @@ static int ended(const char *name, pid_t pid, int fd, int seconds) {
 }
 
 int main(int argc, char **argv) {
-  if (argc == 2 && (!strcmp(argv[1], "--wait") || !strcmp(argv[1], "--spin"))) {
+  if (argc == 2 && !strcmp(argv[1], "--wait")) {
     static const char source[] = "kernel void nothing() {}\n";
     gpu_init(source, sizeof source - 1);
-    if (!strcmp(argv[1], "--wait")) gpu_wait_signal(1ull << 40);  // nothing signals it
-    else gpu_spin_signal(1ull << 40);
+    gpu_wait_signal(1ull << 40);  // nothing signals it
     printf("returned\n");
     fflush(stdout);
     return 0;
   }
-  alarm(200);
-  int wfd, sfd;
-  pid_t w = start(argv[0], "--wait", &wfd), s = start(argv[0], "--spin", &sfd);
-  int ok = ended("gpu_wait_signal", w, wfd, 90);
-  ok &= ended("gpu_spin_signal", s, sfd, 20);  // started with the other: 110 s in all
-  printf("GPU waits that are never signaled end the program: %s\n", ok ? "PASS" : "FAIL");
+  alarm(120);
+  int fd;
+  pid_t w = start(argv[0], "--wait", &fd);
+  int ok = ended("gpu_wait_signal", w, fd, 90);
+  printf("A GPU wait that is never signaled ends the program: %s\n", ok ? "PASS" : "FAIL");
   return !ok;
 }

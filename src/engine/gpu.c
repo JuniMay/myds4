@@ -120,61 +120,25 @@ void gpu_init(const char *source, size_t len) {
   if (profile) atexit(report);
 }
 
-#ifdef MYDS4_PIPELINE_LIMIT
-static unsigned pipeline_limits[128];
-int gpu_kernel_limited(const char *name, unsigned limit) {
-#else
 int gpu_kernel(const char *name) {
-#endif
   for (int i = 0; i < npipes; i++)
     if (!strcmp(names[i], name)
-#ifdef MYDS4_PIPELINE_LIMIT
-        && pipeline_limits[i] == limit
-#endif
     ) return i;
   id fn = MSG(id (*)(id, SEL, id), library, S("newFunctionWithName:"), str(name));
   if (!fn) die("no kernel %s", name);
   id err = 0;
   id p;
-#ifdef MYDS4_PIPELINE_LIMIT
-  if (limit) {
-    id d = MSG(id (*)(id, SEL), MSG(id (*)(id, SEL), (id)objc_getClass("MTLComputePipelineDescriptor"), S("alloc")), S("init"));
-    MSG(void (*)(id, SEL, id), d, S("setComputeFunction:"), fn);
-    MSG(void (*)(id, SEL, unsigned long), d, S("setMaxTotalThreadsPerThreadgroup:"), (unsigned long)limit);
-    p = MSG(id (*)(id, SEL, id, unsigned long, id *, id *), dev,
-            S("newComputePipelineStateWithDescriptor:options:reflection:error:"), d, 0ul, NULL, &err);
-    MSG(void (*)(id, SEL), d, S("release"));
-  } else
-#endif
     p = MSG(id (*)(id, SEL, id, id *), dev, S("newComputePipelineStateWithFunction:error:"), fn, &err);
   if (!p) die("pipeline %s: %s", name, describe(err));
   names[npipes] = name;
   pipes[npipes] = p;
-#ifdef MYDS4_PIPELINE_LIMIT
-  pipeline_limits[npipes] = limit;
-  if (limit) fprintf(stderr, "{\"pipeline_limit\":{\"name\":\"%s\",\"requested\":%u,\"reported\":%lu,\"static_threadgroup_bytes\":%lu}}\n",
-                     name, limit, MSG(unsigned long (*)(id, SEL), p, S("maxTotalThreadsPerThreadgroup")),
-                     MSG(unsigned long (*)(id, SEL), p, S("staticThreadgroupMemoryLength")));
-#endif
   return npipes++;
 }
 
-#ifdef MYDS4_PIPELINE_LIMIT
-int gpu_kernel(const char *name) {
-  unsigned limit = !strcmp(name, "moe_up") ? MYDS4_PIPELINE_LIMIT :
-                   !strcmp(name, "moe_down") ? MYDS4_PIPELINE_DOWN_LIMIT : 0;
-  return gpu_kernel_limited(name, limit);
-}
-#endif
 
 int gpu_threads(int k) {
   return (int)MSG(unsigned long (*)(id, SEL), pipes[k], S("maxTotalThreadsPerThreadgroup"));
 }
-#ifdef MYDS4_LATE_PREENCODE_CHECK
-int gpu_command_status(void) {
-  return (int)MSG(unsigned long (*)(id, SEL), cb, S("status"));
-}
-#endif
 
 Buf gpu_new(size_t size) {
   Buf b = {0};
@@ -236,7 +200,6 @@ void gpu_begin(void) { gpu_encode(gpu_open()); }
 
 // A command buffer that joins the queue only when gpu_submit commits it, so
 // that buffers committed after its opening may run before it.
-void *gpu_open_late(void) { return MSG(id (*)(id, SEL), queue, S("commandBufferWithUnretainedReferences")); }
 
 // Ends the encoding of the current command buffer without committing it.
 void *gpu_close(void) {
@@ -353,18 +316,6 @@ static void unsignaled(uint64_t v) {
 void gpu_wait_signal(uint64_t v) {
   if (!MSG(BOOL (*)(id, SEL, uint64_t, uint64_t), event, S("waitUntilSignaledValue:timeoutMS:"), v, 60000ull))
     unsignaled(v);
-}
-
-// As gpu_wait_signal, spinning: no wake-up delay before what follows. The
-// clock is read every 1,024 polls.
-void gpu_spin_signal(uint64_t v) {
-  double until = 0;
-  for (unsigned i = 0; MSG(uint64_t (*)(id, SEL), event, S("signaledValue")) < v; i++)
-    if (!(i & 1023)) {
-      double t = now();
-      if (!until) until = t + 60;
-      else if (t > until) unsignaled(v);
-    }
 }
 
 static int by_start(const void *a, const void *b) {

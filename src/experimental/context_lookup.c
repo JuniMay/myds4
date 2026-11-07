@@ -105,48 +105,6 @@ ContextDraft context_lookup_propose(const ContextLookup *s, int max_drafts) {
   return lookup_match(s, max_drafts, minimum, minimum == SHORT_KEY);
 }
 
-ContextDraft context_lookup_propose_consensus(const ContextLookup *s, int max_drafts) {
-  ContextDraft out = lookup_match(s, max_drafts, s && s->misses >= 2 ? 16 : LONG_KEY, 0);
-  if (out.count || !s || s->misses >= 2 || s->count < SHORT_KEY || max_drafts < 1) return out;
-  const int32_t *history = s->storage, *previous = history + 2 * s->capacity;
-  const int32_t *heads = history + 3 * s->capacity + s->buckets;
-  int end = s->count - 1;
-  for (int i = 0; i < SHORT_KEY; i++) if (history[end - i] < 0) return out;
-  int sources[CONTEXT_LOOKUP_SEARCH], count = 0, checked = 0;
-  int at = heads[bucket(s, history, end, SHORT_KEY)];
-  if (at == end) at = previous[at];
-  for (; at >= 0 && checked < CONTEXT_LOOKUP_SEARCH; at = previous[at]) {
-    checked++, out.examined++;
-    if (!memcmp(history + at - SHORT_KEY + 1, history + end - SHORT_KEY + 1, SHORT_KEY * sizeof *history))
-      sources[count++] = at + 1;
-  }
-  int total = count;
-  if (max_drafts > 4) max_drafts = 4;
-  for (int depth = 0; count >= 2 && depth < max_drafts; depth++) {
-    int32_t values[CONTEXT_LOOKUP_SEARCH];
-    int votes[CONTEXT_LOOKUP_SEARCH] = {0}, distinct = 0, best = -1;
-    for (int i = 0; i < count; i++) {
-      int pos = sources[i] + depth;
-      if (pos >= s->count || history[pos] < 0) continue;
-      int k = 0;
-      while (k < distinct && values[k] != history[pos]) k++;
-      if (k == distinct) values[distinct++] = history[pos];
-      votes[k]++;
-    }
-    for (int k = 0; k < distinct; k++)
-      if (best < 0 || votes[k] > votes[best] || (votes[k] == votes[best] && values[k] < values[best])) best = k;
-    // Support is measured against the original candidates for the whole
-    // prefix, not renormalized after each token.
-    if (best < 0 || votes[best] < 2 || 5 * votes[best] < 4 * total) break;
-    out.tokens[out.count++] = values[best];
-    int keep = 0;
-    for (int i = 0; i < count; i++)
-      if (sources[i] + depth < s->count && history[sources[i] + depth] == values[best]) sources[keep++] = sources[i];
-    count = keep, out.source = sources[0], out.matched = SHORT_KEY;
-  }
-  return out;
-}
-
 int context_lookup_feedback(ContextLookup *s, int offered, int accepted) {
   if (!s || offered < 0 || offered > CONTEXT_LOOKUP_DRAFTS || accepted < 0 || accepted > offered) return 0;
   if (!offered) return 1;

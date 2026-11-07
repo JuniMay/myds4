@@ -1,10 +1,8 @@
-"""Compare server throughput or direct model decoding on DSH requests.
+"""Compare server throughput on concurrent DSH requests over HTTP.
 
 One server runs at a time. Prompts, answers and diagnostics stay in memory;
 the optional report stores counts, timings and response digests. Tool calls
 produced by the model are never executed.
-With --direct-binary, every prompt is prefilled cold before decoding starts.
-This mode measures the model API; it does not measure HTTP or prefix reuse.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -16,7 +14,6 @@ from pathlib import Path
 import re
 import secrets
 import socket
-import struct
 import subprocess
 import threading
 import time
@@ -53,68 +50,13 @@ def requests(args):
         n = len(counted.strip().split(b","))
         if n + args.tokens > args.context:
             raise ValueError("request exceeds the context budget")
-        bodies.append(rendered if args.direct_binary else payload)
+        bodies.append(payload)
         identities.append({"before_seq": seq, "prompt_tokens": n, "request_sha256": hashlib.sha256(payload).hexdigest()})
     return bodies, identities
 
 
-def run_direct(args, mode, bodies, identities, budget, credit, runahead):
-    """Prepare all states cold, then time only their model decoding work."""
-    batch, share = int(mode.split(":")[0]), mode.endswith(":on")
-    payload = struct.pack("<I", len(bodies)) + b"".join(struct.pack("<I", len(p)) + p for p in bodies)
-    if len(payload) > 12 * 1024**2 + 28:
-        raise ValueError("prepared prompts exceed the input bound")
-    env = {k: v for k, v in os.environ.items() if not k.startswith("MYDS4_")}
-    env["MYDS4_LOCK"] = str(ROOT / "build/myds4.lock")
-    if budget >= 0:
-        env["MYDS4_BATCH_PREFETCH_LIMIT"] = str(budget)
-    if credit:
-        env["MYDS4_BATCH_USAGE_CREDIT"] = str(credit)
-    if runahead:
-        env["MYDS4_RUNAHEAD"] = str(runahead)
-    guard = wait_for_gpu(args.cache, 60, args.reserve, desktop=True, quiet_cpu=True)
-    command = [str(args.direct_binary), str(args.checkpoint), str(args.context), str(args.tokens),
-               str(args.cache), str(args.reserve), str(batch), str(int(share)), str(int(args.prefill_prune))]
-    if args.experts:
-        command.append(str(args.experts))
-    print("SESSION_MODEL_START " + json.dumps({"mode": mode, "prefetch_budget_units": budget,
-          "usage_credit": credit, "runahead": runahead, "requests": len(bodies)}), flush=True)
-    p = guarded_process(command, env, args.timeout, guard["samples"][-1]["memory"], observe_graphics=True,
-                        allow_cpu_helpers=True, abort_cpu_contention=True, input_data=payload)
-    if len(p.stdout) > 65536 or len(p.stderr) > 256 * 1024:
-        raise ValueError("model probe output exceeded its bound")
-    rows = [json.loads(line)["session_model"] for line in p.stdout.decode().splitlines()
-            if line.startswith('{"session_model":')]
-    result = rows[0] if len(rows) == 1 else {}
-    generated = result.get("generated_tokens", 0)
-    outputs = result.get("outputs", [])
-    valid = (p.returncode == 0 and result.get("thread_qos") == "user_interactive" and
-             len(outputs) == len(bodies) and generated >= 128 * len(bodies) and
-             generated == result.get("computed_rows") and result.get("selected_experts") == generated * 40 * 6 and
-             result.get("prefetch_budget_units") == budget and result.get("usage_credit") == credit and
-             result.get("runahead", 0) == runahead and
-             result.get("substituted") == 0 and result.get("slots_released") == 0 and
-             result.get("cache_min_bytes", 0) >= (args.cache - .05) * 1024**3 and
-             result.get("cache_start_bytes") == result.get("cache_min_bytes") == result.get("cache_max_bytes") and
-             all(r["prompt_tokens"] == identity["prompt_tokens"] and r["generated_tokens"] > 0
-                 for r, identity in zip(outputs, identities)))
-    if batch > 1 and len(bodies) > 1 and not any(result.get("batches", [])[1:]):
-        valid = False
-    if runahead == 5:
-        sizes = result.get("batches", [])
-        valid &= (len(sizes) == 6 and result.get("head_batches") == sum(sizes[1:]) and
-                  result.get("head_rows") == generated - sizes[0])
-    if not valid and p.stderr:
-        print(p.stderr.decode(errors="replace")[-2000:], flush=True)
-    return {"mode": mode, "prefetch_budget_units": budget, "usage_credit": credit, "runahead": runahead,
-            "valid": valid, "date_utc": datetime.now(timezone.utc).isoformat(),
-            "outputs": outputs, "model": result, "guard": guard,
-            "cpu_peak": p.background_cpu_peak, "gpu_activity_during_run": p.gpu_activity_samples,
-            "exit": p.returncode}
-
-
-def run(args, mode, bodies, budget=-1, credit=0, runahead=0):
-    batch, share = int(mode.split(":")[0]), mode.endswith(":on")
+def run(args, mode, bodies, runahead=0):
+    batch = int(mode)
     guard = wait_for_gpu(args.cache, 60, args.reserve, desktop=True, quiet_cpu=True)
     baseline = guard["samples"][-1]["memory"]
     with socket.socket() as sock:
@@ -123,15 +65,9 @@ def run(args, mode, bodies, budget=-1, credit=0, runahead=0):
     key = secrets.token_hex(24)
     env = {k: v for k, v in os.environ.items() if not k.startswith("MYDS4_")}
     env.update(MYDS4_API_KEY=key, MYDS4_LOCK=str(ROOT / "build/myds4.lock"))
-    if budget >= 0:
-        env["MYDS4_BATCH_PREFETCH_LIMIT"] = str(budget)
-    if credit:
-        env["MYDS4_BATCH_USAGE_CREDIT"] = str(credit)
     command = [str(args.binary), "-m", str(args.checkpoint), "--serve", str(port), "--ctx", str(args.context),
                "--cache", str(args.cache), "--reserve", str(args.reserve), "--kv-cache", "4", "--batch", str(batch),
                "--temperature", "1", "--top-p", "1", "--seed", "12345"]
-    if share:
-        command += ["--expert-batch"]
     if runahead:
         command += ["--runahead"]
     if args.prefill_prune:
@@ -143,7 +79,6 @@ def run(args, mode, bodies, budget=-1, credit=0, runahead=0):
     done = threading.Event()
     failures, prefill_times, seen_batches = [], [], []
     counters = {"log_bytes": 0, "cpu_peak": 0.0, "maximum_cache_slots": 0, "cache_shrank": False,
-                "budget_seen": None, "credit_seen": None,
                 "request_running": False, "timing_cpu_peak": 0.0, "startup_cpu_peak": 0.0}
     grouping = {}
     lock = threading.Lock()
@@ -158,18 +93,8 @@ def run(args, mode, bodies, budget=-1, credit=0, runahead=0):
                 m = re.search(r"batch: (\d+) requests decoding together", line)
                 if m:
                     seen_batches.append(int(m[1]))
-                m = re.search(r"batch prefetch study: units=(\d+)", line)
-                if m:
-                    counters["budget_seen"] = int(m[1])
-                m = re.search(r"batch usage credit: enabled=(\d+)", line)
-                if m:
-                    counters["credit_seen"] = int(m[1])
-                if line.startswith('{"expert_batch":'):
-                    grouping.update(json.loads(line)["expert_batch"])
                 if line.startswith('{"ready_groups":'):
                     grouping["ready"] = json.loads(line)["ready_groups"]
-                if line.startswith('{"expert_waves":'):
-                    grouping["expert_waves"] = json.loads(line)["expert_waves"]
                 overflow = counters["log_bytes"] > 4 << 20
             if overflow:
                 failures.append("diagnostic output exceeded 4 MiB")
@@ -293,17 +218,10 @@ def run(args, mode, bodies, budget=-1, credit=0, runahead=0):
                  final["expert_cache"]["gib"] >= args.cache - .1 and generated >= 128 * len(bodies))
         if batch > 1 and len(bodies) > 1 and not seen_batches:
             valid = False
-        if budget >= 0 and counters["budget_seen"] != budget:
-            failures.append("server did not enable the requested study budget")
-            valid = False
-        if credit and counters["credit_seen"] != credit:
-            failures.append("server did not enable concurrent-use credit")
-            valid = False
         if initial.get("runahead") != bool(runahead):
             failures.append("server did not apply the public runahead option")
             valid = False
-        return {"mode": mode, "prefetch_budget_units": budget, "usage_credit": credit, "runahead": runahead,
-                "valid": valid, "date_utc": datetime.now(timezone.utc).isoformat(),
+        return {"mode": mode, "runahead": runahead, "valid": valid, "date_utc": datetime.now(timezone.utc).isoformat(),
                 "generated_tokens": generated, "request_wall_seconds": elapsed, "reported_prefill_seconds": prefill,
                 "aggregate_tokens_per_second": generated / elapsed,
                 "aggregate_excluding_reported_prefill_tokens_per_second": generated / max(elapsed - prefill, 1e-9),
@@ -329,12 +247,9 @@ def main():
     parser.add_argument("--binary", type=Path, default=ROOT / "build/myds4-server")
     parser.add_argument("--run-binaries", type=Path, nargs="+",
                         help="one server executable per mode for matched HTTP comparisons; --binary renders requests")
-    parser.add_argument("--direct-binary", type=Path, help="use session-probe for model decoding after all cold prefills; --binary still renders requests")
     parser.add_argument("--experts", type=Path)
-    parser.add_argument("--modes", nargs="+", default=["1:off", "2:off", "2:on", "1:off"])
-    parser.add_argument("--prefetch-budgets", type=int, nargs="+", help="one value per mode; -1 keeps the default, 0-4 require the study server")
-    parser.add_argument("--usage-credits", type=int, nargs="+", help="one 0/1 value per mode; 1 requires the study server")
-    parser.add_argument("--runahead", type=int, nargs="+", help="one 0-5 value per mode; 1 waits per job, 2 uses events, 3 groups ready jobs, 4 regroups after a read wait, 5 uses mode 3 with a batched output head; HTTP supports 0/3 through --runahead; direct model probes support 0-5")
+    parser.add_argument("--modes", nargs="+", default=["1", "2", "1"], help="the server's --batch for each run: 1, 2, 4 or 6")
+    parser.add_argument("--runahead", type=int, nargs="+", help="one 0/1 value per mode: the server's --runahead")
     parser.add_argument("--tokens", type=int, default=512)
     parser.add_argument("--context", type=int, default=65536)
     parser.add_argument("--cache", type=float, default=56)
@@ -344,37 +259,24 @@ def main():
     parser.add_argument("--describe", action="store_true")
     parser.add_argument("--results", type=Path)
     args = parser.parse_args()
-    if args.prefetch_budgets is None:
-        args.prefetch_budgets = [-1] * len(args.modes)
-    if args.usage_credits is None:
-        args.usage_credits = [0] * len(args.modes)
     if args.runahead is None:
         args.runahead = [0] * len(args.modes)
     if not (1 <= len(args.before_seq) <= 6 and len(set(args.before_seq)) == len(args.before_seq)
-            and 128 <= args.tokens <= (8192 if args.direct_binary else 2048) and 16384 <= args.context <= 131072 and 16 <= args.cache <= 80
+            and 128 <= args.tokens <= 2048 and 16384 <= args.context <= 131072 and 16 <= args.cache <= 80
             and 4 <= args.reserve <= 16 and 120 <= args.timeout <= 1800 and len(args.modes) <= 6
-            and len(args.prefetch_budgets) == len(args.modes) and all(-1 <= n <= 4 for n in args.prefetch_budgets)
-            and len(args.usage_credits) == len(args.modes) and all(n in (0, 1) for n in args.usage_credits)
-            and len(args.runahead) == len(args.modes) and all(n in (0, 1, 2, 3, 4, 5) for n in args.runahead)
-            and all(re.fullmatch(r"[1246]:(on|off)", s) for s in args.modes)):
+            and len(args.runahead) == len(args.modes) and all(n in (0, 1) for n in args.runahead)
+            and all(re.fullmatch(r"[1246]", s) for s in args.modes)):
         parser.error("configuration exceeds study bounds")
-    if args.run_binaries and (args.direct_binary or len(args.run_binaries) != len(args.modes)):
+    if args.run_binaries and len(args.run_binaries) != len(args.modes):
         parser.error("--run-binaries needs one executable per HTTP mode")
     args.binary = args.binary.resolve()
     run_binaries = [p.resolve() for p in (args.run_binaries or [args.binary] * len(args.modes))]
     run_hashes = [hashlib.sha256(p.read_bytes()).hexdigest() for p in run_binaries]
-    if not args.direct_binary and any(n not in (0, 3) for n in args.runahead):
-        parser.error("HTTP comparisons use public runahead mode 0 or 3; modes 1-5 require --direct-binary")
-    if args.direct_binary:
-        args.direct_binary = args.direct_binary.resolve()
     bodies, identities = requests(args)
     settings = {"requests": identities, "tokens": args.tokens, "context": args.context, "cache_gib": args.cache,
                 "reserve_gib": args.reserve, "prefill_prune": args.prefill_prune, "temperature": 1, "top_p": 1,
                 "seed": 12345, "binary_sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest(),
                 "checkpoint": args.checkpoint.name, "experts": args.experts.name if args.experts else None}
-    if args.direct_binary:
-        settings.update(direct_binary=args.direct_binary.name,
-                        direct_binary_sha256=hashlib.sha256(args.direct_binary.read_bytes()).hexdigest())
     if args.run_binaries:
         settings["run_binaries"] = [{"name": p.name, "sha256": digest}
                                     for p, digest in zip(run_binaries, run_hashes)]
@@ -384,36 +286,20 @@ def main():
     report = {"schema_version": 1, "scope": "Concurrent reconstructed DSH requests; generated tools not executed. "
               "Response identity covers returned text/reasoning/tool arguments, excluding generated call IDs. "
               "Decode estimate subtracts logged prefill wall time; it is not a GPU-only rate.", "settings": settings, "runs": []}
-    if args.direct_binary:
-        report["scope"] = ("Model API comparison on independent states, all prompts prefilled cold before the decode timer. "
-                           "No HTTP, prefix reuse, DSpark or substitution. Temperature/top-p 1, seed 12345 per state. "
-                           "Output identity covers little-endian uint32 token IDs. Generated tool calls are not executed. "
-                           "This is model throughput, not client latency or a server scheduler comparison.")
     if args.results and args.results.exists():
         old = json.loads(args.results.read_text())
         report["previous_attempts"] = old.get("previous_attempts", []) + old.get("runs", [])
     expected = None
-    for mode, budget, credit, runahead, binary, digest in zip(
-            args.modes, args.prefetch_budgets, args.usage_credits, args.runahead, run_binaries, run_hashes):
+    for mode, runahead, binary, digest in zip(args.modes, args.runahead, run_binaries, run_hashes):
         if hashlib.sha256(args.binary.read_bytes()).hexdigest() != settings["binary_sha256"]:
             raise RuntimeError("server executable changed during the comparison")
-        if args.direct_binary:
-            if hashlib.sha256(args.direct_binary.read_bytes()).hexdigest() != settings["direct_binary_sha256"]:
-                raise RuntimeError("model probe executable changed during the comparison")
-            record = run_direct(args, mode, bodies, identities, budget, credit, runahead)
-        else:
-            if hashlib.sha256(binary.read_bytes()).hexdigest() != digest:
-                raise RuntimeError("server executable changed during the comparison")
-            run_args = argparse.Namespace(**vars(args))
-            run_args.binary = binary
-            record = run(run_args, mode, bodies, budget, credit, runahead)
-            record["server_binary"] = {"name": binary.name, "sha256": digest}
-            if binary.name == "myds4-server-expert-waves":
-                waves = record["grouping"].get("expert_waves", {})
-                exercised = waves.get("batches", 0) > waves.get("layers", 0) > 0
-                record["expert_waves_exercised"] = exercised
-                record["valid"] &= exercised
-        hashes = [r["token_sha256" if args.direct_binary else "response_sha256"] for r in record["outputs"]]
+        if hashlib.sha256(binary.read_bytes()).hexdigest() != digest:
+            raise RuntimeError("server executable changed during the comparison")
+        run_args = argparse.Namespace(**vars(args))
+        run_args.binary = binary
+        record = run(run_args, mode, bodies, runahead)
+        record["server_binary"] = {"name": binary.name, "sha256": digest}
+        hashes = [r["response_sha256"] for r in record["outputs"]]
         record["responses_match_control"] = None if expected is None else hashes == expected
         record["valid"] &= expected is None or hashes == expected
         report["runs"].append(record)

@@ -124,7 +124,7 @@ static void refined_empty_setup(void) {
          score[0] == -INFINITY && !slots[0].loading && !atomic_load(&prefetching));
   // This is the next operation in read_ahead/read_residual_ahead. Already
   // resident candidates do not consume the slot before actual routing.
-  cache_prefetch(1, &keep, 1, 1, 6);
+  cache_prefetch(1, &keep, 1, 6);
   expect("resident forecast leaves the refined slot available", slots[0].expert == -1 && where[1][2] == 2);
 }
 
@@ -140,12 +140,10 @@ static void refined_empty_reuse(void) {
   refined_empty_setup();
   serving = 1;
   expect("the serving layer permits a refined empty slot", victim() == 0);
-#ifdef MYDS4_RUNAHEAD
   slots[0].holds = 1;
   expect("a reservation still excludes an otherwise empty slot", victim() == 1);
   slots[0].holds = 0;
   expect("releasing the reservation restores empty-slot eligibility", victim() == 0);
-#endif
 }
 
 int main(void) {
@@ -157,15 +155,6 @@ int main(void) {
   expect("default clock doubles weight over 50 advances", near(weight, 2));
   expect("clock counts forward advances", token == 60);
   expect("aging preserves raw history between rescalings", escore[0] == 1 && score[0] == 1);
-  slots[0].used = token;
-  CacheStats stats_before = cache_stats;
-  double added = weight * 2;
-  cache_repeat_credit(0, 0, 2);
-  expect("repeated row uses update resident and persistent priority", near(score[0], 1 + added) && score[0] == escore[0]);
-  expect("repeated row uses add no read or cache events", !memcmp(&stats_before, &cache_stats, sizeof stats_before));
-  expect("repeated use protects the more frequent expert", victim() == 1);
-  cache_repeat_credit(0, 0, 0);
-  expect("zero repeated uses leave priority unchanged", near(score[0], 1 + added));
   rejected("negative half-life rejected", bad_half);
   rejected("excessive half-life rejected", too_large_half);
   rejected("invalid weighting flag rejected", bad_cost);
