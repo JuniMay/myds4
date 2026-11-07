@@ -261,6 +261,7 @@ typedef struct {
   int pinned;      // a DSpark pool buffer, exempt from backbone eviction/unmapping
   int fresh;       // joined the residency set this token: needs gpu_use until it is committed
   int mapped;      // in the residency set (or joining it: fresh)
+  int mapped_once; // this buffer has been mapped; the next mapping is a remap
   uint64_t used;   // token of the last use
   unsigned holds; // jobs awaiting or using this expert; released after GPU completion
   dispatch_group_t loading;  // owned until finish(), including after its reads complete
@@ -832,7 +833,8 @@ static void map_slot(int i) {
   gpu_resident(&slots[i].b, 1);
   slots[i].mapped = 1, slots[i].fresh = 1;
   nmapped++;
-  cache_stats.remaps++;
+  if (slots[i].mapped_once) cache_stats.remaps++;
+  slots[i].mapped_once = 1;
 }
 
 static int take(int layer, int e, int optional) {
@@ -862,7 +864,7 @@ static int take(int layer, int e, int optional) {
     slots[i].b = gpu_new(SLOT_SIZE);
     // CPU reads fill the buffer. cache_get maps it when GPU work uses it;
     // a forecast that is never selected does not occupy GPU residency.
-    slots[i].mapped = slots[i].fresh = 0;
+    slots[i].mapped = slots[i].fresh = slots[i].mapped_once = 0;
     nslots++;
   }
   slots[i].prefetched = 0;

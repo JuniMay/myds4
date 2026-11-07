@@ -36,6 +36,7 @@ int main(void) {
   int fresh;
   CHECK(cache_get(0, 0, at, &fresh) == &slots[a].b);
   CHECK(nmapped == 1 && added == 1 && fresh && slots[a].mapped);
+  CHECK(cache_stats.remaps == 0);
   CHECK(cache_get(0, 0, at, &fresh) == &slots[a].b);
   CHECK(nmapped == 1 && added == 1);
   // Reusing an old mapped buffer for a forecast must release its mapping.
@@ -45,6 +46,7 @@ int main(void) {
   CHECK(reused == a && nmapped == 0 && removed == 1 && !slots[a].mapped);
   CHECK(cache_get(2, 0, at, &fresh) == &slots[a].b);
   CHECK(nmapped == 1 && added == 2 && fresh);
+  CHECK(cache_stats.remaps == 1);
   CHECK(nslots == 2 && where[0][0] == -1 && where[2][0] == a);
   for (int i = 0; i < 2; i++) fixture_free(&fixture[i].b);
   fprintf(stderr, "cache mapping: %d/%d CPU checks passed\n", checks - failures, checks);

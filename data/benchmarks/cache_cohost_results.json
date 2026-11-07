@@ -122,8 +122,8 @@
         11
       ],
       "mapping": [
-        12,
-        12
+        14,
+        14
       ],
       "available": [
         11,
@@ -179,6 +179,10 @@
       "different_logits": 0,
       "min_free_gib": 31.661483764648438,
       "swapout_delta": 0
+    },
+    "remap_counter_regression": {
+      "before": "Two checks failed: initial mapping was counted as a remap.",
+      "after": "Both checks pass; the full mapping fixture passes 14 of 14."
     }
   },
   "limitations": [
