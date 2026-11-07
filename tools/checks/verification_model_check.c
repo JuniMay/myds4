@@ -1,5 +1,6 @@
 // Wide target verification and rejected-row rollback against serial decoding.
 #include "myds4.h"
+#include "../../src/model/model.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
