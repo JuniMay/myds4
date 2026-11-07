@@ -20,8 +20,8 @@ The measurement records remain in `data/benchmarks/`. Each section names
 the records it draws on; they add detail, such as every run's settings and
 counters. The README and the design, usage, server and performance
 documents describe only the code that remains, and point here for these
-experiments. One study build remains in the code: the prediction probe, a
-diagnostic capture tool, which the design document describes. Causal
+experiments. Current diagnostic tools and experimental paths are described
+in the design document. Causal
 verification was kept for measurements at large caches and then removed.
 
 ## Background

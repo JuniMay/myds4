@@ -48,6 +48,7 @@ in [Removed experiments](experiments.md).
 | `src/experimental/context_lookup.c`, `src/experimental/context_lookup.h` | Bounded CPU history matching for the CLI and server's context-copy drafts. |
 | `src/experimental/prefill_prune.h` | The dependency plan of `--prefill-prune`. |
 | `src/experimental/runahead.c` | `--runahead`'s scheduler for concurrent requests; included by `deepseek.c`. |
+| `src/experimental/moe_tasks.metal` | Standalone prototype that dispatches ready MXFP4 expert stages from different layers together; used only by `build/moe-tasks-check`. |
 | `src/engine/engine.c`, `src/engine/engine.h` | The engine behind a C ABI for the server: loading, attention states and their snapshots, prefill (with a replay: exact, or bounded under `--ced`, and a capture position), decoding, drafts, sampling, context-copy drafts, images, statistics, the tokenizer and the log. Requests, their scheduling and the KV prefix cache are the server's (see [The server](server.md)). |
 | `src/kernels/library.c` | Every kernel source in one string, compiled once per process (`gpu_start`). |
 | `src/kernels/formats.metal` | The number formats every source decodes (E4M3, E2M1, BF16) and small shared functions. |
@@ -1413,6 +1414,35 @@ server executable per mode. It compares returned text, reasoning and tool
 arguments, and records prefill, client latency, model execution counters,
 cache capacity and expert reads. It never executes generated tools. These
 are workload replays rather than an autonomous agent quality benchmark.
+
+### Experimental multi-layer expert work
+
+`src/experimental/moe_tasks.metal` and `tools/experimental/moe_tasks_check.c`
+test one building block for pipelined decoding. Each task describes a ready
+gate/up stage or a ready down stage for one request and layer. A single
+dispatch can contain both kinds of task from different layers. Each
+threadgroup takes one task's tile, so requests keep separate activations,
+outputs and expert tables. Tiles retain the ordinary scalar MXFP4 products,
+SIMD reductions, BF16 rounding, activation quantization and ordered expert
+sum. Down work uses six SIMD groups; the other two groups in the
+256-thread launch participate in the barrier without reading experts.
+
+The host must submit only independent ready tasks. A down task needs its
+own completed gate/up output. The shader has no device-wide spin barrier
+and does not wait for expert reads. The standalone check uses 24 resident
+experts from four checkpoint layers and synthetic activations. It checks
+all intermediate and final bytes, finite values, and unchanged outputs of
+inactive jobs. It then times warmed kernels. It is not part of the default
+Metal library, CLI or server. Measurements are in
+[Performance](performance.md#multi-layer-expert-task-prototype).
+
+Full pipelined decoding remains unimplemented. It needs request-owned
+scratch for every stage that can overlap, a queue of ready stages with
+explicit GPU completion and SSD-read dependencies, and expert reservations
+that last through GPU use. The scheduler must preserve each request's
+attention state, routing, reduction and sampling order. Model-level logit
+and state comparisons and matched HTTP throughput tests are still required.
+The current runahead scheduler above is a separate implementation.
 
 ### Prompts
 

@@ -14,6 +14,46 @@ faster than other text. A speed measurement holds only for the text it
 decoded: check what the generated text looks like (`rows-bench`'s `--show`
 and `distinct_8grams`, or the CLI's output) before taking a result as valid.
 
+## Multi-layer expert-task prototype
+
+On 2026-11-07, `build/moe-tasks-check` compared the ordinary native MXFP4
+expert kernels with one dispatch containing ready expert stages from
+different layers. This is a kernel test of DeepSeek V4.1 Flash
+(`deepseek-ai/DeepSeek-V4.1-Flash-1017`) on the M5 Max described below.
+It loads 24 experts from layers 3, 11, 23 and 37, about 453 MB. Inputs are
+synthetic; weights stay resident. No complete model, prompts, generated
+tokens, drafts or server requests run. The 16 GiB cache limit allocates only
+the 24 needed slots; it is not a model-throughput cache configuration.
+
+The prototype combines ready gate/up stages and down stages, with six
+experts per task. In mixed cases, the stages belong to independent requests;
+each down stage already has its input. Eight cases with one, two or four
+jobs matched both intermediate activations and final BF16 outputs byte for
+byte, preserved inactive outputs, and produced no nonfinite values.
+
+Each case warms both paths for 48 repetitions, then alternates their order
+over three paired samples of 48 repetitions. These are median GPU times
+per complete work set, not per token:
+
+| Ready tasks | Ordinary dispatches | Combined dispatch | GPU time change |
+| --- | ---: | ---: | ---: |
+| One gate/up | 148.571 µs | 157.538 µs | +6.0% |
+| One down | 69.120 µs | 74.241 µs | +7.4% |
+| Two gate/up | 307.524 µs | 296.716 µs | −3.5% |
+| Two down | 168.760 µs | 164.382 µs | −2.6% |
+| One gate/up, one down | 248.346 µs | 217.253 µs | −12.5% |
+| Four gate/up | 628.891 µs | 556.654 µs | −11.5% |
+| Four down | 353.846 µs | 302.198 µs | −14.6% |
+| Two gate/up, two down | 489.806 µs | 418.703 µs | −14.5% |
+
+The task descriptor and branch cost more for one job. The multi-job
+measurements justify testing a scheduler that supplies independent ready
+stages; they do not establish a decoding speedup. Routing, attention, SSD
+waits, state ownership and the server scheduler are outside this fixture.
+The prototype is not enabled in inference. Free memory stayed above
+60.99 GiB and no swap-outs were recorded.
+[Measurement record](../data/benchmarks/moe_tasks_results.json).
+
 ## Machine
 
 Apple M5 Max (18 CPU cores: 6 performance, 12 efficiency), 128 GiB unified

@@ -278,6 +278,12 @@ build/rows-bench: tools/bench/rows_bench.c $(SRC) $(MODEL_HEADERS) $(KERNELS) da
 
 # ---- Diagnostics ----
 
+# Ready MXFP4 stages from different layers in one experimental dispatch.
+# Reads 24 experts, no complete model; does not measure decoder throughput.
+build/moe-tasks-check: tools/experimental/moe_tasks_check.c src/experimental/moe_tasks.metal src/kernels/formats.metal src/kernels/kernels.metal src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/myds4.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/experimental/moe_tasks_check.c src/engine/io.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
+
 # Diagnostic pipe capture only; its synchronous writes change inference timing.
 build/myds4-predict-probe: $(SRC) tools/experimental/predict_probe.c $(MODEL_HEADERS) $(KERNELS) data/engram.bin
 	@mkdir -p build
