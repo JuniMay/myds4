@@ -316,7 +316,7 @@ kernel void moe_up(constant Expert *ex [[buffer(0)]], device const float *x [[bu
                    device float *h [[buffer(2)]], uint2 tg [[threadgroup_position_in_grid]],
                    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float block[32];
-  if (!ex[tg.y].p[0]) return;  // a null entry (see resolve)
+  if (!ex[tg.y].p[0]) return;  // a null entry: no expert
   uint row = (tg.x * 8 + sg) * 4, e = tg.y;
   constexpr uint K = 5120, W = K / 2 * 2304, S = K / 32 * 2304;
   device const uchar *w = ex[e].p[0] + row * (K / 2), *s = ex[e].p[1] + row * (K / 32);
@@ -349,7 +349,7 @@ kernel void moe_down(constant Expert *ex [[buffer(0)]], device const float *h [[
                      uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
                      uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float4 part[8];
-  if (!pm && !ex[0].p[0]) return;  // null entries (see resolve)
+  if (!pm && !ex[0].p[0]) return;  // null entries: no expert
   if (pm && !ex[sg].p[0]) return;
   uint d = tg * 4;
   constexpr uint K = 2304, W = 5120 * 2304 / 2, S = 5120 * 2304 / 32;
@@ -391,107 +391,6 @@ kernel void moe_parts(device const float *parts [[buffer(0)]], device const floa
     for (uint j = 0; j < 4; j++) v += mix[8 + 4 * j + k] * res[j * 5120 + i];
     out[k * 5120 + i] = bfloat(bf(v));
   }
-}
-
-// Three rows can share the weights without sharing their floating-point
-// accumulators. The descriptor keeps their original expert-sorted slots.
-struct ExpertRows {
-  device const uchar *p[3];
-  uint row[3], slot[3];
-  float weight[3];
-  uint count;
-};
-
-template <uint N>
-inline void fp4_chunk4_rows(device const uchar *w, device const uchar *s, uint stride,
-                            device const float4 *x, thread const uint *xo, uint c,
-                            thread float4 *acc) {
-  #pragma unroll
-  for (uint r = 0; r < 4; r++) {
-    uint4 q = ((device const uint4 *)(w + r * stride))[c];
-    float4 d[N];
-    #pragma unroll
-    for (uint j = 0; j < N; j++) d[j] = 0;
-    #pragma unroll
-    for (uint i = 0; i < 4; i++) {
-      float4 a, b;
-      fp4x8(q[i], a, b);
-      #pragma unroll
-      for (uint j = 0; j < N; j++)
-        d[j] += a * x[xo[j] + 8 * c + 2 * i] + b * x[xo[j] + 8 * c + 2 * i + 1];
-    }
-    float scale = e8m0(s[r * (stride / 16) + c]);
-    #pragma unroll
-    for (uint j = 0; j < N; j++) acc[j][r] += (d[j].x + d[j].y + d[j].z + d[j].w) * scale;
-  }
-}
-
-template <uint N>
-inline void moe_up_rows_n(constant ExpertRows &g, device const float *x, device float *h,
-                          uint2 tg, uint sg, uint lane, threadgroup float *block) {
-  constexpr uint K = 5120, W = K / 2 * 2304, S = K / 32 * 2304;
-  uint row = (tg.x * 8 + sg) * 4, xo[N];
-  float4 a[N], b[N];
-  #pragma unroll
-  for (uint j = 0; j < N; j++) xo[j] = g.row[j] * K / 4, a[j] = 0, b[j] = 0;
-  device const uchar *w = g.p[0] + row * (K / 2), *s = g.p[1] + row * (K / 32);
-  for (uint c = lane; c < K / 32; c += 32) {
-    fp4_chunk4_rows<N>(w, s, K / 2, (device const float4 *)x, xo, c, a);
-    fp4_chunk4_rows<N>(w + 2 * W, s + 2 * S, K / 2, (device const float4 *)x, xo, c, b);
-  }
-  #pragma unroll
-  for (uint j = 0; j < N; j++) {
-    float4 av = float4(simd_sum(a[j].x), simd_sum(a[j].y), simd_sum(a[j].z), simd_sum(a[j].w));
-    float4 bv = float4(simd_sum(b[j].x), simd_sum(b[j].y), simd_sum(b[j].z), simd_sum(b[j].w));
-    if (lane < 4) {
-      float gate = min(bf(av[lane]), 10.0f), u = clamp(bf(bv[lane]), -10.0f, 10.0f);
-      block[j * 32 + sg * 4 + lane] = bf(gate / (1.0f + exp(-gate)) * u * g.weight[j]);
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (sg == 0) {
-    #pragma unroll
-    for (uint j = 0; j < N; j++)
-      h[(g.row[j] * 6 + g.slot[j]) * 2304 + tg.x * 32 + lane] = fp8_act(block[j * 32 + lane]);
-  }
-}
-
-template <uint N>
-inline void moe_down_rows_n(constant ExpertRows &g, device const float *h, device float *parts,
-                            uint2 tg, uint sg, uint lane) {
-  constexpr uint K = 2304, W = 5120 * K / 2, S = 5120 * K / 32;
-  uint d = (tg.x * 8 + sg) * 4, xo[N];
-  float4 a[N];
-  #pragma unroll
-  for (uint j = 0; j < N; j++) xo[j] = (g.row[j] * 6 + g.slot[j]) * K / 4, a[j] = 0;
-  for (uint c = lane; c < K / 32; c += 32)
-    fp4_chunk4_rows<N>(g.p[0] + W + d * (K / 2), g.p[1] + S + d * (K / 32), K / 2,
-                       (device const float4 *)h, xo, c, a);
-  #pragma unroll
-  for (uint j = 0; j < N; j++) {
-    float4 v = float4(bf(simd_sum(a[j].x)), bf(simd_sum(a[j].y)), bf(simd_sum(a[j].z)), bf(simd_sum(a[j].w)));
-    if (lane == 0)
-      for (uint r = 0; r < 4; r++) parts[(g.row[j] * 5120 + d + r) * 8 + g.slot[j]] = v[r];
-  }
-}
-
-kernel void moe_up_rows(constant ExpertRows *groups [[buffer(0)]], device const float *x [[buffer(1)]],
-                        device float *h [[buffer(2)]], uint2 tg [[threadgroup_position_in_grid]],
-                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float block[3 * 32];
-  constant ExpertRows &g = groups[tg.y];
-  if (g.count == 1) moe_up_rows_n<1>(g, x, h, tg, sg, lane, block);
-  else if (g.count == 2) moe_up_rows_n<2>(g, x, h, tg, sg, lane, block);
-  else moe_up_rows_n<3>(g, x, h, tg, sg, lane, block);
-}
-
-kernel void moe_down_rows(constant ExpertRows *groups [[buffer(0)]], device const float *h [[buffer(1)]],
-                          device float *parts [[buffer(2)]], uint2 tg [[threadgroup_position_in_grid]],
-                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-  constant ExpertRows &g = groups[tg.y];
-  if (g.count == 1) moe_down_rows_n<1>(g, h, parts, tg, sg, lane);
-  else if (g.count == 2) moe_down_rows_n<2>(g, h, parts, tg, sg, lane);
-  else moe_down_rows_n<3>(g, h, parts, tg, sg, lane);
 }
 
 // ---- elementwise and normalization ----
@@ -1267,78 +1166,6 @@ inline int tg_argmax(float v, uint t, uint n, threadgroup float *val, threadgrou
   int r = val[b] == -INFINITY ? -1 : int(arg[b]);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   return r;
-}
-
-// --gpu-route: a decoded row's routed experts, looked up on the GPU in the
-// layer's table of ready experts (the addresses of an expert's three spans;
-// 1 for an expert still being read, 0 for one without a slot). With D >= 0
-// (--substitute), selected experts without a slot give way, as
-// substitute() chooses (the lowest-ranked first, the rp.keep highest scores
-// never), to the unselected ready experts with the highest selection keys at
-// most D below theirs, and the weights then follow the router's formula for
-// the experts used. The row's experts go to its Expert
-// entries in expert order, as the reference sums them, and their ids to
-// used, with used[6] the number not ready and used[7] the number
-// substituted. With one not ready, every entry is null, and the expert
-// kernels skip the row: the CPU computes the layer's experts.
-struct Resolve { uint k, stride; float d; uint keep; };
-struct Spans { ulong p[3]; };
-struct ExpertOut { ulong p[3]; float weight, pad; };  // an Expert, written as addresses
-kernel void resolve(device const float *logits [[buffer(0)]], device const float *bias [[buffer(1)]],
-                    device const int *idx [[buffer(2)]], device const float *wts [[buffer(3)]],
-                    device const Spans *tab [[buffer(4)]], device ExpertOut *ex [[buffer(5)]],
-                    device int *used [[buffer(6)]], constant Resolve &rp [[buffer(7)]],
-                    uint row [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]],
-                    uint n [[threads_per_threadgroup]]) {
-  threadgroup float key[384], sc[384], val[12];
-  threadgroup uint arg[12];
-  threadgroup int sel[8], keep[8], changed;  // keep: never replaced; changed: experts substituted
-  uint kk = rp.k;
-  logits += row * n, idx += row * rp.stride, wts += row * rp.stride, ex += row * 8, used += row * 8;
-  float l = logits[t], u = exp(l), v = 1.0f + u;  // as the route kernel computes them
-  float s = sqrt(l > 20.0f ? l : v == 1.0f ? u : log(v) * u / (v - 1.0f));
-  sc[t] = s, key[t] = s + bias[t];
-  if (t < kk) sel[t] = idx[t];
-  if (t == 0) changed = 0;
-  bool ready = tab[t].p[0] > 1;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (t == 0) {  // the rp.keep highest scores, as substitute() keeps them
-    for (uint j = 0; j < kk; j++) keep[j] = 0;
-    for (uint p = 0; p < rp.keep && p < kk; p++) {
-      int b = -1;
-      for (uint j = 0; j < kk; j++)
-        if (!keep[j] && (b < 0 || sc[sel[j]] > sc[sel[b]])) b = int(j);
-      keep[b] = 1;
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int j = int(kk) - 1; j >= 0 && rp.d >= 0; j--) {  // the lowest-ranked first, as substitute()
-    int cur = sel[j];
-    if (keep[j] || tab[cur].p[0]) continue;  // the same for every thread
-    bool taken = false;
-    for (uint i = 0; i < kk; i++) taken |= sel[i] == int(t);
-    int pick = tg_argmax(ready && !taken && key[t] >= key[cur] - rp.d ? key[t] : -INFINITY, t, n, val, arg);
-    if (t == 0 && pick >= 0) sel[j] = pick, changed++;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
-  if (t) return;
-  int e[8];
-  float w[8], sum = 0;
-  for (uint j = 0; j < kk; j++) sum += sc[sel[j]];
-  for (uint j = 0; j < kk; j++) e[j] = sel[j], w[j] = changed ? sc[sel[j]] / (sum + 1e-20f) * 1.5f : wts[j];
-  for (uint i = 1; i < kk; i++)
-    for (uint j = i; j > 0 && e[j - 1] > e[j]; j--) {
-      int a = e[j]; e[j] = e[j - 1], e[j - 1] = a;
-      float b = w[j]; w[j] = w[j - 1], w[j - 1] = b;
-    }
-  int missing = 0;
-  for (uint j = 0; j < kk; j++) missing += tab[e[j]].p[0] <= 1;
-  for (uint j = 0; j < kk; j++) {
-    Spans p = missing ? Spans{{0, 0, 0}} : tab[e[j]];
-    ex[j] = ExpertOut{{p.p[0], p.p[1], p.p[2]}, w[j], 0};
-    used[j] = e[j];
-  }
-  used[6] = missing, used[7] = changed;
 }
 
 // Keeps the GPU's clock up while decoding waits for the SSD: one simdgroup

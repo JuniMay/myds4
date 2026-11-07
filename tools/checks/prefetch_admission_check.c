@@ -28,7 +28,7 @@ int main(void) {
   slots = fixture, score = priorities;
   max_slots = cap = nslots = COUNT, nfree = npinned = 0;
   head = COUNT - 1, tail = 0, token = 10, weight = 1;
-  pass_layer = serving = published = -1;
+  pass_layer = serving = -1;
   memset(where, 0xff, sizeof where);
   expert_spans[0] = expert_spans[2] = 1;
   expert_span[2][future][0] = (FileSpan){fd, 0, 16384};

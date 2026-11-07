@@ -1,6 +1,5 @@
 // All partial masks, untouched slots and ordered sums; bounded resident timings.
 #include "myds4.h"
-#include "expert_batch.h"
 #include "../../src/experimental/expert_compact.h"
 #include "../reference/activation_format.h"
 #include <stdlib.h>

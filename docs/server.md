@@ -122,8 +122,8 @@ tokenizer may be called from any thread. Its parts:
 
 - **Loading and the stop.** `myds4_load(config)` takes the model and engine
   options (`myds4_config`: the checkpoint, `--experts`, `--ctx`, the cache
-  settings, `--substitute`, `--gpu-route`, the draft settings, the online
-  predictor, `--ced`, `--lookup`, `--expert-batch` and `--prefill-prune`) and
+  settings, `--substitute`, the draft settings, the online
+  predictor, `--ced`, `--lookup` and `--prefill-prune`) and
   two hooks: `on_log`, which receives the log's lines instead of stderr (the
   live view's pane), and `on_die`, which runs before a fatal error's message
   (the live view gives the terminal back). It waits for the model lock
@@ -218,8 +218,7 @@ request's sampler. With one active request, lookup supplies eligible copied
 continuations before `--draft` supplies any DSpark fallback. Without
 `--draft`, the server does not load DSpark weights. With multiple active
 requests, each request uses ordinary one-token decoding and retains its
-own lookup history. `--expert-batch` lets verification rows share repeated
-expert weight loads. Both options are off by default.
+own lookup history. Lookup is off by default.
 
 `--runahead` changes how two or more active requests share the model. Each
 request can advance to its next layer when its selected experts are ready.
@@ -230,9 +229,8 @@ remain reserved until every consuming job completes. Per-request sampling
 and selected experts are preserved. A request running alone follows ordinary
 decoding, including context lookup when configured.
 
-Runahead is off by default and enables shared expert loads when selected.
-The server rejects combinations with DSpark, substitution, GPU routing or
-the online predictor. CED retains its configured prefill behavior. The C ABI
+Runahead is off by default. The server rejects combinations with DSpark,
+substitution or the online predictor. CED retains its configured prefill behavior. The C ABI
 offers `myds4_set_runahead(0|1)` before loading, without changing the config
 structure. `/v1/status` reports `runahead` and cumulative `model_decode`
 counters: computed rows, model wall time, main-queue GPU time, expert-read
@@ -251,7 +249,7 @@ chunks, encoder/decoder tokens, CED application, its capture position
 replay`, or `a bounded replay` with `--ced`), how many earlier rows it
 computed again. These are counts, without conversation
 text or API keys. `GET /v1/status` includes configured `ced_depth`,
-`lookup_depth`, `expert_batch`, `prefill_prune` and the `last_prefill` plan.
+`lookup_depth`, `prefill_prune` and the `last_prefill` plan.
 `last_prefill.prune_applied` reports whether that pass actually skipped
 decoder work. A separate title request therefore has its own arrival
 and prefill records rather than appearing as a chunk of the main request.
@@ -278,7 +276,7 @@ system-prefix forks, identical seeded replies on retry, zero recomputation
 for that retry, and image embedding through the default vision path. They
 do not score answer quality. Run `tools/checks/server_prefill_check.py` with
 `--checkpoint CHECKPOINT`, `--binary EXECUTABLE`, `--ced off|128|512`, and
-optional `--experts GGUF`, `--draft`, `--lookup N`, `--expert-batch`, `--prefill-prune`,
+optional `--experts GGUF`, `--draft`, `--lookup N`, `--prefill-prune`,
 `--batch N` and `--image`. Add `--long-prefill --prefill-prune` to require
 that a prompt actually exercises dependency pruning. This longer server
 case is provided for integration testing; it has not yet been run.

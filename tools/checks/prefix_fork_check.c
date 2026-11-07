@@ -619,7 +619,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--limit") && i + 1 < argc) limit = atoi(argv[++i]);  // the text's first N tokens only
     else if (!strcmp(argv[i], "--rendered")) rendered = 1;
     else if (!strcmp(argv[i], "--experts") && i + 1 < argc) o.experts = argv[++i];
-    else if (!strcmp(argv[i], "--draft") && i + 1 < argc) o.draft = atoi(argv[++i]), o.draft_cache = o.draft ? 32 : 0, o.draft_trim = o.draft > 0;
+    else if (!strcmp(argv[i], "--draft") && i + 1 < argc) o.draft = atoi(argv[++i]), o.draft_cache = o.draft ? 32 : 0;
     else if (!strcmp(argv[i], "--cache") && i + 1 < argc) o.budget_gb = atof(argv[++i]);
     else if (!strcmp(argv[i], "--ced") && i + 1 < argc) o.ced = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--random") && i + 1 < argc) randoms = atoi(argv[++i]);

@@ -56,7 +56,7 @@ static void setup(int fd, int prefill) {
   slots = fixture, score = priorities;
   max_slots = cap = nslots = NSLOT, nfree = npinned = 0;
   head = NSLOT - 1, tail = 0, token = 10, weight = 1;
-  pass_layer = prefill ? LAYER : -1, serving = published = -1;
+  pass_layer = prefill ? LAYER : -1, serving = -1;
   pf_enabled = pf_active = 0;
   qhead = qtail = 0;
   atomic_store(&demand, 0), atomic_store(&prefetching, 0);
@@ -175,19 +175,6 @@ int main(void) {
          fixture[6].expert == -1 && !slot_reading(6));
   expect("refinement preserves selected and partially started reads", where[LAYER][0] == 0 &&
          where[LAYER][2] == 2 && atomic_load(&fixture[2].taken[0]) && !atomic_load(&fixture[2].taken[1]));
-  teardown();
-
-  setup(fd, 0);
-  published = LAYER;
-  uint32_t before[QMAX];
-  int count = snapshot(before);
-  uint64_t cancelled = cache_stats.cancelled;
-  cache_demote(LAYER);
-  expect("published layer retains its pending buffers", where[LAYER][1] == 1 && where[LAYER][4] == 6 &&
-         fixture[1].loading && fixture[6].loading && !atomic_load(&fixture[1].taken[0]) &&
-         !atomic_load(&fixture[6].taken[0]));
-  expect("published layer does not alter the read queue", same_queue(before, count) &&
-         cache_stats.cancelled == cancelled);
   teardown();
 
 #ifdef MYDS4_RUNAHEAD

@@ -8,7 +8,7 @@ int main(void) {
   int experts[12], routes[4 * 16] = {0}, saved_routes[4 * 16];
   slots = fixture, score = priorities, max_slots = cap = nslots = 12;
   memset(where, 0xff, sizeof where);
-  head = 11, tail = 0, pass_layer = 0, serving = published = -1;
+  head = 11, tail = 0, pass_layer = 0, serving = -1;
   token = 10, weight = 2;
   for (int i = 0; i < 12; i++) {
     fixture[i].layer = 0, fixture[i].expert = experts[i] = i, fixture[i].mapped = 1;

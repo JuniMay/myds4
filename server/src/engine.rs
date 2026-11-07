@@ -8,7 +8,7 @@ use std::ptr;
 
 use deepseek_recipe::stream::StreamTokenizer;
 
-const ABI: c_int = 6;
+const ABI: c_int = 7;
 
 #[repr(C)]
 struct RawConfig {
@@ -21,15 +21,12 @@ struct RawConfig {
     cache_half_life: c_int,
     cache_read_cost: c_int,
     substitute: f32,
-    gpu_route: c_int,
     draft: c_int,
     draft_cache: c_int,
-    draft_trim: c_int,
     online_predictor: c_int,
     predictor_state: *const c_char,
     ced: c_int,
     lookup: c_int,
-    expert_batch: c_int,
     prefill_prune: c_int,
     on_log: Option<extern "C" fn(*const c_char)>,
     on_die: Option<extern "C" fn()>,
@@ -212,10 +209,8 @@ pub struct Config {
     pub cache_half_life: i32,
     pub cache_read_cost: bool,
     pub substitute: f32,
-    pub gpu_route: bool,
     pub draft: i32,
     pub draft_cache: i32,
-    pub draft_trim: bool,
     pub online_predictor: bool,
     pub predictor_state: Option<String>,
     /// --kv-cache: what the attention states and snapshots may take, GiB (the worker's).
@@ -224,7 +219,6 @@ pub struct Config {
     pub batch: i32,
     pub ced: i32,
     pub lookup: i32,
-    pub expert_batch: bool,
     pub prefill_prune: bool,
     pub runahead: bool,
     /// Receives the log's lines (with their time) instead of stderr; it runs
@@ -254,15 +248,12 @@ pub fn load(c: &Config) -> bool {
         cache_half_life: c.cache_half_life,
         cache_read_cost: c.cache_read_cost.into(),
         substitute: c.substitute,
-        gpu_route: c.gpu_route.into(),
         draft: c.draft,
         draft_cache: c.draft_cache,
-        draft_trim: c.draft_trim.into(),
         online_predictor: c.online_predictor.into(),
         predictor_state: state.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
         ced: c.ced,
         lookup: c.lookup,
-        expert_batch: c.expert_batch.into(),
         prefill_prune: c.prefill_prune.into(),
         on_log: c.on_log,
         on_die: c.on_die,

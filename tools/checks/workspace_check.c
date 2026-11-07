@@ -50,7 +50,6 @@ int main(void) {
   alarm(10);
   opt.ctx = 4096;
   opt.draft = 1;
-  opt.gpu_route = 1;
   cand_words = 17;
   Q = fixture_alloc(128u * HEADS * HEAD_DIM * sizeof(float));
   O = fixture_alloc(Q.size);
@@ -69,7 +68,6 @@ int main(void) {
   expect("query workspace releases unused prompt rows", Q.size == (size_t)(BLOCK + 1) * HEADS * HEAD_DIM * sizeof(float));
   expect("attention output workspace releases unused prompt rows", O.size == Q.size);
   expect("matrix input staging also fits the draft history projection", XB.size >= 128u * 3 * DIM * 2);
-  expect("GPU routing retains every layer's independent slots", RT.size >= (size_t)LAYERS * FEW * 16 * 4);
   expect("new residual storage is cleared", HS.ptr[0] == 0 && HS.ptr[HS.size - 1] == 0);
   int before = allocations;
   for (int m = 1; m <= BLOCK + 1; m++) request_capacity(m);

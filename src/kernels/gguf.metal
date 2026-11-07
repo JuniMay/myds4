@@ -266,123 +266,6 @@ kernel void gg_down(constant Expert *ex [[buffer(0)]], device const float *h [[b
   }
 }
 
-// Small groups share dequantized chunks while retaining the scalar kernels'
-// per-lane accumulation and the original row/expert positions in PARTS.
-template <typename B, uint N>
-inline void gg_chunk_rows(device const B *w, uint nb, device const float4 *x, thread const uint *xo,
-                           uint c, Tab tab, thread float4 *acc) {
-  #pragma unroll
-  for (uint r = 0; r < 4; r++) {
-    float4 v[8];
-    dq32(w + r * nb + c / 8, c % 8, tab, v);
-    float sum[N];
-    #pragma unroll
-    for (uint j = 0; j < N; j++) sum[j] = 0;
-    #pragma unroll
-    for (uint i = 0; i < 8; i++)
-      #pragma unroll
-      for (uint j = 0; j < N; j++) sum[j] += dot(v[i], x[xo[j] + 8 * c + i]);
-    #pragma unroll
-    for (uint j = 0; j < N; j++) acc[j][r] += sum[j];
-  }
-}
-
-template <typename B, uint N>
-inline void gg_up_rows_n(constant ExpertRows &g, device const float *x, device float *h,
-                         uint2 tg, uint sg, uint lane, Tab tab, threadgroup float *block) {
-  constexpr uint NB = 5120 / 256;
-  uint row = (tg.x * 8 + sg) * 4, xo[N];
-  device const B *w1 = (device const B *)g.p[0] + row * NB, *w3 = (device const B *)g.p[1] + row * NB;
-  float4 a[N], b[N];
-  #pragma unroll
-  for (uint j = 0; j < N; j++) xo[j] = g.row[j] * 5120 / 4, a[j] = 0, b[j] = 0;
-  for (uint c = lane; c < NB * 8; c += 32) {
-    gg_chunk_rows<B, N>(w1, NB, (device const float4 *)x, xo, c, tab, a);
-    gg_chunk_rows<B, N>(w3, NB, (device const float4 *)x, xo, c, tab, b);
-  }
-  #pragma unroll
-  for (uint j = 0; j < N; j++) {
-    float4 av = float4(simd_sum(a[j].x), simd_sum(a[j].y), simd_sum(a[j].z), simd_sum(a[j].w));
-    float4 bv = float4(simd_sum(b[j].x), simd_sum(b[j].y), simd_sum(b[j].z), simd_sum(b[j].w));
-    if (lane < 4) {
-      float gate = min(bf(av[lane]), 10.0f), u = clamp(bf(bv[lane]), -10.0f, 10.0f);
-      block[j * 32 + sg * 4 + lane] = bf(gate / (1.0f + exp(-gate)) * u * g.weight[j]);
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (sg == 0) {
-    #pragma unroll
-    for (uint j = 0; j < N; j++)
-      h[(g.row[j] * 6 + g.slot[j]) * 2304 + tg.x * 32 + lane] = fp8_act(block[j * 32 + lane]);
-  }
-}
-
-template <typename B, uint N>
-inline void gg_down_rows_n(constant ExpertRows &g, device const float *h, device float *parts,
-                           uint2 tg, uint sg, uint lane, Tab tab) {
-  constexpr uint NB = 2304 / 256;
-  uint d = (tg.x * 8 + sg) * 4, xo[N];
-  device const B *w = (device const B *)g.p[2] + d * NB;
-  float4 a[N];
-  #pragma unroll
-  for (uint j = 0; j < N; j++) xo[j] = (g.row[j] * 6 + g.slot[j]) * 2304 / 4, a[j] = 0;
-  for (uint c = lane; c < 64; c += 32)
-    gg_chunk_rows<B, N>(w, NB, (device const float4 *)h, xo, c, tab, a);
-  // Keep gg_down's lane assignment for its final eight sub-blocks.
-  uint c = 64 + lane % 8;
-  float4 v[8];
-  dq32(w + lane / 8 * NB + c / 8, c % 8, tab, v);
-  float last[N];
-  #pragma unroll
-  for (uint j = 0; j < N; j++) last[j] = 0;
-  #pragma unroll
-  for (uint i = 0; i < 8; i++)
-    #pragma unroll
-    for (uint j = 0; j < N; j++) last[j] += dot(v[i], ((device const float4 *)h)[xo[j] + 8 * c + i]);
-  #pragma unroll
-  for (uint r = 0; r < 4; r++)
-    #pragma unroll
-    for (uint j = 0; j < N; j++) {
-      float value = simd_shuffle(last[j], 8 * r + lane % 8);
-      if (lane < 8) a[j][r] += value;
-    }
-  #pragma unroll
-  for (uint j = 0; j < N; j++) {
-    float4 value = float4(bf(simd_sum(a[j].x)), bf(simd_sum(a[j].y)), bf(simd_sum(a[j].z)), bf(simd_sum(a[j].w)));
-    if (lane == 0)
-      for (uint r = 0; r < 4; r++) parts[(g.row[j] * 5120 + d + r) * 8 + g.slot[j]] = value[r];
-  }
-}
-
-template <typename B>
-kernel void gg_up_rows(constant ExpertRows *groups [[buffer(0)]], device const float *x [[buffer(1)]],
-                       device float *h [[buffer(2)]], uint2 tg [[threadgroup_position_in_grid]],
-                       uint t [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
-                       uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup uint4 tab[Code<B>::tab];
-  threadgroup float block[3 * 32];
-  tables<B>(tab, t, 256);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  constant ExpertRows &g = groups[tg.y];
-  if (g.count == 1) gg_up_rows_n<B, 1>(g, x, h, tg, sg, lane, tab, block);
-  else if (g.count == 2) gg_up_rows_n<B, 2>(g, x, h, tg, sg, lane, tab, block);
-  else gg_up_rows_n<B, 3>(g, x, h, tg, sg, lane, tab, block);
-}
-
-template <typename B>
-kernel void gg_down_rows(constant ExpertRows *groups [[buffer(0)]], device const float *h [[buffer(1)]],
-                         device float *parts [[buffer(2)]], uint2 tg [[threadgroup_position_in_grid]],
-                         uint t [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
-                         uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup uint4 tab[Code<B>::tab];
-  tables<B>(tab, t, 256);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  constant ExpertRows &g = groups[tg.y];
-  if (g.count == 1) gg_down_rows_n<B, 1>(g, h, parts, tg, sg, lane, tab);
-  else if (g.count == 2) gg_down_rows_n<B, 2>(g, h, parts, tg, sg, lane, tab);
-  else gg_down_rows_n<B, 3>(g, h, parts, tg, sg, lane, tab);
-}
-
 // Many tokens, as moe_up_m and moe_down_m, on the matrix units (128 threads).
 // A threadgroup takes up to 64 pairs of one expert (a MoeTile), so that the
 // weights it decodes into threadgroup memory as half, a K step of 64 at a
@@ -520,8 +403,6 @@ typedef decltype(gg_up<block_q2_K>) gg_up_t;
 typedef decltype(gg_down<block_q2_K>) gg_down_t;
 typedef decltype(gg_up_m<block_q2_K>) gg_up_m_t;
 typedef decltype(gg_down_m<block_q2_K>) gg_down_m_t;
-typedef decltype(gg_up_rows<block_q2_K>) gg_up_rows_t;
-typedef decltype(gg_down_rows<block_q2_K>) gg_down_rows_t;
 // The output head in Q6_K (--experts, when the GGUF file has one): the
 // logits of m rows of x (up to MAXM: a verify pass's or the draft's), each
 // summed as for one row. A simdgroup takes 4 rows of the head.
@@ -577,13 +458,3 @@ GG_KERNELS(block_iq2_s, "iq2_s")
 GG_KERNELS(block_iq3_xxs, "iq3_xxs")
 GG_KERNELS(block_iq1_s, "iq1_s")
 GG_KERNELS(block_iq1_m, "iq1_m")
-
-#define GG_ROW_KERNELS(B, name)                                                       \
-  template [[host_name("gg_up_rows_" name)]] kernel gg_up_rows_t gg_up_rows<B>;       \
-  template [[host_name("gg_down_rows_" name)]] kernel gg_down_rows_t gg_down_rows<B>;
-GG_ROW_KERNELS(block_q2_K, "q2_k")
-GG_ROW_KERNELS(block_iq2_xxs, "iq2_xxs")
-GG_ROW_KERNELS(block_iq2_xs, "iq2_xs")
-GG_ROW_KERNELS(block_iq2_s, "iq2_s")
-GG_ROW_KERNELS(block_iq3_xxs, "iq3_xxs")
-GG_ROW_KERNELS(block_iq1_s, "iq1_s")

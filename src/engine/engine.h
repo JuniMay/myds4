@@ -19,7 +19,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYDS4_ABI 6
+#define MYDS4_ABI 7
 
 // Select concurrent runahead before loading. Zero uses ordinary batching.
 // Returns -1 for invalid values or after loading. The config ABI is unchanged.
@@ -36,15 +36,12 @@ typedef struct {
   int cache_half_life;         // --cache-half-life in forward passes; 0: the default, 50
   int cache_read_cost;         // --cache-read-cost
   float substitute;            // --substitute D; 0: exact
-  int gpu_route;               // --gpu-route
   int draft;                   // --draft N, 0 to 5
   int draft_cache;             // --draft-cache N; 0: all draft experts preloaded
-  int draft_trim;              // --draft-trim
   int online_predictor;        // --online-predictor
   const char *predictor_state; // --predictor-state FILE, or null
   int ced;                     // --ced off|N: 0 or 128 to 1048576 decoder replay tokens; approximate
   int lookup;                  // --lookup off|N: 0 or 1 to 15 context-copy drafts
-  int expert_batch;            // --expert-batch: share repeated expert loads across rows
   int prefill_prune;           // --prefill-prune: preserve dependencies while skipping unused decoder batches
   // The log's lines, each with its time, go to on_log instead of stderr when
   // it is set. It runs on the thread that logs, one line at a time under the

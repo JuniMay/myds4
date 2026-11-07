@@ -339,13 +339,32 @@ void gpu_commit(void) {
   enc = 0;
 }
 
-void gpu_wait_signal(uint64_t v) {
-  MSG(BOOL (*)(id, SEL, uint64_t, uint64_t), event, S("waitUntilSignaledValue:timeoutMS:"), v, 60000ull);
+// The GPU signals the shared event's values in order, each after the command
+// buffers before it. A value that a minute does not bring means that a
+// command buffer failed or the GPU stopped, and the results the caller waits
+// for are not there: a failed buffer's error, or this, ends the program.
+static void unsignaled(uint64_t v) {
+  for (int i = 0; i < ndone; i++)
+    if (MSG(long (*)(id, SEL), done[i], S("status")) == 5)  // MTLCommandBufferStatusError
+      die("GPU: %s", describe(MSG(id (*)(id, SEL), done[i], S("error"))));
+  die("GPU: value %llu not signaled in 60 s", (unsigned long long)v);
 }
 
-// As gpu_wait_signal, spinning: no wake-up delay before what follows.
+void gpu_wait_signal(uint64_t v) {
+  if (!MSG(BOOL (*)(id, SEL, uint64_t, uint64_t), event, S("waitUntilSignaledValue:timeoutMS:"), v, 60000ull))
+    unsignaled(v);
+}
+
+// As gpu_wait_signal, spinning: no wake-up delay before what follows. The
+// clock is read every 1,024 polls.
 void gpu_spin_signal(uint64_t v) {
-  while (MSG(uint64_t (*)(id, SEL), event, S("signaledValue")) < v) {}
+  double until = 0;
+  for (unsigned i = 0; MSG(uint64_t (*)(id, SEL), event, S("signaledValue")) < v; i++)
+    if (!(i & 1023)) {
+      double t = now();
+      if (!until) until = t + 60;
+      else if (t > until) unsignaled(v);
+    }
 }
 
 static int by_start(const void *a, const void *b) {

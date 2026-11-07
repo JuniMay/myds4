@@ -32,7 +32,6 @@ def main():
     ap.add_argument("--ced", choices=("off", "128", "512"), default="off")
     ap.add_argument("--draft", action="store_true")
     ap.add_argument("--lookup", type=int, choices=range(16), default=0)
-    ap.add_argument("--expert-batch", action="store_true")
     ap.add_argument("--prefill-prune", action="store_true")
     ap.add_argument("--long-prefill", action="store_true", help="use a prompt long enough to skip dependency-free decoder batches")
     ap.add_argument("--batch", type=int, choices=range(1, 7), default=1)
@@ -51,9 +50,7 @@ def main():
     if args.experts:
         cmd += ["--experts", str(args.experts)]
     if args.draft:
-        cmd += ["--draft", "2", "--draft-cache", "32", "--draft-trim"]
-    if args.expert_batch:
-        cmd += ["--expert-batch"]
+        cmd += ["--draft", "2", "--draft-cache", "32"]
     if args.prefill_prune:
         cmd += ["--prefill-prune"]
     process = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -141,7 +138,6 @@ def main():
         state = call("/v1/status")
         assert state["ced_depth"] == (0 if args.ced == "off" else int(args.ced))
         assert state["lookup_depth"] == args.lookup
-        assert state["expert_batch"] == args.expert_batch
         assert state["prefill_prune"] == args.prefill_prune
         assert isinstance(state["last_prefill"]["prune_applied"], bool)
         observed = list(lines)
@@ -162,7 +158,7 @@ def main():
         assert not failures, failures
         print(json.dumps({"server_prefill_check": {"binary": args.binary.name, "ced": args.ced,
               "experts": "IQ2" if args.experts else "MXFP4", "draft": args.draft, "lookup": args.lookup,
-              "expert_batch": args.expert_batch, "prefill_prune": args.prefill_prune,
+              "prefill_prune": args.prefill_prune,
               "long_prefill": args.long_prefill, "image": args.image, "batch": args.batch,
               "requests": len(replies) + 1 + int(args.image) + 2 * bool(args.lookup), "identical_retry": True,
               "last_prefill": state["last_prefill"]}}))

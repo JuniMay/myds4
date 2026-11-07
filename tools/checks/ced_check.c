@@ -248,7 +248,7 @@ int main(int argc, char **argv) {
   if (describe_only) return 0;
   alarm(600);
   Options o = {.ctx = 32768, .budget_gb = cache_gib, .reserve_gb = reserve_gib, .experts = experts,
-               .draft = dspark_depth, .draft_cache = dspark_depth ? 32 : 0, .draft_trim = dspark_depth != 0,
+               .draft = dspark_depth, .draft_cache = dspark_depth ? 32 : 0,
                .dump_fd = -1, .routes_fd = -1, .quiet = 1, .ced = runtime_ced};
   model_load(argv[1], &o);
   if (bench_tokens >= 0) {

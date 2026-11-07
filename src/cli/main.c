@@ -55,17 +55,13 @@ static void usage(void) {
         "                (and, with --draft, in a verify pass): the logits must be equal\n"
         "  --draft N     verify up to N (1-5) DSpark drafts per pass using the requested sampler\n"
         "  --lookup off|N  verify up to N (1-15) context-copy drafts; --draft supplies fallback (default off)\n"
-        "  --expert-batch  share repeated expert weight loads across verification rows (exact)\n"
         "  --draft-cache N  with --draft: expert slots per stage, 15-128 (default: all 128 preloaded);\n"
         "                smaller caches load the native selections on demand, within --cache\n"
-        "  --draft-trim  with --draft: compute only requested final-stage query/FFN rows; keep all five keys\n"
         "  --online-predictor  CPU prefetch correction learned online (default off)\n"
         "  --predictor-state FILE  enable online learning, load existing state and save on clean exit\n"
         "  --substitute D  approximate: when decoding, replace selected experts that are not in memory by the\n"
         "                resident experts with the highest selection keys at most D below theirs, the lowest-ranked\n"
         "                first, never the two with the highest scores\n"
-        "  --gpu-route   decoding: the GPU looks up each layer's experts itself, so that a layer whose experts\n"
-        "                are all in memory does not wait for the CPU (exact; --substitute applies on the GPU too)\n"
         "  --experts GGUF  read the routed experts from a GGUF file, or a set of shards given by one\n"
         "                (llama.cpp's layout, e.g. unsloth's UD-IQ2_XXS); approximate: smaller codes\n"
         "  --perplexity  decode the text token by token; print the perplexity of each next token\n"
@@ -138,20 +134,8 @@ int main(int argc, char **argv) {
       if (!raw) raw = 1;
       continue;
     }
-    if (!strcmp(a, "--gpu-route")) {
-      o.gpu_route = 1;
-      continue;
-    }
     if (!strcmp(a, "--cache-read-cost")) {
       o.cache_read_cost = 1;
-      continue;
-    }
-    if (!strcmp(a, "--draft-trim")) {
-      o.draft_trim = 1;
-      continue;
-    }
-    if (!strcmp(a, "--expert-batch")) {
-      o.expert_batch = 1;
       continue;
     }
     if (!strcmp(a, "--prefill-prune")) {
@@ -242,7 +226,6 @@ int main(int argc, char **argv) {
   if (o.ctx < 1 || o.ctx > 1 << 20) die("--ctx takes 1 to %d tokens (the model's longest context)", 1 << 20);
   if (o.draft < 0 || o.draft > BLOCK) die("--draft takes 1 to %d drafts", BLOCK);
   if (o.draft_cache && !o.draft) die("--draft-cache needs --draft");
-  if (o.draft_trim && !o.draft) die("--draft-trim needs --draft");
   if (o.ced && (o.dump_fd >= 0 || check)) die("--dump-fd and --check-prefill require --ced off; they inspect every prompt row");
   if (o.predictor_state) shutdown_watch();
   if (bench) {
@@ -423,7 +406,6 @@ int main(int argc, char **argv) {
   memcpy(p1, phase_s, sizeof p1);
   double g1 = gpu_busy, gap1 = gpu_gap;
   long gaps1 = gpu_gaps;
-  uint64_t fix1 = spec_fixups;
   int pos = n, gen = 0, passes = 0, accepted = 0, t = sample_token(logits, VOCAB, &sampler), len;
   ContextLookup *lookup = NULL;
 #ifdef MYDS4_REJECTION_DRAFT
@@ -632,11 +614,10 @@ int main(int argc, char **argv) {
   fprintf(stderr,
           "decode per token (ms): rows %.1f, waits %.1f, loads %.1f, prefetch %.1f, encode %.1f, adapt %.1f, "
           "drafting %.1f; "
-          "GPU idle between command buffers %.1f (%.1f gaps over 100 us); %.1f layers' experts recomputed\n",
+          "GPU idle between command buffers %.1f (%.1f gaps over 100 us)\n",
           (phase_s[0] - p1[0]) / gen * 1e3, (phase_s[1] - p1[1]) / gen * 1e3, (phase_s[2] - p1[2]) / gen * 1e3,
           (phase_s[3] - p1[3]) / gen * 1e3, (phase_s[4] - p1[4]) / gen * 1e3, (phase_s[5] - p1[5]) / gen * 1e3,
-          (phase_s[6] - p1[6]) / gen * 1e3, (gpu_gap - gap1) / gen * 1e3, (double)(gpu_gaps - gaps1) / gen,
-          (double)(spec_fixups - fix1) / gen);
+          (phase_s[6] - p1[6]) / gen * 1e3, (gpu_gap - gap1) / gen * 1e3, (double)(gpu_gaps - gaps1) / gen);
   cache_metrics_report(stderr);
   return complete();
 }

@@ -15,9 +15,9 @@ int main(int argc, char **argv) {
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--long")) length = 16521;
     else if (!strcmp(argv[i], "--signal")) mode = 2;
-    else if (!strcmp(argv[i], "--grouped")) mode = 3, o.expert_batch = 1;
-    else if (!strcmp(argv[i], "--grouped-after-wait")) mode = 4, o.expert_batch = 1;
-    else if (!strcmp(argv[i], "--batch-head")) mode = 5, o.expert_batch = 1;
+    else if (!strcmp(argv[i], "--grouped")) mode = 3;
+    else if (!strcmp(argv[i], "--grouped-after-wait")) mode = 4;
+    else if (!strcmp(argv[i], "--batch-head")) mode = 5;
     else if (!strcmp(argv[i], "--requests") && i + 1 < argc) count = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--experts") && i + 1 < argc) o.experts = argv[++i];
     else die("invalid runahead check option");

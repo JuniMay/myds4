@@ -56,13 +56,10 @@ const USAGE: &str = "usage: myds4-server -m MODEL --serve PORT [options]
   --cache-read-cost   weight decode eviction priority by expert read bytes
   --experts GGUF  read the routed experts from a GGUF file or set of shards
   --substitute D  approximate: replace selected experts not in memory (see build/myds4)
-  --gpu-route     decoding: the GPU looks up each layer's experts itself
   --draft N       verify up to N (1-5) DSpark drafts per pass
   --lookup off|N  verify up to N (1-15) context-copy drafts; --draft supplies fallback
-  --expert-batch  share repeated expert weight loads across verification rows
-  --runahead     overlap exact concurrent requests with expert reads; enables expert sharing
+  --runahead     overlap exact concurrent requests with expert reads
   --draft-cache N  with --draft: expert slots per stage, 15-128
-  --draft-trim    with --draft: compute only requested final-stage rows
   --online-predictor  CPU prefetch correction learned online
   --predictor-state FILE  online learning, its state loaded and saved
   --render FILE   print the prompt of a JSON test case of the model's encoding/tests, and exit
@@ -131,10 +128,7 @@ fn parse(args: &[String]) -> Args {
         let e = &mut a.engine;
         match flag {
             "--cache-read-cost" => e.cache_read_cost = true,
-            "--gpu-route" => e.gpu_route = true,
-            "--draft-trim" => e.draft_trim = true,
-            "--expert-batch" => e.expert_batch = true,
-            "--runahead" => { e.runahead = true; e.expert_batch = true; },
+            "--runahead" => e.runahead = true,
             "--prefill-prune" => e.prefill_prune = true,
             "--online-predictor" => e.online_predictor = true,
             _ => {
@@ -207,13 +201,11 @@ fn prefill_and_draft_options_keep_the_sampling_defaults() {
     assert!(!defaults.engine.prefill_prune);
     assert_eq!(defaults.engine.ced, 0);
     assert_eq!(defaults.engine.lookup, 0);
-    assert!(!defaults.engine.expert_batch);
-    let args = ["--prefill-prune", "--lookup", "15", "--expert-batch", "--draft", "2"];
+    let args = ["--prefill-prune", "--lookup", "15", "--draft", "2"];
     let enabled = parse(&args.map(String::from));
     assert!(enabled.engine.prefill_prune);
     assert_eq!(enabled.engine.ced, 0);
     assert_eq!(enabled.engine.lookup, 15);
-    assert!(enabled.engine.expert_batch);
     assert_eq!(enabled.engine.draft, 2);
     assert_eq!(enabled.defaults.temperature, 1.0);
     assert_eq!(enabled.defaults.top_p, 1.0);
@@ -223,7 +215,7 @@ fn prefill_and_draft_options_keep_the_sampling_defaults() {
 fn runahead_is_explicit_and_preserves_sampling_defaults() {
     assert!(!parse(&[]).engine.runahead);
     let a = parse(&["--runahead".into(), "--batch".into(), "4".into()]);
-    assert!(a.engine.runahead && a.engine.expert_batch);
+    assert!(a.engine.runahead);
     assert_eq!(a.engine.batch, 4);
     assert_eq!((a.defaults.temperature, a.defaults.top_p), (1.0, 1.0));
     assert_eq!(a.engine.draft, 0);

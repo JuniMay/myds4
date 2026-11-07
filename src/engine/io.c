@@ -349,7 +349,7 @@ typedef struct {
   uint8_t origin_prefetch, used, tracked, phase, issuer;
 } PrefetchLoad;
 typedef struct {
-  uint64_t passes, rows, unsupported_passes, unsupported_rows, batches[2];
+  uint64_t passes, rows, batches[2];
   uint64_t states[2][PF_STATES], payload[2][PF_STATES];
   uint64_t admissions[PF_ISSUERS], timely_first[PF_ISSUERS];
   uint64_t used_by_issuer[PF_ISSUERS], unstarted_at_use[PF_ISSUERS], age_at_use_ns[PF_ISSUERS];
@@ -379,13 +379,6 @@ void cache_metrics_begin(int phase, int rows) {
 }
 
 void cache_metrics_end(void) { pf_active = 0; }
-
-void cache_metrics_unsupported(void) {
-  if (!pf_enabled || !pf_active) return;
-  pf_stats[pf_phase].unsupported_passes++;
-  pf_stats[pf_phase].unsupported_rows += pf_rows;
-  pf_active = 0;
-}
 
 void cache_observe_snapshot(int layer, CacheObservation *o) {
   o->active = pf_enabled && pf_active && layer >= 0 && layer < LAYERS;
@@ -946,7 +939,6 @@ void cache_pass(int layer) { pass_layer = layer; }
 // (-1) rather than evicting experts in use.
 static int serving = -1;  // the layer cache_request makes resident: its experts used this token stay
 
-static int published = -1;  // --gpu-route: the layer whose table entries a committed buffer may still read
 #ifdef MYDS4_RUNAHEAD
 static unsigned held_references;
 #endif
@@ -967,11 +959,10 @@ static int victim(void) {
 #ifdef MYDS4_PREFETCH_POOL
           (segment < 0 || slots[j].probation == segment) && (!complete || !slot_reading(j)) &&
 #endif
-          !(slots[j].expert >= 0 && slots[j].layer == serving && slots[j].used == token) &&
 #ifdef MYDS4_RUNAHEAD
           !slots[j].holds &&
 #endif
-          (slots[j].layer != published || slots[j].expert < 0)) {
+          !(slots[j].expert >= 0 && slots[j].layer == serving && slots[j].used == token)) {
         double priority = eviction_priority(j);
 #ifdef MYDS4_STALE_PRIORITY
         // Prefer stale past layers, then stale future layers, then already
@@ -1024,7 +1015,7 @@ static void map_slot(int i) {
 }
 
 // Experiments rerank a small eligible shortlist. Production victim selection
-// is unchanged; the live action policy cannot evict published/current work.
+// is unchanged; the live action policy cannot evict current work.
 #ifdef MYDS4_PREDICT_LAB
 static uint64_t lab_payload(int layer, int e) {
   uint64_t bytes = 0;
@@ -1041,7 +1032,7 @@ static int action_victims(LabVictim *list) {
   for (int j = 0; j < max_slots; j++) {
     Slot *s = &slots[j];
     if (isnan(score[j]) || score[j] == INFINITY || s->prefetched || s->pinned || slot_reading(j) ||
-        (s->layer == serving && s->used == token) || (s->layer == published && s->expert >= 0)) continue;
+        (s->layer == serving && s->used == token)) continue;
     double p = eviction_priority(j);
     if (n == limit && p >= priority[limit - 1]) continue;
     int at = n < limit ? n++ : limit - 1;
@@ -1562,45 +1553,6 @@ void cache_prefetch_from(int layer, const int *experts, int n, int admit, int in
   pf_issuer = before;
 }
 
-// --gpu-route: the table the GPU looks a decoded row's experts up in (the
-// resolve kernel): the GPU addresses of each expert's three spans in its
-// slot for the experts read in full, 1 for those still being read, 0 for
-// those without a slot. A layer's entries are written before the command
-// buffer that reads them is committed, and until the next layer's are, no
-// slot of the layer is evicted or released. A slot that joined the residency
-// set this token, which the GPU may otherwise use only through gpu_use, is
-// committed into it first.
-static Buf tab;
-
-const Buf *cache_table(void) {
-  if (!tab.obj) tab = gpu_alloc((size_t)CACHE_LAYERS * EXPERTS * 3 * 8);
-  return &tab;
-}
-
-int cache_publish(int layer) {
-  uint64_t *t = (uint64_t *)cache_table()->ptr + (size_t)layer * EXPERTS * 3;
-  int fresh = 0, loading = 0;
-  for (int e = 0; e < EXPERTS; e++) {
-    int i = where[layer][e];
-    if (i >= 0 && slots[i].loading && !dispatch_group_wait(slots[i].loading, DISPATCH_TIME_NOW)) finish(i);
-    fresh |= i >= 0 && !slots[i].loading && slots[i].fresh;
-  }
-  if (fresh) {
-    gpu_residency_commit();
-    for (int i = head; i >= 0; i = slots[i].next) slots[i].fresh = 0;
-  }
-  for (int e = 0; e < EXPERTS; e++, t += 3) {
-    int i = where[layer][e], ok = i >= 0 && !slots[i].loading && (slots[i].mapped || slots[i].pinned);
-    loading += i >= 0 && !ok;
-    for (int k = 0; k < 3; k++) t[k] = ok ? slots[i].b.gpu + slots[i].at[k] : 0;
-    if (i >= 0 && !ok) t[0] = 1;  // being read or not mapped: the CPU's path takes it, mapped, as substitute() does
-  }
-  published = layer;
-  return loading;
-}
-
-void cache_unpublish(void) { published = -1; }
-
 #ifdef MYDS4_PREFETCH_DEMOTE_CANCEL
 static uint64_t demote_cancellations;
 #endif
@@ -1608,7 +1560,7 @@ static uint64_t demote_cancellations;
 // The model thread cancels only pieces that no reader owns. Check and
 // claim under the reader's lock so optional cancellation never waits for I/O.
 static int discard_unstarted(int layer, const int *keep, int n) {
-  if (layer == published || !atomic_load(&prefetching)) return 0;
+  if (!atomic_load(&prefetching)) return 0;
   int retired[EXPERTS], nc = 0;
   // Only the model thread changes slot metadata. Readers can change taken,
   // so this scan is a filter; ownership is rechecked under qlock below.
@@ -1730,13 +1682,13 @@ static void resize(int below) {
   }
   for (int i = tail; nslots > cap && i >= 0;) {
     int prev = slots[i].prev;
-    if (slots[i].layer < below && slots[i].layer != published) release(i), cache_stats.given_back++;
+    if (slots[i].layer < below) release(i), cache_stats.given_back++;
     i = prev;
   }
   while (nmapped > mcap) {  // the mapped slots with the lowest scores that nothing of this pass still needs
     int best = -1;
     for (int j = 0; j < max_slots; j++)
-      if (slots[j].b.obj && slots[j].mapped && slots[j].layer < below && slots[j].layer != published &&
+      if (slots[j].b.obj && slots[j].mapped && slots[j].layer < below &&
           !slots[j].loading && !slots[j].prefetched && (best < 0 || score[j] < score[best]))
         best = j;
     if (best < 0) break;
@@ -1821,10 +1773,8 @@ void cache_metrics_report(FILE *out) {
     }
   for (int p = 0; p < PF_PHASES; p++) {
     PrefetchStats *s = &pf_stats[p];
-    fprintf(out, "{\"prefetch_metrics\":{\"version\":1,\"phase\":\"%s\",\"passes\":%llu,\"rows\":%llu,"
-                 "\"unsupported_gpu_route_passes\":%llu,\"unsupported_gpu_route_rows\":%llu,",
-            phase[p], (unsigned long long)s->passes, (unsigned long long)s->rows,
-            (unsigned long long)s->unsupported_passes, (unsigned long long)s->unsupported_rows);
+    fprintf(out, "{\"prefetch_metrics\":{\"version\":1,\"phase\":\"%s\",\"passes\":%llu,\"rows\":%llu,", phase[p],
+            (unsigned long long)s->passes, (unsigned long long)s->rows);
     for (int v = 0; v < 2; v++) {
       fprintf(out, "\"%s\":{\"layer_batches\":%llu,\"unique_demands\":", v ? "served" : "exact_router",
               (unsigned long long)s->batches[v]);

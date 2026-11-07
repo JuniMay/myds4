@@ -117,11 +117,9 @@ int main(void) {
   cache_metrics_begin(PF_DECODE, 1);
   load(7, 4, 7, 1, PF_PC, 100, 0);
   slots[7].prev = slots[7].next = -1;
-  cache_metrics_unsupported();
+  cache_metrics_end();
   cache_observe_snapshot(4, &snapshot);
-  expect("GPU-route observations explicitly inactive", snapshot.active, 0);
-  expect("GPU-route coverage counted", d->unsupported_passes, 1);
-  expect("GPU-route rows counted", d->unsupported_rows, 1);
+  expect("observations inactive once the pass ends", snapshot.active, 0);
   int unobserved = 7;
   cache_request(4, &unobserved, 1);
   expect("unobserved served request is not later called unused", metadata[7].used, 1);

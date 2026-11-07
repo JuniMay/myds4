@@ -171,27 +171,69 @@ typedef struct { int a, b; } Span;  // code point indices [a, b)
 static uint32_t *cp;   // the segment's code points
 static int *cpoff;     // and their byte offsets
 
+// The piece's symbols as BPE merges them: each symbol's id (-1 once merged
+// into the one before it) and its neighbors; and a heap of the adjacent pairs
+// a merge joins, the lowest rank first, the leftmost among equals. Sized for
+// the longest piece so far (tok_encode runs under the tokenizer's lock).
+typedef struct { int rank, pos; } Pair;
+static int *sym, *prv, *nxt, cap_bpe, nheap;
+static Pair *heap;
+
+static int before(Pair a, Pair b) { return a.rank < b.rank || (a.rank == b.rank && a.pos < b.pos); }
+
+static void push(int rank, int pos) {
+  Pair p = {rank, pos};
+  int i = nheap++;
+  for (; i > 0 && before(p, heap[(i - 1) / 2]); i = (i - 1) / 2) heap[i] = heap[(i - 1) / 2];
+  heap[i] = p;
+}
+
+static Pair pop(void) {
+  Pair top = heap[0], last = heap[--nheap];
+  int i = 0;
+  for (int c; (c = 2 * i + 1) < nheap; i = c) {
+    if (c + 1 < nheap && before(heap[c + 1], heap[c])) c++;
+    if (!before(heap[c], last)) break;
+    heap[i] = heap[c];
+  }
+  heap[i] = last;
+  return top;
+}
+
+// The pair the symbol at i starts, onto the heap if a merge joins it.
+static void offer(int i) {
+  int id, j = nxt[i], rank = j < 0 ? -1 : merge_of(sym[i], sym[j], &id);
+  if (rank >= 0) push(rank, i);
+}
+
+// Byte-level BPE over the whole piece of n bytes, as the reference merges:
+// the lowest-ranked adjacent pair first, the leftmost among equals, until no
+// merge applies. A heap keeps a long piece at O(n log n).
 static int bpe(const char *s, int n, int *out, int max) {
-  int ids[1024], k = 0;
-  if (n > 1024) {  // long runs (e.g. whitespace) in bounded chunks
-    int m = 0;
-    for (int i = 0; i < n; i += 1024) m += bpe(s + i, n - i < 1024 ? n - i : 1024, out + m, max - m);
-    return m;
+  if (n <= 0) return 0;
+  if (n > cap_bpe) {
+    cap_bpe = n;
+    sym = realloc(sym, n * sizeof *sym), prv = realloc(prv, n * sizeof *prv), nxt = realloc(nxt, n * sizeof *nxt);
+    heap = realloc(heap, 3ull * n * sizeof *heap);  // n - 1 pairs, then at most 2 per merge
+    if (!sym || !prv || !nxt || !heap) die("out of memory");
   }
-  for (int i = 0; i < n; i++) ids[k++] = lookup(s + i, 1);
-  for (;;) {
-    int best = -1, rank = 1 << 30, id = 0;
-    for (int i = 0; i + 1 < k; i++) {
-      int nid, r = merge_of(ids[i], ids[i + 1], &nid);
-      if (r >= 0 && r < rank) rank = r, best = i, id = nid;
-    }
-    if (best < 0) break;
-    ids[best] = id;
-    memmove(ids + best + 1, ids + best + 2, (k - best - 2) * sizeof *ids);
-    k--;
+  nheap = 0;
+  for (int i = 0; i < n; i++) sym[i] = lookup(s + i, 1), prv[i] = i - 1, nxt[i] = i + 1 < n ? i + 1 : -1;
+  for (int i = 0; i + 1 < n; i++) offer(i);
+  while (nheap) {
+    Pair p = pop();
+    int id, i = p.pos, j = nxt[i];
+    if (sym[i] < 0 || j < 0 || merge_of(sym[i], sym[j], &id) != p.rank) continue;  // merged since
+    sym[i] = id, sym[j] = -1, nxt[i] = nxt[j];
+    if (nxt[i] >= 0) prv[nxt[i]] = i;
+    if (prv[i] >= 0) offer(prv[i]);
+    offer(i);
   }
-  if (k > max) die("prompt too long");
-  memcpy(out, ids, k * sizeof *ids);
+  int k = 0;
+  for (int i = 0; i >= 0; i = nxt[i]) {
+    if (k >= max) die("prompt too long");
+    out[k++] = sym[i];
+  }
   return k;
 }
 

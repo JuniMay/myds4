@@ -15,7 +15,7 @@ static void setup(void) {
   memset(slots, 0, sizeof memory);
   memset(where, 0xff, sizeof where);
   max_slots = nslots = cap = 3, head = 2, tail = 0;
-  pass_layer = -1, serving = 5, published = -1, token = 7, weight = 2;
+  pass_layer = -1, serving = 5, token = 7, weight = 2;
   for (int i = 0; i < 3; i++) {
     slots[i].expert = i, slots[i].mapped = 1, slots[i].demanded = 6;
     slots[i].prev = i == 2 ? -1 : i + 1, slots[i].next = i ? i - 1 : -1;
@@ -33,8 +33,6 @@ int main(void) {
   expect("stale future precedes actually used past expert", victim() == 1);
   slots[1].demanded = token;
   expect("fallback among used experts follows frequency", victim() == 1);
-  published = 8;
-  expect("published GPU table remains protected", victim() == 2);
   setup();
   slots[0].prefetched = 1;
   expect("protected prefetch remains ineligible", victim() == 1);

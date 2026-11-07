@@ -57,11 +57,8 @@ it, saying so on stderr. `lockf(1)` takes the same lock.
 | `--predictor-state FILE` | Enable online learning, load compatible state if FILE exists, and save changed state on clean completion or handled shutdown. The parent directory must exist and be writable. See [persistent predictor state](#persistent-predictor-state). |
 | `--draft N` | Speculative decoding with DSpark: each pass verifies up to N (1 to 5) proposed tokens using the main model's requested temperature and top-p. Supports greedy and sampled generation. By default, all 128 experts of each draft stage are preloaded within the total cache budget. See [Design](design.md#speculative-decoding). |
 | `--draft-cache N` | With `--draft`, reserve N expert slots per stage, 15 to 128. The default, 0 or 128, preloads all draft experts. Values 15–127 load native selections on demand into separate stage pools, evicting their least recently used experts. The pools use MXFP4-sized slots even with a Q2 backbone and count against `--cache`. |
-| `--draft-trim` | With `--draft`, compute queries, outputs and feed-forward networks (FFNs) for only the requested final-stage rows. All five key/value rows remain available to attention; the earlier stages still compute all five rows. Off by default. |
 | `--lookup off\|N` | Context-copy drafts, default `off`; N is 1–15. The target model verifies every proposed token with the requested sampler. `--draft` supplies DSpark fallback when lookup has no eligible continuation. Available in the CLI and server. |
-| `--expert-batch` | Share repeated experts' weight loads across verification rows while keeping each row's accumulation order. Exact; off by default. Available in the CLI and server. |
 | `--substitute D` | Approximate decoding and prefill, off by default: selected experts that are not in memory give way to the layer's resident experts with the highest selection keys, if such a key is at most D below the missing one's, the lowest-ranked first; the two selected experts with the highest scores are always kept (0.1 to 1.0 measured). In a prompt, an expert that one of its rows cannot do without is read and serves every row that selected it; the rows' other missing experts give way. Faster; the output differs from the model's and varies from run to run (see [Performance](performance.md#approximate-decoding-and-prefill)). |
-| `--gpu-route` | Exact decoding in which the GPU looks up each layer's experts. A layer whose published table does not mark every required expert ready is handled again through the CPU path. Off by default; earlier measurements found the same output and 0.5 to 1.1% higher throughput on the development machine (see [Design](design.md#experts-looked-up-by-the-gpu) and [Performance](performance.md#experts-looked-up-by-the-gpu)). Those timings predate the readiness correction. For a token decoded alone, not for verify passes or concurrent requests. With `--substitute`, the GPU applies the same rule to the table's publication-time state. |
 | `--experts GGUF` | Read the routed experts from GGUF files in llama.cpp's layout (any shard of a split set; see [Design](design.md#experts-from-gguf-files)), for example unsloth's `UD-IQ2_XXS` build, whose experts are 7.6 to 12.1 MB instead of 18.9 MB, or ISTA-DASLab's GSQ-RCO `IQ1_M` build (6.9 to 8.7 MB), and a Q6_K output head if the file has one. Their codes approximate the checkpoint's weights. |
 | `--perplexity` | Decode the text (without the chat template) one token at a time and print the perplexity of each next token, and how often it was the most likely one. |
 | `--prefill N` | With `--perplexity`: prefill the text's first N tokens in one pass, and score only the tokens after them. |
@@ -87,7 +84,7 @@ also the passes and the drafts kept per pass.
 `make server` builds it (it needs `cargo`; see [The server](server.md#build)).
 It takes the model and engine options of `build/myds4` above (`-m`,
 `--experts`, `--ctx`, `--ced`, the cache, draft and predictor options,
-`--substitute` and `--gpu-route`) and the server options below.
+and `--substitute`) and the server options below.
 Every request but `GET /health` needs the API key, which the server reads
 from `--api-key-file FILE` or from the `MYDS4_API_KEY` environment variable,
 and which clients send as `Authorization: Bearer KEY` (or `x-api-key: KEY`).
@@ -103,7 +100,7 @@ The [README](../README.md#run) shows how to create a key file and start the serv
 
 | Option | Effect |
 | --- | --- |
-| `--serve PORT` | Serve on this port. `--experts`, cache settings, draft settings, `--substitute`, `--gpu-route` and `--ctx` apply to every request. |
+| `--serve PORT` | Serve on this port. `--experts`, cache settings, draft settings, `--substitute` and `--ctx` apply to every request. |
 | `--host ADDR` | The IPv4 address to listen on (default `127.0.0.1`, this machine only). The server speaks plain HTTP: on another address, keys and conversations cross the network unencrypted. |
 | `--api-key-file FILE` | The key clients must send. |
 | `--kv-cache GB` | The memory the KV prefix cache may take (default 8 GiB, apart from `--cache`): the attention states it keeps (55 MiB at first, up to 3.1 GiB at 1,048,576 tokens) and their snapshots (5.3 MiB each, 5.8 MiB with a prompt end's logits; more with `--draft`). Spare snapshots and then the least recently used states are dropped to make room; a request that does not fit even then is refused before anything is dropped. A decoding request whose state needs more room (past 16,384 positions, then each doubling) makes room the same way before its state grows; when only decoding states are left, the state grows past the limit and the server logs it. |
@@ -112,7 +109,7 @@ The [README](../README.md#run) shows how to create a key file and start the serv
 | `--seed N` | The sampling seed of requests that set none. Without this option, each request receives a random seed. |
 | `--think N` | The thinking default: 1–100 enables thinking at that effort; 0 disables it. Without this option, the server enables thinking at effort 75. Request fields take precedence. |
 | `--batch N` | Requests decoded together at most, 1 to 6 (default 4). Overlapping requests share forward passes. Aggregate throughput depends on expert-cache contention and the workload (see [Performance](performance.md#concurrent-requests)). A request alone runs the same at any N. |
-| `--runahead` | Let ready concurrent requests advance while other requests' expert reads run. Groups ready requests at the same layer and enables `--expert-batch`. Applies with two or more decoding requests; off by default. Requires no `--draft`, `--online-predictor`, `--gpu-route` or `--substitute`. Context lookup remains available for a request running alone. |
+| `--runahead` | Let ready concurrent requests advance while other requests' expert reads run. Groups ready requests at the same layer. Applies with two or more decoding requests; off by default. Requires no `--draft`, `--online-predictor` or `--substitute`. Context lookup remains available for a request running alone. |
 | `--tui` | A live view on the terminal in place of the log, in five tabs (see below); the `q` key stops the server as Ctrl-C does. |
 | `--tui-theme auto\|light\|dark` | The live view's colors: by the terminal's background color, which the view asks the terminal for (`auto`, the default; light colors when it does not answer), or the light or dark ones. |
 | `--render FILE` | Print the prompt of a JSON test case of the checkpoint's `encoding/tests` (or a request's messages, tools, thinking mode and effort) as the server renders it, and exit; for `tools/reference/check.py encoding`. |
@@ -279,7 +276,7 @@ being verified; the decoding speeds count the tokens generated. The tabs:
      (late), a substitute for one not in memory (`--substitute`), or read
      from the SSD on demand. The hit rate counts the model's own choices
      found in memory (the first three); "with substitutes" adds the
-     substitutes. Layers the GPU routes (`--gpu-route`) are not counted.
+     substitutes.
      The "per token" line: the SSD's bytes and rate, the wait for reads, the
      GPU's time and busy share, reads ahead started and cancelled, and slots
      mapped for the GPU again ("remapped") when there are any. The
@@ -363,9 +360,12 @@ The app stores the key in its own credential file (`~/.dsh/.credentials.yaml`).
 | `python3 -B tools/checks/rendered_prompt_check.py CHECKPOINT` | 7 CPU checks of CLI input modes, literal image-marker text and flag order with tokenization and perplexity. Loads only the tokenizer. |
 | `make build/packed-activation-check`, then `build/packed-activation-check` | Synthetic MXFP4 kernel comparison of packed FP8 activation reads against expanded FP32 reads. Reports numerical differences and GPU-only timings; the prototype is not part of inference. |
 | `make build/expert-stream-probe`, then `build/expert-stream-probe CHECKPOINT` | Compare full expert reads with gate/up computation overlapped with down-weight reads, in an isolated favorable case. Uses the GPU and existing weight files. |
-| `make build/verification-model-check`, then `build/verification-model-check CHECKPOINT` | All sixteen verification rows against sequential decoding and rollback after partial acceptance. `--draft`, `--online`, `--gpu-route`, `--long` and `--experts GGUF` select additional cases. Uses the GPU and model. |
+| `make build/verification-model-check`, then `build/verification-model-check CHECKPOINT` | All sixteen verification rows against sequential decoding and rollback after partial acceptance. `--draft`, `--online`, `--long` and `--experts GGUF` select additional cases. Uses the GPU and model. |
 | `.venv/bin/python tools/reference/check.py tok CHECKPOINT` | The tokenizer against the `tokenizers` library on 17 texts. |
 | `make build/tokenizer-added-check`, then `ASAN_OPTIONS=detect_leaks=0 build/tokenizer-added-check CHECKPOINT` | Loads the checkpoint under address and undefined-behavior sanitizers. Checks literal added tokens that also appear in the BPE vocabulary and ordinary text round trips. |
+| `make build/tokenizer-long-check`, then `ASAN_OPTIONS=detect_leaks=0 build/tokenizer-long-check CHECKPOINT` | Pre-tokens longer than 1,024 bytes (400 CJK characters, a 1,400-byte run of letters, 1,500 letters, 1,099 spaces) against the ids of the `tokenizers` library: BPE runs over the whole piece. Under the same sanitizers. |
+| `make build/gpu-wait-check`, then `build/gpu-wait-check` | A wait for a value the GPU never signals, blocking and spinning, each in a spawned copy of the check: both must end the program after 60 s with the reason, not return or spin on. About a minute; runs no kernels and loads no model. |
+| `make build/draft-rows-check`, then `build/draft-rows-check CHECKPOINT GGUF` | With `--draft`: two sequences decode their next token alone, then together (`model_forward_rows`); afterwards each sequence's draft window keys must equal the alone ones byte for byte. One model process, about a minute. |
 | `make build/speculative-sample-check`, then `build/speculative-sample-check` | Checks the research rejection sampler's probability conservation, conditional two-token distribution, nucleus filtering, EOS and bonus tokens. |
 | `make build/cache-hold-check`, then `build/cache-hold-check` | 13 CPU checks of shared cache reservations, eviction protection and pending fetch ownership. |
 | `make build/batch-prefetch-check`, then run `build/batch-prefetch-check` | CPU checks of concurrent admission limits and shared-use credits. |
@@ -377,7 +377,7 @@ The app stores the key in its own credential file (`~/.dsh/.credentials.yaml`).
 | `.venv/bin/python tools/reference/check.py vision CHECKPOINT IMAGE [BINARY...]` | The image's feature rows (`--vision-fd`) against `inference/image_processor.py` and `vision.py` (ViT and Aligner in BF16 on the CPU): their SNR, overall and per row. With BINARY, each of those builds instead of `build/myds4`, against one reference. Needs `pillow`. |
 | `.venv/bin/python tools/reference/check.py model CHECKPOINT [CACHE]` | Every layer's streams, the routing and the logits of 20 decoded positions against DeepSeek's `inference/model.py` on the CPU (about 12 minutes, up to 55 GB of memory; `CACHE` keeps the reference's results in a file for reruns). The reference reads the checkpoint through the page cache, which then holds tens of GB of it: myds4 counts reclaimable file pages as available, and its expert reads may come from the page cache instead of the SSD. |
 | `build/myds4 -m CHECKPOINT -p TEXT --check-prefill` | The prompt as two batches (the first of odd length) against one: the final logits must be equal. The batched prefill's logits at every position against token-by-token decoding. |
-| `build/myds4 -m CHECKPOINT -p TEXT --check-batch` | The prompt's next token decoded alone and beside another sequence (`model_forward_rows`), and with `--draft N` in a verify pass: the logits must be equal. With `--gpu-route`, the token decoded alone takes the GPU-routed path and the others do not, so the check compares the two paths. |
+| `build/myds4 -m CHECKPOINT -p TEXT --check-batch` | The prompt's next token decoded alone and beside another sequence (`model_forward_rows`), and with `--draft N` in a verify pass: the logits must be equal. |
 | `make gguf-decode-check [GGUF=FILE]` | IQ1_M expert decoding on the GPU against llama.cpp's `dequantize_row_iq1_m`, value by value: 8,192 random blocks and, with `GGUF`, 768 blocks of each IQ1_M expert tensor of the file (any shard of a split set). No model is loaded. |
 | `make cache-ready-check` | Cache readiness and prefetch accounting with completed, pending and released dispatch groups. Runs 45 checks without a model, expert reads or GPU execution. |
 | `make draft-cache-check` | Runs 49 CPU checks of stage-pool bounds, native expert admission, least-recently-used replacement, protected requests and completion-group ownership. No model, expert reads or GPU execution. |
@@ -439,7 +439,7 @@ MYDS4_PREFETCH_METRICS=1 build/myds4 -m "$CHECKPOINT" \
 ```
 
 Either predictor option enables learning; without one it stays inactive. It works with
-`--substitute`, DSpark and its cache/trim options, `--gpu-route`, serving,
+`--substitute`, DSpark and its cache option, serving,
 images, GGUF experts, profiling and diagnostic modes.
 DSpark verification uses the configured temperature and top-p. Add
 `--experts GGUF_SHARD` for Q2 or other external backbone

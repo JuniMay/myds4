@@ -34,7 +34,7 @@ static void setup(int fd) {
   slots = &fixture, score = &priority, pf_loads = &observation;
   priority = 0;
   max_slots = cap = nslots = 1, npinned = nfree = 0, held_references = 0;
-  head = tail = 0, token = 10, weight = 1, pass_layer = published = -1;
+  head = tail = 0, token = 10, weight = 1, pass_layer = -1;
   where[0][0] = 0;
   expert_spans[0] = 1, expert_span[0][0][0] = (FileSpan){fd, 0, 16384};
   pf_enabled = pf_active = 1, pf_phase = PF_DECODE, pf_pass = 1, pf_rows = 1;

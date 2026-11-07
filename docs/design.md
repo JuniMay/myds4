@@ -26,7 +26,6 @@ engine's headers by name.
 | `src/engine/util.c` | Errors, strings, a JSON parser for the model's own files, the safetensors index, GGUF headers. |
 | `src/engine/vision.c` | Images: decoding, the reference's grid, Pillow's resize and padding, the vision encoder's patches and RoPE angles, an image's span of tokens. |
 | `src/engine/sample.c` | Shared temperature/top-p sampling and DSpark prefix verification. |
-| `src/engine/expert_batch.h` | Row grouping and GPU descriptors for the experimental shared-expert kernels. |
 | `src/experimental/context_lookup.c`, `src/experimental/context_lookup.h` | Bounded CPU history matching for the CLI and server's context-copy drafts. |
 | `src/experimental/expert_waves.c` | Experimental execution of completed experts while other selected experts are still loading; included by `model.c`. |
 | `src/experimental/expert_compact.h`, `src/experimental/expert_compact.metal` | Compact partial native expert batches while retaining original result indices and reduction order. |
@@ -262,6 +261,11 @@ products. The next layer's front was committed before that: the experts'
 command buffer was opened (enqueued) first, so it runs first, and the GPU
 starts the next layer as soon as the experts are done.
 
+A signal that a minute does not bring, whether waited for or spun on, means
+that a command buffer failed or the GPU stopped, and the results the CPU
+waits for are not there: the program ends with the failed buffer's error,
+or with the value that was not signaled.
+
 When some of the layer's experts are still being read (of the token's, or of
 any row of a verify pass or of several sequences), the others do not wait
 for them. The experts' buffer gets the products of those in memory, the down
@@ -318,77 +322,6 @@ split of the work must keep the order of every sum, or the outputs change
 (see Numerics): each score's lanes and `simd_sum`, a chunk's probability
 sum as two halves of 32 rows, the values row by row, the chunks from the
 first.
-
-### Experimental sharing across expert rows
-
-`--expert-batch` enables expert sharing in the CLI and server. The
-`build/myds4-expert-batch` diagnostic build enables it by default. In
-batches of two to sixteen rows, it groups up to three uses of the same
-resident expert. Each group shares weight loads and decoding while keeping
-an accumulator, routing weight and output position for each row. Fixed loop
-sizes let the compiler keep those accumulators in registers. The available
-paths cover MXFP4 and the Q2_K, IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S and IQ3_XXS
-codes used by the IQ2 expert build.
-
-Rows retain their scalar lane assignment, order of additions, BF16 rounding
-and FP8 activation quantization. Down products go into `PARTS`; the existing
-`moe_parts` kernel sums each row's experts in expert order and performs its
-hyper-connection expansion. A phase with no repeated expert uses the existing
-per-row kernels. The single-row path and unsupported expert formats also use
-those kernels.
-
-The CPU groups entries after routing and substitution have selected the
-experts. Ready experts run before the SSD wait; late experts run afterward.
-Each layer has separate descriptors for those phases, held until the GPU
-finishes the pass. The descriptor allocation is 480 KiB when sharing is enabled. This preserves the
-existing overlap of expert computation and reads. The SSD request path
-already requests the union of selected experts across rows; grouping targets
-GPU weight traffic and decoding work.
-
-The experimental executable prints aggregate `expert_batch` counters on
-exit: grouped calls, row/expert pairs and weight groups. These describe
-issued kernel work. They do not measure physical GPU memory traffic, SSD
-traffic, cache hits or emitted-token speed.
-
-The retained checks are:
-
-| Target or tool | Scope |
-| --- | --- |
-| `build/expert-batch-check` | Synthetic GPU comparison against the scalar kernels, including all one-to-six-row sizes, three sharing patterns and whole/split/empty-first read phases. `--check-only` omits timing; `--format` selects a supported code. |
-| `build/expert-batch-model-check` | Experimental engine: compare all six verification rows' logits with sequential decoding from the same saved state. Arguments are the checkpoint directory and, optionally, the expert GGUF file. |
-| `build/expert-batch-model-control` | The same all-row check with the ordinary engine. |
-| `tools/bench/expert_batch_bench.py` | Serial ordinary/grouped comparisons with identical prompts, sampling, draft settings and cache budgets. It checks output identity, actual cache bounds and that the candidate issued grouped work. |
-
-The GPU checks take the same model lock as inference. The benchmark runner
-also checks device activity, other compute processes, AC power and memory;
-it interrupts only its own child when interference appears. Source excerpts
-form long repository-review traces. The runner counts the complete chat
-template and stops excerpts before image-marker literals. It keeps prompts
-and generated answers in memory, and can save bounded aggregate results.
-Generated code is not executed. These workloads measure inference on
-agentic-style histories; they do not measure autonomous task completion.
-Before loading, the runner requires the requested expert-cache budget,
-14 GiB for weights and working buffers, and the explicit engine reserve to
-be available. The reserve defaults to 10 GiB; `--reserve` sets it for every
-comparison arm and for the guard. The native memory-pressure policy remains
-active, and a run with cache shrinkage or new swap-outs is rejected. In-memory compression is recorded and allowed.
-The all-row model check requests a 20 GiB cache and a 4 GiB reserve; it
-compares logits and makes no throughput claim.
-The default timing admission limit is 20% device activity. Explicit
-`--desktop` comparisons record ordinary desktop GPU activity without treating
-its aggregate utilization as another model job. Process exclusion and the model
-lock still apply. The runner records device/renderer activity during the
-run. This does not establish exclusive GPU use; desktop-load
-timings must be reported with that limitation and the repeat-control range.
-In this desktop mode, Python jobs and known compiler/build tools are
-logged as background CPU work when the driver exposes GPU-client
-ownership and neither they nor their descendants own a GPU client. During
-inference the model's own GPU client must also be visible for that exception
-to apply. GPU clients, named model/probe jobs and the model lock
-still block a run; memory bounds, cache shrinkage and new swap-outs
-remain grounds to reject a comparison. CPU work does not need a separate
-reservation. The default quiet mode retains the broader Python-job
-exclusion. Background-helper observations are retained with the result.
 
 ### CED and DSpark study tools
 
@@ -970,49 +903,6 @@ reads have come, so with `--substitute` the output varies from run to run,
 also when greedy. [Performance](performance.md#approximate-decoding-and-prefill)
 has the speed and the perplexity.
 
-### Experts looked up by the GPU
-
-`--gpu-route`, off by default, lets a decoded token's layers run without
-waiting for the CPU between a layer's routing and its experts. It applies
-to a token decoded alone, not to verify passes or to several sequences at
-once. Each layer is one command buffer: the front, the `resolve` kernel, the
-routing signal, the shared expert, then the routed experts as `resolve`
-names them. The CPU encodes each layer's buffer two layers ahead, and the
-head's in a buffer of its own, since the head's norm overwrites the FFN
-input that a recomputation of the last layer's experts reads (see below).
-It commits a layer's buffer as soon as the layer before has found all its
-own experts in memory, or once it has had them computed again.
-
-Before committing a layer's buffer, the CPU publishes the layer's table:
-for each expert, the GPU addresses of its three spans if its slot is read in
-full, 1 if it is still being read, else 0. It publishes the table before it
-waits for the routing signal of the layer before, and again just before the
-commit if experts were still being read. A ready slot that joined the
-residency set during this token is committed into the set first, since the
-GPU may use it only through `gpu_use` until then. Until the next layer's
-table, no slot of the published layer is evicted or released.
-
-`resolve` computes the selection keys as the route kernel does (with
-`--substitute`, it substitutes an expert without a slot in the published
-table by the CPU's rule),
-writes the layer's six experts in expert order into entries of their own in
-the experts' table, and reports the experts used and how many are not ready.
-If one is not, every entry is null, the expert kernels return at once,
-and the CPU computes the layer's experts as in the two-buffer path, in a
-command buffer of its own with entries of its own. That buffer joins the
-queue before the next layer's, so it runs after the layer's pass and before
-the next layer. Each layer writes its routing and predictions into rows of
-its own, which the CPU reads after the next layer's buffer has been
-committed.
-
-The GPU runs the same kernels on the same inputs in the same order as in
-the two-buffer path, so the output is the same bit for bit
-(`--check-batch --gpu-route` compares the two). It is 0.5 to 1.1% faster
-(see [Performance](performance.md#experts-looked-up-by-the-gpu)): by the
-gaps between command buffers, a layer whose experts are in memory already
-starts them within 100 us of its front's end in the two-buffer path, and a
-layer whose expert is still being read waits for the SSD either way.
-
 ## Speculative decoding
 
 With `--draft N`, decoding runs the checkpoint's DSpark draft
@@ -1050,12 +940,8 @@ the main model:
    expert still being read instead of replacing it, the rows read ahead
    only the next layer's top 3.
 
-`--draft-trim`, off by default, trims only the final stage's query/output
-rows and feed-forward networks (FFNs) to the number of drafts requested by
-that pass. Its attention still receives all five key/value rows, and the
-first two stages still compute all five rows. The final requested count can
-be smaller than `--draft N` near the generation or context limit. The head
-already processes only the requested rows, with or without trimming.
+Every stage computes all five rows, whose keys every query attends to; the
+head processes only the rows whose drafts the pass requested.
 
 By default, each stage preloads all 128 MXFP4 experts. `--draft-cache N`
 reserves 15–128 slots per stage within the total `--cache` budget. Values
@@ -1134,11 +1020,11 @@ needed to resume. DSpark retains its own five-position architecture.
 The sampler checks up to 15 proposals, every rejection point, EOS and random
 state preservation. GPU checks compare all sixteen rows with serial
 decoding and resume after accepting 1, 2, 6, 15 or 16 rows. These checks
-cover MXFP4 and IQ2, including an MXFP4 run with DSpark, online prefetching
-and GPU routing. Candidate tests alone do not measure model acceptance or
+cover MXFP4 and IQ2, including an MXFP4 run with DSpark and online
+prefetching. Candidate tests alone do not measure model acceptance or
 throughput. The CLI prints exact lookup attempt, offered and accepted
-counts; the server logs them per request and exposes `lookup_depth` and
-`expert_batch` in status. Copy-heavy and reconstructed Harness timings are
+counts; the server logs them per request and exposes `lookup_depth` in
+status. Copy-heavy and reconstructed Harness timings are
 reported separately in [Performance](performance.md#context-copy-drafting).
 
 The experimental `build/myds4-consensus-lookup` keeps the longer-match
@@ -1654,7 +1540,6 @@ experts together, and `other` covers unclassified callers.
 | `unconsumed_prefetch_read_bytes_live`, `prefetch_bytes_outstanding_live` | Unconsumed completed bytes and remaining prefetch bytes still in live slots at reporting time. Future use is unresolved. |
 | `prefetch_caused_evictions` | Slots displaced by an admitted prefetch. |
 | Each view's `rerequests_after_prefetch_eviction`, `absent_after_prefetch_eviction` | Later requests for those victims, with the absent subset separated. A served request clears the victim marker; an exact-router observation alone does not. |
-| `unsupported_gpu_route_passes`, `unsupported_gpu_route_rows` | Work that actually used the GPU lookup path and is excluded from the readiness views. |
 | `first_uses_outside_observed_routes` | Previously tracked reads consumed outside those views, recorded separately without a timely-hit reward. |
 | `scope`, `pollution_scope` | Descriptions of the population, byte units and limits of attribution. |
 
@@ -1673,11 +1558,6 @@ diagnostic observations, not additional hit credits. A promoted prefetch's
 queue interval starts at its original admission, not at promotion to demand.
 Piece durations can overlap across readers and must not be added to infer
 wall time. All timing hooks are disabled with the observer.
-
-GPU lookup uses a table published before routing. A later CPU completion
-query does not establish whether that published table was ready, so its
-passes explicitly report unsupported coverage. Verification passes still use
-the supported CPU routing path even when `--gpu-route` is configured.
 
 Eviction and rerequest fields are observations, not a counterfactual estimate
 of lost baseline hits. They do not measure causal cache pollution or saved
@@ -1741,9 +1621,11 @@ indexer and sparse attention) runs as a decoded row's, with that row's
 state bound and its own position and Engram history. Each row's logits are
 therefore those of its token decoded alone: `--check-batch` compares them,
 and a verify pass's first row, with a token decoded alone (0 of 129,280
-logits differed, with the GGUF experts and two drafts). A sequence decoded
-beside others does not update the draft's windows, so drafting it alone
-later keeps fewer drafts until they refill.
+logits differed, with the GGUF experts and two drafts). With `--draft`, the
+step then writes each row's draft window keys into its own sequence's
+windows at its position (`draft_rows`), as decoding the sequence alone does,
+so a sequence that drafts alone again later finds its windows whole
+(`build/draft-rows-check` compares them byte for byte).
 
 ### Concurrent scheduling experiments
 

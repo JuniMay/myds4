@@ -34,7 +34,7 @@ static void check_pool(int fd, int limit) {
   slots = fixture, score = priorities, free_list = available;
   nslots = cap = max_slots = nmapped = N, nfree = npinned = 0;
   head = N - 1, tail = 0, token = 10, weight = 1;
-  pass_layer = published = -1, serving = 1;
+  pass_layer = -1, serving = 1;
   qhead = qtail = 0;
   atomic_store(&demand, 0), atomic_store(&prefetching, 0);
   expert_spans[2] = expert_spans[3] = 1;
@@ -74,10 +74,6 @@ static void check_pool(int fd, int limit) {
   expect("held segment entries remain protected", where[3][future] == -1 && where[0][limit] == limit);
   fixture[limit].holds = 0;
 #endif
-  published = 0;
-  cache_prefetch(3, &future, 1, 1, 16);
-  expect("published segment entries remain protected", where[3][future] == -1 && where[0][limit] == limit);
-  published = -1;
   cache_prefetch(3, &future, 1, 1, 16);
   expect("new forecast replaces only the demoted entry", where[3][future] == limit && where[0][limit] == -1);
   int survivors = 0;

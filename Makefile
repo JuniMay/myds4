@@ -4,7 +4,7 @@ CFLAGS = -std=c23 -O2 -Wall -Wextra -Wno-unused-parameter -Isrc/engine -DMYDS4_R
 LDLIBS = -framework Metal -framework Foundation -framework IOKit -framework ImageIO -framework CoreGraphics -framework Accelerate -lobjc \
          $(shell pkg-config --libs yyjson libjpeg)
 SRC = src/cli/main.c src/engine/model.c src/engine/io.c src/engine/gpu.c src/engine/tok.c src/engine/util.c src/engine/vision.c src/experimental/online_predictor.c src/experimental/context_lookup.c src/engine/sample.c
-MODEL_HEADERS = src/engine/myds4.h src/experimental/online_predictor_math.h src/experimental/context_lookup.h src/engine/expert_batch.h src/experimental/prefill_prune.h src/experimental/runahead.c src/experimental/expert_waves.c src/experimental/urgent_io_diagnostic.h
+MODEL_HEADERS = src/engine/myds4.h src/experimental/online_predictor_math.h src/experimental/context_lookup.h src/experimental/prefill_prune.h src/experimental/runahead.c src/experimental/expert_waves.c src/experimental/urgent_io_diagnostic.h
 KERNELS = src/kernels/kernels.metal src/kernels/gguf_grids.metal src/kernels/gguf.metal src/kernels/vision.metal
 
 build/shared-gate-check: tools/checks/shared_gate_check.c src/experimental/shared_gate.metal tools/reference/activation_format.h src/engine/gpu.c src/engine/util.c src/engine/myds4.h $(KERNELS)
@@ -68,10 +68,6 @@ context-lookup-check: build/context-lookup-check
 build/context-lookup-replay: tools/experimental/context_lookup_replay.c src/experimental/context_lookup.c src/experimental/context_lookup.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/experimental/context_lookup_replay.c src/experimental/context_lookup.c
-
-build/expert-stream-probe: tools/experimental/expert_stream_probe.c src/engine/io.c src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS) $(KERNELS)
-	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ tools/experimental/expert_stream_probe.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
 
 build/expert-phase-check: tools/checks/expert_phase_check.c src/engine/io.c src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS)
 	@mkdir -p build
@@ -172,7 +168,7 @@ build/myds4-causal-group-rejection-draft: $(SRC) src/experimental/runahead.c src
 
 build/causal-group-check: tools/checks/verification_model_check.c $(SRC) src/experimental/runahead.c src/experimental/causal_verify.c $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
 	@mkdir -p build
-	$(CC) $(CFLAGS) -DMYDS4_RUNAHEAD -DMYDS4_CAUSAL_VERIFY -DMYDS4_CAUSAL_SIGNALS -DMYDS4_CAUSAL_GROUP -DMYDS4_EXPERT_BATCH -o $@ tools/checks/verification_model_check.c $(filter-out src/cli/main.c,$(SRC)) $(LDLIBS)
+	$(CC) $(CFLAGS) -DMYDS4_RUNAHEAD -DMYDS4_CAUSAL_VERIFY -DMYDS4_CAUSAL_SIGNALS -DMYDS4_CAUSAL_GROUP -o $@ tools/checks/verification_model_check.c $(filter-out src/cli/main.c,$(SRC)) $(LDLIBS)
 
 build/myds4-causal-route-only: $(SRC) src/experimental/runahead.c src/experimental/causal_verify.c $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
 	@mkdir -p build
@@ -186,10 +182,6 @@ build/early-verify-check: tools/checks/early_verify_check.c $(SRC) src/experimen
 	@mkdir -p build
 	$(CC) $(CFLAGS) -DMYDS4_RUNAHEAD -DMYDS4_CAUSAL_VERIFY -DMYDS4_CAUSAL_SIGNALS -DMYDS4_CAUSAL_GROUP -DMYDS4_RUNAHEAD_NO_FORECASTS -DMYDS4_CAUSAL_EARLY_STOP -DMYDS4_CAUSAL_LEAD_FIRST -o $@ tools/checks/early_verify_check.c $(filter-out src/cli/main.c,$(SRC)) $(LDLIBS)
 
-build/myds4-draft-expert-batch: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
-	@mkdir -p build
-	$(CC) $(CFLAGS) -DMYDS4_DRAFT_EXPERT_BATCH -o $@ $(SRC) $(LDLIBS)
-
 build/myds4-draft-cache-control: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -DMYDS4_DRAFT_CACHE_METRICS -o $@ $(SRC) $(LDLIBS)
@@ -202,13 +194,9 @@ build/draft-shared-pool-check: tools/checks/draft_shared_pool_check.c tools/chec
 	@mkdir -p build
 	$(CC) $(CFLAGS) -DMYDS4_DRAFT_SHARED_POOL -o $@ tools/checks/draft_shared_pool_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
 
-build/draft-expert-batch-check: tools/checks/draft_expert_batch_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
-	@mkdir -p build
-	$(CC) $(CFLAGS) -DMYDS4_DRAFT_EXPERT_BATCH -o $@ tools/checks/draft_expert_batch_check.c $(filter-out src/cli/main.c src/engine/model.c,$(SRC)) $(LDLIBS)
-
 build/causal-route-only-check: tools/checks/verification_model_check.c $(SRC) src/experimental/runahead.c src/experimental/causal_verify.c $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
 	@mkdir -p build
-	$(CC) $(CFLAGS) -DMYDS4_RUNAHEAD -DMYDS4_CAUSAL_VERIFY -DMYDS4_CAUSAL_SIGNALS -DMYDS4_CAUSAL_GROUP -DMYDS4_RUNAHEAD_NO_FORECASTS -DMYDS4_EXPERT_BATCH -o $@ tools/checks/verification_model_check.c $(filter-out src/cli/main.c,$(SRC)) $(LDLIBS)
+	$(CC) $(CFLAGS) -DMYDS4_RUNAHEAD -DMYDS4_CAUSAL_VERIFY -DMYDS4_CAUSAL_SIGNALS -DMYDS4_CAUSAL_GROUP -DMYDS4_RUNAHEAD_NO_FORECASTS -o $@ tools/checks/verification_model_check.c $(filter-out src/cli/main.c,$(SRC)) $(LDLIBS)
 
 build/prefill-prune-check: tools/checks/prefill_prune_check.c src/experimental/prefill_prune.h
 	@mkdir -p build
@@ -237,6 +225,10 @@ build/state-fork-check: tools/checks/state_fork_check.c $(SRC) $(MODEL_HEADERS) 
 state-fork-check: build/state-fork-check
 	./build/state-fork-check
 
+build/draft-rows-check: tools/checks/draft_rows_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/draft_rows_check.c $(filter-out src/cli/main.c src/engine/model.c,$(SRC)) $(LDLIBS)
+
 build/prefix-fork-check: tools/checks/prefix_fork_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/prefix_fork_check.c $(filter-out src/cli/main.c src/engine/model.c,$(SRC)) $(LDLIBS)
@@ -258,7 +250,7 @@ verification-schedule-check: build/verification-schedule-check
 
 build/verification-model-check: tools/checks/verification_model_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
 	@mkdir -p build
-	$(CC) $(CFLAGS) -DMYDS4_EXPERT_BATCH -o $@ tools/checks/verification_model_check.c $(filter-out src/cli/main.c,$(SRC)) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ tools/checks/verification_model_check.c $(filter-out src/cli/main.c,$(SRC)) $(LDLIBS)
 
 # CED numerical and prefill/DSpark timing checks.
 build/ced-check: tools/checks/ced_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
@@ -276,10 +268,6 @@ build/prefill-state-check: tools/checks/prefill_state_check.c $(SRC) $(MODEL_HEA
 build/attention-candidate-check: tools/checks/attention_candidate_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/attention_candidate_check.c $(filter-out src/cli/main.c src/engine/model.c,$(SRC)) $(LDLIBS)
-
-build/expert-batch-check: tools/checks/expert_batch_check.c tools/reference/activation_format.h src/engine/gpu.c src/engine/util.c src/engine/myds4.h src/engine/expert_batch.h src/kernels/kernels.metal src/kernels/gguf_grids.metal src/kernels/gguf.metal src/experimental/mxfp4_loads.metal src/experimental/expert_rows_specialized.metal
-	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ tools/checks/expert_batch_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
 
 # Experimental exact sharing of resident expert weights across verification rows.
 build/myds4-fp4-early: $(SRC) $(MODEL_HEADERS) $(KERNELS) src/experimental/mxfp4_loads.metal data/engram.bin data/unicode.bin
@@ -346,6 +334,10 @@ build/index-mask-check: tools/checks/index_mask_check.c src/engine/gpu.c src/eng
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/index_mask_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
 
+build/gpu-wait-check: tools/checks/gpu_wait_check.c src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/gpu_wait_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
+
 build/fp8-tensor-check: tools/checks/fp8_tensor_check.c src/engine/gpu.c src/engine/util.c tools/reference/activation_format.h $(MODEL_HEADERS) $(KERNELS) src/experimental/fp8_tensor.metal
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/fp8_tensor_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
@@ -365,10 +357,6 @@ build/myds4-prune-gpu48: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data
 build/cache-stale-check: tools/checks/cache_stale_check.c src/engine/io.c src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/cache_stale_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
-
-build/myds4-expert-batch: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
-	@mkdir -p build
-	$(CC) $(CFLAGS) -DMYDS4_EXPERT_BATCH -o $@ $(SRC) $(LDLIBS)
 
 # Experimental draft sampling with copied target uniforms; ordinary sampling is unchanged.
 build/myds4-coupled-draft: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
@@ -394,6 +382,10 @@ build/myds4-staged-draft: $(SRC) $(MODEL_HEADERS) src/experimental/draft_queue.h
 build/tokenizer-added-check: tools/checks/tokenizer_added_check.c src/engine/tok.c src/engine/util.c $(MODEL_HEADERS) data/engram.bin data/unicode.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ tools/checks/tokenizer_added_check.c src/engine/tok.c src/engine/util.c $(shell pkg-config --libs yyjson)
+
+build/tokenizer-long-check: tools/checks/tokenizer_long_check.c src/engine/tok.c src/engine/util.c $(MODEL_HEADERS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ tools/checks/tokenizer_long_check.c src/engine/tok.c src/engine/util.c $(shell pkg-config --libs yyjson)
 
 build/myds4-staged-coupled-draft: $(SRC) $(MODEL_HEADERS) src/experimental/draft_queue.h $(KERNELS) data/engram.bin data/unicode.bin
 	@mkdir -p build
@@ -450,14 +442,6 @@ build/myds4-consensus-prefetch1: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.
 build/myds4-consensus-row-credit: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -DMYDS4_PREFILL_PRUNE -DMYDS4_CONSENSUS_LOOKUP -DMYDS4_VERIFY_ROW_CREDIT -o $@ $(SRC) $(LDLIBS)
-
-build/expert-batch-model-check: tools/checks/expert_batch_model_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
-	@mkdir -p build
-	$(CC) $(CFLAGS) -DMYDS4_EXPERT_BATCH -o $@ tools/checks/expert_batch_model_check.c $(filter-out src/cli/main.c,$(SRC)) $(LDLIBS)
-
-build/expert-batch-model-control: tools/checks/expert_batch_model_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
-	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ tools/checks/expert_batch_model_check.c $(filter-out src/cli/main.c,$(SRC)) $(LDLIBS)
 
 # Retained research build: explicit feature ablations and real prefetch trials.
 build/myds4-predict-lab: $(SRC) src/experimental/predictor_lab.c src/experimental/predictor_lab.h $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
@@ -520,7 +504,7 @@ build/prefetch-promote-check: tools/checks/prefetch_promote_check.c src/engine/i
 	@mkdir -p build
 	$(CC) $(CFLAGS) -DMYDS4_EARLY_DEMAND_PROMOTION -o $@ tools/checks/prefetch_promote_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
 
-build/expert-compact-check: tools/checks/expert_compact_check.c src/experimental/expert_compact.h src/experimental/expert_compact.metal src/engine/expert_batch.h tools/reference/activation_format.h src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS) $(KERNELS)
+build/expert-compact-check: tools/checks/expert_compact_check.c src/experimental/expert_compact.h src/experimental/expert_compact.metal tools/reference/activation_format.h src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS) $(KERNELS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/expert_compact_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
 
@@ -532,11 +516,11 @@ build/expert-compact-model-check: tools/checks/expert_compact_model_check.c $(SR
 	@mkdir -p build
 	$(CC) $(CFLAGS) -DMYDS4_EXPERT_COMPACT -o $@ tools/checks/expert_compact_model_check.c $(filter-out src/cli/main.c src/engine/model.c,$(SRC)) $(LDLIBS)
 
-build/expert-limit256-check: tools/checks/expert_compact_check.c src/experimental/expert_compact.h src/experimental/expert_compact.metal src/engine/expert_batch.h tools/reference/activation_format.h src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS) $(KERNELS)
+build/expert-limit256-check: tools/checks/expert_compact_check.c src/experimental/expert_compact.h src/experimental/expert_compact.metal tools/reference/activation_format.h src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS) $(KERNELS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -DMYDS4_PIPELINE_LIMIT=256 -DMYDS4_PIPELINE_DOWN_LIMIT=192 -o $@ tools/checks/expert_compact_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
 
-build/expert-limit512-check: tools/checks/expert_compact_check.c src/experimental/expert_compact.h src/experimental/expert_compact.metal src/engine/expert_batch.h tools/reference/activation_format.h src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS) $(KERNELS)
+build/expert-limit512-check: tools/checks/expert_compact_check.c src/experimental/expert_compact.h src/experimental/expert_compact.metal tools/reference/activation_format.h src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS) $(KERNELS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -DMYDS4_PIPELINE_LIMIT=512 -DMYDS4_PIPELINE_DOWN_LIMIT=256 -o $@ tools/checks/expert_compact_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
 

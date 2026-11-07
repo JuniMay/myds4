@@ -50,7 +50,6 @@ class Config:
     max_new_tokens: int = 256
     timeout: float = 300
     binary: str = str(ROOT / "build" / "myds4")
-    draft_trim: bool = False
     cache_half_life: float = 50
     cache_read_cost: bool = False
     thinking: int = 0
@@ -530,7 +529,6 @@ def run_case(case, config):
         or not isinstance(config.draft_cache, int)
         or not (config.draft_cache == 0 or 15 <= config.draft_cache <= 128)
         or (config.draft_cache and not config.draft)
-        or (config.draft_trim and not config.draft)
         or not 1 <= config.cache_half_life <= 1000
         or config.thinking not in (0, 16)
         or not isinstance(config.online_predictor, bool)
@@ -606,8 +604,6 @@ def run_case(case, config):
         command += ["--draft", str(config.draft)]
     if config.draft_cache:
         command += ["--draft-cache", str(config.draft_cache)]
-    if config.draft_trim:
-        command += ["--draft-trim"]
     if config.cache_half_life != 50:
         command += ["--cache-half-life", str(config.cache_half_life)]
     if config.cache_read_cost:

@@ -12,14 +12,13 @@ static int compare(const float *a, const float *b) {
 }
 
 int main(int argc, char **argv) {
-  if (argc < 2) die("usage: verification-model-check CHECKPOINT [--long] [--draft] [--gpu-route] [--online] [--experts GGUF]");
+  if (argc < 2) die("usage: verification-model-check CHECKPOINT [--long] [--draft] [--online] [--experts GGUF]");
   Options o = {.ctx = 2048, .budget_gb = 20, .reserve_gb = 4, .lookup = VERIFY_DRAFTS,
                .dump_fd = -1, .routes_fd = -1, .quiet = 1};
   int longer = 0;
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--long")) longer = 1, o.ctx = 32768;
-    else if (!strcmp(argv[i], "--draft")) o.draft = 2, o.draft_cache = 32, o.draft_trim = 1;
-    else if (!strcmp(argv[i], "--gpu-route")) o.gpu_route = 1;
+    else if (!strcmp(argv[i], "--draft")) o.draft = 2, o.draft_cache = 32;
     else if (!strcmp(argv[i], "--online")) o.online_predictor = 64;
     else if (!strcmp(argv[i], "--experts") && i + 1 < argc) o.experts = argv[++i];
     else die("invalid verification check option");

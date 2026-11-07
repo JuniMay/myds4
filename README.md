@@ -112,10 +112,9 @@ match full prefill. Long-prompt prefill improved, while subsequent decode
 slowed in the measured MXFP4 case; see
 [prefill measurements](docs/performance.md#dependency-pruned-prefill-checks).
 
-`--lookup N` enables context-copy drafting with up to 15 candidates;
-`--expert-batch` shares repeated expert weight loads during verification.
+`--lookup N` enables context-copy drafting with up to 15 candidates.
 Every candidate is checked by the target model with the requested sampler.
-Without `--draft`, these options do not load DSpark weights. Both are off
+Without `--draft`, lookup does not load DSpark weights. It is off
 by default. Context copy speeds repeated text in the measured copy task,
 but slows the measured long DSH continuation; see
 [context-copy measurements](docs/performance.md#context-copy-drafting).

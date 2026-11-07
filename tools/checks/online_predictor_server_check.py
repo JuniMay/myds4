@@ -126,7 +126,6 @@ def arguments():
     parser.add_argument("--draft", type=int, choices=range(6), default=2)
     parser.add_argument("--draft-cache", type=int, default=32)
     parser.add_argument("--substitute", type=float, default=0)
-    parser.add_argument("--gpu-route", action="store_true")
     parser.add_argument("--image-smoke", action="store_true")
     parser.add_argument("--temperature", type=float, default=0)
     parser.add_argument("--top-p", type=float, default=1)
@@ -202,8 +201,6 @@ def main():
         cmd += ["--draft", str(args.draft), "--draft-cache", str(args.draft_cache)]
     if args.substitute:
         cmd += ["--substitute", str(args.substitute)]
-    if args.gpu_route:
-        cmd.append("--gpu-route")
     state_existed = args.predictor_state is not None and args.predictor_state.exists()
     if args.predictor_state is not None:
         cmd += ["--predictor-state", str(args.predictor_state)]

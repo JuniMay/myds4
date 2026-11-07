@@ -105,13 +105,12 @@ int myds4_load(const myds4_config *c) {
                   : c->draft_cache && !c->draft     ? "--draft-cache needs --draft"
                   : c->draft_cache && (c->draft_cache < DRAFT_CACHE_MIN || c->draft_cache > DRAFT_EXPERTS)
                       ? "--draft-cache takes 15 to 128 slots per stage (0 keeps the default)"
-                  : c->draft_trim && !c->draft      ? "--draft-trim needs --draft"
                   : c->ced && (c->ced < WINDOW || c->ced > 1 << 20)
                       ? "--ced takes off or 128 to 1048576 replay tokens"
                   : c->cache_half_life < 0 || c->cache_half_life > CACHE_HALF_LIFE_MAX
                       ? "--cache-half-life takes 1 to 1000000 forward passes"
-                  : requested_runahead && (c->draft || c->online_predictor || c->gpu_route || c->substitute > 0)
-                      ? "--runahead requires --draft off, no online predictor, no GPU routing and no substitution"
+                  : requested_runahead && (c->draft || c->online_predictor || c->substitute > 0)
+                      ? "--runahead requires --draft off, no online predictor and no substitution"
                   : c->reserve_gb && !(c->reserve_gb >= CACHE_RESERVE_MIN && c->reserve_gb <= CACHE_RESERVE_MAX)
                       ? "--reserve takes 2 to 1024 GiB"
                   : loaded                          ? "the model is loaded already"
@@ -125,11 +124,10 @@ int myds4_load(const myds4_config *c) {
   die_hook = c->on_die;
   opt = (Options){.ctx = c->ctx, .budget_gb = c->cache_gb, .reserve_gb = c->reserve_gb, .cache_half_life = c->cache_half_life,
                   .cache_read_cost = c->cache_read_cost, .dump_fd = -1, .routes_fd = -1, .draft = c->draft,
-                  .draft_cache = c->draft_cache, .draft_trim = c->draft_trim, .predictor_state = cfg.predictor_state,
-                  .substitute = c->substitute, .gpu_route = c->gpu_route, .experts = cfg.experts, .quiet = 1,
+                  .draft_cache = c->draft_cache, .predictor_state = cfg.predictor_state,
+                  .substitute = c->substitute, .experts = cfg.experts, .quiet = 1,
                   .online_predictor = c->online_predictor || c->predictor_state ? 64 : 0, .ced = c->ced,
-                  .lookup = c->lookup, .expert_batch = c->expert_batch || requested_runahead,
-                  .prefill_prune = c->prefill_prune, .runahead = requested_runahead};
+                  .lookup = c->lookup, .prefill_prune = c->prefill_prune, .runahead = requested_runahead};
   if (opt.predictor_state) shutdown_watch();  // an interrupt while loading still saves the state
   pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);  // the model's GPU work goes before background work
   myds4_tokenizer(cfg.model);

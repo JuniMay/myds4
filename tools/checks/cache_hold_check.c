@@ -9,7 +9,7 @@ int main(void) {
   double priorities[4] = {1, 2, 3, 4};
   slots = fixture, score = priorities, max_slots = cap = nslots = 4;
   memset(where, 0xff, sizeof where);
-  head = 3, tail = 0, pass_layer = serving = published = -1;
+  head = 3, tail = 0, pass_layer = serving = -1;
   token = 10, weight = 1;
   for (int i = 0; i < 4; i++) {
     fixture[i].layer = 0, fixture[i].expert = i, fixture[i].mapped = 1;

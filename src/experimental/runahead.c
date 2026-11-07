@@ -89,12 +89,8 @@ static int run_group(RunJob **jobs, const int *ids, int count, Buf **live, const
     const int *rt = (const int *)jobs[r]->saved[7].ptr;
     fill_entries(layer, entries + r * 256, rt, (const float *)rt + 8, NULL, 0);
   }
-  int grouped = opt.expert_batch && experts_rows(layer, count, entries, 0);
-  for (int r = 0; r < count; r++) {
-    size_t mf = (size_t)r * MIX * 4, hs = (size_t)r * HC * DIM * STREAM_BYTES;
-    if (grouped) experts_sum(r, mf, hs);
-    else experts_go(layer, r, entries + r * 256, mf, hs, 0);
-  }
+  for (int r = 0; r < count; r++)
+    experts_go(layer, r, entries + r * 256, (size_t)r * MIX * 4, (size_t)r * HC * DIM * STREAM_BYTES, 0);
   uint64_t signal;
   int deferred_head = runahead_enabled == 5 && !captures;
   if (layer == LAYERS - 1) {

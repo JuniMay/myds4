@@ -267,7 +267,6 @@ typedef struct {
 } CacheObservation;
 void cache_metrics_begin(int phase, int rows);
 void cache_metrics_end(void);
-void cache_metrics_unsupported(void);
 void cache_observe_snapshot(int layer, CacheObservation *snapshot);
 void cache_observe_routes(const CacheObservation *snapshot, const int *ids, int rows, int stride, int served);
 void cache_prefetch_from(int layer, const int *experts, int n, int admit, int inflight, int issuer);
@@ -279,13 +278,6 @@ void cache_io_diagnostic_decode(void);
 void cache_refine(int layer, const int *keep, int n);
 void cache_demote(int layer);  // after its routing: the layer's unselected read-aheads are evicted first
 void cache_pass(int layer);  // a prompt pass is at this layer (-1: none): keep later layers' experts
-// --gpu-route: writes the layer's entries in the table of ready experts'
-// span addresses (cache_table), which a command buffer committed next reads;
-// from then on until cache_unpublish or the next layer's entries, its slots
-// stay. Returns how many of its experts are still being read.
-const Buf *cache_table(void);
-int cache_publish(int layer);
-void cache_unpublish(void);
 void cache_adapt(void);             // between tokens
 void cache_adapt_pass(int layer);   // within a prompt pass at this layer
 void cache_idle(void);              // while no request runs: resizes as between tokens
@@ -297,12 +289,15 @@ int cache_max(void);        // and at most
 uint64_t cache_slot_bytes(void);
 uint64_t cache_uncached_bytes(int *experts);  // the backbone's experts without a slot: bytes and count
 extern CacheStats cache_stats;
-extern uint64_t spec_fixups;  // --gpu-route: decoded layers whose experts the CPU computed again
 // An expert's bytes in the files: an MXFP4 expert's codes (w1, w2, w3 back
 // to back) and scales, or with --experts the GGUF rows of w1, w3 and w2.
 typedef struct { int fd; uint64_t off, len; } FileSpan;
 extern FileSpan expert_span[CACHE_LAYERS][EXPERTS][3];
 extern int expert_spans[CACHE_LAYERS];  // spans per expert of the layer, 0: not set
+// A routed expert as the expert kernels read it: the GPU addresses of its
+// three matrices (null: no expert) and its routing weight.
+typedef struct { uint64_t p[3]; float weight, pad; } ExpertRef;
+static_assert(sizeof(ExpertRef) == 32, "Metal expert record layout");
 
 // ---- tok.c ----
 void tok_load(const char *dir);
@@ -362,12 +357,9 @@ typedef struct {
   int routes_fd;      // -1, or a pipe receiving every decoded token's routes, predictions and router logits
   int draft;          // keep the DSpark stages' windows, for model_draft
   int lookup;         // 0: off; otherwise up to VERIFY_DRAFTS context-copy candidates
-  int expert_batch;   // share repeated experts' weight loads across verification rows
   int draft_cache;    // draft expert slots per stage; 0 = all 128 preloaded
-  int draft_trim;     // final draft stage: only requested query/FFN rows; keep all five keys
   const char *predictor_state; // load or create online state; save on clean completion
   float substitute;            // > 0: replace a missing expert by a resident one up to this far below in key
-  int gpu_route;               // decoding: the GPU looks up each layer's experts (see step_spec)
   const char *experts;         // a GGUF file (set) whose routed experts replace the checkpoint's, or null
   int quiet;                   // no progress lines on stderr
   int online_predictor;        // rank64 online prefetch corrector; 0 disables it

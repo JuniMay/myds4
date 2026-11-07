@@ -28,7 +28,7 @@ static void setup(int half_life, int cost) {
   slots = fixture, score = fixture_score;
   max_slots = cap = nslots = 3, npinned = nfree = 0;
   head = 2, tail = 0, token = 10, weight = 1;
-  pass_layer = serving = published = -1;
+  pass_layer = serving = -1;
   pf_enabled = 0;
   for (int i = 0; i < 3; i++) {
     slots[i].layer = 0, slots[i].expert = i, slots[i].mapped = 1;
@@ -138,8 +138,8 @@ static void refined_empty_reuse(void) {
   expect("refinement regression performs no I/O", cache_stats.bytes == 0);
 
   refined_empty_setup();
-  serving = published = 1;
-  expect("published layer permits a refined empty slot", victim() == 0);
+  serving = 1;
+  expect("the serving layer permits a refined empty slot", victim() == 0);
 #ifdef MYDS4_RUNAHEAD
   slots[0].holds = 1;
   expect("a reservation still excludes an otherwise empty slot", victim() == 1);
@@ -180,9 +180,7 @@ int main(void) {
   expect("prefetch protection unchanged", victim() == 1);
   serving = 0, slots[1].used = token;
   expect("current union protection unchanged", victim() == 2);
-  published = 0;
-  expect("published layer protection unchanged", victim() == -1);
-  published = serving = -1, slots[0].prefetched = 0;
+  serving = -1, slots[0].prefetched = 0;
   score[0] = score[1] = 2, score[2] = 3;
   expect("equal priorities retain physical-slot tie break", victim() == 0);
   score[2] = -INFINITY, slots[2].expert = -1;

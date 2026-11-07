@@ -38,9 +38,11 @@ def main():
     add("removed server", ["--serve", "1234"], expected="usage:")
     add("removed live view", ["--tui"], expected="usage:")
     add("removed prompt rendering", ["--render", "case.json"], expected="usage:", online=False)
+    add("removed draft trim", ["--draft", "2", "--draft-trim"], expected="usage:", online=False)
+    add("removed GPU routing", ["--gpu-route"], expected="usage:", online=False)
+    add("removed expert batching", ["--expert-batch"], expected="usage:", online=False)
     for args in (
         ["--substitute", "1"],
-        ["--gpu-route"],
         ["--routes-fd", "3"],
         ["--dump-fd", "3"],
         ["--check-prefill"],
@@ -54,13 +56,11 @@ def main():
             "2",
             "--draft-cache",
             "32",
-            "--draft-trim",
             "--cache-half-life",
             "10",
             "--cache-read-cost",
             "--substitute",
             "0.5",
-            "--gpu-route",
         ],
     ):
         add(args[0], args)
@@ -81,9 +81,8 @@ def main():
         ("context lookup", ["--lookup", "15", "-t", "1", "--top-p", "1"], None, missing_tokenizer),
         ("context lookup off", ["--lookup", "off"], None, missing_tokenizer),
         ("context lookup with DSpark", ["--lookup", "15", "--draft", "2", "--draft-cache", "32"], None, missing_tokenizer),
-        ("context lookup with shared experts", ["--lookup", "15", "--expert-batch"], None, missing_tokenizer),
         ("dependency-pruned prefill", ["--prefill-prune", "--ced", "off"], None, missing_tokenizer),
-        ("pruned prefill with lookup", ["--prefill-prune", "--lookup", "15", "--expert-batch"], None, missing_tokenizer),
+        ("pruned prefill with lookup", ["--prefill-prune", "--lookup", "15"], None, missing_tokenizer),
         ("invalid context lookup", ["--lookup", "16"], None, "--lookup"),
         (
             "temperature and nucleus sampling",
@@ -103,7 +102,6 @@ def main():
             None,
             "--draft-cache needs --draft",
         ),
-        ("draft trim constraint", ["--draft-trim"], None, "--draft-trim needs --draft"),
         ("memory reserve", ["--reserve", "4"], None, missing_tokenizer),
         ("fractional memory reserve", ["--reserve", "2.5"], None, missing_tokenizer),
         ("zero memory reserve", ["--reserve", "0"], None, "--reserve takes 2 to 1024 GiB"),

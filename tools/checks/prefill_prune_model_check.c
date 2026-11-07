@@ -9,9 +9,9 @@ static size_t bytes_differ(const void *a, const void *b, size_t count) {
 }
 
 int main(int argc, char **argv) {
-  if (argc < 2) die("usage: prefill-prune-model-check CHECKPOINT [--stdin|--long] [--tokens N] [--chunk32] [--index-only] [--prefix N] [--wide] [--resume] [--no-draft] [--gpu-route] [--experts GGUF]");
+  if (argc < 2) die("usage: prefill-prune-model-check CHECKPOINT [--stdin|--long] [--tokens N] [--chunk32] [--index-only] [--prefix N] [--wide] [--resume] [--no-draft] [--experts GGUF]");
   Options o = {.ctx = 131072, .budget_gb = 20, .reserve_gb = 4, .draft = 2, .draft_cache = 32,
-               .draft_trim = 1, .expert_batch = 1, .quiet = 1, .dump_fd = -1, .routes_fd = -1};
+               .quiet = 1, .dump_fd = -1, .routes_fd = -1};
   int longer = 0, resume = 0, prefix = 1024, prefix_set = 0, input = 0, chunk32 = 0, count = 0, index_only = 0;
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--long")) longer = 1;
@@ -22,8 +22,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--stdin")) input = 1;
     else if (!strcmp(argv[i], "--wide")) o.lookup = 15;
     else if (!strcmp(argv[i], "--resume")) resume = 1;
-    else if (!strcmp(argv[i], "--no-draft")) o.draft = o.draft_cache = o.draft_trim = 0;
-    else if (!strcmp(argv[i], "--gpu-route")) o.gpu_route = 1;
+    else if (!strcmp(argv[i], "--no-draft")) o.draft = o.draft_cache = 0;
     else if (!strcmp(argv[i], "--experts") && i + 1 < argc) o.experts = argv[++i];
     else die("invalid pruning check option");
   }

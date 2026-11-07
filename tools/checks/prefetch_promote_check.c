@@ -44,7 +44,7 @@ int main(void) {
   slots = fixture, score = priorities;
   max_slots = cap = nslots = 2, nfree = npinned = 0;
   head = 1, tail = 0, token = 10, weight = 1;
-  pass_layer = serving = published = -1;
+  pass_layer = serving = -1;
   memset(where, 0xff, sizeof where);
   expert_spans[0] = 1;
   for (int i = 0; i < 2; i++) {

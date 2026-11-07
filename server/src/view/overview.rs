@@ -263,10 +263,6 @@ pub fn draw(s: &Snapshot, h: &History, log: &[String], w: usize, rows: usize) ->
             line.extend([text("   "), Span::styled(format!("remapped {remaps:.1}"), color(t.sources[2]))]);
         }
         l.push(Line::from(line));
-    } else if rows_d > 0.0 {
-        // only --gpu-route layers, which the GPU looks up without counting
-        let note = format!("{} tokens; the GPU looked up all their experts (--gpu-route)", count(rows_d));
-        l.push(Line::from(vec![text(" "), label(note)]));
     } else {
         l.push(Line::from(vec![text(" "), label("no decoded tokens yet")]));
     }
