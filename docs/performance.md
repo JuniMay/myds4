@@ -1572,6 +1572,26 @@ matched its non-streamed counterpart. Effective sampler settings and draft
 counts were read from server logs. Image output was checked for successful
 execution, not visual accuracy.
 
+### Two drafts at a 56 GiB cache
+
+With the 8,190-token repository-review prompt of
+`tools/bench/compare_bench.py` (512 tokens, temperature and top-p 1, seed
+12345, `--prefill-prune`, desktop load recorded; 2026-11-06), two-draft
+DSpark decoded slower than decoding without drafts in every format, and
+every run's output matched its control's. Tokens/s:
+
+| Experts | Plain decoding | Two-draft DSpark |
+| --- | ---: | ---: |
+| MXFP4 | 11.85, 11.92 | 10.42, 10.38 |
+| `UD-IQ2_XXS` | 20.27, 20.31 | 19.63, 19.58 |
+| `UD-IQ1_M` | 22.64, 22.87 | 20.83, 20.76 |
+
+A verify pass costs nearly as much per row as separate tokens (see
+Concurrent rows under [Limits](#limits)): more than the accepted drafts
+saved on this prompt. A study that scheduled a verify pass's rows by layer
+readiness was slower still and was removed (see
+[Removed experiments](experiments.md#causal-verification)).
+
 ### Sampled draft-length sweep
 
 On 2026-11-01, the original scheduler fixture in
@@ -2608,9 +2628,7 @@ local state and global KV match ordinary concurrent decoding. An added
 ownership regression found that the first prototype changed the caller's
 active session; the fixed version also preserves that identity. The
 event-based schedule, which the current grouped schedule extends, passes
-the same checks. Causal speculative scheduling matches all 16 serial
-verification rows and all five tested rollback lengths, including
-subsequent DSpark drafts. Saved-prompt forks match full prefill after the
+the same checks. Saved-prompt forks match full prefill after the
 source advances eight tokens, on both short and 16K MXFP4 prompts. These
 are bounded numerical checks rather than a quality benchmark.
 [Validation records](../data/benchmarks/signal_validation_results.json)
@@ -2618,79 +2636,3 @@ contain the final event-based and long-prompt checks. The first timing
 screen of concurrent schedules established no gain for any candidate; it
 is recorded with the removed schedules in
 [Removed experiments](experiments.md#runahead-schedules-other-than-the-public-one).
-
-### Causal verification
-
-Causal verification is a study under evaluation, built by
-`build/myds4-causal-draft`, `build/myds4-causal-signal-draft` and
-`build/myds4-causal-group-draft`. With large caches it is slower than
-ordinary DSpark verification.
-
-**At a 56 GiB cache** (2026-11-06, `tools/bench/compare_bench.py`: the
-8,190-token repository-review prompt, 512 tokens, temperature and top-p 1,
-seed 12345, `--prefill-prune`, desktop load recorded; every run's output
-matched its control's). Tokens/s of decoding:
-
-| Experts | Plain decoding | Ordinary two-draft DSpark | Grouped causal DSpark |
-| --- | ---: | ---: | ---: |
-| MXFP4 | 11.85, 11.92 | 10.42, 10.38 | 10.25, 9.96, 10.27 |
-| `UD-IQ2_XXS` | 20.27, 20.31 | 19.63, 19.58 | 17.24, 17.30, 17.19 |
-| `UD-IQ1_M` | 22.64, 22.87 | 20.83, 20.76 | 17.79, 18.15, 18.19 |
-
-Causal verification is 1 to 12% slower than ordinary DSpark there, and
-ordinary DSpark is 3 to 12% slower than decoding without drafts in every
-format: a verify pass costs nearly as much per row as separate tokens (see
-Concurrent rows under [Limits](#limits)), more than the accepted drafts
-save on this prompt.
-
-**At a 20 GiB cache**, the earlier measurements below.
-
-The grouped causal scheduler advances a speculative token whose selected
-experts are ready while another token waits for reads. Ready tokens at one
-layer share the next layer's front in the existing small-batch kernels.
-The scheduler retains each token's attention dependencies and verifies
-every draft. It issues reads for selected experts and does not admit
-forecast-based reads during verification.
-
-The bounded MXFP4 comparison uses a 13,772-token request reconstructed from
-DSH history, temperature and top-p 1, seed 12345, dependency pruning and
-shared expert loads (`--expert-batch`, an option since removed: the
-grouped tokens then also shared their expert weight loads, while each
-token now loads its own). CED, substitution, and the learned predictor are
-off. The request ends naturally after 308 output tokens. Every completed
-arm produces identical output. The total expert-cache budget stays at
-20 GiB; with DSpark, 1.7 GiB of that budget holds its draft experts.
-Available memory did not permit the earlier 56 GiB configuration.
-
-| Configuration | Output tokens/s | Read-wait seconds | GPU seconds |
-| --- | ---: | ---: | ---: |
-| Ordinary decoding, no DSpark | 6.37 | 37.84 | 10.56 |
-| Ordinary two-draft DSpark, controls | 6.09–6.14 | 42.18–42.57 | 7.52 |
-| Grouped causal DSpark, first comparison | 6.37 | 32.17 | 11.58 |
-| Grouped causal DSpark, repeat beside ordinary decoding | 6.33 | 32.13 | 11.60 |
-
-Grouping improves this sample by about 4.2% over the mean of its two
-ordinary DSpark controls, but does not beat ordinary decoding without
-DSpark. A control that only disabled verification's forecast reads is
-recorded in [Removed experiments](experiments.md#verification-forecast-admission-by-row).
-One interrupted closing control was discarded because background
-compilation appeared, then repeated. These are short workload
-measurements, not an 8K-generation validation or a general speedup claim.
-The [group scheduling records](../data/benchmarks/causal_group_speed_results.json)
-and [ordinary decoding comparison](../data/benchmarks/causal_group_plain_results.json)
-retain the controls, output hashes, fixed-cache checks, and traffic counters.
-
-The causal builds also omit the residual and future-layer router
-projections, which this scheduler never reads; they keep the
-selected-expert router. That omission was first measured as a separate
-build. Its model check matched all 16 verification rows and the
-continuation logits and DSpark drafts after accepting 1, 2, 6, 15 or 16
-rows. In the same short DSH workload, GPU time fell from 11.32–11.35 to
-10.94 seconds, but output throughput was 6.42 tokens/s against controls of
-6.42 and 6.45, so no throughput gain is established for it. The closing
-control's prefill slowed to 30.46 seconds from about 22 seconds, so this
-run is not evidence for a prefill or total-request speedup. The
-[validation](../data/benchmarks/causal_route_only_validation.json) and
-[timing records](../data/benchmarks/causal_route_only_speed_results.json)
-keep numerical checks separate from performance. The normal engine does
-not enable these schedules.

@@ -267,36 +267,7 @@ build/rows-bench: tools/bench/rows_bench.c $(SRC) $(MODEL_HEADERS) $(KERNELS) da
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/bench/rows_bench.c $(filter-out src/cli/main.c src/engine/model.c,$(SRC)) $(LDLIBS)
 
-# ---- Studies kept for evaluation ----
-
-# Causal verification: DSpark verification rows scheduled by layer readiness
-# (CAUSAL_VERIFY), with GPU signals (CAUSAL_SIGNALS) and ready rows grouped by
-# layer (CAUSAL_GROUP). Each executable has its check of the same flags.
-CAUSAL_DEPS = $(SRC) src/experimental/causal_verify.c $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
-
-build/myds4-causal-draft: $(CAUSAL_DEPS)
-	@mkdir -p build
-	$(CC) $(CFLAGS) -DMYDS4_CAUSAL_VERIFY -o $@ $(SRC) $(LDLIBS)
-
-build/causal-verify-check: tools/checks/verification_model_check.c $(CAUSAL_DEPS)
-	@mkdir -p build
-	$(CC) $(CFLAGS) -DMYDS4_CAUSAL_VERIFY -o $@ tools/checks/verification_model_check.c $(filter-out src/cli/main.c,$(SRC)) $(LDLIBS)
-
-build/myds4-causal-signal-draft: $(CAUSAL_DEPS)
-	@mkdir -p build
-	$(CC) $(CFLAGS) -DMYDS4_CAUSAL_VERIFY -DMYDS4_CAUSAL_SIGNALS -o $@ $(SRC) $(LDLIBS)
-
-build/causal-signal-check: tools/checks/verification_model_check.c $(CAUSAL_DEPS)
-	@mkdir -p build
-	$(CC) $(CFLAGS) -DMYDS4_CAUSAL_VERIFY -DMYDS4_CAUSAL_SIGNALS -o $@ tools/checks/verification_model_check.c $(filter-out src/cli/main.c,$(SRC)) $(LDLIBS)
-
-build/myds4-causal-group-draft: $(CAUSAL_DEPS)
-	@mkdir -p build
-	$(CC) $(CFLAGS) -DMYDS4_CAUSAL_VERIFY -DMYDS4_CAUSAL_SIGNALS -DMYDS4_CAUSAL_GROUP -o $@ $(SRC) $(LDLIBS)
-
-build/causal-group-check: tools/checks/verification_model_check.c $(CAUSAL_DEPS)
-	@mkdir -p build
-	$(CC) $(CFLAGS) -DMYDS4_CAUSAL_VERIFY -DMYDS4_CAUSAL_SIGNALS -DMYDS4_CAUSAL_GROUP -o $@ tools/checks/verification_model_check.c $(filter-out src/cli/main.c,$(SRC)) $(LDLIBS)
+# ---- Diagnostics ----
 
 # Diagnostic pipe capture only; its synchronous writes change inference timing.
 build/myds4-predict-probe: $(SRC) tools/experimental/predict_probe.c $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin

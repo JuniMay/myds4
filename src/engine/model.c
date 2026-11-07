@@ -465,10 +465,6 @@ void model_load(const char *dir, const Options *options) {
   if (options->ced && options->dump_fd >= 0) die("per-layer dumps require --ced off");
   lock_model();
   opt = *options;
-#ifdef MYDS4_CAUSAL_VERIFY
-  if (opt.online_predictor || opt.substitute > 0 || opt.dump_fd >= 0 || opt.routes_fd >= 0)
-    die("causal verification study requires exact decoding without prediction diagnostics");
-#endif
   runahead_enabled = opt.runahead;
   if (runahead_enabled && (opt.draft || opt.online_predictor || opt.substitute > 0 ||
                           opt.dump_fd >= 0 || opt.routes_fd >= 0))
@@ -2453,21 +2449,11 @@ void model_draft(int token, int pos, int *drafts, int n) {
 // Engram history, which model_accept rebuilds, and the draft's windows, which
 // it writes for the accepted rows only.
 static int32_t verify_history[3];
-#ifdef MYDS4_CAUSAL_VERIFY
-static const float *causal_verify(const int *tokens, int count, int pos);
-#endif
 
 const float *model_verify(const int *tokens, int m, int pos) {
   if (m < 1 || m > replay_margin() + 1 || m > FEW) die("invalid target verification row count");
   memcpy(verify_history, history, sizeof history);
   verifying = 1;
-#ifdef MYDS4_CAUSAL_VERIFY
-  if (m > 1) {
-    const float *result = causal_verify(tokens, m, pos);
-    verifying = 0;
-    return result;
-  }
-#endif
   step(tokens, m, pos);
   verifying = 0;
   return (const float *)logits.ptr;
@@ -2826,9 +2812,6 @@ void model_state_use(State *s) {
 }
 
 #include "../experimental/runahead.c"
-#ifdef MYDS4_CAUSAL_VERIFY
-#include "../experimental/causal_verify.c"
-#endif
 
 const float *model_forward_rows(State **st, const int *tokens, const int *pos, int m) {
   if (m < 1 || m > BLOCK + 1) die("%d rows of sequences at once: 1 to %d", m, BLOCK + 1);

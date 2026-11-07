@@ -41,23 +41,19 @@ static void run_issue(RunJob *job) {
 
 // Gather ready jobs at one layer into the existing small-batch kernels.
 // Blit copies carry tracked source/destination dependencies across buffers.
-static int run_group(RunJob **jobs, const int *ids, int count, Buf **live, const Buf *original,
-                     float *outputs, Buf **captures, const Buf *original_capture) {
+static int run_group(RunJob **jobs, const int *ids, int count, Buf **live, const Buf *original, float *outputs) {
   const size_t bytes[RUN_BUFFERS] = {HC * DIM * STREAM_BYTES, MIX * 4, (IDX_TOPK + 1) * 4,
     (size_t)cand_words * 4, DIM * 4, HC * DIM * STREAM_BYTES, DIM * 4, 0,
     ENGRAM_ROWS * ENGRAM_DIM, ENGRAM_ROWS * ENGRAM_DIM, ENGRAM_ROWS * 8, ENGRAM_ROWS * 8, 0, 0};
-  GpuCopy copies[FEW * (RUN_BUFFERS + 1)];
+  GpuCopy copies[FEW * RUN_BUFFERS];
   int ncopy = 0, layer = jobs[0]->layer;
   runahead_group_count++, runahead_group_rows += count;
   for (int k = 0; k < RUN_BUFFERS; k++) *live[k] = original[k];
-  if (captures) MAINH = *original_capture;
   for (int r = 0; r < count; r++) {
     RunJob *job = jobs[r];
     cache_wait(layer, job->experts, TOPK);
     for (int k = 0; k < RUN_BUFFERS; k++) if (bytes[k])
       copies[ncopy++] = (GpuCopy){&job->saved[k], live[k], 0, r * bytes[k], bytes[k]};
-    if (captures)
-      copies[ncopy++] = (GpuCopy){captures[r], &MAINH, 0, (size_t)r * 3 * DIM * 4, 3 * DIM * 4};
   }
   gpu_begin();
   gpu_copies(copies, ncopy);
@@ -87,7 +83,6 @@ static int run_group(RunJob **jobs, const int *ids, int count, Buf **live, const
     for (int r = 0; r < count; r++) {
       RunJob *job = jobs[r];
       memcpy(job->saved[7].ptr, original[7].ptr + (size_t)r * 16 * 4, 16 * 4);
-      if (captures) memcpy(captures[r]->ptr, original_capture->ptr + (size_t)r * 3 * DIM * 4, 3 * DIM * 4);
       for (int k = 0; k < 7; k++)
         copies[ncopy++] = (GpuCopy){live[k], &job->saved[k], r * bytes[k], 0, bytes[k]};
     }
@@ -170,7 +165,7 @@ static const float *runahead_rows(State **states, const int *tokens, const int *
         if (available) ids[group] = j, jobs[group++] = &run_jobs[j];
       }
       if (group > 1) {
-        remaining -= run_group(jobs, ids, group, live, original, run_logits, NULL, NULL);
+        remaining -= run_group(jobs, ids, group, live, original, run_logits);
         continue;
       }
     }

@@ -11,19 +11,14 @@ The C sources are in four folders:
   benchmarks. `build/myds4` holds it, the engine's files without `engine.c`,
   the online predictor and context lookup.
 - `src/kernels/`: the Metal kernels, which `src/engine/model.c` embeds.
-- `src/experimental/`: optional features and one study. `build/myds4` and
-  the server include the online predictor, context lookup, the
-  prefill-pruning plan and runahead (an option of the server), each off
-  unless its option is given; only the causal verification study builds
-  compile `causal_verify.c` (see
-  [Concurrent scheduling](#concurrent-scheduling-and-causal-verification)).
+- `src/experimental/`: optional features. `build/myds4` and the server
+  include the online predictor, context lookup, the prefill-pruning plan and
+  runahead (an option of the server), each off unless its option is given.
 
 The Makefile adds `-Isrc/engine`, so C files in every folder include the
 engine's headers by name.
 
-Two kinds of study build remain beside the ordinary ones. The causal
-verification builds are a study under evaluation (see
-[Concurrent scheduling](#concurrent-scheduling-and-causal-verification)).
+One diagnostic build remains beside the ordinary ones.
 `build/myds4-predict-probe` (`make predict-probe`, switch
 `MYDS4_PREDICT_PROBE`, capture code in `tools/experimental/predict_probe.c`)
 is a diagnostic capture tool: it writes records of the routing, the
@@ -46,7 +41,6 @@ in [Removed experiments](experiments.md).
 | `src/experimental/context_lookup.c`, `src/experimental/context_lookup.h` | Bounded CPU history matching for the CLI and server's context-copy drafts. |
 | `src/experimental/prefill_prune.h` | The dependency plan of `--prefill-prune`. |
 | `src/experimental/runahead.c` | `--runahead`'s scheduler for concurrent requests; included by `model.c`. |
-| `src/experimental/causal_verify.c` | The causal verification study; included by `model.c` only in its study builds. |
 | `src/engine/engine.c`, `src/engine/engine.h` | The engine behind a C ABI for the server: loading, attention states and their snapshots, prefill (with a replay: exact, or bounded under `--ced`, and a capture position), decoding, drafts, sampling, context-copy drafts, images, statistics, the tokenizer and the log. Requests, their scheduling and the KV prefix cache are the server's (see [The server](server.md)). |
 | `src/kernels/kernels.metal` | The GPU kernels. |
 | `src/kernels/gguf.metal`, `src/kernels/gguf_grids.metal` | The kernels for routed experts in GGUF codes (`--experts`), and their codebook grids, generated from llama.cpp's `ggml-common.h` (MIT License). |
@@ -1337,7 +1331,7 @@ windows at its position (`draft_rows`), as decoding the sequence alone does,
 so a sequence that drafts alone again later finds its windows whole
 (`build/draft-rows-check` compares them byte for byte).
 
-### Concurrent scheduling and causal verification
+### Concurrent scheduling
 
 The server's `--runahead`, off by default, lets ready requests advance
 while other requests' expert reads run (`src/experimental/runahead.c`). It
@@ -1372,33 +1366,10 @@ rows, and `forecast_work` the row-layers that ran without forecast
 projections. The
 [Bevy paper](https://arxiv.org/html/2611.04794v1) describes the broader
 approach, including grouping ready requests at the same layer. Other
-schedules, and sharing expert weight loads within a group, were measured
-and removed; see
-[Removed experiments](experiments.md#runahead-schedules-other-than-the-public-one).
-
-Causal verification is a study under evaluation, not part of the ordinary
-builds. Its CLI builds, `build/myds4-causal-draft` (`MYDS4_CAUSAL_VERIFY`),
-`build/myds4-causal-signal-draft` (with `MYDS4_CAUSAL_SIGNALS`) and
-`build/myds4-causal-group-draft` (with `MYDS4_CAUSAL_GROUP` as well),
-schedule a verification pass's rows within one session as runahead
-schedules requests (`src/experimental/causal_verify.c`). Each row's next
-layer front waits for the preceding row to reach that layer, so each row
-sees its predecessor's keys; routed expert products can finish earlier and
-wait in a private residual buffer. The signal builds wait for routing
-signals instead of whole command buffers, and the group build runs
-consecutive ready rows at one layer together. Like runahead, the study
-reads only the selected experts and leaves out the forecast projections.
-The draft-input captures are assembled in token order for normal rollback
-and DSpark continuation. These builds still compute every proposed row
-before sampling decides which prefix to accept, and they refuse the online
-predictor, substitution and the routing and dump diagnostics.
-`build/causal-verify-check`, `build/causal-signal-check` and
-`build/causal-group-check` compare each build's verification rows and
-rollbacks with serial decoding. The study's performance with large caches
-is still to be measured; see
-[Performance](performance.md#causal-verification-at-a-20-gib-expert-cache-budget).
-Variants that stopped early, read with priorities or spun were removed (see
-[Removed experiments](experiments.md#early-rejection-priority-reads-and-spinning-in-causal-verification)).
+schedules, sharing expert weight loads within a group, and scheduling a
+verify pass's rows the same way were measured and removed; see
+[Removed experiments](experiments.md#runahead-schedules-other-than-the-public-one)
+and [Causal verification](experiments.md#causal-verification).
 
 `tools/bench/session_bench.py` compares server throughput on concurrent
 reconstructed Harness requests over HTTP. It starts one server at a time,

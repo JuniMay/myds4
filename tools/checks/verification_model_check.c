@@ -67,9 +67,5 @@ int main(int argc, char **argv) {
     failed |= different != 0 || draft_diff;
   }
   free(reference), free(tokens);
-#ifdef MYDS4_CAUSAL_GROUP
-  printf("{\"ready_groups_checked\":%llu}\n", (unsigned long long)model_ready_groups());
-  failed |= !model_ready_groups();
-#endif
   return failed;
 }

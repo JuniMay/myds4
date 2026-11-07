@@ -20,9 +20,9 @@ The measurement records remain in `data/benchmarks/`. Each section names
 the records it draws on; they add detail, such as every run's settings and
 counters. The README and the design, usage, server and performance
 documents describe only the code that remains, and point here for these
-experiments. Two studies remain in the code: causal verification, which is
-under evaluation, and the prediction probe, a diagnostic capture tool. The
-design and performance documents describe them.
+experiments. One study build remains in the code: the prediction probe, a
+diagnostic capture tool, which the design document describes. Causal
+verification was kept for measurements at large caches and then removed.
 
 ## Background
 
@@ -415,7 +415,7 @@ rejection sampling ([arXiv 2302.01318](https://arxiv.org/abs/2302.01318)),
 keeps the target's distribution exactly, but a given seed no longer gives
 the same text as ordinary decoding. Variants combined it with the causal
 verification scheduler, a study that remains (see
-[Early rejection, priority reads and spinning](#early-rejection-priority-reads-and-spinning-in-causal-verification))
+[Early rejection, priority reads and spinning](#early-rejection-priority-reads-and-spinning))
 (`build/myds4-causal-rejection-draft`,
 `build/myds4-causal-signal-rejection-draft`,
 `build/myds4-causal-group-rejection-draft`) and with a two-row forecast
@@ -689,23 +689,88 @@ line) in `src/engine/io.c`, the two builds, `build/draft-shared-pool-check`
 and `tools/checks/draft_shared_pool_check.c`. The ordinary per-stage pools
 of `--draft-cache` remain.
 
-### Early rejection, priority reads and spinning in causal verification
+### Causal verification
 
-These experiments extended the causal verification study
-(`MYDS4_CAUSAL_VERIFY`, with `MYDS4_CAUSAL_SIGNALS` and
-`MYDS4_CAUSAL_GROUP`). That study remains in the code as a study under
-evaluation: its performance with large caches is still to be measured
-before it is kept or removed. The design and performance documents
-describe it. This section covers only the variants built on it that were
-removed.
+**Problem.** A verify pass computes the token and its drafts through every
+layer together. When some rows' experts are missing, the whole pass waits
+for their reads, although rows whose experts are in memory could go on.
 
-The study verifies a pass's rows as separate jobs on one attention state.
-A row runs a layer's front only after the row before it has run that
-front, so each row sees its predecessor's keys. A row's routed experts may
-finish earlier and wait in a private buffer, so a row whose experts are
-ready can advance while another row waits for reads. The grouped variant
-runs ready rows at one layer together. Rows are still all computed before
-sampling decides which prefix to keep.
+**How it worked.** Switch `MYDS4_CAUSAL_VERIFY`, with
+`MYDS4_CAUSAL_SIGNALS` and `MYDS4_CAUSAL_GROUP`; builds
+`build/myds4-causal-draft`, `build/myds4-causal-signal-draft` and
+`build/myds4-causal-group-draft`; code in
+`src/experimental/causal_verify.c`, which `model.c` included in those
+builds. It verified a pass's rows as separate jobs on one attention state,
+the way runahead schedules requests. A row ran a layer's front only after
+the row before it had run that front, so each row saw its predecessor's
+keys. A row's routed experts could finish earlier and wait in a private
+residual buffer, so a row whose experts were ready could advance while
+another waited for reads. The signal builds waited for routing signals
+instead of whole command buffers, and the grouped build ran consecutive
+ready rows at one layer together. Like runahead, it read only the selected
+experts and left out the forecast projections. The draft-input captures
+were assembled in token order for rollback and DSpark continuation. Every
+proposed row was still computed before sampling decided which prefix to
+keep. `build/causal-verify-check`, `build/causal-signal-check` and
+`build/causal-group-check` compared each build's verification rows and
+rollbacks with serial decoding: all 16 rows and all five tested rollback
+lengths matched, including the DSpark drafts that followed.
+
+**How it was measured.** First at a 20 GiB cache with MXFP4: the
+13,772-token request reconstructed from DSH history, temperature and top-p
+1, seed 12345, dependency pruning and shared expert loads (`--expert-batch`,
+since removed: the grouped rows then also shared their expert weight
+loads), 308 tokens, every completed arm with identical output; with DSpark,
+1.7 GiB of the budget held its draft experts. Then, on 2026-11-06, at a
+56 GiB cache in three formats with `tools/bench/compare_bench.py`: the
+8,190-token repository-review prompt, 512 tokens, temperature and top-p 1,
+seed 12345, `--prefill-prune`, desktop load recorded, every run's output
+matching its control's.
+
+**Results.** At 20 GiB with MXFP4:
+
+| Configuration | Output tokens/s | Read-wait seconds | GPU seconds |
+| --- | ---: | ---: | ---: |
+| Ordinary decoding, no DSpark | 6.37 | 37.84 | 10.56 |
+| Ordinary two-draft DSpark, controls | 6.09–6.14 | 42.18–42.57 | 7.52 |
+| Grouped causal DSpark, first comparison | 6.37 | 32.17 | 11.58 |
+| Grouped causal DSpark, repeat beside ordinary decoding | 6.33 | 32.13 | 11.60 |
+
+At 56 GiB (tokens/s of decoding):
+
+| Experts | Plain decoding | Ordinary two-draft DSpark | Grouped causal DSpark |
+| --- | ---: | ---: | ---: |
+| MXFP4 | 11.85, 11.92 | 10.42, 10.38 | 10.25, 9.96, 10.27 |
+| `UD-IQ2_XXS` | 20.27, 20.31 | 19.63, 19.58 | 17.24, 17.30, 17.19 |
+| `UD-IQ1_M` | 22.64, 22.87 | 20.83, 20.76 | 17.79, 18.15, 18.19 |
+
+An earlier long request at 56 GiB (2026-11-04: the 51,895-token DSH
+request, 512 tokens, both arms with `--expert-batch` and `--draft-trim`)
+decoded at 8.47 tokens/s with the signal build against controls of 8.30
+and 8.21 (`causal_draft_speed_results.json`). The 20 GiB records are
+`causal_group_speed_results.json` and `causal_group_plain_results.json`.
+
+**Why it did not help.** With a small cache the scheduler hid some read
+waits: 4.2% over ordinary DSpark at 20 GiB, with shared expert loads on,
+and 2.6% on the long request. It never beat decoding without drafts. With
+a 56 GiB cache, where fewer reads wait, it ran 1 to 12% below ordinary
+DSpark in all three formats, and ordinary DSpark itself ran 3 to 12% below
+plain decoding. A verify pass costs nearly as much per row as separate
+tokens (see Concurrent rows under the performance document's Limits), and
+per-row jobs add command buffers and waits; that last cause is inferred
+from the slower runs at equal reads, not measured directly.
+
+**What was removed.** The switches `MYDS4_CAUSAL_VERIFY`,
+`MYDS4_CAUSAL_SIGNALS` and `MYDS4_CAUSAL_GROUP`;
+`src/experimental/causal_verify.c` and its hook in `model_verify`; the
+three builds and the three checks above (built from
+`tools/checks/verification_model_check.c`, which keeps its ordinary
+check); and `run_group`'s draft-capture parameters in
+`src/experimental/runahead.c`, which only this study used.
+
+#### Early rejection, priority reads and spinning
+
+These variants extended the study.
 
 **Problem.** When the target rejects an early draft, the later rows'
 remaining layers are wasted. Their expert reads also compete with the
@@ -783,15 +848,20 @@ router below used; the targets `build/myds4-causal-early`,
 and `tools/checks/speculative_read_check.c`. `build/gpu-wait-check` now
 checks only the blocking wait, `gpu_wait_signal`.
 
-**The separate route-only build.** `build/myds4-causal-route-only` and its
-check `build/causal-route-only-check` built the grouped study with
-`MYDS4_RUNAHEAD_NO_FORECASTS`, which omits the residual and next-layer
-router projections that the scheduler never reads. By the time of this
-cleanup the default compiler flags defined that switch for every build, so
-the other causal builds behaved the same. The code now omits those
-projections in every causal build without a switch, and the two separate
-targets are gone. The performance document keeps the measurement of that
-change.
+#### The route-only build
+
+`build/myds4-causal-route-only` and its check `build/causal-route-only-check`
+built the grouped study with `MYDS4_RUNAHEAD_NO_FORECASTS`, which omits the
+residual and next-layer router projections that the scheduler never read;
+it kept the selected-expert router. Its model check matched all 16
+verification rows and the continuation logits and DSpark drafts after
+accepting 1, 2, 6, 15 or 16 rows. In the short DSH workload, GPU time fell
+from 11.32–11.35 to 10.94 s, but output throughput was 6.42 tokens/s
+against controls of 6.42 and 6.45, so no throughput gain was established;
+the closing control's prefill slowed to 30.46 s from about 22 s, so the
+run is not evidence for a prefill speedup either
+(`causal_route_only_validation.json`, `causal_route_only_speed_results.json`).
+Later every causal build omitted those projections; runahead still does.
 
 ## Expert-cache and read-ahead studies
 
