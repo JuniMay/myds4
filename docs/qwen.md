@@ -198,8 +198,9 @@ to BF16 and attention's operands to FP16.
 - The MTP head drafts one token; drafts are used while one request decodes
   (see [the server](server.md#chat-formats)).
 - While it serves, the model's weights stay resident on the GPU (20 GB, plus
-  the states and snapshots). Beside it, DeepSeek's expert cache held fewer
-  slots than its `cache` allows (see [the server](server.md#models)). After
+  the states and snapshots). Those weights share the GPU residency budget
+  with DeepSeek's mapped experts. Unmapped expert slots remain in RAM;
+  allocated and GPU-mapped cache sizes differ (see [the server](server.md#models)). After
   60 s without
   requests, the server takes the model's buffers out of the GPU's residency
   set (`qwen_reside`; they stay in memory), and puts them back before the

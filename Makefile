@@ -139,6 +139,10 @@ build/cache-ready-check: tools/checks/cache_ready_check.c src/engine/io.c src/en
 cache-ready-check: build/cache-ready-check
 	./build/cache-ready-check
 
+build/cache-mapping-check: tools/checks/cache_mapping_check.c src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/myds4.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/cache_mapping_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
+
 build/cache-hold-check: tools/checks/cache_hold_check.c src/engine/io.c src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/cache_hold_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)

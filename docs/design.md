@@ -1029,8 +1029,9 @@ including when that target is zero or unavailable. Cached files are not
 reported as used memory in the TUI.
 
 Initial expert capacity uses this available total minus the reserve and
-reserved draft pools, bounded by the requested cache budget. macOS reclaims
-file pages as slots are populated; no manual file-cache purge is required.
+reserved draft pools, bounded by the requested cache budget. File pages
+remain available for macOS to reclaim, but this total is not a guarantee
+that it will reclaim them before compressing or swapping anonymous pages.
 The cache responds to actual memory pressure and swapping. Compression
 in RAM has no separate limit. A requested budget remains an upper bound, because later pressure
 can shrink the allocation.
@@ -1050,8 +1051,10 @@ off (`iogpu.disable_wired_collector`) or a low-water mark is set
 (`iogpu.wired_lwm_mb`, which then is the limit); a margin of 3 GiB covers
 slots taken out of the set, which the driver counts for about a second
 more. The other slots stay in memory, so the cache's size follows free
-memory and `--cache` alone: a slot whose expert a layer needs is mapped
-again before the GPU uses it. Committing a mapped slot into the set took
+memory and `--cache` alone. CPU reads fill unmapped buffers. `cache_get`
+maps a slot when an encoder uses its expert; a forecast never used by the
+GPU needs no mapping. Reusing a buffer for another expert removes its old
+mapping before the CPU reads it. Committing a mapped slot into the set took
 about 0.1 ms of CPU time for a 12 MB slot and 0.15 ms for an 18.9 MB one
 (see [Performance](performance.md#gpu-resident-memory)), against about 1 and
 1.4 ms to read the expert from the SSD. Between tokens,
@@ -1096,14 +1099,18 @@ are wired for the GPU; macOS may compress other slots in RAM. Compression
 alone does not shrink the cache or prevent growth. The engine checks memory
 at each decode or verification pass, during each prompt layer and every
 second while the server idles. It shrinks when macOS reports pressure,
-when swap-outs or swapper wakeups increase, or when available memory falls
+when swap-outs increase and the cache can release slots above its two-layer
+minimum, or when available memory falls
 below the reserve. It waits one second between releases unless pressure
 is critical or swapping occurs.
 
 After 32 calm checks, the cache can grow by a quarter of the headroom when
 availability exceeds the reserve by 4 GiB, up to the requested budget.
-For five minutes after swapping, growth uses free pages alone. In-memory
-compression does not start that cooldown.
+For five minutes after swap-driven reclamation, growth uses free pages
+alone. Compression, a swapper wakeup without swap-outs, and a global
+swap-out while this cache is empty or at its minimum do not start that
+cooldown. Actual pressure and a shortage against the reserve still limit
+an empty cache's future allocation.
 Within a prompt pass at layer l it releases and unmaps only slots of layers
 before l - 1, which no GPU work in flight uses.
 
@@ -1114,6 +1121,15 @@ the next layer of a prompt pass; until then the command buffers that use
 the slot declare it themselves (`useResource`), and a buffer read that way
 took the GPU about as long as one in the set. A slot leaves the set only at
 those commits, when no GPU work in flight can read it.
+
+`MYDS4_CACHE_TRACE=1` prints changes to allocation and mapping limits on
+stderr. Each line includes the allocated and mapped slot counts, configured
+maximum, memory-pressure level, new swap-outs, free and available bytes,
+GPU headroom and whether growth uses free pages or available memory. The
+trace is off by default. `build/cache-memory-check` exercises resize
+decisions with controlled VM counters; `build/cache-mapping-check` checks
+mapping at GPU use, including reuse of an old mapped slot. Both run on the
+CPU without model weights or GPU commands.
 
 With `--draft`, the default preloads the stages' 384 experts into dedicated
 slots of their own size (7.3 GB in MXFP4, taken off the total cache budget).

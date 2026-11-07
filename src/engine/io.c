@@ -544,7 +544,7 @@ static void push_front(int i) {
   if (tail < 0) tail = i;
 }
 
-static void cancel(int i), start_readers(void), start(int i, int urgent), finish(int i);
+static void cancel(int i), start_readers(void), start(int i, int urgent), finish(int i), map_slot(int i);
 
 static void release(int i) {
   if (slots[i].holds) die("cannot release an expert held by a runahead job");
@@ -655,6 +655,7 @@ void cache_init(uint64_t budget, int layers) {
 const Buf *cache_get(int layer, int expert, uint32_t at[3], int *fresh) {
   int i = where[layer][expert];
   if (i < 0) return 0;
+  if (!slots[i].pinned) map_slot(i);
   *fresh = slots[i].fresh;
   memcpy(at, slots[i].at, sizeof slots[i].at);
   return &slots[i].b;
@@ -851,12 +852,17 @@ static int take(int layer, int e, int optional) {
     unlink_slot(i);
     if (slots[i].expert >= 0) where[slots[i].layer][slots[i].expert] = -1;
     cache_stats.evictions++;
-    if (!slots[i].mapped) map_slot(i);
+    if (slots[i].mapped) {
+      gpu_resident(&slots[i].b, 0);
+      slots[i].mapped = slots[i].fresh = 0;
+      nmapped--;
+    }
   } else {
     i = free_list[--nfree];
     slots[i].b = gpu_new(SLOT_SIZE);
-    gpu_resident(&slots[i].b, 1), slots[i].fresh = 1;  // committed with the token's other changes
-    slots[i].mapped = 1, nmapped++;
+    // CPU reads fill the buffer. cache_get maps it when GPU work uses it;
+    // a forecast that is never selected does not occupy GPU residency.
+    slots[i].mapped = slots[i].fresh = 0;
     nslots++;
   }
   slots[i].prefetched = 0;
@@ -975,7 +981,7 @@ int cache_request(int layer, const int *experts, int n) {
   for (int k = 0; k < n; k++) {
     int e = experts[k], i = where[layer][e], pending;
     if (i >= 0) {
-      if (!slots[i].pinned) unlink_slot(i), push_front(i), map_slot(i);
+      if (!slots[i].pinned) unlink_slot(i), push_front(i);
       pending = slot_reading(i);
       // A forecast can outlive its predicted pass and lose its protection.
       // Any later demand must promote its queued pieces, protected or not.
@@ -1169,27 +1175,29 @@ void cache_refine(int layer, const int *keep, int n) {
 }
 
 // Resizes the cache. It gives slots back, the least recently used of the
-// layers below `below` first, on memory pressure, when anything was swapped
-// out or the swapper woke, when the available memory falls below the
-// reserve. Compression in RAM has no separate limit. It grows again after
-// 32 calm calls by a quarter of the headroom; after swapping, growth uses
-// only free pages for five minutes.
+// layers below `below` first, on memory pressure or when the available
+// memory falls below the reserve. Actual swap-outs also shrink a cache
+// above its minimum. A global swap-out cannot reclaim an empty cache.
+// Compression in RAM has no separate limit. Growth uses a quarter of the
+// headroom after 32 calm calls; for five minutes after swap-driven
+// reclamation it uses only free pages.
 static void resize(int below) {
-  static uint64_t swapouts, wakeups;
+  static uint64_t swapouts;
   static int calm, init;
   static double gave;  // when slots were last given back: their memory shows as free only later
-  static double bad = -1e9;  // last observed swap-out or swapper wakeup
+  static double bad = -1e9;  // last swap-out while the cache could release memory
   vm_statistics64_data_t s = vm();
   uint64_t free = (uint64_t)s.free_count * vm_page_size, avail = avail_of(s), slot = SLOT_SIZE, margin = 4 * (uint64_t)GiB;
-  uint64_t woke = sysctl_u64("vm.compressor.swapper.wakeups.total");
-  if (!init) swapouts = s.swapouts, wakeups = woke, init = 1;
+  if (!init) swapouts = s.swapouts, init = 1;
   int64_t room = mem_gpu_room();
-  int level = mem_pressure(), swapped = s.swapouts > swapouts || woke > wakeups;
+  uint64_t swap_delta = s.swapouts > swapouts ? s.swapouts - swapouts : 0;
+  int level = mem_pressure(), swapped = swap_delta && nslots > 2 * EXPERTS;
   int low = level >= 2 || swapped || avail < reserve;
   static int calm_map;
   static double unmapped;  // when the GPU's excess was last unmapped: the driver shows it about a second later
   if (swapped) bad = now();
-  swapouts = s.swapouts, wakeups = woke;
+  swapouts = s.swapouts;
+  int old_cap = cap, old_mcap = mcap;
   uint64_t headroom = now() - bad > 300 ? avail : free;
   if (low && (level >= 4 || swapped || now() - gave > 1)) {
     uint64_t to = avail;
@@ -1227,6 +1235,14 @@ static void resize(int below) {
     nmapped--;
   }
   gpu_residency_commit();
+  static int trace = -1;
+  if (trace < 0) trace = getenv("MYDS4_CACHE_TRACE") != NULL;
+  if (trace && (cap != old_cap || mcap != old_mcap))
+    fprintf(stderr, "cache resize: limit %d -> %d, allocated %d, map limit %d -> %d, mapped %d, "
+                    "maximum %d, pressure %d, swap-outs +%llu, available %.2f GiB, free %.2f GiB, "
+                    "GPU room %.2f GiB, growth uses %s\n",
+            old_cap, cap, nslots, old_mcap, mcap, nmapped, max_slots, level, (unsigned long long)swap_delta,
+            avail / GiB, free / GiB, room / GiB, now() - bad > 300 ? "available memory" : "free pages");
 }
 
 // Between tokens (pass < 0) no GPU work references a slot, so any slot can be

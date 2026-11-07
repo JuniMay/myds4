@@ -119,18 +119,31 @@ GPU's resident memory of all processes, which past about 55 GiB stalls the
 GPU: past that point the cache unmaps the excess within about a second, also
 while idle.
 
-Beside a Qwen model, DeepSeek's expert cache held fewer experts than its
-`cache` allows. On 2026-11-07 (DeepSeek V4.1 Flash, `UD-IQ1_M` experts,
-`cache` 72, Qwen3.8-27B NVFP4 in the same process, through the server, one
-request at a time, a 34-token request for ISO 8601 parsing code answered
-greedily in 236 tokens), the cache held 3,509 slots (33.9 GiB) after four
-requests while 35 GiB of memory stayed available: about half of what
-`cache` 72 allows. Why it stopped growing there is not yet determined. The
-same request sent again repeats the same greedy tokens, and so the same
-experts: it hit 100.0% of its experts with DeepSeek alone and 94.0% beside
-Qwen. A repeat like this shows what the cache kept, not a decoding speed. A
-valid comparison of DeepSeek's decoding speed alone and beside Qwen has not
-been made.
+The allocated cache and its GPU-mapped part are separate. Qwen's resident
+weights reduce the room for mapped experts, but an unmapped expert stays
+in the cache. CPU reads fill unmapped buffers; GPU work maps an expert
+when it uses it. `cache` is an upper bound. A swapper wakeup alone does not
+reduce it. A global swap-out reduces allocation and starts a five-minute
+growth cooldown only when the expert cache has slots above its minimum
+to release. Actual pressure and the configured reserve still apply.
+
+On 2026-11-07, a bounded memory check served DeepSeek V4.1 Flash with
+`UD-IQ1_M` experts and Qwen3.8-27B NVFP4 in one process. DeepSeek used
+`cache` 24, `reserve` 16 and a 4,096-token context. Three distinct code and
+scheduler prompts of 596, 660 and 682 tokens each generated 64 tokens;
+two Qwen prompts between them each generated 24 tokens. Temperature and
+top-p were 1; drafts, CED and substitution were off. DeepSeek retained all
+2,484 slots (24 GiB), released none for pressure, and the run recorded no
+new swap-outs. Free memory stayed above 12.98 GiB. This checked memory
+behavior, not comparative throughput.
+
+Larger checks did not complete under the same 10 GiB free-memory guard.
+The first 56 GiB attempt also recorded swap-outs while the engine still
+reported about 33 GiB available. File-backed pages count as available, but
+macOS need not reclaim them before swapping anonymous memory. A large
+co-hosted allocation is therefore not validated by the available-memory
+figure alone. A valid comparison of DeepSeek's speed alone and beside
+Qwen has not been made.
 
 Qwen3.8-27B with `draft` 1 decoded its 300-token reply to the same prompt at
 40.7 tokens/s beside DeepSeek (147 of 151 drafts accepted). When both models

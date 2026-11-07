@@ -1,0 +1,189 @@
+{
+  "date": "2026-11-07",
+  "scope": "Cache allocation, GPU mapping and numerical correctness. No throughput comparison.",
+  "models": [
+    {
+      "name": "DeepSeek V4.1 Flash",
+      "checkpoint": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+      "expert_checkpoint": "unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
+      "expert_format": "UD-IQ1_M"
+    },
+    {
+      "name": "Qwen3.8-27B",
+      "checkpoint": "nvidia/Qwen3.8-27B-NVFP4"
+    }
+  ],
+  "reproductions": {
+    "before": {
+      "wakeup_only_limit": [
+        2929,
+        2745
+      ],
+      "empty_cache_global_swap_limit": [
+        2929,
+        768
+      ],
+      "minimum_cache_recovery_after_32_calm_calls": [
+        768,
+        768
+      ],
+      "mapping_checks_passed": 5,
+      "mapping_checks_total": 12
+    },
+    "after": {
+      "wakeup_only_limit": [
+        2929,
+        2929
+      ],
+      "empty_cache_global_swap_limit": [
+        2929,
+        2929
+      ],
+      "minimum_cache_recovery_after_32_calm_calls": [
+        768,
+        953
+      ],
+      "mapping_checks_passed": 12,
+      "mapping_checks_total": 12
+    }
+  },
+  "live": {
+    "interface": "server",
+    "processes": 1,
+    "cache_gib": 24,
+    "reserve_gib": 16,
+    "ctx": 4096,
+    "kv_cache_gib_per_model": 1,
+    "temperature": 1,
+    "top_p": 1,
+    "drafts": 0,
+    "ced": "off",
+    "substitution": 0,
+    "prompts": "Distinct synthetic code review, event merge, scheduler and file-cache questions; no private session text.",
+    "request_order": [
+      "DeepSeek",
+      "Qwen",
+      "DeepSeek",
+      "Qwen",
+      "DeepSeek"
+    ],
+    "prompt_tokens": [
+      596,
+      77,
+      660,
+      73,
+      682
+    ],
+    "generated_tokens": [
+      64,
+      24,
+      64,
+      24,
+      64
+    ],
+    "seeds": [
+      27180,
+      27181,
+      27182,
+      27183,
+      27184
+    ],
+    "deepseek_allocated_slots_after_each_request": [
+      2484,
+      2484,
+      2484,
+      2484,
+      2484
+    ],
+    "slots_released": 0,
+    "min_free_gib": 12.986328125,
+    "swapout_delta": 0,
+    "compression_delta": 0,
+    "guard_failures": []
+  },
+  "incomplete_live_checks": [
+    {
+      "cache_gib": 56,
+      "outcome": "Stopped after free memory crossed 10 GiB; 180 new system swap-outs recorded before exit. Last trace showed about 33 GiB available. Initial resize-only fix, before delayed GPU mapping."
+    },
+    {
+      "cache_gib": 32,
+      "outcome": "Stopped during first prefill below 10 GiB free. Reached all 3313 slots. Not a completed validation."
+    },
+    {
+      "cache_gib": 28,
+      "outcome": "Stopped during first prefill at 9.8649 GiB free. Reached all 2898 slots; no new swap-outs at termination. Not a completed validation."
+    }
+  ],
+  "checks": {
+    "cpu": {
+      "memory": [
+        11,
+        11
+      ],
+      "mapping": [
+        12,
+        12
+      ],
+      "available": [
+        11,
+        11
+      ],
+      "ready": [
+        45,
+        45
+      ],
+      "holds": [
+        13,
+        13
+      ],
+      "draft": [
+        49,
+        49
+      ],
+      "refine": [
+        8,
+        8
+      ],
+      "queue": [
+        14,
+        14
+      ],
+      "metrics": [
+        54,
+        54
+      ],
+      "admission": [
+        19,
+        19
+      ],
+      "demotion": [
+        37,
+        37
+      ]
+    },
+    "server": {
+      "passed": 69,
+      "ignored": 1
+    },
+    "native": {
+      "format": "MXFP4",
+      "case_count": 21,
+      "different_logits": 0,
+      "min_free_gib": 30.828216552734375,
+      "swapout_delta": 0
+    },
+    "iq1": {
+      "format": "UD-IQ1_M",
+      "case_count": 21,
+      "different_logits": 0,
+      "min_free_gib": 31.661483764648438,
+      "swapout_delta": 0
+    }
+  },
+  "limitations": [
+    "The original 72 GiB co-hosted allocation remains unvalidated.",
+    "Available memory includes file-backed pages but is not a guarantee that macOS reclaims those pages before swapping anonymous pages.",
+    "Numerical tests compare execution paths within each checkpoint representation. They do not measure IQ1 model quality or equality to native MXFP4."
+  ]
+}

@@ -216,15 +216,15 @@ void cache_reserve(double gib);
 void cache_init(uint64_t budget, int layers);
 // Bounded draft pools are demand-only. Finish prior GPU use of a stage's
 // buffers before cache_load/cache_request may replace their experts.
-// The model thread owns cache mutations and slot lifetimes. Slot queries
-// (cache_get, cache_slot, cache_ready, cache_where) may also run in synchronous
-// parallel helpers while the model thread waits for them. No slot may be
-// replaced or released until those helpers return.
-// The slot of a resident expert; at[k]: where span k is in it; *fresh:
-// resident only through gpu_use until the next token.
+// The model thread owns cache mutations and slot lifetimes. Read-only
+// queries (cache_slot, cache_ready, cache_where) may run in synchronous
+// helpers while the model thread waits. Slots cannot change until they
+// return. cache_get runs on the model thread and maps the expert for GPU
+// use; at[k] is span k's offset, and *fresh requires gpu_use until the
+// residency set is next committed.
 const Buf *cache_get(int layer, int expert, uint32_t at[3], int *fresh);
-void cache_load(int layer, const int *experts, int n);  // makes them resident
-// Starts making the experts resident. Returns how many had pending reads
+void cache_load(int layer, const int *experts, int n);  // finishes their reads into memory
+// Starts reading the experts into memory. Returns how many had pending reads
 // when each was checked; prefetch lateness uses that same completion check.
 int cache_request(int layer, const int *experts, int n);
 void cache_wait(int layer, const int *experts, int n);     // waits for their reads

@@ -10,7 +10,7 @@
 #include <unistd.h>
 static vm_statistics64_data_t vm_fixture;
 static int pressure_fixture = 1;
-static uint64_t compressed_fixture;
+static uint64_t compressed_fixture, wakeups_fixture;
 static kern_return_t fixture_host(host_t host, host_flavor_t flavor, host_info64_t out, mach_msg_type_number_t *n) {
   memcpy(out, &vm_fixture, sizeof vm_fixture);
   return KERN_SUCCESS;
@@ -22,7 +22,8 @@ static kern_return_t fixture_task(task_name_t task, task_flavor_t flavor, task_i
 }
 static int fixture_sysctl(const char *name, void *out, size_t *n, void *in, size_t len) {
   uint64_t value = !strcmp(name, "hw.memsize") ? 128ull << 30 :
-                   !strcmp(name, "kern.memorystatus_vm_pressure_level") ? pressure_fixture : 0;
+                   !strcmp(name, "kern.memorystatus_vm_pressure_level") ? pressure_fixture :
+                   !strcmp(name, "vm.compressor.swapper.wakeups.total") ? wakeups_fixture : 0;
   if (!out || !n) return -1;
   size_t size = *n < sizeof value ? *n : sizeof value;
   memcpy(out, &value, size), *n = size;
@@ -55,6 +56,8 @@ static void child_case(int kind) {
   vm_fixture.external_page_count = (20ull << 30) / vm_page_size;
   vm_fixture.speculative_count = 0;
   nslots = cap = max_slots - 256;
+  if (kind == 7) nslots = 0;
+  if (kind == 8) nslots = cap = 2 * EXPERTS;
   int before = cap;
   if (kind == 2) pressure_fixture = 2;
   resize(-1);
@@ -65,6 +68,8 @@ static void child_case(int kind) {
   }
   if (kind == 3) vm_fixture.compressions++, compressed_fixture = 128ull << 20;
   if (kind == 4) vm_fixture.swapouts++;
+  if (kind == 6) wakeups_fixture++;
+  if (kind == 7 || kind == 8) vm_fixture.swapouts++;
   if (kind == 5) {
     for (int i = 0; i < 32; i++) {
       vm_fixture.compressions++, compressed_fixture += 128ull << 20;
@@ -73,6 +78,16 @@ static void child_case(int kind) {
     _exit(cap > before && cap <= max_slots ? 0 : 1);
   }
   if (kind >= 3) resize(-1);
+  if (kind == 6 || kind == 7) {
+    fprintf(stderr, "cache reproduction %d: limit %d -> %d, allocated %d, swapouts %llu, wakeups %llu\n",
+            kind, before, cap, nslots, (unsigned long long)vm_fixture.swapouts, (unsigned long long)wakeups_fixture);
+    _exit(cap == before ? 0 : 1);
+  }
+  if (kind == 8) {
+    for (int i = 0; i < 32; i++) resize(-1);
+    fprintf(stderr, "cache reproduction %d: limit %d -> %d after 32 calm calls, allocated %d\n", kind, before, cap, nslots);
+    _exit(cap > before && cap <= max_slots ? 0 : 1);
+  }
   if (kind == 3) _exit(cap == before ? 0 : 1);
   _exit(cap < before ? 0 : 1);
 }
@@ -94,8 +109,9 @@ int main(void) {
   expect("initial capacity respects the configured upper bound", cap <= max_slots);
   const char *names[] = {"low free pages with ample file cache do not shrink", "calm growth uses available file cache",
                          "actual memory pressure still shrinks", "compression alone does not shrink", "new swapping still shrinks",
-                         "compression alone does not prevent growth"};
-  for (int kind = 0; kind < 6; kind++) {
+                         "compression alone does not prevent growth", "a swapper wakeup without swap-outs does not shrink",
+                         "a global swap-out cannot reclaim an empty expert cache", "a minimum-sized cache can recover using available memory"};
+  for (int kind = 0; kind < 9; kind++) {
     pid_t pid = fork();
     if (!pid) child_case(kind);
     int status;
