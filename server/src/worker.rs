@@ -449,7 +449,7 @@ pub fn status(model: usize) -> Value {
         "waiting": waiting, "sessions": sessions,
         "kv_cache_gib": round(st.kv_bytes as f64 / GIB, 3), "kv_cache_limit_gib": round(m.served.kv_gb, 3),
         "totals": {"requests": st.requests, "prompt_tokens": st.prompt_tokens, "generated_tokens": st.generated_tokens},
-        "ced_depth": o.ced, "lookup_depth": o.lookup, "prefill_prune": o.prefill_prune, "runahead": o.runahead,
+        "ced_depth": o.ced, "lookup_depth": o.lookup, "prefill_prune": o.prefill_prune, "runahead": o.runahead, "pipeline": o.pipeline,
         "drafts": m.model.draft_block(),
         "model_decode": {"computed_rows": c.decode_rows, "seconds": c.decode_seconds,
                          "main_queue_gpu_seconds": c.decode_gpu_seconds, "requested_expert_gb": c.decode.bytes as f64 / 1e9,

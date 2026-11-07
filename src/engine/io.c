@@ -33,6 +33,7 @@
 #include <string.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "myds4.h"
 
@@ -674,6 +675,28 @@ static uint32_t queue[QUEUE], qhead, qtail;  // entries: slot << 4 | piece
 static pthread_mutex_t qlock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t qcond = PTHREAD_COND_INITIALIZER;
 static _Atomic int demand, prefetching;  // demand pieces, and prefetched slots, in flight
+static pthread_mutex_t progress_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t progress_cond = PTHREAD_COND_INITIALIZER;
+static _Atomic int progress_enabled;
+static uint64_t progress_epoch;
+
+uint64_t cache_read_epoch(void) {
+  atomic_store(&progress_enabled, 1);
+  pthread_mutex_lock(&progress_lock);
+  uint64_t value = progress_epoch;
+  pthread_mutex_unlock(&progress_lock);
+  return value;
+}
+
+void cache_wait_progress(uint64_t epoch) {
+  struct timespec until;
+  clock_gettime(CLOCK_REALTIME, &until);
+  until.tv_nsec += 20000000;
+  if (until.tv_nsec >= 1000000000) until.tv_sec++, until.tv_nsec -= 1000000000;
+  pthread_mutex_lock(&progress_lock);
+  if (progress_epoch == epoch) pthread_cond_timedwait(&progress_cond, &progress_lock, &until);
+  pthread_mutex_unlock(&progress_lock);
+}
 
 static void piece_finished(Slot *s, int piece) {
   // Release the admission when the last I/O/cancellation finishes. Deferring
@@ -683,6 +706,14 @@ static void piece_finished(Slot *s, int piece) {
     if (s->background_load) atomic_fetch_sub_explicit(&prefetching, 1, memory_order_relaxed);
   }
   dispatch_group_leave(s->loading);
+  // Publish after leaving the group. Every piece signals: the reader that
+  // decrements unfinished last need not leave the dispatch group last.
+  if (atomic_load(&progress_enabled)) {
+    pthread_mutex_lock(&progress_lock);
+    progress_epoch++;
+    pthread_cond_broadcast(&progress_cond);
+    pthread_mutex_unlock(&progress_lock);
+  }
 }
 
 static void *reader(void *arg) {

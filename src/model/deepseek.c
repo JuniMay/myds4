@@ -60,6 +60,8 @@ static Buf final_norm, cs_base, cs_comp;
 static Tensor embed_t;
 static Options opt;
 static int runahead_enabled;
+static int pipeline_enabled;
+static void pipeline_report(FILE *out);
 static uint64_t experimental_workspace_bytes;
 static uint64_t runahead_group_count, runahead_group_rows;
 static int runahead_route_only;
@@ -475,6 +477,7 @@ static void predictor_identity(uint8_t result[32]) {
 uint64_t deepseek_ready_groups(void) { return runahead_group_count; }
 
 void deepseek_save_predictor(void) {
+  if (pipeline_enabled) pipeline_report(stderr);
   if (runahead_group_count)
     fprintf(stderr, "{\"ready_groups\":{\"groups\":%llu,\"rows\":%llu}}\n",
             (unsigned long long)runahead_group_count, (unsigned long long)runahead_group_rows);
@@ -491,6 +494,11 @@ void deepseek_load(const char *dir, const Options *options) {
   lock_model();
   opt = *options;
   runahead_enabled = opt.runahead;
+  pipeline_enabled = opt.pipeline;
+  if (pipeline_enabled && (opt.experts || opt.runahead || opt.draft || opt.online_predictor || opt.predictor_state ||
+                           opt.substitute > 0 || opt.dump_fd >= 0 || opt.routes_fd >= 0 || getenv("MYDS4_PROFILE")))
+    die("pipeline requires native MXFP4, exact routing, no runahead, DSpark, online predictor or dispatch profiling");
+  if (pipeline_enabled) fprintf(stderr, "pipeline: experimental; native MXFP4 concurrent requests\n");
   if (runahead_enabled && (opt.draft || opt.online_predictor || opt.substitute > 0 ||
                           opt.dump_fd >= 0 || opt.routes_fd >= 0))
     die("runahead requires exact decoding without DSpark or online prediction");
@@ -2830,6 +2838,7 @@ void deepseek_state_use(State *s) {
 }
 
 #include "../experimental/runahead.c"
+#include "../experimental/pipeline.c"
 
 const float *deepseek_forward_rows(State **st, const int *tokens, const int *pos, int m) {
   if (m < 1 || m > BATCH_ROWS) die("%d rows of sequences at once: 1 to %d", m, BATCH_ROWS);
@@ -2839,6 +2848,7 @@ const float *deepseek_forward_rows(State **st, const int *tokens, const int *pos
     row_state[r] = st[r], row_pos[r] = pos[r];
   }
   memcpy(active->history, history, sizeof history);
+  if (pipeline_enabled && m > 1) return pipeline_rows(st, tokens, pos, m);
   if (runahead_enabled && m > 1) return runahead_rows(st, tokens, pos, m);
   nrows = m;
   step(tokens, m, pos[0]);

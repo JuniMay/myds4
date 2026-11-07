@@ -4,9 +4,9 @@ CFLAGS = -std=c23 -O2 -Wall -Wextra -Wno-unused-parameter -Isrc/engine $(shell p
 LDLIBS = -framework Metal -framework Foundation -framework IOKit -framework ImageIO -framework CoreGraphics -framework Accelerate -lobjc -licucore \
          $(shell pkg-config --libs yyjson libjpeg)
 SRC = src/cli/main.c src/model/model.c src/model/deepseek.c src/model/qwen.c src/kernels/library.c src/engine/io.c src/engine/gpu.c src/engine/tok.c src/engine/util.c src/engine/vision.c src/experimental/online_predictor.c src/experimental/context_lookup.c src/engine/sample.c
-MODEL_HEADERS = src/engine/myds4.h src/model/model.h src/model/qwen.h src/experimental/online_predictor_math.h src/experimental/context_lookup.h src/experimental/prefill_prune.h src/experimental/runahead.c
+MODEL_HEADERS = src/engine/myds4.h src/model/model.h src/model/qwen.h src/experimental/online_predictor_math.h src/experimental/context_lookup.h src/experimental/prefill_prune.h src/experimental/runahead.c src/experimental/pipeline.c src/experimental/moe_tasks.h
 KERNELS = src/kernels/formats.metal src/kernels/kernels.metal src/kernels/gguf_grids.metal src/kernels/gguf.metal \
-          src/kernels/vision.metal src/kernels/rows.metal src/kernels/products.metal src/kernels/deltanet.metal src/kernels/gqa.metal
+          src/kernels/vision.metal src/kernels/rows.metal src/kernels/products.metal src/kernels/deltanet.metal src/kernels/gqa.metal src/experimental/moe_tasks.metal
 
 build/myds4: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin
 	@mkdir -p build
@@ -142,6 +142,10 @@ cache-ready-check: build/cache-ready-check
 build/cache-mapping-check: tools/checks/cache_mapping_check.c src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/myds4.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/cache_mapping_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
+
+build/cache-progress-check: tools/checks/cache_progress_check.c src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/myds4.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/cache_progress_check.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
 
 build/cache-hold-check: tools/checks/cache_hold_check.c src/engine/io.c src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS)
 	@mkdir -p build
@@ -280,7 +284,7 @@ build/rows-bench: tools/bench/rows_bench.c $(SRC) $(MODEL_HEADERS) $(KERNELS) da
 
 # Ready MXFP4 stages from different layers in one experimental dispatch.
 # Reads 24 experts, no complete model; does not measure decoder throughput.
-build/moe-tasks-check: tools/experimental/moe_tasks_check.c src/experimental/moe_tasks.metal src/kernels/formats.metal src/kernels/kernels.metal src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/myds4.h
+build/moe-tasks-check: tools/experimental/moe_tasks_check.c src/experimental/moe_tasks.h src/experimental/moe_tasks.metal src/kernels/formats.metal src/kernels/kernels.metal src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/myds4.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/experimental/moe_tasks_check.c src/engine/io.c src/engine/gpu.c src/engine/util.c $(LDLIBS)
 

@@ -48,7 +48,8 @@ in [Removed experiments](experiments.md).
 | `src/experimental/context_lookup.c`, `src/experimental/context_lookup.h` | Bounded CPU history matching for the CLI and server's context-copy drafts. |
 | `src/experimental/prefill_prune.h` | The dependency plan of `--prefill-prune`. |
 | `src/experimental/runahead.c` | `--runahead`'s scheduler for concurrent requests; included by `deepseek.c`. |
-| `src/experimental/moe_tasks.metal` | Standalone prototype that dispatches ready MXFP4 expert stages from different layers together; used only by `build/moe-tasks-check`. |
+| `src/experimental/pipeline.c` | `--pipeline`'s experimental request-stage scheduler, included by `deepseek.c`. |
+| `src/experimental/moe_tasks.metal` | Ready MXFP4 expert stages from different layers in one dispatch; used by the pipeline and `build/moe-tasks-check`. |
 | `src/engine/engine.c`, `src/engine/engine.h` | The engine behind a C ABI for the server: loading, attention states and their snapshots, prefill (with a replay: exact, or bounded under `--ced`, and a capture position), decoding, drafts, sampling, context-copy drafts, images, statistics, the tokenizer and the log. Requests, their scheduling and the KV prefix cache are the server's (see [The server](server.md)). |
 | `src/kernels/library.c` | Every kernel source in one string, compiled once per process (`gpu_start`). |
 | `src/kernels/formats.metal` | The number formats every source decodes (E4M3, E2M1, BF16) and small shared functions. |
@@ -1415,10 +1416,39 @@ arguments, and records prefill, client latency, model execution counters,
 cache capacity and expert reads. It never executes generated tools. These
 are workload replays rather than an autonomous agent quality benchmark.
 
-### Experimental multi-layer expert work
+### Experimental pipelined decoding
 
-`src/experimental/moe_tasks.metal` and `tools/experimental/moe_tasks_check.c`
-test one building block for pipelined decoding. Each task describes a ready
+`--pipeline` selects `src/experimental/pipeline.c` for a pass of two or more
+requests with native MXFP4 experts. It is off by default. A request alone
+keeps ordinary decoding and context lookup. The engine refuses pipeline
+with GGUF experts, runahead, DSpark, substitution, online prediction or
+dispatch profiling. Prefill keeps its configured behavior.
+
+Each request advances through a GPU layer front, CPU routing, required SSD
+reads, a GPU gate/up stage and a GPU down stage. Shared events report GPU
+completion without a blocking wait for each request. The CPU can issue one
+request's expert reads while GPU work for another request is in flight.
+When the GPU has no pending stage, the scheduler waits for completion of
+any expert read, using an epoch to avoid losing a wakeup between scanning
+requests and sleeping. A submitted up stage permits its down stage to be
+queued without a CPU wait: GPU resource dependencies order their accesses.
+After down work is submitted, the next layer's front is queued behind it.
+Completion signals govern CPU reads of routing and release of expert slots.
+
+Requests own the activations, router outputs, selections, expert tables,
+intermediate expert values, logits and Engram inputs that survive between
+stages. Layer-front scratch follows command-queue order. Expert reservations
+stay held through the down stage's completion signal. Indirect task inputs
+and outputs are declared to Metal for read/write hazard tracking. Task
+descriptors occupy separate regions until the complete pass retires its GPU
+commands. Cache resizing happens only between passes.
+
+The pipeline covers one next-token row per request in a model call. All
+those rows finish before the call returns to the server for sampling. It
+does not yet keep a fast request's next token in flight across calls while
+another request is finishing its previous token.
+
+`src/experimental/moe_tasks.metal` combines ready expert work. Each task describes a ready
 gate/up stage or a ready down stage for one request and layer. A single
 dispatch can contain both kinds of task from different layers. Each
 threadgroup takes one task's tile, so requests keep separate activations,
@@ -1432,17 +1462,22 @@ own completed gate/up output. The shader has no device-wide spin barrier
 and does not wait for expert reads. The standalone check uses 24 resident
 experts from four checkpoint layers and synthetic activations. It checks
 all intermediate and final bytes, finite values, and unchanged outputs of
-inactive jobs. It then times warmed kernels. It is not part of the default
-Metal library, CLI or server. Measurements are in
+inactive jobs. It then times warmed kernels. Single ready tasks use the
+ordinary kernels because the task shader costs more in that case. Kernel measurements are in
 [Performance](performance.md#multi-layer-expert-task-prototype).
 
-Full pipelined decoding remains unimplemented. It needs request-owned
-scratch for every stage that can overlap, a queue of ready stages with
-explicit GPU completion and SSD-read dependencies, and expert reservations
-that last through GPU use. The scheduler must preserve each request's
-attention state, routing, reduction and sampling order. Model-level logit
-and state comparisons and matched HTTP throughput tests are still required.
-The current runahead scheduler above is a separate implementation.
+The concurrent pipeline uses exact router selections and does not issue
+the native forecasts. It preserves each request's reduction and sampling
+order. The model check compares all logits, rolling state, compressed KV,
+index keys and Engram history against ordinary batched decoding. Short
+checks pass with two and four requests, and the one-request fallback passes.
+These checks establish bounded numerical equality, not a throughput gain.
+Runahead above remains a separate scheduler.
+
+On exit, the `pipeline` JSON line reports steps, stage batches, tasks,
+batches mixing stages or layers, the most GPU stages in flight, and wait
+times. Waiting for GPU completion and waiting for required reads are
+reported separately; they are not a complete additive wall-time breakdown.
 
 ### Prompts
 

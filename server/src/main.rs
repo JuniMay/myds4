@@ -71,6 +71,8 @@ const USAGE: &str = "usage: myds4-server (-m MODEL [model options] | --config FI
   --experts GGUF  read the routed experts from a GGUF file or set of shards
   --substitute D  approximate: replace selected experts not in memory (see build/myds4)
   --runahead     overlap exact concurrent requests with expert reads
+  --pipeline     experimental native MXFP4 pipeline for concurrent requests (default off);
+                 incompatible with --runahead, --draft, --experts, online prediction and substitution
   --draft-cache N  with --draft: expert slots per stage, 15-128
   --online-predictor  CPU prefetch correction learned online
   --predictor-state FILE  online learning, its state loaded and saved
@@ -117,7 +119,7 @@ fn parse(args: &[String]) -> Args {
         let switch = |name: &str| (name.to_string(), Value::Bool(true));
         match flag {
             "--tui" => a.tui = true,
-            "--cache-read-cost" | "--runahead" | "--prefill-prune" | "--online-predictor" => {
+            "--cache-read-cost" | "--runahead" | "--pipeline" | "--prefill-prune" | "--online-predictor" => {
                 options.push(switch(&flag[2..].replace('-', "_")))
             }
             _ => {
@@ -179,6 +181,9 @@ fn parse(args: &[String]) -> Args {
 
 #[test]
 fn one_model_takes_its_options_from_the_command_line() {
+    let pipeline = parse(&["-m", "/m/d", "--pipeline", "--serve", "8008"].map(String::from));
+    assert!(pipeline.models[0].engine.pipeline);
+    assert!(!pipeline.models[0].engine.runahead);
     let a = parse(&["-m", "/m/d", "--prefill-prune", "--lookup", "15", "--draft", "2", "--ced", "off", "--serve", "8008", "--tui"].map(String::from));
     let m = &a.models[0];
     assert!(m.engine.prefill_prune);

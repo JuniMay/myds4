@@ -146,6 +146,7 @@ void gpu_kern(int k);
 void gpu_buf(int idx, const Buf *b, size_t off);
 void gpu_bytes(int idx, const void *p, size_t n);
 void gpu_use(const Buf *b);
+void gpu_use_rw(const Buf *b);  // indirect read/write access, including hazard tracking
 typedef struct { const Buf *from, *to; size_t from_offset, to_offset, bytes; } GpuCopy;
 void gpu_copies(const GpuCopy *copies, int count);
 void gpu_go(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t tx, uint32_t ty, uint32_t tz);
@@ -153,6 +154,7 @@ uint64_t gpu_signal(void);  // ends the encoder, signals the returned value
 void gpu_keep_clock(double seconds);  // keeps the GPU's clock up for about that long
 void gpu_commit(void);
 void gpu_wait_signal(uint64_t v);
+uint64_t gpu_signal_value(void);  // latest completed signal, without waiting
 void gpu_sync(void);
 int gpu_threads(int k);  // max threads per threadgroup of a kernel
 int gpu_profiling(void);       // MYDS4_PROFILE set: dispatches run one at a time, timed
@@ -228,6 +230,10 @@ void cache_load(int layer, const int *experts, int n);  // finishes their reads 
 // when each was checked; prefetch lateness uses that same completion check.
 int cache_request(int layer, const int *experts, int n);
 void cache_wait(int layer, const int *experts, int n);     // waits for their reads
+// Read the epoch before scanning pending requests, then wait only if no
+// piece completed since that scan. A completion for any layer wakes it.
+uint64_t cache_read_epoch(void);
+void cache_wait_progress(uint64_t epoch);
 int cache_slot(int layer, int expert);   // it has a slot: resident, or being read
 int cache_hold(int layer, const int *experts, int n);
 void cache_unhold(int layer, const int *experts, int n);
@@ -354,6 +360,7 @@ typedef struct {
   int ced;                    // 0: no approximate replay; otherwise decoder replay tokens (at least WINDOW)
   int prefill_prune;          // skip decoder batches outside the final and saved-prefix dependencies
   int runahead;               // exact concurrent requests: group ready jobs while other expert reads run
+  int pipeline;               // experimental native MXFP4 stages across concurrent requests
 } Options;
 void online_predictor_init(int rank, const float *const biases[LAYERS]);
 void online_predictor_reset(void);

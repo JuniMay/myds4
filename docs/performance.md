@@ -50,9 +50,77 @@ The task descriptor and branch cost more for one job. The multi-job
 measurements justify testing a scheduler that supplies independent ready
 stages; they do not establish a decoding speedup. Routing, attention, SSD
 waits, state ownership and the server scheduler are outside this fixture.
-The prototype is not enabled in inference. Free memory stayed above
+The experimental `--pipeline` scheduler now uses this shader when multiple
+expert stages are ready; the table above remains a standalone kernel
+measurement. Free memory stayed above
 60.99 GiB and no swap-outs were recorded.
 [Measurement record](../data/benchmarks/moe_tasks_results.json).
+
+## Pipelined server decoding
+
+The experimental `--pipeline` path was tested on 2026-11-07 with DeepSeek
+V4.1 Flash (`deepseek-ai/DeepSeek-V4.1-Flash-1017`), native MXFP4 experts,
+one Rust server and four concurrent requests reconstructed from a real
+Harness conversation. The prompts had 13,014, 13,772, 19,129 and 22,481
+tokens. Each request generated 128 tokens at temperature/top-p 1 and seed
+12345, with a 32,768-token context. DSpark, context-copy drafting, CED,
+substitution, online prediction and prefill pruning were off.
+
+Admission order was fixed. Each arm started a fresh process and used the
+same requests, cache budget and sampler settings. The runs returned the
+same text, reasoning and tool arguments; generated tool calls were not
+executed. The 512 output tokens include four first tokens sampled from
+prefill logits. Engine decode throughput below uses the other 508 rows
+and the engine's decode wall-time counter. It is combined throughput across
+the four requests, not the speed of a single request.
+
+| Expert cache | Ordinary controls, rows/s | Pipeline, rows/s | Runahead reference, rows/s |
+| --- | ---: | ---: | ---: |
+| 28 GiB | 7.23 / 7.22 | 7.83 | 7.66 |
+| 80 GiB | 15.37 / 15.29 | 16.48 | 16.17 |
+
+The first series used control–pipeline–control order. At 28 GiB, the
+pipeline improved decode throughput by 8.4% against the mean control
+duration, and by 2.2% against one runahead run. Queueing a down stage behind
+its up stage without a CPU completion wait subsequently measured 7.83
+again; its following ordinary control measured 7.13. That wait removal did
+not establish another throughput gain.
+
+The 80 GiB series used that GPU dependency ordering and another
+control–pipeline–control comparison. Its decode improvement was 7.5%, and
+1.9% against one runahead run. The 80 GiB runs retained all 4,551 slots
+(79.998 GiB) with an 8 GiB program reserve. The 28 GiB runs retained all
+1,592 slots with a 12 GiB reserve. No run swapped or shrank its cache.
+The 80 GiB runs allowed compression and counted reclaimable file cache as
+available memory: macOS reclaimed file pages during allocation. Increasing
+the cache changes the resource budget; that increase is not a code
+optimization.
+
+These are short decoding comparisons. Full request time varied with
+prefill: at 80 GiB, the ordinary arms took 110.39 and 121.96 s, and the
+pipeline arm took 122.89 s. A general prefill or whole-request latency gain
+is not established. At 80 GiB, pipeline decode read 350.2 GB of logical
+expert-file bytes, against 405.5–406.9 GB for ordinary batching, while its
+main-queue GPU time increased to 16.54 s from 10.68–10.76 s. These counters
+overlap and are not an additive time breakdown or physical bandwidth
+measurements.
+
+The pipeline remains off by default and is limited to native MXFP4. It
+uses separate layer fronts for requests, so it gives up some dense-weight
+sharing. It still drains each multi-request token pass before sampling;
+continuous pipelining across token boundaries is not implemented. The
+measurements do not establish a long-run gain, a single-request gain, or
+performance while Qwen is also loaded.
+
+[28 GiB comparison](../data/benchmarks/pipeline_server_results.json),
+[queued-stage comparison](../data/benchmarks/pipeline_queued_results.json),
+[28 GiB runahead reference](../data/benchmarks/pipeline_runahead_reference.json),
+[80 GiB comparison](../data/benchmarks/pipeline_80g_results.json) and
+[80 GiB runahead reference](../data/benchmarks/pipeline_80g_runahead_reference.json)
+contain the individual results. The
+[validation record](../data/benchmarks/pipeline_validation_results.json)
+records full logit and state comparisons, the single-request fallback,
+and the CPU checks for cache reservations and completion notifications.
 
 ## Machine
 

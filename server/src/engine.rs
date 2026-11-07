@@ -9,7 +9,7 @@ use std::ptr;
 
 use deepseek_recipe::stream::StreamTokenizer;
 
-const ABI: c_int = 8;
+const ABI: c_int = 9;
 
 #[repr(C)]
 struct RawProcess {
@@ -37,6 +37,7 @@ struct RawConfig {
     lookup: c_int,
     prefill_prune: c_int,
     runahead: c_int,
+    pipeline: c_int,
 }
 
 #[repr(C)]
@@ -286,6 +287,7 @@ pub struct Options {
     pub lookup: i32,
     pub prefill_prune: bool,
     pub runahead: bool,
+    pub pipeline: bool,
 }
 
 /// Logits of one row or more, valid until the next call that runs a model.
@@ -325,6 +327,7 @@ impl Model {
             lookup: o.lookup,
             prefill_prune: o.prefill_prune.into(),
             runahead: o.runahead.into(),
+            pipeline: o.pipeline.into(),
         };
         let m = unsafe { myds4_load(&raw) };
         (!m.is_null()).then_some(Model(m))

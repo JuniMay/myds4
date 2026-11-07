@@ -55,7 +55,7 @@ def process_snapshot(child=None, preflight=True, allow_cpu_helpers=False, backgr
                    (Path(row[3]).name.lower().startswith("python") or Path(row[3]).name.lower() in cpu_tools)]
     if allow_cpu_helpers and gpu_clients is None and foreign_cpu:
         gpu_clients = set(gpu_activity()["gpu_client_pids"])
-    ownership_known = bool(gpu_clients) and (child is None or child in gpu_clients)
+    ownership_known = bool(gpu_clients) and (child is None or bool(children & set(gpu_clients)))
     gpu_ancestors = set(gpu_clients or ())
     for owner in list(gpu_ancestors):
         parent = processes.get(owner, (0,))[0]

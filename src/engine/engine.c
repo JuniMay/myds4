@@ -95,6 +95,8 @@ myds4_model *myds4_load(const myds4_config *c) {
                       ? "cache-half-life takes 1 to 1000000 forward passes"
                   : c->runahead && (c->draft || c->online_predictor || c->substitute > 0)
                       ? "runahead requires draft off, no online predictor and no substitution"
+                  : c->pipeline && (c->experts || c->runahead || c->draft || c->online_predictor || c->predictor_state || c->substitute > 0)
+                      ? "pipeline requires native MXFP4, no runahead, draft, online predictor or substitution"
                   : c->reserve_gb && !(c->reserve_gb >= CACHE_RESERVE_MIN && c->reserve_gb <= CACHE_RESERVE_MAX)
                       ? "reserve takes 2 to 1024 GiB"
                                                     : 0;
@@ -117,7 +119,7 @@ myds4_model *myds4_load(const myds4_config *c) {
                      .predictor_state = copy(c->predictor_state), .substitute = c->substitute,
                      .experts = copy(c->experts), .quiet = 1,
                      .online_predictor = c->online_predictor || c->predictor_state ? 64 : 0, .ced = c->ced,
-                     .lookup = c->lookup, .prefill_prune = c->prefill_prune, .runahead = c->runahead};
+                     .lookup = c->lookup, .prefill_prune = c->prefill_prune, .runahead = c->runahead, .pipeline = c->pipeline};
   const char *why = ops->refuse(&x->opt);
   if (why) {
     fprintf(stderr, "myds4: %s: %s\n", c->model, why);

@@ -22,7 +22,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYDS4_ABI 8
+#define MYDS4_ABI 9
 
 // ---- the process ----
 
@@ -74,6 +74,7 @@ typedef struct {
   int lookup;                  // 0 or 1 to 15 context-copy drafts
   int prefill_prune;           // DeepSeek: skip unused decoder batches, dependencies kept
   int runahead;                // DeepSeek: concurrent requests' scheduler
+  int pipeline;                // DeepSeek: experimental native MXFP4 stage pipeline
 } myds4_config;
 
 typedef struct myds4_model myds4_model;

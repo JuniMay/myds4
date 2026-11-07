@@ -1,0 +1,182 @@
+{
+  "date": "2026-11-07",
+  "model": "DeepSeek V4.1 Flash",
+  "model_identifier": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "expert_format": "native MXFP4",
+  "fixture": "tools/checks/runahead_model_check.c --pipeline",
+  "settings": {
+    "cache_gib": 20,
+    "reserve_gib": 4,
+    "context_capacity": 32768,
+    "prompt_lengths": "257 + 17 * request_index",
+    "steps": 4,
+    "drafts": 0,
+    "ced": 0,
+    "substitution": 0,
+    "sampling": "Reference argmax tokens are forced through both execution paths; this is a numerical check, not a speed benchmark."
+  },
+  "model_checks": [
+    {
+      "requests": 1,
+      "logit_bytes_differ": 0,
+      "rolling_state_bytes_differ": 0,
+      "global_kv_and_index_bytes_differ": 0,
+      "nonfinite": 0,
+      "active_state_changes": 0,
+      "pipeline_tasks": 0,
+      "min_free_gib": 23.888992309570312,
+      "swapout_delta": 0
+    },
+    {
+      "requests": 2,
+      "logit_bytes_differ": 0,
+      "rolling_state_bytes_differ": 0,
+      "global_kv_and_index_bytes_differ": 0,
+      "nonfinite": 0,
+      "active_state_changes": 0,
+      "pipeline_tasks": 640,
+      "mixed_stage_batches": 4,
+      "mixed_layer_batches": 11,
+      "max_inflight": 2,
+      "min_free_gib": 25.716705322265625,
+      "swapout_delta": 0
+    },
+    {
+      "requests": 4,
+      "logit_bytes_differ": 0,
+      "rolling_state_bytes_differ": 0,
+      "global_kv_and_index_bytes_differ": 0,
+      "nonfinite": 0,
+      "active_state_changes": 0,
+      "pipeline_tasks": 1280,
+      "mixed_stage_batches": 17,
+      "mixed_layer_batches": 103,
+      "max_inflight": 4,
+      "min_free_gib": 23.927047729492188,
+      "swapout_delta": 0
+    }
+  ],
+  "initial_failed_check": {
+    "requests": 2,
+    "logit_bytes_differ": 3226672,
+    "rolling_state_bytes_differ": 103441,
+    "global_kv_and_index_bytes_differ": 2883,
+    "nonfinite": 0,
+    "correction": "Declare indirect task inputs and outputs to Metal with the correct read/write resource usage, so later layer fronts depend on the task's writes."
+  },
+  "cpu_checks": {
+    "cache_completion_notifications": [
+      8,
+      8
+    ],
+    "cache_holds": [
+      13,
+      13
+    ],
+    "cache_readiness": [
+      45,
+      45
+    ],
+    "cache_mapping": [
+      14,
+      14
+    ],
+    "cache_memory": [
+      11,
+      11
+    ],
+    "prefetch_refinement_race": [
+      8,
+      8
+    ],
+    "server_unit_tests": {
+      "passed": 71,
+      "ignored": 1
+    }
+  },
+  "http_validation": {
+    "record": "pipeline_server_results.json",
+    "runahead_record": "pipeline_runahead_reference.json",
+    "requests_per_arm": 4,
+    "generated_tokens_per_arm": 512,
+    "matching_text_reasoning_and_tool_arguments": true,
+    "limits": "Fixed admission order, identical 28 GiB cache, temperature/top-p 1, seed 12345; real Harness prefixes. No commands from the requests were executed.",
+    "cache80_record": "pipeline_80g_results.json",
+    "cache80_runahead_record": "pipeline_80g_runahead_reference.json"
+  },
+  "limitations": [
+    "No claim of equality to cold prefill; the existing KV reuse behavior applies.",
+    "No IQ2 pipeline, DSpark pipeline, online predictor pipeline or substitution pipeline.",
+    "Numerical full-state comparisons cover short prompts. Longer HTTP prompts compare returned content and usage rather than every state byte.",
+    "The scheduler drains each multi-request token pass before sampling the next tokens. It does not pipeline across model calls."
+  ],
+  "queued_dependency_check": {
+    "requests": 4,
+    "steps": 4,
+    "logit_bytes_differ": 0,
+    "rolling_state_bytes_differ": 0,
+    "global_kv_and_index_bytes_differ": 0,
+    "nonfinite": 0,
+    "active_state_changes": 0,
+    "tasks": 1280,
+    "batches": 1170,
+    "mixed_layer_batches": 62,
+    "minimum_free_gib": 23.284133911132812,
+    "swapout_delta": 0
+  },
+  "qwen_cancelled_prefill_compatibility": {
+    "completed": true,
+    "passed": 1,
+    "filtered_out": 3,
+    "model": "Qwen3.8-27B",
+    "model_identifier": "nvidia/Qwen3.8-27B-NVFP4",
+    "first_prompt_tokens": 38384,
+    "resumed_prompt_tokens": 38416,
+    "reused_tokens": 1536,
+    "reply_matches_reference": true,
+    "minimum_free_gib": 44.3577880859375,
+    "swapout_delta": 0,
+    "guard_failures": [],
+    "initial_attempt": "Interrupted by the conservative process guard; excluded. Descendant GPU ownership detection was corrected before retry."
+  },
+  "unsupported_pipeline_options": [
+    {
+      "args": [
+        "--experts",
+        "/not-a-gguf"
+      ],
+      "passed": true,
+      "exit_code": 2
+    },
+    {
+      "args": [
+        "--runahead"
+      ],
+      "passed": true,
+      "exit_code": 2
+    },
+    {
+      "args": [
+        "--draft",
+        "1"
+      ],
+      "passed": true,
+      "exit_code": 2
+    },
+    {
+      "args": [
+        "--online-predictor"
+      ],
+      "passed": true,
+      "exit_code": 2
+    },
+    {
+      "args": [
+        "--substitute",
+        "0.2"
+      ],
+      "passed": true,
+      "exit_code": 2
+    }
+  ]
+}

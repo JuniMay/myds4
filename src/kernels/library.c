@@ -8,6 +8,8 @@ static const char source[] = {
     , '\n',
 #embed "kernels.metal"
     , '\n',
+#embed "../experimental/moe_tasks.metal"
+    , '\n',
 #embed "gguf_grids.metal"
     , '\n',
 #embed "gguf.metal"

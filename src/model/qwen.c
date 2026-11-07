@@ -799,9 +799,9 @@ static ModelCounters counted;     // decoding and prompt passes' rows and times
 static const char *q_refuse(const Options *o) {
   if (o->experts || o->ced || o->substitute > 0 || o->online_predictor || o->predictor_state || o->prefill_prune ||
       o->draft_cache || o->dump_fd >= 0 || o->routes_fd >= 0 || o->runahead || o->budget_gb || o->reserve_gb || o->cache_half_life ||
-      o->cache_read_cost)
+      o->cache_read_cost || o->pipeline)
     return "experts, ced, substitute, online-predictor, predictor-state, prefill-prune, draft-cache, cache, reserve, "
-           "cache-half-life, cache-read-cost, dump-fd, routes-fd and runahead apply to DeepSeek's routed experts and "
+           "cache-half-life, cache-read-cost, dump-fd, routes-fd, runahead and pipeline apply to DeepSeek's routed experts and "
            "layers, which a qwen3_5 model does not have";
   if (o->draft > 1) return "draft: the MTP head drafts one token";
   return 0;

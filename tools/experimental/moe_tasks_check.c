@@ -2,6 +2,7 @@
 // in one dispatch. Uses checkpoint weights, synthetic activations, no model
 // state or SSD reads during timing. It is not a decoder throughput test.
 #include "myds4.h"
+#include "../../src/experimental/moe_tasks.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,11 +16,6 @@ static const char source[] = {
 #embed "../../src/experimental/moe_tasks.metal"
 };
 typedef struct { uint64_t p[3]; float weight, pad; } Entry;
-typedef struct {
-  uint64_t ex, x, h, shared_out, mix, res, out;
-  uint32_t first, groups, kind, experts;
-} Task;
-static_assert(sizeof(Task) == 72);
 static_assert(sizeof(Entry) == 32);
 enum { JOBS = 4, REPEATS = 48 };
 typedef struct { Buf ex, x, h, shared, mix, res, out; } Job;
@@ -50,12 +46,12 @@ static void ordinary(int job, int kind) {
 }
 static int kind_of(int pattern, int j) { return pattern == 2 ? j % 2 : pattern; }
 static uint32_t plan(int n, int pattern) {
-  Task *t = (Task *)tasks.ptr;
+  MoeTask *t = (MoeTask *)tasks.ptr;
   uint32_t groups = 0;
   for (int i = 0; i < n; i++) {
     Job *j = jobs + i;
     int kind = kind_of(pattern, i);
-    t[i] = (Task){address(j->ex), address(j->x), address(j->h), address(j->shared), address(j->mix),
+    t[i] = (MoeTask){address(j->ex), address(j->x), address(j->h), address(j->shared), address(j->mix),
                   address(j->res), address(j->out), groups, kind ? DIM / 4 : TOPK * (INTER / 32), kind, TOPK};
     groups += t[i].groups;
   }
@@ -89,7 +85,7 @@ int main(int argc, char **argv) {
   // reserves metadata, not buffers for unused slots.
   cache_reserve(16), cache_init(16ull << 30, LAYERS);
   const int layers[JOBS] = {3, 11, 23, 37};
-  tasks = zeros(JOBS * sizeof(Task)), dummy = zeros(16);
+  tasks = zeros(JOBS * sizeof(MoeTask)), dummy = zeros(16);
   for (int i = 0; i < JOBS; i++) {
     Job *j = jobs + i;
     j->ex = zeros(TOPK * sizeof(Entry)), j->x = zeros(DIM * 4), j->h = zeros(TOPK * INTER * 4);

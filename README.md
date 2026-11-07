@@ -135,6 +135,13 @@ substitution and the online predictor when using it. The option is off by
 default. See the [server comparison](docs/performance.md#http-runahead-comparison)
 for measured throughput and its limits.
 
+The server also has an experimental `--pipeline` option for concurrent
+native MXFP4 requests. It keeps request stages in flight and combines ready
+expert work across layers. A lone request keeps ordinary decoding. It is
+off by default and requires runahead, DSpark, substitution and online
+prediction to be off. See the [pipeline design](docs/design.md#experimental-pipelined-decoding)
+and [measurements](docs/performance.md#pipelined-server-decoding).
+
 ## Performance
 
 Exact decoding (no `--substitute`), measured on 2026-11-01 on the M5 Max with

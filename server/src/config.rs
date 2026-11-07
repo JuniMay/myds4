@@ -79,6 +79,7 @@ impl ModelConfig {
             "predictor_state" => e.predictor_state = Some(text()?),
             "prefill_prune" => e.prefill_prune = flag()?,
             "runahead" => e.runahead = flag()?,
+            "pipeline" => e.pipeline = flag()?,
             "kv_cache" => self.kv_gb = num()?,
             "batch" => self.batch = int().ok().filter(|n| *n >= 1).ok_or("batch takes a positive integer")? as usize,
             "temperature" => {
@@ -138,6 +139,17 @@ mod tests {
         assert_eq!((d.engine.draft, d.id.as_deref()), (0, None));
         assert_eq!((q.id.as_deref(), q.engine.draft, q.engine.ctx, q.top_k, q.think), (Some("qwen"), 1, 32768, Some(20), Some(0)));
         assert_eq!(q.engine.cache_gb, 0.0);
+    }
+
+    #[test]
+    fn pipeline_is_explicit_and_per_model() {
+        let models = parse(&json!({"models": [
+            {"model": "/models/deepseek", "pipeline": true}, {"model": "/models/qwen"}
+        ]})).unwrap();
+        assert!(models[0].engine.pipeline);
+        assert!(!models[0].engine.runahead);
+        assert!(!models[1].engine.pipeline);
+        assert!(parse(&json!({"models": [{"model": "/models/deepseek", "pipeline": "on"}]})).is_err());
     }
 
     #[test]

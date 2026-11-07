@@ -22,6 +22,7 @@ static int ndone, current, profile;
 static double prof_s[128];
 static long prof_n[128];
 static id used[1024];  // resources made resident in the current encoder
+static unsigned long used_usage[1024];
 static int nused;
 static void report(void);
 double gpu_busy, gpu_gap;
@@ -231,7 +232,12 @@ void gpu_bytes(int idx, const void *p, size_t n) {
 
 void gpu_use(const Buf *b) {
   MSG(void (*)(id, SEL, id, unsigned long), enc, s_use, (id)b->obj, 1ul);  // read
-  if (nused < (int)(sizeof used / sizeof *used)) used[nused++] = b->obj;
+  if (nused < (int)(sizeof used / sizeof *used)) used_usage[nused] = 1, used[nused++] = b->obj;
+}
+
+void gpu_use_rw(const Buf *b) {
+  MSG(void (*)(id, SEL, id, unsigned long), enc, s_use, (id)b->obj, 3ul);
+  if (nused < (int)(sizeof used / sizeof *used)) used_usage[nused] = 3, used[nused++] = b->obj;
 }
 
 void gpu_copies(const GpuCopy *copies, int count) {
@@ -263,7 +269,7 @@ void gpu_go(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t tx, uint32_t ty, uin
     prof_n[current]++;
     int n = nused;
     gpu_encode(gpu_open());
-    for (int i = 0; i < n; i++) MSG(void (*)(id, SEL, id, unsigned long), enc, s_use, used[i], 1ul);
+    for (int i = 0; i < n; i++) MSG(void (*)(id, SEL, id, unsigned long), enc, s_use, used[i], used_usage[i]);
     nused = n;
     gpu_kern(current);
   }
@@ -316,6 +322,10 @@ static void unsignaled(uint64_t v) {
 void gpu_wait_signal(uint64_t v) {
   if (!MSG(BOOL (*)(id, SEL, uint64_t, uint64_t), event, S("waitUntilSignaledValue:timeoutMS:"), v, 60000ull))
     unsignaled(v);
+}
+
+uint64_t gpu_signal_value(void) {
+  return MSG(uint64_t (*)(id, SEL), event, S("signaledValue"));
 }
 
 static int by_start(const void *a, const void *b) {

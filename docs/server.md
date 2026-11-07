@@ -268,7 +268,7 @@ it keeps reading the connection meanwhile; reads have no deadline then.
 ## The C ABI
 
 [`src/engine/engine.h`](../src/engine/engine.h) is the whole interface. Its
-version is `MYDS4_ABI = 8`. Callers must use the matching structure layouts
+version is `MYDS4_ABI = 9`. Callers must use the matching structure layouts
 and rebuild with the engine. The engine runs the models; everything about
 requests (their queues, scheduling, the KV prefix caches, the status and the
 live view's data) is the server's. Every function that runs a model or
@@ -286,7 +286,7 @@ be called from any thread. Its parts:
 - **Models.** `myds4_load(config)` takes one model's options
   (`myds4_config`: the checkpoint, the context, the drafts and lookups, and
   DeepSeek's `experts`, cache settings, `substitute`, `draft_cache`, online
-  predictor, `ced`, `prefill_prune` and `runahead`) and returns the model,
+  predictor, `ced`, `prefill_prune`, `runahead` and `pipeline`) and returns the model,
   its family from `config.json`; a family refuses options it has no use for,
   and the process holds one model of each family. A DeepSeek model waits for
   the model lock (`myds4.lock` beside the executable, or `$MYDS4_LOCK`).
@@ -407,6 +407,24 @@ The HTTP comparison uses a short off/on/off sequence, not a general
 throughput guarantee, and it ran while runahead still shared expert weight
 loads within a group. Its [recorded results](performance.md#http-runahead-comparison)
 include the memory budget, prompt reuse and output equality.
+
+`--pipeline` is an experimental alternative for two or more native MXFP4
+requests. The same option is `"pipeline": true` in a model's configuration.
+It keeps multiple request stages in flight and combines ready expert stages
+from different layers in one GPU dispatch. Expert reads use exact routing;
+buffers remain reserved until GPU use completes. It preserves one engine
+thread and one process. A lone request keeps ordinary decoding.
+
+Pipeline is off by default and cannot be combined with `--runahead`, GGUF
+experts, DSpark, substitution or online prediction. CED and prefill pruning
+retain their existing scope; context lookup applies to a lone request.
+The model status reports `pipeline`. The exit report records combined
+stage and layer dispatches. See [Design](design.md#experimental-pipelined-decoding)
+for the ownership and completion rules. Short native MXFP4 comparisons
+show decode gains at 28 and 80 GiB caches, with matching outputs; a general
+whole-request latency gain is not established. See
+[Performance](performance.md#pipelined-server-decoding). The option remains
+experimental and off by default.
 
 Arrival logs carry an HTTP identifier, body size, and message/tool counts.
 Queue logs show waiting requests and how many the scheduler admits for
