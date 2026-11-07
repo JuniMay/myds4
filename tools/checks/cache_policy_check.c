@@ -23,6 +23,7 @@ static void setup(int half_life, int cost) {
   memset(fixture, 0, sizeof fixture);
   memset(where, 0xff, sizeof where);
   memset(escore, 0, sizeof escore);
+  memset(dscore, 0, sizeof dscore);
   memset(expert_spans, 0, sizeof expert_spans);
   memset(&cache_stats, 0, sizeof cache_stats);
   slots = fixture, score = fixture_score;
@@ -185,31 +186,53 @@ int main(void) {
   for (int i = 0; i < 3; i++) reload_cost[i] = .5;
   expect("uniform read costs preserve victim", victim() == 0);
 
-  // A prompt pass keeps what decoding uses most: its victim is the
-  // lowest-priority slot of a layer the pass is done with, not the least
-  // recently used one, else of a layer after the next. Slot 0 is the least
-  // recently used, and the one decoding uses most.
+  // A prompt pass keeps what decoding uses most: its victim is the slot of a
+  // layer the pass is done with whose expert decoding used least, not the
+  // least recently used one, else of a layer after the next. Slot 0 is the
+  // least recently used, and the one decoding uses most.
   setup(10, 0);
   slots[0].layer = 0, slots[1].layer = 1, slots[2].layer = 3;
   score[0] = 9, score[1] = 2, score[2] = 1;
+  dscore[0] = 9, dscore[EXPERTS + 1] = 2, dscore[3 * EXPERTS + 2] = 1;
   pass_layer = 2;
-  expect("prefill evicts the lowest-priority slot of a done layer", victim() == 1);
+  expect("prefill evicts the done layers' slot decoding used least", victim() == 1);
   pass_layer = 0;
   expect("prefill fallback protects current and next layer", victim() == 2);
   slots[2].layer = 1;
   expect("prefill finds no victim in its current and next layers", victim() == -1);
   pass_layer = -1;
 
-  // Between slots of equal priority (a cold cache: the prompt credited every
-  // expert alike), a prompt pass takes the expert cheapest to read again.
+  // A first prompt, with no decoding history: the prompt credits an expert
+  // once for each of its batches that selects it, so under --ced the encoder
+  // layers' experts (every batch) score above the decoder layers' (the last
+  // ring's one batch). A prompt pass ranks by decoding's use alone, and among
+  // equals takes the least recently used slot: the earlier layer's slot 0,
+  // not the later layer's lower-scored slot 1, whose expert the decoding
+  // after the prompt needs.
+  setup(10, 0);
+  slots[0].layer = 0, slots[1].layer = 1, slots[2].layer = 3;
+  score[0] = escore[0] = 4, score[1] = escore[EXPERTS + 1] = 1, score[2] = 1;
+  pass_layer = 2;
+  expect("a first prompt's pass evicts the least recently used slot", victim() == 0);
+  pass_layer = -1;
+
+  // Between slots decoding used alike, recency decides, not the read cost.
   setup(10, 0);
   slots[2].layer = 3;
   score[0] = score[1] = 5, score[2] = 1;
   expert_spans[0] = 1;
   expert_span[0][0][0].len = 200, expert_span[0][1][0].len = 100;
   pass_layer = 2;
-  expect("prefill breaks a priority tie by read cost", victim() == 1);
+  expect("prefill breaks a decoding tie by recency", victim() == 0);
   expert_spans[0] = 0, pass_layer = -1;
+
+  // Decoding's use outranks recency: an older slot decoding used stays.
+  setup(10, 0);
+  slots[0].layer = 0, slots[1].layer = 1, slots[2].layer = 3;
+  dscore[0] = 3;
+  pass_layer = 2;
+  expect("prefill keeps an older slot that decoding used", victim() == 1);
+  pass_layer = -1;
 
   setup(10, 1);
   SLOT_SIZE = 65536, expert_spans[0] = 2;

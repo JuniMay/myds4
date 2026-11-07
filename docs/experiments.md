@@ -1005,6 +1005,63 @@ builds named above, and the checks `build/prefill-credit-check`
 (`tools/checks/prefill_credit_check.c`) and `build/prefill-priority-check`
 (`tools/checks/prefill_priority_check.c`).
 
+### Prompt-pass eviction by the whole score
+
+**Problem.** After a long prompt, decoding missed far more experts in the
+early layers. A prompt pass evicted the least recently used slot of a layer
+it was done with; the pass runs layer 0 first, so layer 0's experts went
+first, then layer 1's, whatever decoding had used.
+
+**How it worked.** A prompt pass took, among the layers it was done with
+(else the layers after the next), the slot with the lowest eviction
+priority: the score decoding evicts by, which sums a weight for every
+request that selected the expert. Between equal priorities it took the
+expert cheapest to read again (`expert_bytes` in `src/engine/io.c`).
+
+**How it was measured.** `build/cache-policy-check` checked the victim and
+the tie. `tools/bench/turn_bench.py` timed two turns of one conversation
+through the server (thinking on, greedy, 128 tokens a turn, `UD-IQ1_M`) on
+2026-11-06, with three rules built from the same tree: the least recently
+used slot (old), this rule (score), and the rule that replaced it, the slot
+whose expert decoding used least, the least recently used among equals
+(decoding). The runs went old, score, decoding, decoding, score, old, so
+that a steady drift cancels in each pair. Decode rows per second, each
+pair's two runs and their mean, and expert misses per decoded row:
+
+| Settings | Rule | Turn 1 | Turn 2 | Turn 2 misses |
+| --- | --- | ---: | ---: | ---: |
+| `--cache 72 --ced 128`, a 4,000-character second turn | old | 24.50, 22.63 (23.57) | 25.15, 22.02 (23.59) | 8.4 to 8.7 |
+| | score | 22.55, 22.49 (22.52) | 25.85, 23.25 (24.55) | 6.2 |
+| | decoding | 24.35, 24.54 (24.44) | 26.62, 26.57 (26.60) | 5.7 |
+| `--cache 64`, a 13,700-token document in the second turn | old | 23.78, 23.61 (23.70) | 23.58, 23.20 (23.39) | 12.9 |
+| | score | 24.16, 23.79 (23.98) | 26.02, 25.25 (25.63) | 9.3 |
+| | decoding | 24.07, 23.80 (23.94) | 25.87, 26.00 (25.94) | 8.5 |
+
+**Results.** Every rule gave the same replies. After the document, both
+rules that keep decoding's experts decoded 10 to 11% faster than the old
+one. Under `--ced 128` the score rule decoded the first turn 8% slower than
+the other two, and over its first 31 decoded rows 16% slower (16.5 against
+19.7 rows/s with the old rule, 26.1 against 18.8 ms of read waits per row).
+Its prefills read less (98.5 against 103 GB in the first turn, 30 to 32
+against 36 GB in the second), so its first token came 0.3 s and 0.1 s sooner
+than with the decoding rule. The prefills slowed over the six runs with the
+document (the second turn's first token after 23.9 s in the first run and
+28.8 s in the last), alike for every rule.
+
+**Why it did not help.** A prompt pass credits an expert once for each of
+its batches that selects it, so the score ranked the layers by how many
+batches each ran. Under `--ced` layers 21 to 39 run only the last ring's
+batch: after the first prompt (7,746 tokens, four batches) their experts,
+which decoding needed next, scored a quarter of the encoder layers' and
+went first. The decoding rule ranks by decoding's part of the score alone.
+Without decoding history it falls back to recency, which keeps the
+prompt's last layers and rows, and it kept decoding's experts after the
+document as well as the score rule did.
+
+**What was removed.** The score-based prompt-pass victim and its read-cost
+tie-break (`expert_bytes`) in `src/engine/io.c`, and the tie's case in
+`tools/checks/cache_policy_check.c`, which now checks the recency tie.
+
 ### Cancelling unused forecasts after routing
 
 **Problem.** When a layer's router selects its experts, forecast reads for

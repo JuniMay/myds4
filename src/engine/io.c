@@ -474,6 +474,7 @@ static int draft_pool_count(int layers) {
 static int head = -1, tail = -1;
 static double weight = 1;  // the current token's
 static double escore[CACHE_LAYERS * EXPERTS];  // per expert
+static double dscore[CACHE_LAYERS * EXPERTS];  // per expert: the part of escore that decoding's requests gave
 static double *score;  // per slot: its expert's score; INFINITY for a free slot, -INFINITY for an empty one
 static int retention_half_life = CACHE_HALF_LIFE_DEFAULT, retention_read_cost;
 static double retention_growth;
@@ -515,7 +516,7 @@ static double eviction_priority(int i) {
 static void advance_score_clock(void) {
   token++;
   if ((weight *= retention_growth) > 0x1p500) {  // rescale raw history and resident scores together
-    for (int k = 0; k < CACHE_LAYERS * EXPERTS; k++) escore[k] /= weight;
+    for (int k = 0; k < CACHE_LAYERS * EXPERTS; k++) escore[k] /= weight, dscore[k] /= weight;
     for (int i = 0; i < max_slots + npinned; i++) score[i] /= weight;
     weight = 1;
   }
@@ -770,27 +771,31 @@ static int pass_layer = -1;
 void cache_pass(int layer) { pass_layer = layer; }
 
 // A slot for (layer, e), resident and non-volatile: a free one, or a victim.
-// The victim has the lowest priority (eviction_priority), so the experts
-// that decoding uses most stay. When decoding, the experts that the layer
-// being served selected this token and read-aheads whose layer has not been
-// served yet are not victims. In a prompt pass the victim is of a layer the
-// pass is done with, else of a layer after the next: the experts the prompt
-// alone needed go first, whatever their layer, and decoding after the prompt
-// finds the experts it used before. Between slots of equal priority (in a
-// cold cache the prompt credits every expert alike) a prompt pass takes the
-// expert cheapest to read again. A prefetch that finds none is skipped (-1)
-// rather than evicting experts in use.
+// When decoding, the victim has the lowest priority (eviction_priority), so
+// the experts used most stay; the experts that the layer being served
+// selected this token and read-aheads whose layer has not been served yet
+// are not victims. In a prompt pass the victim is of a layer the pass is done
+// with, else of a layer after the next, and is the one whose expert decoding
+// used least (decoding_priority): the experts the prompt alone needed go
+// first, whatever their layer, and decoding after the prompt finds the
+// experts it used before. Among equals, as in a cache that has not decoded
+// yet, the least recently used goes, so that the experts of the prompt's
+// last layers and rows, which decoding needs first, stay longest. A
+// prefetch that finds none is skipped (-1) rather than evicting experts in
+// use.
 static int serving = -1;  // the layer cache_request makes resident: its experts used this token stay
 
 static unsigned held_references;
 
-// The bytes slot i's expert takes in its files: what reading it again costs.
-static uint64_t expert_bytes(int i) {
-  const Slot *s = &slots[i];
-  if (s->expert < 0 || s->layer < 0 || s->layer >= CACHE_LAYERS) return 0;
-  uint64_t bytes = 0;
-  for (int k = 0; k < expert_spans[s->layer]; k++) bytes += expert_span[s->layer][s->expert][k].len;
-  return bytes;
+// What a prompt pass evicts by: how much decoding used slot i's expert (its
+// part of the score, read-cost weighted as eviction_priority weights it); an
+// empty slot first.
+static double decoding_priority(int i) {
+  if (!isfinite(score[i]) || slots[i].expert < 0 || slots[i].layer < 0 || slots[i].layer >= CACHE_LAYERS)
+    return score[i];
+  double d = dscore[slots[i].layer * EXPERTS + slots[i].expert];
+  if (!retention_read_cost || slots[i].layer >= LAYERS) return d;
+  return d * reload_cost[slots[i].layer * EXPERTS + slots[i].expert];
 }
 
 static int victim(void) {
@@ -806,14 +811,14 @@ static int victim(void) {
       }
     return best;
   }
+  // From the least recently used on, so that the oldest of equals goes.
   for (int later = 0; later < 2 && best < 0; later++)
-    for (int j = 0; j < max_slots; j++) {
+    for (int j = tail; j >= 0; j = slots[j].prev) {
       int l = slots[j].layer;
       if (later ? l <= pass_layer + 1 : l >= pass_layer) continue;
       if (score[j] == INFINITY || slots[j].holds) continue;
-      double priority = eviction_priority(j);
-      if (best < 0 || priority < lowest || (priority == lowest && expert_bytes(j) < expert_bytes(best)))
-        best = j, lowest = priority;
+      double priority = decoding_priority(j);
+      if (best < 0 || priority < lowest) best = j, lowest = priority;
     }
   return best;
 }
@@ -955,6 +960,7 @@ static int draft_request(int layer, const int *experts, int n) {
     slots[i].used = stamp;
     draft_age[i - max_slots] = ++draft_touch_clock;
     score[i] = escore[layer * EXPERTS + e] += weight;
+    dscore[layer * EXPERTS + e] += weight;  // drafts run only while decoding
     reading += slot_reading(i);
   }
   return reading;
@@ -1000,6 +1006,7 @@ int cache_request(int layer, const int *experts, int n) {
     double *history = &escore[layer * EXPERTS + e];
     *history += weight;
     score[i] = *history;
+    if (pass_layer < 0) dscore[layer * EXPERTS + e] += weight;
     reading += pending;
   }
   return reading;

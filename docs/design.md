@@ -1059,8 +1059,9 @@ several tokens. These are forward-pass units, not emitted-token units. The
 growth ratio is computed at setup; occasional common rescaling keeps the
 stored history and resident scores within range.
 
-The victim of an eviction, in decoding and in a prompt pass, is the
-eligible slot with the lowest priority, by default its score. With
+When decoding, the victim of an eviction is the eligible slot with the
+lowest priority, by default its score; a prompt pass ranks by decoding's
+part of the score (below). With
 `--cache-read-cost`, off by default, the priority is the raw score
 times the expert's aligned read bytes divided by the fixed backbone slot
 size. Read bytes cover all of that expert's file spans rounded to the read
@@ -1110,14 +1111,17 @@ a smaller GGUF backbone buffer. Both allocation modes reserve their bytes
 before allocating the adaptive backbone cache. See
 [Speculative decoding](#speculative-decoding) for pool limits and replacement.
 
-During a prompt pass at layer l, the victim is the lowest-priority slot of
-a layer before l, which the pass is done with, or else of a layer after
-l + 1; it is never of layer l or l + 1, which the pass still needs. Because
-the priority is the one decoding uses, the experts that only the prompt
-needed go first, from whichever eligible layer, and decoding after the
-prompt finds the experts it used before. Between slots of equal priority,
-as in a cold cache where the prompt credited every expert alike, the pass
-takes the expert cheapest to read again. The cache therefore needs room
+During a prompt pass at layer l, the victim is a slot of a layer before l,
+which the pass is done with, or else of a layer after l + 1; it is never of
+layer l or l + 1, which the pass still needs. Among those it is the slot
+whose expert decoding used least: each expert keeps, besides its score,
+the part of it that decoding's requests gave (weighted by read cost as the
+priority is). So the experts that only prompts needed go first, from
+whichever eligible layer, and decoding after the prompt finds the experts it
+used before. Among slots decoding used alike, as in a cache that has not
+decoded yet, the least recently used goes, so that the experts of the
+prompt's last layers and rows, which the decoding after the prompt needs
+first, stay longest. The cache therefore needs room
 for two backbone layers' experts (768 slots). A fixed
 `--cache` budget must cover those slots plus the reserved draft pools. The
 minimum byte budget depends on the backbone's slot size and draft settings.
@@ -1179,7 +1183,7 @@ read fixtures use `/dev/zero`:
 | `make cache-ready-check` | 45 | Completed/pending groups, readiness, late counts and consumer release. |
 | `make draft-cache-check` | 49 | Separate stage pools, native demand admission, replacement and protected groups. |
 | `make prefetch-metrics-check` | 54 | Fixed snapshots, first use, read origin, byte accounting and I/O timing. |
-| `make cache-policy-check` | 56 | Aging ratios, victim rules in decoding and in a prompt pass (with its read-cost tie-break), aligned read costs, history, rescaling and reuse of refined empty slots. |
+| `make cache-policy-check` | 58 | Aging ratios, victim rules in decoding and in a prompt pass (decoding's use first, then recency, also in a cache that has not decoded), aligned read costs, history, rescaling and reuse of refined empty slots. |
 | `make prefetch-queue-check` | 14 | Admission release on completion or cancellation, pending ownership and delayed notifications. |
 | `make prefetch-admission-check` | 19 | In-flight admission limits, promotion, repeated candidates and preservation of required data. |
 | `make prefetch-demote-check` | 37 | Demotion after routing, which cancels no read in decoding or prefill; refinement, which cancels only wholly unstarted forecasts it excludes, keeping the queue's order, the accounting and the reuse of emptied slots; held and partly read forecasts. |
