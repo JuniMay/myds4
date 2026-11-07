@@ -51,6 +51,7 @@ pub struct Defaults {
 }
 
 /// A request the server answers with an error before its response starts.
+#[derive(Debug)]
 pub struct Error {
     pub status: StatusCode,
     pub message: String,

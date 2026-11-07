@@ -2,7 +2,8 @@
 
 This document defines the speed limits of DeepSeek-V4.1-Flash-1017 on the
 target machine, from measured hardware constants and the model's byte and
-operation counts, and records what myds4 reaches.
+operation counts, and records what myds4 reaches. Qwen3.8-27B's
+measurements are in [Qwen3.8 models](qwen.md#speed).
 
 Decoding speed depends on the text. A token selects 6 experts in every
 layer, so the context and the generated text decide which experts a token

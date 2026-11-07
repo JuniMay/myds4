@@ -32,7 +32,10 @@ later for the standard-library `compression.zstd` module.
 Each run that loads the model takes most of the memory, so only one runs at
 a time: it holds an exclusive lock on `myds4.lock` beside the executable (or
 on the file `MYDS4_LOCK` names) until it ends, and a second run waits for
-it, saying so on stderr. `lockf(1)` takes the same lock.
+it, saying so on stderr. `lockf(1)` takes the same lock. A Qwen3.8 model's
+engine takes no lock: the server runs it beside DeepSeek's (see
+[Server](#server)), and `build/qwen` runs it alone ([Qwen3.8
+models](qwen.md#the-check-cli)).
 
 | Option | Effect |
 | --- | --- |
@@ -97,6 +100,25 @@ response for 60 s, ends its request (see
 [Connections](server.md#connections)).
 
 The [README](../README.md#run) shows how to create a key file and start the server.
+
+`-m` may be given more than once: the server serves every model side by side
+on the same port, and each request goes to the model its `model` field names
+(as `GET /v1/models` lists them). The first model runs in the server's
+process, each further one in a child process on the next ports, with the same
+options. A model is DeepSeek V4.1 Flash or a Qwen3.8 (`qwen3_5_text`)
+checkpoint such as Qwen3.8-27B NVFP4 ([Qwen3.8 models](qwen.md)); for a Qwen
+model `--ctx` is at most the model's own context (262,144), `--kv-cache` and
+`--batch` (up to 8) apply as below, and the DeepSeek-only options (experts,
+cache, drafts, `--ced`, the predictor) do nothing. For example, DeepSeek with
+its experts and the 27B (`QWEN`, its directory) beside it:
+
+```sh
+build/myds4-server -m "$CHECKPOINT" --experts "$EXPERTS" --cache 56 \
+  -m "$QWEN" --serve 8008 --api-key-file ~/.config/myds4/api-key
+```
+
+See [Several models](server.md#several-models) for routing and memory, and
+[Qwen3.8 models](server.md#qwen38-models) for a Qwen model's requests.
 
 | Option | Effect |
 | --- | --- |
@@ -456,7 +478,7 @@ Multirow substitution computes only the next-layer forecast, so that path
 trains and uses only the available horizon.
 
 Learned corrections belong to the engine and remain in memory across requests,
-KV-state resets and switches between attention states. The server's single model worker shares
+KV-state resets and switches between attention states. The server's DeepSeek worker shares
 one learner across its requests; each row trains against its own native router
 result. Without a state path, starting the engine initializes a new learner
 and all learned state remains in RAM. Tensor state uses about 23 MiB and

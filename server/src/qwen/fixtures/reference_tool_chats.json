@@ -1,0 +1,260 @@
+[
+ {
+  "messages": [
+   {
+    "role": "system",
+    "content": " You are terse. "
+   },
+   {
+    "role": "user",
+    "content": "Read a.txt"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read",
+     "description": "Read a file",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string",
+        "description": "the file"
+       },
+       "lines": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     },
+     "strict": false
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "shell",
+     "description": "Run a command — carefully",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   }
+  ],
+  "rendered": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"read\", \"description\": \"Read a file\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"the file\"}, \"lines\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}, \"strict\": false}}\n{\"type\": \"function\", \"function\": {\"name\": \"shell\", \"description\": \"Run a command — carefully\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are terse.<|im_end|>\n<|im_start|>user\nRead a.txt<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Read a.txt and list"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": " I should read it. ",
+    "content": "Reading.",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "read",
+       "arguments": {
+        "path": "a.txt",
+        "lines": 3
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "shell",
+       "arguments": {
+        "command": [
+         "ls",
+         "-l"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": " line 1\nline 2 "
+   },
+   {
+    "role": "tool",
+    "content": "a.txt\nb.txt"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "Done.",
+    "content": " Two files. "
+   },
+   {
+    "role": "user",
+    "content": "Thanks"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read",
+     "description": "Read a file",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string",
+        "description": "the file"
+       },
+       "lines": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     },
+     "strict": false
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "shell",
+     "description": "Run a command — carefully",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   }
+  ],
+  "rendered": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"read\", \"description\": \"Read a file\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"the file\"}, \"lines\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}, \"strict\": false}}\n{\"type\": \"function\", \"function\": {\"name\": \"shell\", \"description\": \"Run a command — carefully\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nRead a.txt and list<|im_end|>\n<|im_start|>assistant\n<think>\nI should read it.\n</think>\n\nReading.\n\n<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n<parameter=lines>\n3\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=shell>\n<parameter=command>\n[\"ls\", \"-l\"]\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nline 1\nline 2\n</tool_response>\n<tool_response>\na.txt\nb.txt\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nDone.\n</think>\n\nTwo files.<|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be kind."
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": [],
+  "enable_thinking": false,
+  "rendered": "<|im_start|>system\nBe kind.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Read b"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "read",
+       "arguments": {
+        "path": "b"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "B"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read",
+     "description": "Read a file",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string",
+        "description": "the file"
+       },
+       "lines": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     },
+     "strict": false
+    }
+   }
+  ],
+  "reasoning_effort": "low",
+  "rendered": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"read\", \"description\": \"Read a file\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"the file\"}, \"lines\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}, \"strict\": false}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nRead b<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=read>\n<parameter=path>\nb\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nB\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read",
+     "description": "Read a file",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string",
+        "description": "the file"
+       },
+       "lines": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     },
+     "strict": false
+    }
+   }
+  ],
+  "reasoning_effort": "medium",
+  "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"read\", \"description\": \"Read a file\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"the file\"}, \"lines\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}, \"strict\": false}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ }
+]

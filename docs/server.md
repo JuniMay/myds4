@@ -7,7 +7,9 @@ behind a C ABI, [`src/engine/engine.h`](../src/engine/engine.h), and the Rust
 code handles HTTP, request conversion, prompts, output and the live view. It
 serves `POST /v1/chat/completions`, streamed or as one response,
 `GET /v1/models`, `GET /v1/status` and `GET /health`; its options are in
-[Usage](usage.md#server).
+[Usage](usage.md#server). It serves DeepSeek V4.1 Flash, a Qwen3.8 model
+([Qwen3.8 models](qwen.md)), or several models side by side, each request
+going to the model it names ([Several models](#several-models)).
 
 ## Parts
 
@@ -24,6 +26,11 @@ serves `POST /v1/chat/completions`, streamed or as one response,
 | The engine's ABI in Rust: declarations and thin wrappers | Rust | `server/src/engine.rs` |
 | The engine: loading, attention states and snapshots, prefill (with a replay, exact or bounded under `--ced`, and a capture position), decoding, drafts, sampling, context-copy drafts, images, statistics, the tokenizer, the log | C | `src/engine/engine.c` |
 | The model, the expert cache, the vision encoder, the tokenizer, signals | C, Metal | `src/engine/model.c`, `src/engine/io.c`, `src/engine/gpu.c`, `src/engine/vision.c`, `src/engine/tok.c`, `src/engine/util.c` |
+| Several models: the other models' server processes, their logs, and forwarding requests to them | Rust | `server/src/peers.rs` |
+| Qwen3.8 requests: conversion, the chat template, the tokenizer (ICU), the reply's reasoning and tool calls, the responses | Rust | `server/src/qwen/mod.rs`, `template.rs`, `tokenizer.rs`, `icu.rs`, `protocol.rs` |
+| The Qwen worker: the queue, prompt and decoding passes, MTP drafts, the KV prefix cache's plans | Rust | `server/src/qwen/worker.rs` |
+| The Qwen engine's ABI in Rust | Rust | `server/src/qwen/engine.rs` |
+| The Qwen engine: states, snapshots, prompt and decoding passes, the MTP head | C, Metal | `src/qwen/qwen.c`, `src/qwen/qwen.metal` ([Qwen3.8 models](qwen.md)) |
 
 ## Threads
 
@@ -61,6 +68,117 @@ live view then gives the terminal back with the last log lines. It also does
 so before a fatal error's message, the engine's (`on_die`) or the server's,
 and after a panic; a panic on the worker's thread ends the process, since
 its requests could not end otherwise.
+
+## Several models
+
+Each `-m` names a checkpoint; its `config.json` tells DeepSeek V4.1 Flash
+from a Qwen3.8 (`qwen3_5_text`) model. The first runs in the server's own
+process. Each further model runs in a child process of the server, the same
+executable with the same options but its own `-m`, on the next port (the
+second model on `--serve`'s port + 1, the third on + 2) at 127.0.0.1; it
+takes the API key from the environment and ends when the server does
+(`--parent`, checked several times a second). Its log lines come into the
+server's log (and its live view) with the model's id in front. The server
+stops its children with SIGTERM when it stops.
+
+| Request | Answer |
+| --- | --- |
+| `GET /v1/models` | Every model: DeepSeek's `deepseek-v4.1-flash`, a Qwen model by its directory's name in lower case (`qwen3.8-27b-nvfp4`), with its context. |
+| `"model"` names this process's model, or none | This process answers. |
+| `"model"` names another model (case does not matter) | The server forwards the request to that model's process (HTTP/1.0 over loopback, so that the response's body ends with the connection) and passes the response back as it comes. Before that process listens: 502. |
+| `"model"` names no model served | 404 that lists the models; with one model served, that model answers whatever the name. |
+
+Each process schedules its own model, and the GPU runs their command
+buffers in turn. Memory is shared through the system: a Qwen model's weights
+(20 GB) stay resident on the GPU while it serves (after 60 s without
+requests they leave the GPU's residency set until its next request), and
+DeepSeek's expert cache adapts around them. Its slots follow the memory available (with `--reserve` left to other
+programs), and its GPU-mapped slots follow the GPU's resident memory of all
+processes, which past about 55 GiB stalls the GPU: past that point the
+cache unmaps the excess within about a second, also while idle (the worker's
+idle check runs every second). Measured with DeepSeek (UD-IQ1_M
+experts, `--cache 72`) and Qwen3.8-27B served together, on 300-token code
+replies, greedy: DeepSeek decoded at 23.9 tokens/s with the Qwen model
+resident and idle, and at 24.2 after the Qwen model's buffers had left the
+residency set; with both decoding at once, DeepSeek at 12.8 tokens/s and the
+Qwen model at 30.3 (with MTP drafts, 85% accepted).
+
+## Qwen3.8 models
+
+A Qwen model's requests take their own path ([Qwen3.8 models](qwen.md) for
+the engine):
+
+1. **Conversion** (`qwen/mod.rs`): the messages' text (content parts of
+   type `text`; images are refused), the leading `system` and `developer`
+   messages joined as the system message (a later one speaks as the user,
+   since the template takes one system message, first), assistant
+   `reasoning_content` (or `reasoning`) and `tool_calls` (their `arguments`
+   parsed as a JSON object), tool messages, and `tools` as given.
+2. **The chat template** (`template.rs`): the checkpoint's
+   `chat_template.jinja` as code, checked against renderings of the template
+   itself (`server/src/qwen/fixtures/`): every assistant turn keeps its
+   reasoning, tools are listed as the request gives them, tool responses
+   join in one user turn. Thinking and its effort:
+
+   | Request | Template |
+   | --- | --- |
+   | none | thinking at effort `xhigh` (the template's default) |
+   | `reasoning_effort` `none` or `off`, `thinking.type` `disabled`, `chat_template_kwargs.enable_thinking` false | thinking off |
+   | `reasoning_effort` `minimal` or `low` (or 1-50) | `low` |
+   | `reasoning_effort` `medium` (or 51-75) | `medium` |
+   | `reasoning_effort` `high`, `xhigh`, `max`, `ultra` (or 76-100) | `xhigh` |
+
+3. **Tokens** (`tokenizer.rs`, `icu.rs`): the checkpoint's byte-level BPE
+   with NFC and its split regex through macOS's ICU, checked against the
+   reference tokenizer's ids for 155 texts. The template's markers become
+   their token ids; text from messages is encoded without the added
+   vocabulary, so a message that spells `<|im_start|>` stays text.
+4. **The worker** (`qwen/worker.rs`, one thread that owns the engine): up to
+   `--batch` requests run at once and 16 wait. Each turn of its loop runs one
+   prompt pass of the request prefilling (512 positions, or 128 while others
+   decode), then one decoding pass for every decoding request. Prefills run
+   one at a time, and a request is planned against the KV prefix cache only
+   when its prefill is about to start, so it resumes from what the prefills
+   before it left: four requests that arrived together with the same
+   6.7K-token system prompt and tools finished in 21.8 s, the later three
+   resuming at 6,144 and 6,747 positions.
+   A request that decodes alone verifies the MTP head's draft in its pass
+   (two rows). With several decoding, drafts would double the pass's rows,
+   which by the measured pass times gives about as many tokens a second for
+   two requests and fewer for more, so the rows are one each. Every decoded
+   token gives the MTP head its keys.
+5. **The KV prefix cache** (`kv.rs`, with no rewind room and no replay): a
+   prompt continues an idle state that it extends, resumes from a snapshot
+   (the source's keys copied before it), or starts cold. Every prompt end
+   gets a snapshot with its logits (an identical retry resumes at once), a
+   prefill captures the point where its prompt parts from every state (a
+   later request that parts there resumes from it), and takes one at every
+   multiple of 2,048 positions when the budget (`--kv-cache`) allows, so
+   that a request sharing a long start with another (the same system prompt
+   and tools) resumes near where they part; a reply's end gets one when the
+   budget allows. Three requests with the same 6.7K-token system prompt and
+   24 tools and different questions took 10.3 s (cold), 1.4 s (resumed at
+   6,144) and 0.4 s (resumed at the second's branch point, 6,721). A state takes 314 MB plus
+   68 KiB a position (in rooms doubling from 1,024 positions), a snapshot
+   157 MB.
+6. **Sampling**: `temperature`, `top_p`, `top_k` and `seed` from the
+   request; otherwise `-t` and `--top-p` when given, else the checkpoint's
+   `generation_config.json` (Qwen3.8-27B: temperature 1, top_p 0.95,
+   top_k 20). The end tokens are `generation_config.json`'s.
+7. **The reply** (`protocol.rs`): reasoning up to `</think>` streams as
+   `reasoning_content`, then text as `content` (the template's newlines
+   after `</think>` left out); a standalone `<tool_call>` line at the top
+   level (not in a code block) starts the calls, which are parsed at the
+   end: after an end token they become `tool_calls` (`finish_reason`
+   `tool_calls`), each parameter a string where its schema takes one and
+   JSON otherwise; calls that do not parse, or a reply cut short, come back
+   as text. `stop` strings end the reply before them. The usage gives the
+   prompt tokens reused (`prompt_cache_hit_tokens`,
+   `prompt_tokens_details.cached_tokens`).
+
+`GET /v1/status` gives the model's id. The live view shows DeepSeek's
+engine; with a Qwen model in the server's own process the log stays on
+stderr.
 
 ## A request's path
 
@@ -448,7 +566,8 @@ conversations with tools differ.
 make server
 ```
 
-builds `build/libmyds4.a` (the engine: the C sources but `src/cli/main.c`),
+builds `build/libmyds4.a` (the engines: the C sources but `src/cli/main.c`,
+with the Qwen engine of `src/qwen/qwen.c`),
 then the crate with `cargo build --release --target-dir build/cargo`, and
 copies the executable to `build/myds4-server`. Beside `build/myds4`, it takes the same lock,
 `build/myds4.lock`, so only one of the two loads the model at a time. The
@@ -467,8 +586,9 @@ not call them: prompts and output use the engine's tokenizer.
 | Command | What it checks |
 | --- | --- |
 | `.venv/bin/python tools/reference/check.py encoding CHECKPOINT` | The server's prompts (`build/myds4-server --render FILE`) against `encoding.py` on the test cases and the generated conversations ([above](#prompts-compared-with-encodingpy)). |
-| `make server-check` (`MYDS4_CHECKPOINT=CHECKPOINT` for the tokenizer test) | The compatibility steps, a numeric effort in the prompt, the worker's events through recipe's processor with the checkpoint's tokenizer (reasoning, content, finish, usage), the KV prefix cache's decisions (`server/src/kv.rs`), and the live view's tabs on a test terminal: the title and the tabs first, every line within the terminal's width at sizes from 220 x 60 down to 12 x 4, each tab's parts, the keys and clicks that choose tabs, nodes and requests, a node's text answered while its session grows and a chosen node kept through a fork that splits it, the last minute's samples (the counters' differences, arrivals, routed rows of the snapshot's size, the SSD's rate from the reads as they complete, a prefill's rate with no sample between two prefills), the throughput's windows and its since-start figures from counters counted together, per-request speeds, the colors (the terminal's answer for its background, light and dark, the 256 colors) and the quit keys; and the connections' limits on a local socket, with short timeouts: 503 beyond the connection limit, 431, a late head, 408 and 413, and a client that leaves or stops reading ending its request. No model is loaded; without `MYDS4_CHECKPOINT` the tokenizer test is skipped. With `MYDS4_EXPERTS` (a GGUF file) set too, it also runs the fork tests through HTTP (next row). |
+| `make server-check` (`MYDS4_CHECKPOINT=CHECKPOINT` for the tokenizer test, `MYDS4_QWEN=DIR` for the Qwen tokenizer's) | The Qwen path: the template's renderings against the checkpoint's own template (`server/src/qwen/fixtures/`: ten conversations, and five with tools, tool history, thinking off and the low and medium efforts, rendered with jinja2 as Hugging Face renders them), the tokenizer's ids against the reference tokenizer's for 155 texts (with `MYDS4_QWEN`), ICU's normalization and split, the reply's reasoning and calls at every chunk boundary, prose and code-block examples kept as text, calls that do not parse given back as text, the request conversion (roles, content parts, tool history, effort and thinking), sampling (greedy, top-k, top-p), and a child process's arguments. The compatibility steps, a numeric effort in the prompt, the worker's events through recipe's processor with the checkpoint's tokenizer (reasoning, content, finish, usage), the KV prefix cache's decisions (`server/src/kv.rs`), and the live view's tabs on a test terminal: the title and the tabs first, every line within the terminal's width at sizes from 220 x 60 down to 12 x 4, each tab's parts, the keys and clicks that choose tabs, nodes and requests, a node's text answered while its session grows and a chosen node kept through a fork that splits it, the last minute's samples (the counters' differences, arrivals, routed rows of the snapshot's size, the SSD's rate from the reads as they complete, a prefill's rate with no sample between two prefills), the throughput's windows and its since-start figures from counters counted together, per-request speeds, the colors (the terminal's answer for its background, light and dark, the 256 colors) and the quit keys; and the connections' limits on a local socket, with short timeouts: 503 beyond the connection limit, 431, a late head, 408 and 413, and a client that leaves or stops reading ending its request. No model is loaded; without `MYDS4_CHECKPOINT` the tokenizer test is skipped. With `MYDS4_EXPERTS` (a GGUF file) set too, it also runs the fork tests through HTTP (next row). |
 | `MYDS4_CHECKPOINT=CHECKPOINT MYDS4_EXPERTS=GGUF cargo test --release --manifest-path server/Cargo.toml --target-dir build/cargo --test prefix_fork -- --nocapture` | The fork test through HTTP (`server/tests/prefix_fork.rs`, about 12 minutes, one model process at a time): a conversation with a long system prompt and user turn decodes, and 20 forks of it, cut in the system prompt or the user turn and continued differently, must each reuse at least the prefix they share with it less what an exact replay there computes again, and no more than that prefix, and must give the tokens that a server starting without a cache gives. With `--ced 128` the same forks must each reuse at least the shared prefix less 136 tokens; their tokens are printed. A thinking turn's next turn, which shares all of the turn's prompt but its last token (`<think>` there, `</think>` in the next turn's history), must reuse that shared prefix and compute only its new tokens (`last_prefill.tokens` in `/v1/status`), with and without `--ced 128`, and without `--ced` give the cold server's tokens. A fork after an image (a 32 x 32 PNG the test builds) must give the cold server's tokens. Two tests check the budget with a tight `--kv-cache` set from what a first server reports: a retry of a saved prompt must fit a cache filled to within 2 MiB of its limit, and a generation that takes its state past 16,384 positions must free an idle state before its state grows and keep the cache within its limit in every status sample. `MYDS4_SERVER` and `MYDS4_CLI` pick the binaries (default `build/myds4-server` and `build/myds4`). |
+| `MYDS4_QWEN=DIR cargo test --release --manifest-path server/Cargo.toml --target-dir build/cargo --test qwen -- --nocapture --test-threads 1` | A Qwen3.8 model through HTTP (`server/tests/qwen.rs`, about 3 minutes, one model process at a time): a request whose client leaves during the prefill of a 38K-token prompt, and then a prompt that extends that whole prompt, which must reuse only what the cut-short state ran and give the reply the same conversation gets where nothing was cancelled; and a reply that runs to the context's end (`--ctx 160`) must take every position up to it. |
 | `MYDS4_CHECKPOINT=CHECKPOINT MYDS4_EXPERTS=GGUF cargo test --release --manifest-path server/Cargo.toml --target-dir build/cargo --test live_view -- --nocapture` | The live view with a model (`server/tests/live_view.rs`, about 40 s, one model process): the server runs with `--tui` in a pseudo-terminal of 160 x 46 cells that answers the view's question for its background as a dark terminal would. While a request decodes, the test presses the tabs' keys and rebuilds the screen from the output: the dark colors, the expert map's request at four experts a cell, the KV tree, a node's text, the last minute and the log must be drawn, the mouse taken and given back, and the server must exit with status 0 after `q`. `MYDS4_SERVER` picks the server (default `build/myds4-server`). |
 | `build/prefix-fork-check CHECKPOINT --text FILE [--rendered] [--limit N] [--experts GGUF] [--draft N] [--cache GB] [--ced N] --fork [--random N] [--at P]... [--prompt-only] [--suffix N]` | The fork test in the engine (`tools/checks/prefix_fork_check.c`): a conversation (the text's prompt, or its first `--limit` tokens, then a decoded reply, a tool-like result and a second decoded reply) forked at 26 position classes and N random positions (default 16). Where the history before a fork came from prompts, the exact replay, the latest snapshot and the first snapshot after the fork within the rewind margin (continued at the fork) must give a cold prefill's bytes in the logits, every state tensor and the next 16 greedy tokens; where it holds decoded rows, both snapshot resumes must give the bytes of the conversation computed again as it ran, and the replay must be about as close to the cold prefill as that conversation is. Each fork's branch-point snapshot, resumed over that fork's rows, must give the fork's own bytes. Without `--ced` it also checks the KV cache's stale-row count: a state with 3 stale rows (a short prompt continued before a state's end, or a verify pass of 4 rows that keeps 1 token), resumed within the room the cache gives it, and the state 3 tokens later, resumed the whole margin before its end, must give the cold prefill's bytes; resumes past the room are printed. With `--ced N` the replay is bounded: it must keep the copied compressed rows and index keys byte for byte and give finite logits, and each fork's distance from the cold prefill is printed. `--measure` prints how far decoding a reply and prefilling it differ. |
 
@@ -603,6 +723,8 @@ with an assistant message is printed without the next turn's start, as
 ## Not done yet
 
 - The Responses and Messages endpoints, which recipe converts too.
+- For Qwen models: images, log probabilities, `tool_choice` (the tools are
+  always offered) and the live view.
 - Log probabilities, and the constraints of structured output (recipe
   converts them; the engine does not enforce them).
 - Prefilling several queued prompts in shared passes.

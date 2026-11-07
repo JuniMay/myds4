@@ -1,0 +1,154 @@
+[
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": " Hello! "
+      }
+    ],
+    "enable_thinking": null,
+    "rendered": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": " Hello! "
+      }
+    ],
+    "enable_thinking": true,
+    "rendered": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": " Hello! "
+      }
+    ],
+    "enable_thinking": false,
+    "rendered": "<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "system",
+        "content": " Be concise. "
+      },
+      {
+        "role": "user",
+        "content": "Hi"
+      },
+      {
+        "role": "assistant",
+        "content": "Hello."
+      },
+      {
+        "role": "user",
+        "content": "Again"
+      }
+    ],
+    "enable_thinking": null,
+    "rendered": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nBe concise.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nHello.<|im_end|>\n<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "system",
+        "content": " Be concise. "
+      },
+      {
+        "role": "user",
+        "content": "Hi"
+      },
+      {
+        "role": "assistant",
+        "content": "Hello."
+      },
+      {
+        "role": "user",
+        "content": "Again"
+      }
+    ],
+    "enable_thinking": true,
+    "rendered": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nBe concise.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nHello.<|im_end|>\n<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "system",
+        "content": " Be concise. "
+      },
+      {
+        "role": "user",
+        "content": "Hi"
+      },
+      {
+        "role": "assistant",
+        "content": "Hello."
+      },
+      {
+        "role": "user",
+        "content": "Again"
+      }
+    ],
+    "enable_thinking": false,
+    "rendered": "<|im_start|>system\nBe concise.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nHello.<|im_end|>\n<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "system",
+        "content": "  "
+      },
+      {
+        "role": "user",
+        "content": "test"
+      }
+    ],
+    "enable_thinking": null,
+    "rendered": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\ntest<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "system",
+        "content": "  "
+      },
+      {
+        "role": "user",
+        "content": "test"
+      }
+    ],
+    "enable_thinking": true,
+    "rendered": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\ntest<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "system",
+        "content": "  "
+      },
+      {
+        "role": "user",
+        "content": "test"
+      }
+    ],
+    "enable_thinking": false,
+    "rendered": "<|im_start|>user\ntest<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "system",
+        "content": "\u001cBe brief\u001d"
+      },
+      {
+        "role": "user",
+        "content": "\u001e Hi\u001f"
+      }
+    ],
+    "enable_thinking": false,
+    "rendered": "<|im_start|>system\nBe brief<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+]
