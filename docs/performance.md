@@ -4,6 +4,15 @@ This document defines the speed limits of DeepSeek-V4.1-Flash-1017 on the
 target machine, from measured hardware constants and the model's byte and
 operation counts, and records what myds4 reaches.
 
+Decoding speed depends on the text. A token selects 6 experts in every
+layer, so the context and the generated text decide which experts a token
+needs, how many of them are already in memory, and how long decoding waits
+for the SSD. A generation that repeats itself, as greedy decoding of a short
+prompt often does, selects the same few experts again and again and runs far
+faster than other text. A speed measurement holds only for the text it
+decoded: check what the generated text looks like (`rows-bench`'s `--show`
+and `distinct_8grams`, or the CLI's output) before taking a result as valid.
+
 ## Machine
 
 Apple M5 Max (18 CPU cores: 6 performance, 12 efficiency), 128 GiB unified
@@ -30,7 +39,10 @@ after a day of benchmarks, the same kind of read (150 expert spans) reached
 
 The GPU lowers its clock within milliseconds of idling and takes milliseconds
 to raise it again; the High Power energy mode does not change this (2.7 x
-measured in it). The desktop used 14% of the GPU while myds4 was not running
+measured in it). Under minutes of sustained load it also slows: three runs
+of the same 4-row decode, 20 s apart (2026-11-06), took 60.4, 78.3 and
+74.5 ms of GPU time a pass. Comparisons therefore alternate their builds
+and let the machine rest between runs. The desktop used 14% of the GPU while myds4 was not running
 during these measurements.
 
 ## Model bytes and operations
@@ -212,39 +224,47 @@ experts. A pass takes at least the larger of two times:
   counting no shared experts;
 - the experts it reads from the SSD, at 13.6 GB/s.
 
-Measured on 2026-11-06 with `build/rows-bench`: B independent sequences
-(short prompts, each prefilled alone) decode in lockstep, 96 timed passes
-after 32, each B in a fresh process. The bounds use each run's measured
+Measured on 2026-11-06 with `build/rows-bench`: B sequences, each continuing
+its own 4,096-token part of `src/engine/model.c` (prefilled alone), decode
+greedily in lockstep, 128 timed passes after 128, each B in a fresh process.
+The generated text was C code, not a loop (0.92 to 0.98 of the first
+sequence's 8-token windows were new). The bounds use each run's measured
 reads per row, including read-aheads that went unused:
 
 | Experts, cache | B | Pass | GPU busy | GPU idle | SSD per row | Bound: memory, SSD | Tokens/s | Bound tokens/s |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `UD-IQ1_M`, 64 GiB | 1 | 34.0 ms | 25.6 ms | 7.7 ms | 98 MB | 17.2, 7.2 ms | 29.4 | 58 |
-| | 2 | 50.5 ms | 37.2 ms | 12.3 ms | 104 MB | 20.8, 15.3 ms | 39.6 | 96 |
-| | 4 | 93.2 ms | 79.7 ms | 12.0 ms | 103 MB | 28.1, 30.3 ms | 42.9 | 132 |
-| | 6 | 146.7 ms | 122.9 ms | 21.4 ms | 114 MB | 35.4, 50.3 ms | 40.9 | 119 |
-| `UD-IQ2_XXS`, 40 GiB | 1 | 40.8 ms | 26.9 ms | 13.3 ms | 289 MB | 17.9, 21.3 ms | 24.5 | 47 |
-| | 2 | 70.4 ms | 40.0 ms | 29.5 ms | 357 MB | 22.2, 52.5 ms | 28.4 | 38 |
-| | 4 | 130.5 ms | 63.3 ms | 65.7 ms | 386 MB | 30.8, 113.5 ms | 30.6 | 35 |
-| | 6 | 222.4 ms | 89.0 ms | 131.3 ms | 424 MB | 39.4, 187 ms | 27.0 | 32 |
+| `UD-IQ1_M`, 64 GiB | 1 | 38.7 ms | 27.7 ms | 10.3 ms | 211 MB | 17.2, 15.5 ms | 25.9 | 58 |
+| | 2 | 55.8 ms | 39.0 ms | 15.9 ms | 184 MB | 20.8, 27.1 ms | 35.8 | 74 |
+| | 4 | 107.8 ms | 91.5 ms | 14.6 ms | 204 MB | 28.0, 60.0 ms | 37.1 | 67 |
+| | 6 | 131.3 ms | 109.0 ms | 20.0 ms | 199 MB | 35.3, 87.8 ms | 45.7 | 68 |
+| `UD-IQ2_XXS`, 40 GiB | 1 | 49.5 ms | 27.2 ms | 21.6 ms | 478 MB | 17.8, 35.1 ms | 20.2 | 28 |
+| | 2 | 85.6 ms | 41.1 ms | 43.5 ms | 491 MB | 22.1, 72.2 ms | 23.4 | 28 |
+| | 4 | 147.7 ms | 64.9 ms | 81.3 ms | 458 MB | 30.7, 134.7 ms | 27.1 | 30 |
+| | 6 | 222.0 ms | 93.2 ms | 126.5 ms | 471 MB | 39.3, 207.6 ms | 27.0 | 29 |
 
-With `UD-IQ2_XXS` at 40 GiB the SSD binds from two rows up, and decoding
-reaches 84 to 87% of its bound at four and six rows: each added row mainly
-reads more experts, because the cache cannot hold several rows' working sets.
-With `UD-IQ1_M` at 64 GiB the bound rises to 132 tokens/s at four rows, but
-decoding reaches a third of it. There the GPU's work grows nearly in
-proportion to the rows (25.6, 37.2, 79.7 and 122.9 ms a pass), although the
+A second run of `UD-IQ1_M` at four rows took 86.0 ms a pass with 61.0 ms of
+GPU work (46.5 tokens/s): the GPU's time for the same pass varied by half
+between two runs, so single runs do not settle differences of that size.
+With `UD-IQ2_XXS` at 40 GiB the SSD binds at every B, and decoding reaches
+71% of its bound at one row and 91 to 93% at four and six: each added row
+mainly reads more experts, because the cache cannot hold several rows'
+working sets.
+With `UD-IQ1_M` at 64 GiB the SSD binds from two rows up, and decoding
+reaches 45 to 67% of its bound. There the GPU's work grows nearly in
+proportion to the rows (27.7, 39.0, 91.5 and 109.0 ms a pass), although the
 dense reads are shared; the bound's memory time grows only from 17.2 to
-28.1 ms. A pass of one row reaches half its bound: the GPU works 25.6 ms
-against 17.2 ms of reads, and idles 7.7 ms. In both formats the idle time is
-about 1.1 ms for each expert read on demand.
+35.3 ms. A pass of one row reaches 45% of its bound: the GPU works 27.7 ms
+against 17.2 ms of reads, and idles 10.3 ms. The idle time per expert read
+on demand was 1.1 ms with `UD-IQ2_XXS` and 1.4 ms with `UD-IQ1_M`, whose
+rows also mapped 28 to 44 slots for the GPU again per token (item 4 below).
 
 Where the gaps come from, in the order of what they cost the IQ1_M runs:
 
-1. **Work per row.** Four rows cost the GPU 2.3 to 3.1 times one row's work
-   (58.0 ms at a 56 GiB cache, 79.7 ms at 64 GiB, where the slots mapped
-   again per token were 36 and more); the memory bound allows 1.6 times. A
-   4-row pass profiled at 56 GiB (`MYDS4_PROFILE=1`, each dispatch alone)
+1. **Work per row.** Four rows cost the GPU 3.3 times one row's work at a
+   64 GiB cache (91.5 against 27.7 ms, with 36 slots mapped again per row
+   and token); the memory bound allows 1.6 times. A 4-row pass profiled at
+   56 GiB (`MYDS4_PROFILE=1`, each dispatch alone; short story prompts, but a
+   pass's GPU work barely depends on the text)
    took 59.4 ms: the dense products 25.6 ms, 1.68 times one row's 15.2 ms
    where the memory bound is about 13 ms; the routed experts 23.5 ms, each
    row's six in their own dispatches, at about 350 GB/s where the bound is
@@ -261,11 +281,13 @@ Where the gaps come from, in the order of what they cost the IQ1_M runs:
 3. **Idle time.** It follows the demand reads (above): the cure is reading
    experts ahead early enough (see Lead time).
 4. **Slots the GPU cannot map.** The cache maps at most 52.5 GiB with the
-   weights for the GPU (see [GPU resident memory](#gpu-resident-memory)). At
-   64 GiB, 3,651 of the 6,626 `UD-IQ1_M` slots could be mapped, and decoding
-   mapped 8.4 slots again per token (30.3 after a 32,000-token prompt). A
-   32 GiB cache, all mapped, decoded as fast (28.3 against 28.6 tokens/s)
-   with twice the SSD reads (223 against 97 MB per token).
+   weights for the GPU (see [GPU resident memory](#gpu-resident-memory)).
+   Continuing 8,192 tokens of `src/engine/io.c` (one row, `UD-IQ1_M`, 512
+   timed tokens after 256; the text was code, 0.97 of its 8-token windows
+   new), caches of 32, 48, 64 and 72 GiB decoded at 21.7, 21.3, 24.5 and
+   25.5 tokens/s (27.7 in a second run at 72 GiB), with 18.8, 11.1, 6.7 and
+   5.0 experts read on demand per token. Above 32 GiB only 3,400 to 3,600
+   slots stayed mapped, and decoding mapped 26 to 28 slots again per token.
 
 Context length adds little GPU work: after a 32,135-token prompt a one-row
 pass took 27.1 ms of GPU time against 25.9 ms (`UD-IQ1_M`, 64 GiB); its
