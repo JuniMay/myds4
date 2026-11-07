@@ -98,7 +98,7 @@ Json *json_get(const Json *obj, const char *key);
 typedef struct { // one tensor of the checkpoint
   int fd;
   uint64_t off, size;
-  int dtype;  // 'b' bf16, 'f' f32, '8' fp8 e4m3, 'e' e8m0, 'i' packed e2m1
+  int dtype;  // 'b' bf16, 'f' f32, '8' fp8 e4m3, 'e' e8m0, 'i' packed e2m1 (I8), 'u' U8 (packed NVFP4)
   int64_t shape[4];
   int ndim;
 } Tensor;

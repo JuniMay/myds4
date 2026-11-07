@@ -282,7 +282,7 @@ void st_open(const char *dir) {
       t->off = 8 + n + (uint64_t)of->kid[0].num;
       t->size = (uint64_t)of->kid[1].num - (uint64_t)of->kid[0].num;
       t->dtype = !strcmp(dt, "BF16") ? 'b' : !strcmp(dt, "F32") ? 'f' : !strcmp(dt, "F8_E4M3") ? '8'
-               : !strcmp(dt, "F8_E8M0") ? 'e' : !strcmp(dt, "I8") ? 'i' : '?';
+               : !strcmp(dt, "F8_E8M0") ? 'e' : !strcmp(dt, "I8") ? 'i' : !strcmp(dt, "U8") ? 'u' : '?';
       t->ndim = sh->n;
       for (int d = 0; d < sh->n && d < 4; d++) t->shape[d] = (int64_t)sh->kid[d].num;
     }

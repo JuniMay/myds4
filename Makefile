@@ -11,14 +11,22 @@ build/myds4: $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDLIBS)
 
+# The Qwen3.8 engine (src/qwen/, docs/qwen.md) and its check CLI.
+QWEN_SRC = src/qwen/qwen.c src/engine/gpu.c src/engine/util.c src/engine/sample.c
+build/qwen: src/qwen/qwen_cli.c $(QWEN_SRC) src/qwen/qwen.h src/qwen/qwen.metal src/engine/myds4.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ src/qwen/qwen_cli.c $(QWEN_SRC) $(LDLIBS)
+
 # The engine behind src/engine/engine.h, for the Rust server (server/): the sources
 # of build/myds4 without those in src/cli/, and with engine.c.
-LIB_SRC = src/engine/model.c src/engine/io.c src/engine/gpu.c src/engine/tok.c src/engine/util.c src/engine/vision.c src/experimental/online_predictor.c src/experimental/context_lookup.c src/engine/sample.c src/engine/engine.c
+LIB_SRC = src/engine/model.c src/engine/io.c src/engine/gpu.c src/engine/tok.c src/engine/util.c src/engine/vision.c src/experimental/online_predictor.c src/experimental/context_lookup.c src/engine/sample.c src/engine/engine.c src/qwen/qwen.c
 LIB_OBJ = $(LIB_SRC:src/%.c=build/lib/%.o)
 
 build/lib/%.o: src/%.c $(MODEL_HEADERS) src/engine/engine.h $(KERNELS) data/engram.bin data/unicode.bin
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+build/lib/qwen/qwen.o: src/qwen/qwen.metal src/qwen/qwen.h
 
 build/libmyds4.a: $(LIB_OBJ)
 	rm -f $@

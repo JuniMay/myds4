@@ -13,7 +13,7 @@ void sampler_seed(Sampler *s, uint64_t seed) {
 }
 
 int sample_argmax(const float *logits, int count) {
-  if (count < 1 || count > VOCAB) die("invalid sampling vocabulary size");
+  if (count < 1) die("invalid sampling vocabulary size");
   int best = 0;
   for (int i = 0; i < count; i++) {
     if (isnan(logits[i])) die("cannot sample NaN logits");
@@ -23,8 +23,17 @@ int sample_argmax(const float *logits, int count) {
   return best;
 }
 
-static double probability[VOCAB];
-static int order[VOCAB];
+// The workspace grows to the largest vocabulary sampled (any model's).
+static double *probability;
+static int *order, room;
+
+static void make_room(int count) {
+  if (count <= room) return;
+  free(probability), free(order);
+  probability = xmalloc((size_t)count * sizeof *probability);
+  order = xmalloc((size_t)count * sizeof *order);
+  room = count;
+}
 
 static int by_probability(const void *a, const void *b) {
   int i = *(const int *)a, j = *(const int *)b;
@@ -36,6 +45,7 @@ int sample_token(const float *logits, int count, Sampler *s) {
   if (!sampler_valid(s)) die("temperature must be finite and nonnegative; top-p must be in [0, 1]");
   int best = sample_argmax(logits, count);
   if (s->temp == 0) return best;
+  make_room(count);
   double sum = 0;
   for (int i = 0; i < count; i++) {
     double p =
@@ -74,7 +84,7 @@ int sample_token(const float *logits, int count, Sampler *s) {
 // keeping a matching prefix preserves its distribution and random stream.
 // A mismatch is already the next token: never draw it a second time.
 int sample_verify(const float *logits, int count, const int *drafts, int ndraft, int eos, Sampler *s, int *accepted) {
-  if (ndraft < 0 || count < 1 || count > VOCAB) die("invalid draft verification size");
+  if (ndraft < 0 || count < 1) die("invalid draft verification size");
   int n = 0;
   for (;;) {
     int next = sample_token(logits + (size_t)n * count, count, s);
