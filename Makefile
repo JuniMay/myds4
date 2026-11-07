@@ -262,6 +262,11 @@ build/runahead-model-check: tools/checks/runahead_model_check.c $(SRC) $(MODEL_H
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/runahead_model_check.c $(filter-out src/cli/main.c src/engine/model.c,$(SRC)) $(LDLIBS)
 
+# Decoding B sequences together: step time, GPU busy and idle, reads per row.
+build/rows-bench: tools/bench/rows_bench.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin data/unicode.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/bench/rows_bench.c $(filter-out src/cli/main.c src/engine/model.c,$(SRC)) $(LDLIBS)
+
 # ---- Studies kept for evaluation ----
 
 # Causal verification: DSpark verification rows scheduled by layer readiness

@@ -12,6 +12,7 @@ memory, 2 TB internal SSD, macOS 27.0.1.
 | Constant | Measured | How |
 | --- | ---: | --- |
 | GPU memory read bandwidth | 521 GB/s | sum over a 4 GiB FP32 tensor (PyTorch MPS) |
+| myds4's one-row matrix-vector products | 370 to 571 GB/s of their weights | each dense matrix of a layer, 40 layers (`--bench`, 2026-11-06); the large ones (`wq_b`, `wo_a`, `wo_b`) 547 to 571 GB/s |
 | GPU FP16 matrix throughput | 56.8 TFLOPS | 8192 x 8192 x 8192 FP16 product (PyTorch MPS) |
 | SSD read bandwidth | 14.1 GB/s | 400 expert spans not read before (18.8 MB, 16 KiB-aligned), `F_NOCACHE`, 8 threads |
 | CPU-GPU round trip | 130 to 160 µs | a tiny command buffer signals an event the CPU waits for (`--bench`) |
@@ -22,7 +23,10 @@ Reads of 1 to 17 MiB per request reach the SSD bandwidth from 4 threads up;
 one thread reaches 11.8 GB/s. Spans read before come from the page cache at
 about 42 GB/s, so measurements use spans not read before. On 2026-10-30,
 after a day of benchmarks, the same kind of read (150 expert spans) reached
-13.4 to 13.7 GB/s from 4 to 16 threads and pieces of 2 to 32 MiB.
+13.4 to 13.7 GB/s from 4 to 16 threads and pieces of 2 to 32 MiB. On
+2026-11-06, 400 whole MXFP4 experts of layers 20 to 39 (7.5 GB, 6 reads each,
+`F_NOCACHE`) took 0.55 s, 13.6 GB/s, from 8 or 16 threads
+(`tools/analysis/ssd_bench.py`).
 
 The GPU lowers its clock within milliseconds of idling and takes milliseconds
 to raise it again; the High Power energy mode does not change this (2.7 x
@@ -189,6 +193,84 @@ ahead. The next token's misses are not named by this token's routing: of
 the top uncached expert below each layer's 6 selected (40 reads per token),
 4% is used by the next token. On the Python module, myds4's predictions
 simulate at 13.1, 13.9 and 15.2 tokens/s at 46, 50 and 56 GiB.
+
+**GGUF experts.** With GGUF experts (`--experts`) the head is the file's
+Q6_K head, 0.54 GB, so the dense part a token reads is 7.73 GB. The routed
+experts take 2.45 GB per token with `UD-IQ2_XXS` (7.6 to 12.1 MB an expert,
+growing with depth) and 2.07 GB with `UD-IQ1_M` (6.9 to 10.2 MB):
+`tools/analysis/model_bytes.py` reads these sizes from the files' headers. A
+token reads 10.2 and 9.8 GB in all. At 571 GB/s, the rate of myds4's largest
+matrix-vector products, that takes 17.9 and 17.2 ms (56 and 58 tokens/s);
+the checkpoint's 13.0 GB take 22.8 ms.
+
+**Concurrent rows.** A pass over B rows (B requests decoding together, or a
+token and its drafts in a verify pass) reads the dense weights once and each
+row's routed experts. Four independent requests share about 13% of their
+experts. A pass takes at least the larger of two times:
+
+- the memory reads, (dense bytes + B x a row's expert bytes) / 571 GB/s,
+  counting no shared experts;
+- the experts it reads from the SSD, at 13.6 GB/s.
+
+Measured on 2026-11-06 with `build/rows-bench`: B independent sequences
+(short prompts, each prefilled alone) decode in lockstep, 96 timed passes
+after 32, each B in a fresh process. The bounds use each run's measured
+reads per row, including read-aheads that went unused:
+
+| Experts, cache | B | Pass | GPU busy | GPU idle | SSD per row | Bound: memory, SSD | Tokens/s | Bound tokens/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `UD-IQ1_M`, 64 GiB | 1 | 34.0 ms | 25.6 ms | 7.7 ms | 98 MB | 17.2, 7.2 ms | 29.4 | 58 |
+| | 2 | 50.5 ms | 37.2 ms | 12.3 ms | 104 MB | 20.8, 15.3 ms | 39.6 | 96 |
+| | 4 | 93.2 ms | 79.7 ms | 12.0 ms | 103 MB | 28.1, 30.3 ms | 42.9 | 132 |
+| | 6 | 146.7 ms | 122.9 ms | 21.4 ms | 114 MB | 35.4, 50.3 ms | 40.9 | 119 |
+| `UD-IQ2_XXS`, 40 GiB | 1 | 40.8 ms | 26.9 ms | 13.3 ms | 289 MB | 17.9, 21.3 ms | 24.5 | 47 |
+| | 2 | 70.4 ms | 40.0 ms | 29.5 ms | 357 MB | 22.2, 52.5 ms | 28.4 | 38 |
+| | 4 | 130.5 ms | 63.3 ms | 65.7 ms | 386 MB | 30.8, 113.5 ms | 30.6 | 35 |
+| | 6 | 222.4 ms | 89.0 ms | 131.3 ms | 424 MB | 39.4, 187 ms | 27.0 | 32 |
+
+With `UD-IQ2_XXS` at 40 GiB the SSD binds from two rows up, and decoding
+reaches 84 to 87% of its bound at four and six rows: each added row mainly
+reads more experts, because the cache cannot hold several rows' working sets.
+With `UD-IQ1_M` at 64 GiB the bound rises to 132 tokens/s at four rows, but
+decoding reaches a third of it. There the GPU's work grows nearly in
+proportion to the rows (25.6, 37.2, 79.7 and 122.9 ms a pass), although the
+dense reads are shared; the bound's memory time grows only from 17.2 to
+28.1 ms. A pass of one row reaches half its bound: the GPU works 25.6 ms
+against 17.2 ms of reads, and idles 7.7 ms. In both formats the idle time is
+about 1.1 ms for each expert read on demand.
+
+Where the gaps come from, in the order of what they cost the IQ1_M runs:
+
+1. **Work per row.** Four rows cost the GPU 2.3 to 3.1 times one row's work
+   (58.0 ms at a 56 GiB cache, 79.7 ms at 64 GiB, where the slots mapped
+   again per token were 36 and more); the memory bound allows 1.6 times. A
+   4-row pass profiled at 56 GiB (`MYDS4_PROFILE=1`, each dispatch alone)
+   took 59.4 ms: the dense products 25.6 ms, 1.68 times one row's 15.2 ms
+   where the memory bound is about 13 ms; the routed experts 23.5 ms, each
+   row's six in their own dispatches, at about 350 GB/s where the bound is
+   14.5 ms; attention 5.8 ms, the head 1.8 ms and the small kernels, which
+   already take all rows at once, 2.7 ms. Verify passes with drafts (3 to 9
+   rows) pay the same per-row cost.
+2. **One row's GPU work.** Of 26.5 ms per token with `UD-IQ2_XXS` (profile,
+   each dispatch alone, 2026-11-06): the dense products 15.2 ms (529 GB/s),
+   the head 1.0 ms, the routed experts 6.3 ms (388 GB/s: their decoding is
+   arithmetic-bound), and about 800 small kernels 3.9 ms, mostly each
+   dispatch's fixed cost of a few microseconds. A token issues about 1,060
+   dispatches. Merging the small kernels into the products around them
+   would remove most of the 3.9 ms, about 15% of a one-row token.
+3. **Idle time.** It follows the demand reads (above): the cure is reading
+   experts ahead early enough (see Lead time).
+4. **Slots the GPU cannot map.** The cache maps at most 52.5 GiB with the
+   weights for the GPU (see [GPU resident memory](#gpu-resident-memory)). At
+   64 GiB, 3,651 of the 6,626 `UD-IQ1_M` slots could be mapped, and decoding
+   mapped 8.4 slots again per token (30.3 after a 32,000-token prompt). A
+   32 GiB cache, all mapped, decoded as fast (28.3 against 28.6 tokens/s)
+   with twice the SSD reads (223 against 97 MB per token).
+
+Context length adds little GPU work: after a 32,135-token prompt a one-row
+pass took 27.1 ms of GPU time against 25.9 ms (`UD-IQ1_M`, 64 GiB); its
+other costs came from the cache, which the long prefill had emptied of
+decoding's experts.
 
 **Prefill.** A prompt of more than a few hundred tokens selects nearly every
 expert of every layer, so a pass reads every expert that is not in memory
@@ -2537,13 +2619,31 @@ screen of concurrent schedules established no gain for any candidate; it
 is recorded with the removed schedules in
 [Removed experiments](experiments.md#runahead-schedules-other-than-the-public-one).
 
-### Causal verification at a 20 GiB expert-cache budget
+### Causal verification
 
 Causal verification is a study under evaluation, built by
 `build/myds4-causal-draft`, `build/myds4-causal-signal-draft` and
-`build/myds4-causal-group-draft`. Its performance with large caches is
-still to be measured before it is kept or removed; the measurements below
-use a 20 GiB budget.
+`build/myds4-causal-group-draft`. With large caches it is slower than
+ordinary DSpark verification.
+
+**At a 56 GiB cache** (2026-11-06, `tools/bench/compare_bench.py`: the
+8,190-token repository-review prompt, 512 tokens, temperature and top-p 1,
+seed 12345, `--prefill-prune`, desktop load recorded; every run's output
+matched its control's). Tokens/s of decoding:
+
+| Experts | Plain decoding | Ordinary two-draft DSpark | Grouped causal DSpark |
+| --- | ---: | ---: | ---: |
+| MXFP4 | 11.85, 11.92 | 10.42, 10.38 | 10.25, 9.96, 10.27 |
+| `UD-IQ2_XXS` | 20.27, 20.31 | 19.63, 19.58 | 17.24, 17.30, 17.19 |
+| `UD-IQ1_M` | 22.64, 22.87 | 20.83, 20.76 | 17.79, 18.15, 18.19 |
+
+Causal verification is 1 to 12% slower than ordinary DSpark there, and
+ordinary DSpark is 3 to 12% slower than decoding without drafts in every
+format: a verify pass costs nearly as much per row as separate tokens (see
+Concurrent rows under [Limits](#limits)), more than the accepted drafts
+save on this prompt.
+
+**At a 20 GiB cache**, the earlier measurements below.
 
 The grouped causal scheduler advances a speculative token whose selected
 experts are ready while another token waits for reads. Ready tokens at one
