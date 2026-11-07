@@ -184,11 +184,32 @@ int main(void) {
   expect("priority multiplication leaves raw ghost history", escore[1] == 2);
   for (int i = 0; i < 3; i++) reload_cost[i] = .5;
   expect("uniform read costs preserve victim", victim() == 0);
+
+  // A prompt pass keeps what decoding uses most: its victim is the
+  // lowest-priority slot of a layer the pass is done with, not the least
+  // recently used one, else of a layer after the next. Slot 0 is the least
+  // recently used, and the one decoding uses most.
+  setup(10, 0);
   slots[0].layer = 0, slots[1].layer = 1, slots[2].layer = 3;
-  pass_layer = 1;
-  expect("prefill uses left-layer LRU", victim() == 0);
+  score[0] = 9, score[1] = 2, score[2] = 1;
+  pass_layer = 2;
+  expect("prefill evicts the lowest-priority slot of a done layer", victim() == 1);
   pass_layer = 0;
   expect("prefill fallback protects current and next layer", victim() == 2);
+  slots[2].layer = 1;
+  expect("prefill finds no victim in its current and next layers", victim() == -1);
+  pass_layer = -1;
+
+  // Between slots of equal priority (a cold cache: the prompt credited every
+  // expert alike), a prompt pass takes the expert cheapest to read again.
+  setup(10, 0);
+  slots[2].layer = 3;
+  score[0] = score[1] = 5, score[2] = 1;
+  expert_spans[0] = 1;
+  expert_span[0][0][0].len = 200, expert_span[0][1][0].len = 100;
+  pass_layer = 2;
+  expect("prefill breaks a priority tie by read cost", victim() == 1);
+  expert_spans[0] = 0, pass_layer = -1;
 
   setup(10, 1);
   SLOT_SIZE = 65536, expert_spans[0] = 2;

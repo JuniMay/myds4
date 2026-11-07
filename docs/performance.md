@@ -1687,8 +1687,11 @@ setting must be evaluated on the intended workload.
 Q2 experts occupy fixed 12,189,696-byte slots. The longer capture's
 activation-weighted logical footprint leaves about 15.8% of that reservation
 unused on average. This is a capacity opportunity, not implemented variable
-slot packing. The byte-cost option changes only decode victim priority;
-prefill eviction, pressure release and GPU mapping priority remain unchanged.
+slot packing. In these runs the byte-cost option changed only the decode
+victim priority, and a prompt pass evicted the least recently used slots.
+A prompt pass now chooses its victims by the same priority as decoding
+(see [The expert cache and memory](design.md#the-expert-cache-and-memory));
+pressure release and GPU mapping priority do not use the byte cost.
 
 A longer live check used the 1,229-token scheduler prompt, thinking effort 16
 and 512 generated tokens. All outputs matched within each format:

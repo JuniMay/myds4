@@ -469,8 +469,7 @@ static int draft_pool_count(int layers) {
 // forward-pass aging steps. A verification batch advances once, as does the
 // end of prefill. The victim has the lowest priority, an empty slot first.
 // Optional read-cost weighting affects that priority, not the score history.
-// A recency list
-// (head = most recently used) orders the slots for prompt passes and for giving
+// A recency list (head = most recently used) orders the slots for giving
 // slots back.
 static int head = -1, tail = -1;
 static double weight = 1;  // the current token's
@@ -765,26 +764,39 @@ static void cancel(int i) {
   finish(i);
 }
 
-// During a prompt pass at layer pass_layer, the experts of later layers
-// will be needed in this pass: the victim is the least recently used slot of
-// a layer already done.
+// The layer a prompt pass is at (-1: decoding). The pass still needs the
+// experts of this layer and the next; it is done with earlier layers.
 static int pass_layer = -1;
 void cache_pass(int layer) { pass_layer = layer; }
 
 // A slot for (layer, e), resident and non-volatile: a free one, or a victim.
-// When decoding, the victim has the lowest score, except the experts that
-// the layer being served selected this token and read-aheads whose layer has
-// not been served yet. In a prompt pass the victim is of a layer already
-// done, else of a layer after the next. A prefetch that finds none is skipped
-// (-1) rather than evicting experts in use.
+// The victim has the lowest priority (eviction_priority), so the experts
+// that decoding uses most stay. When decoding, the experts that the layer
+// being served selected this token and read-aheads whose layer has not been
+// served yet are not victims. In a prompt pass the victim is of a layer the
+// pass is done with, else of a layer after the next: the experts the prompt
+// alone needed go first, whatever their layer, and decoding after the prompt
+// finds the experts it used before. Between slots of equal priority (in a
+// cold cache the prompt credits every expert alike) a prompt pass takes the
+// expert cheapest to read again. A prefetch that finds none is skipped (-1)
+// rather than evicting experts in use.
 static int serving = -1;  // the layer cache_request makes resident: its experts used this token stay
 
 static unsigned held_references;
 
+// The bytes slot i's expert takes in its files: what reading it again costs.
+static uint64_t expert_bytes(int i) {
+  const Slot *s = &slots[i];
+  if (s->expert < 0 || s->layer < 0 || s->layer >= CACHE_LAYERS) return 0;
+  uint64_t bytes = 0;
+  for (int k = 0; k < expert_spans[s->layer]; k++) bytes += expert_span[s->layer][s->expert][k].len;
+  return bytes;
+}
+
 static int victim(void) {
+  int best = -1;
+  double lowest = INFINITY;
   if (pass_layer < 0) {
-    int best = -1;
-    double lowest = INFINITY;
     for (int j = 0; j < max_slots; j++)
       if (score[j] < INFINITY && !slots[j].prefetched &&
           !slots[j].holds &&
@@ -794,11 +806,16 @@ static int victim(void) {
       }
     return best;
   }
-  for (int j = tail; j >= 0; j = slots[j].prev)
-    if (slots[j].layer < pass_layer) return j;
-  for (int j = tail; j >= 0; j = slots[j].prev)
-    if (slots[j].layer > pass_layer + 1) return j;
-  return -1;
+  for (int later = 0; later < 2 && best < 0; later++)
+    for (int j = 0; j < max_slots; j++) {
+      int l = slots[j].layer;
+      if (later ? l <= pass_layer + 1 : l >= pass_layer) continue;
+      if (score[j] == INFINITY || slots[j].holds) continue;
+      double priority = eviction_priority(j);
+      if (best < 0 || priority < lowest || (priority == lowest && expert_bytes(j) < expert_bytes(best)))
+        best = j, lowest = priority;
+    }
+  return best;
 }
 
 

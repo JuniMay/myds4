@@ -1065,20 +1065,21 @@ several tokens. These are forward-pass units, not emitted-token units. The
 growth ratio is computed at setup; occasional common rescaling keeps the
 stored history and resident scores within range.
 
-Decode eviction chooses the lowest score by default. With
-`--cache-read-cost`, off by default, the victim priority is the raw score
+The victim of an eviction, in decoding and in a prompt pass, is the
+eligible slot with the lowest priority, by default its score. With
+`--cache-read-cost`, off by default, the priority is the raw score
 times the expert's aligned read bytes divided by the fixed backbone slot
 size. Read bytes cover all of that expert's file spans rounded to the read
 alignment. The cost factor is computed once from the known file layout;
-raw score history and request increments remain unweighted. This policy
-does not change prefill eviction, least-recently-used release under memory
-pressure, GPU unmapping priorities or the draft pools' replacement rule.
+raw score history and request increments remain unweighted. This weighting
+does not change least-recently-used release under memory pressure, GPU
+unmapping priorities or the draft pools' replacement rule.
 
 Slots emptied by cancelled read-aheads go first. An empty entry is exempt
 from current-layer usage protection, even if it retains that layer's usage
-stamp. Held references still prevent reuse. Experts requested by the
-layer being served in the current pass and protected read-aheads cannot be
-victims. A recency list orders the slots for prompt passes and for giving
+stamp. Held references still prevent reuse. When decoding, the experts
+requested by the layer being served in the current pass and protected
+read-aheads cannot be victims. A recency list orders the slots for giving
 slots back.
 
 Every slot contributes to the process's memory footprint. Mapped slots
@@ -1115,9 +1116,15 @@ a smaller GGUF backbone buffer. Both allocation modes reserve their bytes
 before allocating the adaptive backbone cache. See
 [Speculative decoding](#speculative-decoding) for pool limits and replacement.
 
-During a prompt pass the victim of an eviction is a slot of a layer already
-done, never of the next layers, which the pass still needs. The cache
-therefore needs room for two backbone layers' experts (768 slots). A fixed
+During a prompt pass at layer l, the victim is the lowest-priority slot of
+a layer before l, which the pass is done with, or else of a layer after
+l + 1; it is never of layer l or l + 1, which the pass still needs. Because
+the priority is the one decoding uses, the experts that only the prompt
+needed go first, from whichever eligible layer, and decoding after the
+prompt finds the experts it used before. Between slots of equal priority,
+as in a cold cache where the prompt credited every expert alike, the pass
+takes the expert cheapest to read again. The cache therefore needs room
+for two backbone layers' experts (768 slots). A fixed
 `--cache` budget must cover those slots plus the reserved draft pools. The
 minimum byte budget depends on the backbone's slot size and draft settings.
 
@@ -1178,7 +1185,7 @@ read fixtures use `/dev/zero`:
 | `make cache-ready-check` | 45 | Completed/pending groups, readiness, late counts and consumer release. |
 | `make draft-cache-check` | 49 | Separate stage pools, native demand admission, replacement and protected groups. |
 | `make prefetch-metrics-check` | 54 | Fixed snapshots, first use, read origin, byte accounting and I/O timing. |
-| `make cache-policy-check` | 54 | Aging ratios, victim rules, aligned read costs, history, rescaling and reuse of refined empty slots. |
+| `make cache-policy-check` | 56 | Aging ratios, victim rules in decoding and in a prompt pass (with its read-cost tie-break), aligned read costs, history, rescaling and reuse of refined empty slots. |
 | `make prefetch-queue-check` | 14 | Admission release on completion or cancellation, pending ownership and delayed notifications. |
 | `make prefetch-admission-check` | 19 | In-flight admission limits, promotion, repeated candidates and preservation of required data. |
 | `make prefetch-demote-check` | 37 | Demotion after routing, which cancels no read in decoding or prefill; refinement, which cancels only wholly unstarted forecasts it excludes, keeping the queue's order, the accounting and the reuse of emptied slots; held and partly read forecasts. |
