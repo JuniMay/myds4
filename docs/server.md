@@ -110,6 +110,12 @@ while others of its requests decode), so that a long prompt does not stall
 the replies in progress. Passes of different models therefore alternate on
 the GPU, a pass at a time.
 
+Admission publishes only the prefix whose rows the new state already
+holds. Each completed prefill call publishes its newly computed rows.
+Later requests may reuse a busy state's computed prefix, but cannot copy
+the suffix of a prompt that is still waiting for prefill. This rule applies
+to whole-prompt and chunked prefill alike.
+
 **Memory.** All models share the process's memory: a Qwen model's weights
 (20 GB) stay resident while it serves (after 60 s without passes its
 buffers leave the GPU's residency set until its next pass), and DeepSeek's

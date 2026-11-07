@@ -998,7 +998,7 @@ impl Slot {
             }
         };
         let bytes = self.model.state_bytes(self.states[&id], n + 1);
-        let dropped = self.cache.start(id, &prompt, from, bytes, kv::stale_at(origin, n));
+        let dropped = self.cache.start(id, &prompt, from, bytes, kv::stale_at(origin, from));
         for x in dropped {
             self.free_snap(id, x.pos);
         }
@@ -1123,6 +1123,7 @@ impl Slot {
             panic!("the engine refused a prefill of positions {done} to {end}");
         };
         let origin = p.origin;
+        self.cache.prefilled(state, prompt, kv::stale_at(origin, end));
         if let Some(at) = inner
             && !captured.is_null()
         {

@@ -323,9 +323,9 @@ impl Cache {
     }
 
     /// A request starts in `id` (just added, or continued in place) at `from`:
-    /// it is busy and holds the prompt (its rows before `from` copied or its
-    /// own, the others prefilled), with `stale` stale rows at the prompt's
-    /// end. Its rows after `from` are overwritten, so the snapshots past
+    /// only its rows before `from` are available, copied or its own. `stale`
+    /// describes those rows at `from`. Prefill publishes new rows only after
+    /// the engine computes them. Its rows after `from` will be overwritten, so snapshots past
     /// `from` are dropped: returned for the worker to free.
     pub fn start(&mut self, id: Id, p: &[i32], from: usize, bytes: u64, stale: usize) -> Vec<Snap> {
         let used = self.tick();
@@ -335,10 +335,21 @@ impl Cache {
         e.bytes = bytes;
         e.stale = stale;
         e.tokens.clear();
-        e.tokens.extend_from_slice(p);
+        e.tokens.extend_from_slice(&p[..from]);
         let (keep, dropped): (Vec<Snap>, Vec<Snap>) = e.snaps.drain(..).partition(|s| s.pos <= from);
         e.snaps = keep;
         dropped
+    }
+
+    /// A prefill call completed every position in `p`; publish its new
+    /// rows for later requests, including requests admitted before this
+    /// generation finishes. `stale` is the rewind state at this boundary.
+    pub fn prefilled(&mut self, id: Id, p: &[i32], stale: usize) {
+        let e = self.entries.get_mut(&id).expect("a live prefilling state");
+        assert!(e.tokens.len() <= p.len());
+        debug_assert_eq!(e.tokens, p[..e.tokens.len()]);
+        e.tokens.extend_from_slice(&p[e.tokens.len()..]);
+        e.stale = stale;
     }
 
     /// The source of a fork: it is used now, and requests reused it up to `at`.
@@ -627,11 +638,28 @@ mod tests {
     fn state(c: &mut Cache, tokens: &[i32], snaps: &[usize]) -> Id {
         let id = c.add(1 << 20);
         c.start(id, tokens, 0, 1 << 20, 0);
+        c.prefilled(id, tokens, 0);
         for &pos in snaps {
             c.add_snap(id, Snap { pos, kind: Kind::PromptEnd, bytes: SNAP, stale: 0 });
         }
         c.finish(id, 1 << 20);
         id
+    }
+
+    #[test]
+    fn a_waiting_prefill_exposes_only_the_rows_already_copied() {
+        let mut c = Cache::new(u64::MAX, 256);
+        let source = state(&mut c, &seq(0..13772), &[13772]);
+        c.entries.get_mut(&source).unwrap().busy = true;
+        let pending = c.add(1 << 20);
+        c.start(pending, &seq(0..19129), 13772, 1 << 20, 0);
+        let next = c.plan(&seq(0..22481), LIMITS);
+        assert!(next.reused() <= 13772, "an admitted prompt has not computed its suffix: {next:?}");
+        assert_eq!(c.entries[&pending].tokens.len(), 13772);
+        c.prefilled(pending, &seq(0..16384), 0);
+        assert!(c.plan(&seq(0..22481), LIMITS).reused() <= 16384);
+        c.prefilled(pending, &seq(0..19129), 0);
+        assert_eq!(c.plan(&seq(0..22481), LIMITS).reused(), 19129);
     }
 
     #[test]
@@ -798,6 +826,7 @@ mod tests {
         let stale = stale_at(c.origin(&plan, retry.len()), retry.len());
         assert_eq!(stale, 3);
         c.start(s, &retry, 3999, 1 << 20, stale);
+        c.prefilled(s, &retry, stale);
         c.finish(s, 1 << 20);
         let again = [&retry[..3995], &seq(-90..-60)[..]].concat();
         assert_ne!(c.plan(&again, LIMITS), Plan::InPlace { state: s, from: 3995 });
@@ -863,6 +892,8 @@ mod tests {
         assert_eq!(c.plan(&p, LIMITS), Plan::InPlace { state: s, from: 998 });
         let dropped = c.start(s, &p, 998, 1 << 20, 0);
         assert_eq!(dropped.iter().map(|x| x.pos).collect::<Vec<_>>(), vec![1000]);
+        assert_eq!(c.entries[&s].tokens, p[..998]);
+        c.prefilled(s, &p, 0);
         let e = &c.entries[&s];
         assert_eq!(e.tokens, p);
         assert_eq!(e.snaps.iter().map(|x| x.pos).collect::<Vec<_>>(), vec![400, 998]);
@@ -881,6 +912,7 @@ mod tests {
         assert_eq!((source, at), (s, 5000));
         let new = c.add(1 << 20);
         c.start(new, &p, at, 1 << 20, 0);
+        c.prefilled(new, &p, 0);
         c.add_snap(new, Snap { pos: at, kind: Kind::Branch, bytes: SNAP, stale: 0 });
         c.touch(source, at);
         c.finish(new, 1 << 20);
