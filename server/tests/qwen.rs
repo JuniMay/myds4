@@ -51,7 +51,15 @@ impl Server {
         Server::spawn(args)
     }
 
-    fn spawn(mut args: Vec<String>) -> Server {
+    fn spawn(args: Vec<String>) -> Server {
+        Self::spawn_input(args, None)
+    }
+
+    fn with_config(config: Value) -> Server {
+        Self::spawn_input(vec!["--config".into(), "/dev/stdin".into()], Some(config.to_string()))
+    }
+
+    fn spawn_input(mut args: Vec<String>, input: Option<String>) -> Server {
         let port = TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).expect("a free port").port();
         let key = format!("qwen-test-{}-{port}-key", std::process::id());
         let server = std::env::var("MYDS4_SERVER").map(PathBuf::from).unwrap_or_else(|_| root().join("build/myds4-server"));
@@ -59,10 +67,15 @@ impl Server {
         let mut child = Command::new(server)
             .args(&args)
             .env("MYDS4_API_KEY", &key)
+            .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .expect("start the server");
+        if let Some(text) = input {
+            let mut stdin = child.stdin.take().expect("config input");
+            stdin.write_all(text.as_bytes()).expect("send the config");
+        }
         let log = Arc::new(Mutex::new(Vec::new()));
         let (mut err, lines) = (child.stderr.take().expect("the server's stderr"), log.clone());
         std::thread::spawn(move || {
@@ -142,7 +155,8 @@ impl Server {
 
     fn chat(&self, body: &Value) -> Value {
         let (status, answer) = self.post(body, None);
-        assert_eq!(status, 200, "chat completion: {}", String::from_utf8_lossy(&answer));
+        assert_eq!(status, 200, "chat completion: {}; recent server log: {:?}", String::from_utf8_lossy(&answer),
+                   self.log.lock().unwrap().iter().rev().take(24).collect::<Vec<_>>());
         serde_json::from_slice(&answer).expect("a JSON answer")
     }
 
@@ -291,14 +305,11 @@ fn deepseek_and_qwen_share_one_process() {
         return;
     };
     let _one = one_model();
-    let config = std::env::temp_dir().join(format!("myds4-two-models-{}.json", std::process::id()));
-    let models = json!({"models": [
-        {"model": deepseek, "experts": experts, "cache": 40, "kv_cache": 4},
-        {"model": qwen, "ctx": 4096, "kv_cache": 4}
+    let models = json!({"kv_cache": 8, "reserve": 10, "models": [
+        {"model": deepseek, "experts": experts, "cache": 40},
+        {"model": qwen, "ctx": 4096}
     ]});
-    std::fs::write(&config, models.to_string()).expect("write the config file");
-    let s = Server::spawn(vec!["--config".to_string(), config.display().to_string()]);
-    let _ = std::fs::remove_file(&config);
+    let s = Server::with_config(models);
     // the config's order: DeepSeek first
     let ids: Vec<String> =
         s.get("/v1/models")["data"].as_array().expect("models").iter().map(|m| m["id"].as_str().unwrap().to_string()).collect();
@@ -319,4 +330,53 @@ fn deepseek_and_qwen_share_one_process() {
         let after: i64 = last.trim_end_matches(" slots").rsplit(' ').next().and_then(|n| n.parse().ok()).expect("a slot count");
         assert_eq!(after, slots, "the log says the cache shrank to {after} slots ({last:?}); it has {slots}");
     }
+}
+
+/// A single tight pool must evict idle states across model boundaries,
+/// free them through the right model, and never match another model's KV.
+#[test]
+fn models_share_one_kv_budget_and_one_reserve() {
+    let (Some(qwen), Ok(deepseek)) = (checkpoint(), std::env::var("MYDS4_CHECKPOINT")) else {
+        eprintln!("MYDS4_QWEN or MYDS4_CHECKPOINT is not set: skipped");
+        return;
+    };
+    let _one = one_model();
+    let s = Server::with_config(json!({"reserve": 13, "kv_cache": 0.75, "models": [
+        {"model": deepseek, "id": "deepseek-budget", "cache": 20, "ctx": 4096, "batch": 4},
+        {"model": qwen, "id": "qwen-budget", "batch": 8}
+    ]}));
+    let models = s.get("/v1/models");
+    let q = models["data"].as_array().unwrap().iter().find(|m| m["id"] == "qwen-budget").unwrap();
+    assert_eq!(q["context_length"], 262144, "Qwen defaults to its checkpoint's 256K context");
+    let ask = |model: &str, text: &str| {
+        let mut b = body(json!([{"role": "user", "content": text}]), 16, false);
+        b["model"] = json!(model);
+        let a = s.chat(&b);
+        assert!(!content(&a).trim().is_empty());
+        a
+    };
+    ask("deepseek-budget", "Name three colors, in one line.");
+    ask("qwen-budget", "Give three prime numbers, in one line.");
+    for id in ["deepseek-budget", "qwen-budget"] {
+        let st = &s.get(&format!("/v1/models/{id}"))["status"];
+        assert_eq!(st["reserve_gib"], 13.0);
+        assert_eq!(st["kv_cache_limit_gib"], 0.75);
+        assert_eq!(st["kv_cache_scope"], "server");
+        assert!(st["kv_cache_total_gib"].as_f64().unwrap() <= 0.751);
+        assert_eq!(st["model_memory"].as_array().unwrap().len(), 2);
+    }
+    // A fresh Qwen state and its snapshots cannot coexist with all the
+    // old allocations under this budget. DeepSeek's oldest idle state goes.
+    ask("qwen-budget", "Write one Python expression that reverses a list.");
+    let ds = s.get("/v1/models/deepseek-budget");
+    assert!(ds["status"]["sessions"].as_array().unwrap().is_empty(), "old DeepSeek state was not evicted: {ds}");
+    assert!(ds["status"]["kv_cache_total_gib"].as_f64().unwrap() <= 0.751);
+    let again = ask("deepseek-budget", "Name three colors, in one line.");
+    assert_eq!(again["usage"]["prompt_cache_hit_tokens"], 0, "evicted rows cannot be reused");
+    let ds = s.get("/v1/models/deepseek-budget");
+    let qw = s.get("/v1/models/qwen-budget");
+    let total = ds["status"]["kv_cache_total_gib"].as_f64().unwrap();
+    let parts = ds["status"]["kv_cache_gib"].as_f64().unwrap() + qw["status"]["kv_cache_gib"].as_f64().unwrap();
+    assert!((total - parts).abs() <= 0.002 && total <= 0.751);
+    eprintln!("shared KV: {total:.3} GiB of 0.75; reserve 13 GiB; cross-model eviction passed");
 }

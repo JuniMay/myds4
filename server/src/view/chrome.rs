@@ -16,10 +16,11 @@ pub enum Tab {
     Experts,
     Minute,
     Log,
+    Memory,
 }
 
-pub const TABS: [(Tab, &str); 5] =
-    [(Tab::Overview, "Overview"), (Tab::Kv, "KV cache"), (Tab::Experts, "Experts"), (Tab::Minute, "Last minute"), (Tab::Log, "Log")];
+pub const TABS: [(Tab, &str); 6] =
+    [(Tab::Overview, "Overview"), (Tab::Kv, "KV cache"), (Tab::Experts, "Experts"), (Tab::Minute, "Last minute"), (Tab::Log, "Log"), (Tab::Memory, "Memory")];
 
 /// What a click on a place of the screen chooses.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -183,7 +184,7 @@ pub fn tab_row(buf: &mut Buffer, mut x: u16, y: u16, right: u16, items: Vec<(Lin
 }
 
 fn keys(ui: &Ui) -> Vec<(&'static str, &'static str)> {
-    let mut k = vec![("1–5", "tabs")];
+    let mut k = vec![("1–6", "tabs")];
     match ui.tab {
         Tab::Kv if ui.text.is_some() => {
             k.extend([("←→", "node"), ("↑↓", "row"), ("PgUp PgDn Home End", "scroll the text"), ("esc", "close it")])

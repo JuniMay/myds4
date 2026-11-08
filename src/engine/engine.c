@@ -64,6 +64,8 @@ void myds4_log(const char *line) { say("%s", line); }
 
 int myds4_init(const myds4_process *p) {
   if (!p || p->abi != MYDS4_ABI || initialized) return -1;
+  if (p->reserve_gb && !(p->reserve_gb >= CACHE_RESERVE_MIN && p->reserve_gb <= CACHE_RESERVE_MAX)) return -1;
+  cache_reserve(p->reserve_gb);
   proc = *p;
   die_hook = p->on_die;
   pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);  // the models' GPU work goes before background work
@@ -97,8 +99,6 @@ myds4_model *myds4_load(const myds4_config *c) {
                       ? "runahead requires draft off, no online predictor and no substitution"
                   : c->pipeline && (c->experts || c->runahead || c->draft || c->online_predictor || c->predictor_state || c->substitute > 0)
                       ? "pipeline requires native MXFP4, no runahead, draft, online predictor or substitution"
-                  : c->reserve_gb && !(c->reserve_gb >= CACHE_RESERVE_MIN && c->reserve_gb <= CACHE_RESERVE_MAX)
-                      ? "reserve takes 2 to 1024 GiB"
                                                     : 0;
   if (bad) {
     fprintf(stderr, "myds4: %s\n", bad);
@@ -113,7 +113,7 @@ myds4_model *myds4_load(const myds4_config *c) {
     }
   myds4_model *x = xmalloc(sizeof *x);
   x->ops = ops;
-  x->opt = (Options){.ctx = c->ctx, .budget_gb = c->cache_gb, .reserve_gb = c->reserve_gb,
+  x->opt = (Options){.ctx = c->ctx, .budget_gb = c->cache_gb,
                      .cache_half_life = c->cache_half_life, .cache_read_cost = c->cache_read_cost, .dump_fd = -1,
                      .routes_fd = -1, .draft = c->draft, .draft_cache = c->draft_cache,
                      .predictor_state = copy(c->predictor_state), .substitute = c->substitute,

@@ -16,7 +16,7 @@
 //! view's snapshot.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -29,7 +29,7 @@ use crate::kv::{self, Cache, Kind, Limits, Plan, Snap};
 
 /// Requests waiting for a model at most; more are answered 429.
 pub const WAITING: usize = 16;
-/// Attention states a model's cache keeps at most, whatever its kv-cache allows.
+/// Attention states the shared cache keeps at most, across all models.
 pub const STATES: usize = 256;
 /// A prefill call's rows while other requests of the model decode, for a
 /// model whose prefill runs in calls of its prefill rows.
@@ -153,8 +153,6 @@ pub struct Served {
     pub engine: engine::Options,
     /// Requests running together at most (at most the model's rows per pass).
     pub batch: usize,
-    /// What the model's attention states and snapshots may take, GiB.
-    pub kv_gb: f64,
 }
 
 #[derive(Default)]
@@ -250,6 +248,7 @@ struct Status {
     states: Vec<(u64, usize, Instant)>,
     tree: Vec<(kv::Node, Instant)>,
     kv_bytes: u64,
+    kv_allocated: u64,
 }
 
 /// A model as the threads share it: its settings, its engine handle (its
@@ -264,6 +263,8 @@ struct Shared {
     queue: Mutex<Queue>,
     wake: Condvar,
     models: Vec<ModelShared>,
+    budgets: crate::config::Budgets,
+    kv_used: AtomicU64,
     started: Instant,
 }
 
@@ -287,13 +288,13 @@ pub fn models() -> Vec<(String, Arc<Model>, Served)> {
 /// Starts the worker's engine thread, which initializes the engine and loads
 /// every model; returns once it takes requests, or false when a model's
 /// settings are invalid (the engine says why on stderr).
-pub fn start(served: Vec<Served>, on_log: Option<extern "C" fn(*const std::ffi::c_char)>, on_die: Option<extern "C" fn()>) -> bool {
+pub fn start(served: Vec<Served>, budgets: crate::config::Budgets, on_log: Option<extern "C" fn(*const std::ffi::c_char)>, on_die: Option<extern "C" fn()>) -> bool {
     let (tx, rx) = std::sync::mpsc::channel();
     let handle = thread::Builder::new()
         .name("myds4-engine".into())
         .stack_size(16 << 20)
         .spawn(move || {
-            if !engine::init(on_log, on_die) {
+            if !engine::init(budgets.reserve_gb, on_log, on_die) {
                 let _ = tx.send(false);
                 return;
             }
@@ -310,6 +311,8 @@ pub fn start(served: Vec<Served>, on_log: Option<extern "C" fn(*const std::ffi::
                 queue: Mutex::new(Queue { jobs: (0..n).map(|_| VecDeque::new()).collect(), ..Queue::default() }),
                 wake: Condvar::new(),
                 models,
+                budgets,
+                kv_used: AtomicU64::new(0),
                 started: Instant::now(),
             });
             *SHARED.lock().unwrap() = Some(s.clone());
@@ -426,6 +429,16 @@ fn round(x: f64, digits: i32) -> f64 {
     (x * f).round() / f
 }
 
+fn memory_models(s: &Shared) -> Vec<Value> {
+    s.models.iter().map(|m| {
+        let c = m.model.stats();
+        let st = lock(&m.status);
+        json!({"model": m.served.id, "weights": c.dense_bytes, "experts": c.cache_bytes,
+               "kv": st.kv_allocated, "kv_committed": st.kv_bytes,
+               "tracked": c.dense_bytes + c.cache_bytes + st.kv_allocated})
+    }).collect()
+}
+
 /// Model `model`'s status (JSON): what it is doing, its requests, KV prefix
 /// cache, counters, expert cache and the process's memory.
 pub fn status(model: usize) -> Value {
@@ -433,6 +446,7 @@ pub fn status(model: usize) -> Value {
     let Some(m) = s.models.get(model) else { return Value::Null };
     let waiting = lock(&s.queue).jobs[model].len();
     let c = m.model.stats();
+    let allocations = memory_models(&s);
     let st = lock(&m.status);
     let now = Instant::now();
     let sessions: Vec<Value> = st
@@ -447,7 +461,9 @@ pub fn status(model: usize) -> Value {
         "phase_seconds": round(st.since.map_or(0.0, |t| (now - t).as_secs_f64()), 1), "decoding": st.active,
         "request": st.request, "prompt_tokens": st.prompt, "reused_tokens": st.reused, "generated_tokens": st.generated,
         "waiting": waiting, "sessions": sessions,
-        "kv_cache_gib": round(st.kv_bytes as f64 / GIB, 3), "kv_cache_limit_gib": round(m.served.kv_gb, 3),
+        "kv_cache_gib": round(st.kv_bytes as f64 / GIB, 3), "kv_cache_limit_gib": round(s.budgets.kv_gb, 3),
+        "kv_cache_scope": "server", "kv_cache_total_gib": round(s.kv_used.load(Ordering::Relaxed) as f64 / GIB, 3),
+        "reserve_gib": s.budgets.reserve_gb, "model_memory": allocations,
         "totals": {"requests": st.requests, "prompt_tokens": st.prompt_tokens, "generated_tokens": st.generated_tokens},
         "ced_depth": o.ced, "lookup_depth": o.lookup, "prefill_prune": o.prefill_prune, "runahead": o.runahead, "pipeline": o.pipeline,
         "drafts": m.model.draft_block(),
@@ -471,6 +487,7 @@ pub fn view(model: usize) -> String {
     let Some(m) = s.models.get(model) else { return "{}".into() };
     let waiting = lock(&s.queue).jobs[model].len();
     let c = m.model.stats();
+    let allocations = memory_models(&s);
     let mut st = lock(&m.status);
     let now = Instant::now();
     // the routed rows copied since the snapshot before, each in one snapshot
@@ -508,7 +525,9 @@ pub fn view(model: usize) -> String {
         "totals": {"requests": st.requests, "prompt_tokens": st.prompt_tokens, "reused_tokens": st.reused_tokens,
                    "generated_tokens": st.generated_tokens},
         "kinds": {"new": st.kinds[0], "continued": st.kinds[1], "saved": st.kinds[2], "forked": st.kinds[3]},
-        "sessions": st.states.len(), "kv_gib": round(st.kv_bytes as f64 / GIB, 3), "kv_limit_gib": round(m.served.kv_gb, 3),
+        "sessions": st.states.len(), "kv_gib": round(st.kv_bytes as f64 / GIB, 3), "kv_limit_gib": round(s.budgets.kv_gb, 3),
+        "kv_total_gib": round(s.kv_used.load(Ordering::Relaxed) as f64 / GIB, 3),
+        "reserve_gib": s.budgets.reserve_gb, "model_memory": allocations,
         "tree": tree,
         "decode": {"rows": c.decode_rows, "tokens": st.decoded, "seconds": round(c.decode_seconds, 3),
                    "gpu_seconds": round(c.decode_gpu_seconds, 3),
@@ -587,30 +606,96 @@ impl Gen {
     }
 }
 
-/// One model's part of the worker: its engine handle, KV prefix cache,
-/// states and snapshots, and requests.
+/// One model's engine handle and requests. State IDs belong to Memory's
+/// shared budget; prefix matching remains scoped to this model.
 struct Slot {
     index: usize,
     model: Arc<Model>,
     served: Served,
     ctx: usize,
     batch: usize,
-    cache: Cache,
-    states: HashMap<kv::Id, *mut RawState>,
-    snaps: HashMap<(kv::Id, usize), *mut RawSnapshot>,
-    used: HashMap<kv::Id, Instant>,
     gens: Vec<Gen>,
     think_start: Option<i32>,
     think_end: Option<i32>,
     shown: usize,
-    published: Instant,
     /// The experts a decoded row holds: the live view's routed rows.
     per_row: usize,
+}
+
+// One KV budget and one LRU clock across models. Prefix matching is
+// model-scoped; engine handles retain their owning model for eviction.
+struct Memory {
+    cache: Cache,
+    states: HashMap<kv::Id, *mut RawState>,
+    snaps: HashMap<(kv::Id, usize), *mut RawSnapshot>,
+    owners: HashMap<kv::Id, Arc<Model>>,
+    used: HashMap<kv::Id, Instant>,
+    published: Instant,
+}
+
+impl Memory {
+    fn new(limit: u64) -> Self {
+        Self { cache: Cache::new(limit, STATES), states: HashMap::new(), snaps: HashMap::new(),
+               owners: HashMap::new(), used: HashMap::new(), published: Instant::now() }
+    }
+
+    fn add(&mut self, model: usize, owner: Arc<Model>) -> kv::Id {
+        let id = self.cache.add_for(model, 0);
+        self.owners.insert(id, owner);
+        id
+    }
+
+    /// Frees a snapshot's engine copy.
+    fn free_snap(&mut self, id: kv::Id, pos: usize) {
+        if let Some(x) = self.snaps.remove(&(id, pos)) {
+            self.owners[&id].snapshot_free(x);
+        }
+    }
+
+    /// Frees what an eviction or a truncation dropped.
+    fn free(&mut self, snaps: Vec<(kv::Id, Snap)>, states: Vec<(kv::Id, Vec<Snap>)>) {
+        for (id, s) in snaps {
+            self.free_snap(id, s.pos);
+        }
+        for (id, held) in states {
+            for s in held {
+                self.free_snap(id, s.pos);
+            }
+            if let Some(st) = self.states.remove(&id) {
+                self.owners[&id].state_free(st);
+            }
+            self.used.remove(&id);
+            self.owners.remove(&id);
+        }
+    }
+
+    fn publish(&mut self, s: &Shared) {
+        let now = Instant::now();
+        s.kv_used.store(self.cache.bytes(), Ordering::Relaxed);
+        for (model, m) in s.models.iter().enumerate() {
+            let entries: Vec<_> = self.cache.entries.iter().filter(|(_, e)| e.model == model).collect();
+            let by_number: HashMap<_, _> = entries.iter().map(|(id, e)|
+                (e.number, *self.used.get(id).unwrap_or(&now))).collect();
+            let mut st = lock(&m.status);
+            st.states = entries.iter().map(|(id, e)|
+                (e.number, e.tokens.len(), *self.used.get(id).unwrap_or(&now))).collect();
+            st.tree = self.cache.tree_for(model, 24, 40).into_iter().map(|x| {
+                let used = *by_number.get(&x.number).unwrap_or(&now);
+                (x, used)
+            }).collect();
+            st.kv_bytes = self.cache.bytes_for(model);
+            st.kv_allocated = entries.iter().map(|(id, e)|
+                self.owners[id].state_bytes(self.states[id], 0) + e.snaps.iter().map(|x| x.bytes).sum::<u64>()).sum();
+        }
+        self.published = now;
+    }
 }
 
 struct Worker {
     s: Arc<Shared>,
     slots: Vec<Slot>,
+    memory: Memory,
+    maintained: Instant,
 }
 
 impl Worker {
@@ -622,11 +707,10 @@ impl Worker {
             .map(|(index, m)| {
                 let model = m.model.clone();
                 let served = m.served.clone();
-                let limit = (served.kv_gb * GIB) as u64;
                 engine::log(&format!(
-                    "{}: kv cache up to {:.1} GiB; a state takes {:.0} MiB at first, {:.2} GiB at {} tokens; a snapshot {:.1} MiB",
+                    "{}: shares the {:.1} GiB KV budget; a state takes {:.0} MiB at first, {:.2} GiB at {} tokens; a snapshot {:.1} MiB",
                     served.id,
-                    served.kv_gb,
+                    s.budgets.kv_gb,
                     model.state_bytes(std::ptr::null(), 0) as f64 / 1048576.0,
                     model.state_bytes(std::ptr::null(), served.engine.ctx as usize) as f64 / GIB,
                     served.engine.ctx,
@@ -636,31 +720,56 @@ impl Worker {
                     index,
                     ctx: served.engine.ctx as usize,
                     batch: served.batch.max(1).min(model.max_rows()),
-                    cache: Cache::new(limit, STATES),
-                    states: HashMap::new(),
-                    snaps: HashMap::new(),
-                    used: HashMap::new(),
                     gens: Vec::new(),
                     think_start: model.tokenizer().special("<think>"),
                     think_end: model.tokenizer().special("</think>"),
                     shown: 0,
-                    published: Instant::now(),
                     per_row: model.stats().experts_per_row.max(0) as usize,
                     model,
                     served,
                 }
             })
             .collect();
-        Worker { s, slots }
+        let memory = Memory::new((s.budgets.kv_gb * GIB) as u64);
+        Worker { s, slots, memory, maintained: Instant::now() }
+    }
+
+    /// Apply one RAM reserve between engine calls, including while only a
+    /// dense model is active. Release expert slots first, then idle KV.
+    fn maintain(&mut self) {
+        let mut released = 0;
+        for slot in &self.slots {
+            if slot.per_row > 0 {
+                let before = slot.model.stats().cache_bytes;
+                slot.model.idle();
+                released += before.saturating_sub(slot.model.stats().cache_bytes);
+            } else if slot.gens.is_empty() {
+                slot.model.idle();
+            }
+        }
+        if let Some(slot) = self.slots.first() {
+            let available = slot.model.stats().available;
+            let reserve = (self.s.budgets.reserve_gb * GIB) as u64;
+            // Released expert pages can take a moment to reach the VM
+            // counters. Do not free the same deficit twice in this turn.
+            let deficit = reserve.saturating_sub(available).saturating_sub(released);
+            if deficit > 0 {
+                let (snaps, states) = self.memory.cache.reclaim(deficit);
+                self.memory.free(snaps, states);
+                self.memory.publish(&self.s);
+            }
+        }
+        self.maintained = Instant::now();
     }
 
     /// Every model takes one step a turn: admitting, one prefill call, one
-    /// decoding step. A model with no request gives memory back to other
-    /// programs about once a second. On the stop, every request ends with
+    /// decoding step. Shared memory maintenance runs between model calls
+    /// about once a second. On the stop, every request ends with
     /// Finish::Shutdown.
     fn run(&mut self) {
         let s = self.s.clone();
         while !engine::stopping() {
+            if self.maintained.elapsed() >= Duration::from_secs(1) { self.maintain(); }
             let mut q = lock(&s.queue);
             let idle = |q: &Queue, slots: &[Slot]| {
                 q.jobs.iter().all(|j| j.is_empty()) && q.text.is_none() && slots.iter().all(|x| x.gens.is_empty())
@@ -670,9 +779,7 @@ impl Worker {
                 q = guard;
                 if timeout.timed_out() && q.jobs.iter().all(|j| j.is_empty()) {
                     drop(q);
-                    for x in &self.slots {
-                        x.model.idle();
-                    }
+                    self.maintain();
                     q = lock(&s.queue);
                 }
             }
@@ -699,16 +806,16 @@ impl Worker {
             if let Some((model, session, start, end)) = question
                 && let Some(x) = self.slots.get(model)
             {
-                let answer = x.node_text(session, start, end);
+                let answer = x.node_text(session, start, end, &self.memory);
                 lock(&s.models[model].status).text = Some(answer);
             }
             for (x, admit) in self.slots.iter_mut().zip(admitted) {
-                x.step(&s, admit);
+                x.step(&s, admit, &mut self.memory);
             }
         }
         for x in &mut self.slots {
             for g in std::mem::take(&mut x.gens) {
-                x.finish(&s, g, true);
+                x.finish(&s, g, true, &mut self.memory);
             }
         }
         let waiting: Vec<Job> = {
@@ -742,16 +849,16 @@ fn end_waiting(job: Job, finish: Finish) {
 
 impl Slot {
     /// The model's limits for its cache's plans.
-    fn plan(&self, prompt: &[i32]) -> Plan {
+    fn plan(&self, prompt: &[i32], memory: &Memory) -> Plan {
         let model = self.model.clone();
         let cost = move |k: usize| model.replay_rows(k).unwrap_or(0);
         let limits = Limits { rewind: self.model.rewind(), replay: self.model.replay_rows(1).is_some(), replay_cost: &cost };
-        self.cache.plan(prompt, limits)
+        memory.cache.plan_for(self.index, prompt, limits)
     }
 
     /// One step of the model: its admitted requests start, one prefill call
     /// runs, the generations that are done end, the others advance a token.
-    fn step(&mut self, s: &Shared, admit: Vec<Job>) {
+    fn step(&mut self, s: &Shared, admit: Vec<Job>, memory: &mut Memory) {
         for job in admit {
             if engine::stopping() {
                 end_waiting(job, Finish::Shutdown);
@@ -759,24 +866,24 @@ impl Slot {
                 engine::log(&format!("req {}: client gone while waiting", job.id));
                 end_waiting(job, Finish::Cancelled);
             } else {
-                self.waiting_start(s, job);
+                self.waiting_start(s, job, memory);
             }
         }
         if engine::stopping() {
             return;
         }
-        self.prefill_call(s);
+        self.prefill_call(s, memory);
         let ctx = self.ctx;
         let mut i = 0;
         while i < self.gens.len() {
             if self.gens[i].decoding() && Self::over(&self.model, &mut self.gens[i], ctx) {
                 let g = self.gens.swap_remove(i);
-                self.finish(s, g, false);
+                self.finish(s, g, false, memory);
             } else if !self.gens[i].decoding() && self.gens[i].job.flags.cancelled.load(Ordering::SeqCst) {
                 let mut g = self.gens.swap_remove(i);
                 g.cancelled = true;
-                self.prefill_cut(&mut g);
-                self.finish(s, g, false);
+                self.prefill_cut(&mut g, memory);
+                self.finish(s, g, false, memory);
             } else {
                 i += 1;
             }
@@ -791,7 +898,7 @@ impl Slot {
             return;
         }
         if decoding > 0 {
-            self.advance();
+            self.advance(memory);
             if self.per_row > 0 && ROUTES.swap(false, Ordering::Relaxed) {
                 self.copy_routes(s);
             }
@@ -812,22 +919,15 @@ impl Slot {
         }
         let phase = if self.gens.iter().any(|g| !g.decoding()) { "prefill" } else { "decode" };
         self.set_status(s, phase);
-        if self.published.elapsed() >= Duration::from_secs(1) {
-            self.publish(s);
-        }
-    }
-
-    /// Frees a snapshot's engine copy.
-    fn free_snap(&mut self, id: kv::Id, pos: usize) {
-        if let Some(x) = self.snaps.remove(&(id, pos)) {
-            self.model.snapshot_free(x);
+        if memory.published.elapsed() >= Duration::from_secs(1) {
+            memory.publish(s);
         }
     }
 
     /// The tokens of state `session`'s positions start..end, for the live
     /// view: at most TEXT_TOKENS from start, none if the state is gone.
-    fn node_text(&self, session: u64, start: usize, end: usize) -> NodeText {
-        let tokens = self.cache.entries.values().find(|e| e.number == session).map_or(&[][..], |e| &e.tokens[..]);
+    fn node_text(&self, session: u64, start: usize, end: usize, memory: &Memory) -> NodeText {
+        let tokens = memory.cache.entries.values().find(|e| e.model == self.index && e.number == session).map_or(&[][..], |e| &e.tokens[..]);
         let to = end.min(tokens.len());
         let from = start.min(to);
         NodeText { model: self.index, session, start, end, ids: tokens[from..to.min(from + TEXT_TOKENS)].to_vec() }
@@ -836,63 +936,21 @@ impl Slot {
     /// Before a pass that makes the busy state `id` hold `positions`: the
     /// cache charges its growth before the engine grows it (kv::Cache::grow),
     /// and what the cache gives up for it is freed.
-    fn make_room(&mut self, id: kv::Id, positions: usize) {
-        let before = self.cache.entries[&id].bytes;
-        let (snaps, states) = self.cache.grow(id, self.model.state_bytes(self.states[&id], positions));
-        self.free(snaps, states);
-        let after = self.cache.entries[&id].bytes;
-        if after > before && self.cache.over() > 0 {
+    fn make_room(&mut self, id: kv::Id, positions: usize, memory: &mut Memory) {
+        let before = memory.cache.entries[&id].bytes;
+        let (snaps, states) = memory.cache.grow(id, self.model.state_bytes(memory.states[&id], positions));
+        memory.free(snaps, states);
+        let after = memory.cache.entries[&id].bytes;
+        if after > before && memory.cache.over() > 0 {
             engine::log(&format!(
                 "{}: a decoding state grows to {:.2} GiB at {positions} positions; with only decoding states left, the kv cache takes {:.2} GiB of the {:.1} GiB it allows",
                 self.served.id,
                 after as f64 / GIB,
-                self.cache.bytes() as f64 / GIB,
-                self.served.kv_gb
+                memory.cache.bytes() as f64 / GIB,
+                memory.cache.limit as f64 / GIB
             ));
         }
-    }
-
-    /// Frees what an eviction or a truncation dropped.
-    fn free(&mut self, snaps: Vec<(kv::Id, Snap)>, states: Vec<(kv::Id, Vec<Snap>)>) {
-        for (id, s) in snaps {
-            self.free_snap(id, s.pos);
-        }
-        for (id, held) in states {
-            for s in held {
-                self.free_snap(id, s.pos);
-            }
-            if let Some(st) = self.states.remove(&id) {
-                self.model.state_free(st);
-            }
-            self.used.remove(&id);
-        }
-    }
-
-    /// The cache's states and tree, for the status and the view.
-    fn publish(&mut self, s: &Shared) {
-        let now = Instant::now();
-        let states = self
-            .cache
-            .entries
-            .iter()
-            .map(|(id, e)| (e.number, e.tokens.len(), *self.used.get(id).unwrap_or(&now)))
-            .collect();
-        let by_number: HashMap<u64, Instant> =
-            self.cache.entries.iter().map(|(id, e)| (e.number, *self.used.get(id).unwrap_or(&now))).collect();
-        let tree = self
-            .cache
-            .tree(24, 40)
-            .into_iter()
-            .map(|x| {
-                let t = *by_number.get(&x.number).unwrap_or(&now);
-                (x, t)
-            })
-            .collect();
-        let mut st = lock(&s.models[self.index].status);
-        st.states = states;
-        st.tree = tree;
-        st.kv_bytes = self.cache.bytes();
-        self.published = now;
+        if after > before { memory.publish(&shared()); }
     }
 
     fn set_status(&mut self, s: &Shared, phase: &'static str) {
@@ -917,7 +975,7 @@ impl Slot {
     /// plan carried out, its prefill to come (or, for the same prompt again,
     /// its first token from the prompt-end snapshot). Its plan is made here,
     /// when it is admitted, after the prefills before it.
-    fn waiting_start(&mut self, s: &Shared, job: Job) {
+    fn waiting_start(&mut self, s: &Shared, job: Job, memory: &mut Memory) {
         let mut prompt = job.request.prompt.clone();
         let mut images = None;
         if !job.request.images.is_empty() {
@@ -945,65 +1003,74 @@ impl Slot {
             return refuse(job, "invalid sampling settings");
         };
         let max_new = (job.request.max_tokens.max(1) as usize).min(self.ctx - n);
-        let plan = self.plan(&prompt);
-        let origin = self.cache.origin(&plan, n);
+        let plan = self.plan(&prompt, memory);
+        let origin = memory.cache.origin(&plan, n);
         let capture = plan.capture(n);
         // The state at the prompt's end and its first token, and the
         // snapshots the plan takes.
         let state_need = match plan {
             Plan::InPlace { state, .. } => {
-                self.model.state_bytes(self.states[&state], n + 1).saturating_sub(self.cache.entries[&state].bytes)
+                self.model.state_bytes(memory.states[&state], n + 1).saturating_sub(memory.cache.entries[&state].bytes)
             }
             _ => self.model.state_bytes(std::ptr::null(), n + 1),
         };
         let need = state_need + plan.snapshot_need(n, self.model.snapshot_bytes(false), self.model.snapshot_bytes(true));
         let new_state = !matches!(plan, Plan::InPlace { .. });
         let keep: Vec<kv::Id> = plan.source().into_iter().collect();
-        let Some(ev) = self.cache.fit(need, new_state, &keep) else {
-            let busy: u64 = self.cache.entries.values().filter(|e| e.busy).map(|e| e.bytes).sum();
+        let Some(ev) = memory.cache.fit(need, new_state, &keep) else {
+            let busy: u64 = memory.cache.entries.values().filter(|e| e.busy).map(|e| e.bytes).sum();
             let m = format!(
                 "the conversation's attention state needs {:.1} GiB ({:.1} GiB with its snapshots); the kv cache allows {:.1} GiB, and the requests running take {:.1} GiB of it",
                 self.model.state_bytes(std::ptr::null(), n + 1) as f64 / GIB,
                 need as f64 / GIB,
-                self.served.kv_gb,
+                memory.cache.limit as f64 / GIB,
                 busy as f64 / GIB
             );
             return refuse(job, &m);
         };
         let wait = job.queued.elapsed().as_secs_f64();
-        let (snaps, states) = self.cache.evict(&ev);
-        self.free(snaps, states);
+        let (snaps, states) = memory.cache.evict(&ev);
+        memory.free(snaps, states);
         let from = plan.reused();
         let id = match plan {
             Plan::Cold => {
-                let id = self.cache.add(0);
-                self.states.insert(id, self.model.state_new());
+                let id = memory.add(self.index, self.model.clone());
+                memory.states.insert(id, self.model.state_new());
                 id
             }
             Plan::InPlace { state, from } => {
-                self.cache.touch(state, from);
+                memory.cache.touch(state, from);
                 state
             }
             Plan::Snapshot { source, at, .. } | Plan::Replay { source, at } => {
-                let id = self.cache.add(0);
+                let id = memory.add(self.index, self.model.clone());
                 let st = self.model.state_new();
-                self.states.insert(id, st);
-                self.model.state_copy(st, self.states[&source], at);
-                self.cache.touch(source, at);
-                self.used.insert(source, Instant::now());
+                memory.states.insert(id, st);
+                self.model.state_copy(st, memory.states[&source], at);
+                memory.cache.touch(source, at);
+                memory.used.insert(source, Instant::now());
                 if let Plan::Snapshot { snap, .. } = plan {
-                    self.model.snapshot_restore(st, self.snaps[&(source, snap)]);
+                    self.model.snapshot_restore(st, memory.snaps[&(source, snap)]);
                 }
                 id
             }
         };
-        let bytes = self.model.state_bytes(self.states[&id], n + 1);
-        let dropped = self.cache.start(id, &prompt, from, bytes, kv::stale_at(origin, from));
-        for x in dropped {
-            self.free_snap(id, x.pos);
+        let bytes = self.model.state_bytes(memory.states[&id], n + 1);
+        let dropped = memory.cache.start(id, &prompt, from, bytes, kv::stale_at(origin, from));
+        let mut promised = Vec::new();
+        if from < n {
+            promised.push(Snap { pos: n, kind: Kind::PromptEnd, bytes: self.model.snapshot_bytes(true), stale: kv::stale_at(origin, n) });
         }
-        self.used.insert(id, Instant::now());
-        let number = self.cache.entries[&id].number;
+        if let Some(pos) = capture {
+            promised.push(Snap { pos, kind: Kind::Branch, bytes: self.model.snapshot_bytes(false), stale: kv::stale_at(origin, pos) });
+        }
+        memory.cache.reserve_snapshots(id, promised);
+        for x in dropped {
+            memory.free_snap(id, x.pos);
+        }
+        memory.used.insert(id, Instant::now());
+        memory.publish(s);
+        let number = memory.cache.entries[&id].number;
         let kind = plan.kind(n);
         let thinking = self.think_start == Some(prompt[n - 1]);
         engine::log(&format!(
@@ -1071,14 +1138,14 @@ impl Slot {
         if from == n {
             // The same prompt again: its prompt-end snapshot holds its logits.
             let source = plan.source().expect("a saved prompt");
-            let x = self.snaps[&(source, n)];
+            let x = memory.snaps[&(source, n)];
             if source == id {
-                self.model.snapshot_restore(self.states[&id], x);
+                self.model.snapshot_restore(memory.states[&id], x);
             }
             let prompt = g.prefill.as_ref().map(|p| p.prompt.clone()).unwrap_or_default();
-            self.model.seek(self.states[&id], &prompt, n);
+            self.model.seek(memory.states[&id], &prompt, n);
             let lg = self.model.snapshot_logits(x);
-            self.started(s, &mut g, lg, PrefillInfo::default());
+            self.started(s, &mut g, lg, PrefillInfo::default(), memory);
         }
         self.gens.push(g);
     }
@@ -1087,13 +1154,13 @@ impl Slot {
     /// its prompt for a model that takes it in one call, otherwise up to its
     /// prefill rows (fewer while others decode), cut at the capture point and,
     /// for a model that cannot replay, at the snapshot grid.
-    fn prefill_call(&mut self, s: &Shared) {
+    fn prefill_call(&mut self, s: &Shared, memory: &mut Memory) {
         let Some(i) = self.gens.iter().position(|g| !g.decoding()) else { return };
         let others = self.gens.iter().any(|g| g.decoding());
         let chunked = self.model.prefill_rows();
         let can_replay = self.model.replay_rows(1).is_some();
         let (state, rows) = (self.gens[i].state, self.gens[i].n);
-        let st = self.states[&state];
+        let st = memory.states[&state];
         let p = self.gens[i].prefill.as_ref().expect("a prefill");
         let (done, capture) = (p.done, p.capture);
         let end = match chunked {
@@ -1123,30 +1190,30 @@ impl Slot {
             panic!("the engine refused a prefill of positions {done} to {end}");
         };
         let origin = p.origin;
-        self.cache.prefilled(state, prompt, kv::stale_at(origin, end));
+        memory.cache.prefilled(state, prompt, kv::stale_at(origin, end));
         if let Some(at) = inner
             && !captured.is_null()
         {
-            self.snaps.insert((state, at), captured);
+            memory.snaps.insert((state, at), captured);
             let stale = kv::stale_at(origin, at);
-            self.cache.add_snap(state, Snap { pos: at, kind: Kind::Branch, bytes: self.model.snapshot_bytes(false), stale });
+            memory.cache.add_snap(state, Snap { pos: at, kind: Kind::Branch, bytes: self.model.snapshot_bytes(false), stale });
         }
         let last = end == rows;
         if chunked.is_some() && !last {
-            let grid = !can_replay && end % SNAP_GRID == 0 && self.cache.snap(state, end).is_none();
+            let grid = !can_replay && end % SNAP_GRID == 0 && memory.cache.snap(state, end).is_none();
             if capture == Some(end) || grid {
                 let bytes = self.model.snapshot_bytes(false);
                 let fits = capture == Some(end)
-                    || self.cache.fit(bytes, false, &[state]).is_some_and(|ev| {
-                        let (snaps, states) = self.cache.evict(&ev);
-                        self.free(snaps, states);
+                    || memory.cache.fit(bytes, false, &[state]).is_some_and(|ev| {
+                        let (snaps, states) = memory.cache.evict(&ev);
+                        memory.free(snaps, states);
                         true
                     });
                 if fits {
                     let x = self.model.snapshot_take(st, end, false);
-                    self.snaps.insert((state, end), x);
+                    memory.snaps.insert((state, end), x);
                     let stale = kv::stale_at(origin, end);
-                    self.cache.add_snap(state, Snap { pos: end, kind: Kind::Branch, bytes, stale });
+                    memory.cache.add_snap(state, Snap { pos: end, kind: Kind::Branch, bytes, stale });
                 }
             }
         }
@@ -1155,19 +1222,19 @@ impl Slot {
             return;
         }
         let x = self.model.snapshot_take(st, rows, true);
-        self.snaps.insert((state, rows), x);
+        memory.snaps.insert((state, rows), x);
         let stale = kv::stale_at(origin, rows);
-        self.cache.add_snap(state, Snap { pos: rows, kind: Kind::PromptEnd, bytes: self.model.snapshot_bytes(true), stale });
+        memory.cache.add_snap(state, Snap { pos: rows, kind: Kind::PromptEnd, bytes: self.model.snapshot_bytes(true), stale });
         let mut g = self.gens.remove(i);
-        self.started(s, &mut g, lg, info);
+        self.started(s, &mut g, lg, info, memory);
         self.gens.insert(i, g);
     }
 
     /// A cancelled request whose prefill ran part of its prompt: its state's
     /// tokens are those its rows hold.
-    fn prefill_cut(&mut self, g: &mut Gen) {
+    fn prefill_cut(&mut self, g: &mut Gen, memory: &mut Memory) {
         if let Some(p) = g.prefill.take()
-            && let Some(e) = self.cache.entries.get_mut(&g.state)
+            && let Some(e) = memory.cache.entries.get_mut(&g.state)
         {
             e.tokens.truncate(p.done);
             g.pos = p.done;
@@ -1175,7 +1242,8 @@ impl Slot {
     }
 
     /// The prefill ended with these logits: the request's first token.
-    fn started(&mut self, s: &Shared, g: &mut Gen, lg: Logits, info: PrefillInfo) {
+    fn started(&mut self, s: &Shared, g: &mut Gen, lg: Logits, info: PrefillInfo, memory: &mut Memory) {
+        memory.cache.clear_pending(g.state);
         let p = g.prefill.take().expect("a prefill");
         let n = g.n;
         let from = g.from;
@@ -1231,7 +1299,7 @@ impl Slot {
         g.t1 = t1;
         g.tick = t1;
         g.c1 = c1.cache;
-        self.publish(s);
+        memory.publish(s);
     }
 
     /// The token t ran at g's position: into its state's tokens and the step's output.
@@ -1285,7 +1353,7 @@ impl Slot {
         false
     }
 
-    fn finish(&mut self, s: &Shared, mut g: Gen, shutdown: bool) {
+    fn finish(&mut self, s: &Shared, mut g: Gen, shutdown: bool, memory: &mut Memory) {
         if !g.out.is_empty() {
             let _ = g.job.tx.send(Event::Tokens(std::mem::take(&mut g.out)));
         }
@@ -1306,23 +1374,23 @@ impl Slot {
         };
         g.job.last(Event::Done { finish: why });
         if g.prefill.is_some() {
-            self.prefill_cut(&mut g);
+            self.prefill_cut(&mut g, memory);
         }
         // The generation's end, for forks there, when the cache keeps it.
-        let stale = self.cache.entries[&g.state].stale;
-        let end = self.cache.snap(g.state, g.pos).is_none().then(|| Snap {
+        let stale = memory.cache.entries[&g.state].stale;
+        let end = memory.cache.snap(g.state, g.pos).is_none().then(|| Snap {
             pos: g.pos,
             kind: Kind::GenerationEnd,
             bytes: self.model.snapshot_bytes(false),
             stale,
         });
-        let (take, (snaps, states)) = self.cache.end(g.state, self.model.state_bytes(self.states[&g.state], g.pos), end);
+        let (take, (snaps, states)) = memory.cache.end(g.state, self.model.state_bytes(memory.states[&g.state], g.pos), end);
         if take {
-            let x = self.model.snapshot_take(self.states[&g.state], g.pos, false);
-            self.snaps.insert((g.state, g.pos), x);
+            let x = self.model.snapshot_take(memory.states[&g.state], g.pos, false);
+            memory.snaps.insert((g.state, g.pos), x);
         }
-        self.free(snaps, states);
-        self.used.insert(g.state, Instant::now());
+        memory.free(snaps, states);
+        memory.used.insert(g.state, Instant::now());
         let st = self.model.stats();
         let (c2, dt) = (st.cache, g.t1.elapsed().as_secs_f64());
         let hits = c2.hits - g.c1.hits + c2.prefetch_hits - g.c1.prefetch_hits;
@@ -1342,8 +1410,8 @@ impl Slot {
             g.generated,
             g.reasoning,
             g.generated as f64 / dt.max(1e-9),
-            self.cache.entries.len(),
-            self.cache.bytes() as f64 / GIB,
+            memory.cache.entries.len(),
+            memory.cache.bytes() as f64 / GIB,
             st.available as f64 / GIB,
             st.footprint as f64 / GIB
         ));
@@ -1364,18 +1432,18 @@ impl Slot {
         status.generated_tokens += g.generated as u64;
         status.reused_tokens += g.from as u64;
         drop(status);
-        self.publish(s);
+        memory.publish(s);
     }
 
     /// One token for each decoding generation: alone with its drafts, or
     /// together, each row as it would run alone.
-    fn advance(&mut self) {
+    fn advance(&mut self, memory: &mut Memory) {
         let (think_end, ctx) = (self.think_end, self.ctx);
         let decoding: Vec<usize> = (0..self.gens.len()).filter(|&i| self.gens[i].decoding()).collect();
         if decoding.len() == 1 {
             let gi = decoding[0];
             let state = self.gens[gi].state;
-            let st = self.states[&state];
+            let st = memory.states[&state];
             let lookup = self.served.engine.lookup as usize;
             let verify_room = self.model.max_verify().saturating_sub(1);
             let (mut rows, proposal, k, pos) = {
@@ -1410,7 +1478,7 @@ impl Slot {
                 (rows, proposal, k, g.pos)
             };
             // The rows the pass writes: the token and its drafts or proposals.
-            self.make_room(state, pos + 1 + k);
+            self.make_room(state, pos + 1 + k, memory);
             let model = self.model.clone();
             let g = &mut self.gens[gi];
             let (next, a) = if k > 0 {
@@ -1440,19 +1508,19 @@ impl Slot {
                 if g.ended {
                     break;
                 }
-                Self::emit(&model, &mut self.cache, g, t, think_end);
+                Self::emit(&model, &mut memory.cache, g, t, think_end);
                 kept += 1;
             }
             // the pass's rows after the kept tokens took places in the rings
-            self.cache.rejected(g.state, rows.len() - kept);
+            memory.cache.rejected(g.state, rows.len() - kept);
             g.t = next;
             return;
         }
         let rooms: Vec<(kv::Id, usize)> = decoding.iter().map(|&i| (self.gens[i].state, self.gens[i].pos + 1)).collect();
         for (id, positions) in rooms {
-            self.make_room(id, positions);
+            self.make_room(id, positions, memory);
         }
-        let mut st: Vec<*mut RawState> = decoding.iter().map(|&i| self.states[&self.gens[i].state]).collect();
+        let mut st: Vec<*mut RawState> = decoding.iter().map(|&i| memory.states[&self.gens[i].state]).collect();
         let tokens: Vec<i32> = decoding.iter().map(|&i| self.gens[i].t).collect();
         let pos: Vec<i32> = decoding.iter().map(|&i| self.gens[i].pos as i32).collect();
         let model = self.model.clone();
@@ -1460,7 +1528,7 @@ impl Slot {
         let vocab = model.vocab();
         for (r, &i) in decoding.iter().enumerate() {
             let g = &mut self.gens[i];
-            Self::emit(&model, &mut self.cache, g, tokens[r], think_end);
+            Self::emit(&model, &mut memory.cache, g, tokens[r], think_end);
             // Safety: myds4_rows returns one row of the vocabulary for each state.
             g.t = model.sample(unsafe { lg.add(r * vocab) }, &mut g.sampler);
         }

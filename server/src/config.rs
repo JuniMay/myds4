@@ -1,7 +1,8 @@
 //! The models the server serves and each one's settings (docs/server.md):
 //! one model from `-m DIR` and its options on the command line, or several
 //! from `--config FILE`, a JSON file that lists them, each with its own
-//! options under the same names (without the dashes, `-` as `_`).
+//! options under the same names (without the dashes, `-` as `_`). The root
+//! holds the process-wide reserve and shared KV budget.
 
 use serde_json::{Map, Value};
 
@@ -14,8 +15,6 @@ pub struct ModelConfig {
     /// The name requests give in `model`; None: the family's default name.
     pub id: Option<String>,
     pub engine: engine::Options,
-    /// What its attention states and snapshots may take, GiB.
-    pub kv_gb: f64,
     /// Requests running together at most.
     pub batch: usize,
     /// Its requests' defaults where a request sets none; None: the
@@ -33,7 +32,6 @@ impl ModelConfig {
         ModelConfig {
             id: None,
             engine: engine::Options { model: model.into(), ctx: 1 << 20, ..Default::default() },
-            kv_gb: 8.0,
             batch: 4,
             temperature: None,
             top_p: None,
@@ -63,7 +61,6 @@ impl ModelConfig {
                 }
             }
             "cache" => e.cache_gb = num()?,
-            "reserve" => e.reserve_gb = num()?,
             "cache_half_life" => e.cache_half_life = int()?,
             "cache_read_cost" => e.cache_read_cost = flag()?,
             "substitute" => e.substitute = num()? as f32,
@@ -80,7 +77,7 @@ impl ModelConfig {
             "prefill_prune" => e.prefill_prune = flag()?,
             "runahead" => e.runahead = flag()?,
             "pipeline" => e.pipeline = flag()?,
-            "kv_cache" => self.kv_gb = num()?,
+            "reserve" | "kv_cache" => return Err(format!("{name} is server-wide; move it outside models")),
             "batch" => self.batch = int().ok().filter(|n| *n >= 1).ok_or("batch takes a positive integer")? as usize,
             "temperature" => {
                 self.temperature = Some(num().ok().filter(|t| t.is_finite() && *t >= 0.0).ok_or("temperature must be finite and nonnegative")?)
@@ -95,17 +92,52 @@ impl ModelConfig {
     }
 }
 
-/// The models of a configuration file: {"models": [{"model": DIR, ...}]}.
-pub fn read(path: &str) -> Result<Vec<ModelConfig>, String> {
+/// One process-wide reserve and one KV budget shared by every model.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Budgets {
+    pub reserve_gb: f64,
+    pub kv_gb: f64,
+}
+
+impl Default for Budgets {
+    fn default() -> Self { Self { reserve_gb: 10.0, kv_gb: 8.0 } }
+}
+
+impl Budgets {
+    pub fn set(&mut self, name: &str, value: &Value) -> Result<(), String> {
+        let n = value.as_f64().filter(|n| n.is_finite()).ok_or(format!("{name} takes a finite number"))?;
+        match name {
+            "reserve" if (2.0..=1024.0).contains(&n) => self.reserve_gb = n,
+            "kv_cache" if n > 0.0 && n <= 1024.0 => self.kv_gb = n,
+            "reserve" => return Err("reserve takes 2 to 1024 GiB".into()),
+            "kv_cache" => return Err("kv_cache takes a positive budget up to 1024 GiB".into()),
+            _ => return Err(format!("no server budget {name}")),
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Config {
+    pub budgets: Budgets,
+    pub models: Vec<ModelConfig>,
+}
+
+/// Reads process-wide budgets and the models they serve.
+pub fn read(path: &str) -> Result<Config, String> {
     let text = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let root: Value = serde_json::from_slice(&text).map_err(|e| format!("{path}: {e}"))?;
     parse(&root).map_err(|e| format!("{path}: {e}"))
 }
 
-pub fn parse(root: &Value) -> Result<Vec<ModelConfig>, String> {
+pub fn parse(root: &Value) -> Result<Config, String> {
     let Some(obj) = root.as_object() else { return Err("not a JSON object".into()) };
-    if let Some(k) = obj.keys().find(|k| *k != "models") {
-        return Err(format!("no setting {k} (the file lists models)"));
+    if let Some(k) = obj.keys().find(|k| !["models", "reserve", "kv_cache"].contains(&k.as_str())) {
+        return Err(format!("no server setting {k}"));
+    }
+    let mut budgets = Budgets::default();
+    for name in ["reserve", "kv_cache"] {
+        if let Some(value) = obj.get(name) { budgets.set(name, value)?; }
     }
     let list = obj.get("models").and_then(Value::as_array).filter(|l| !l.is_empty()).ok_or("models must be a nonempty list")?;
     let mut out = Vec::new();
@@ -118,7 +150,7 @@ pub fn parse(root: &Value) -> Result<Vec<ModelConfig>, String> {
         }
         out.push(c);
     }
-    Ok(out)
+    Ok(Config { budgets, models: out })
 }
 
 #[cfg(test)]
@@ -127,15 +159,33 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn reserve_and_kv_cache_are_server_wide() {
+        let root = json!({"reserve": 10, "kv_cache": 12, "models": [
+            {"model": "/models/deepseek", "cache": 56}, {"model": "/models/qwen"}
+        ]});
+        assert!(parse(&root).is_ok(), "one reserve and one KV budget must cover every model");
+    }
+
+    #[test]
+    fn model_entries_cannot_create_separate_memory_budgets() {
+        for setting in ["reserve", "kv_cache"] {
+            let mut model = json!({"model": "/models/qwen"});
+            model[setting] = json!(8);
+            assert!(parse(&json!({"models": [model]})).is_err(), "{setting} belongs at the server level");
+        }
+    }
+
+    #[test]
     fn a_file_gives_each_model_its_own_options() {
-        let models = parse(&json!({"models": [
-            {"model": "/m/deepseek", "cache": 72, "ced": 128, "kv_cache": 16, "batch": 4},
+        let c = parse(&json!({"kv_cache": 16, "models": [
+            {"model": "/m/deepseek", "cache": 72, "ced": 128, "batch": 4},
             {"model": "/m/qwen", "id": "qwen", "draft": 1, "ctx": 32768, "top_k": 20, "think": 0}
         ]}))
         .unwrap();
+        let models = c.models;
         assert_eq!(models.len(), 2);
         let (d, q) = (&models[0], &models[1]);
-        assert_eq!((d.engine.model.as_str(), d.engine.cache_gb, d.engine.ced, d.kv_gb), ("/m/deepseek", 72.0, 128, 16.0));
+        assert_eq!((d.engine.model.as_str(), d.engine.cache_gb, d.engine.ced, c.budgets.kv_gb), ("/m/deepseek", 72.0, 128, 16.0));
         assert_eq!((d.engine.draft, d.id.as_deref()), (0, None));
         assert_eq!((q.id.as_deref(), q.engine.draft, q.engine.ctx, q.top_k, q.think), (Some("qwen"), 1, 32768, Some(20), Some(0)));
         assert_eq!(q.engine.cache_gb, 0.0);
@@ -145,7 +195,7 @@ mod tests {
     fn pipeline_is_explicit_and_per_model() {
         let models = parse(&json!({"models": [
             {"model": "/models/deepseek", "pipeline": true}, {"model": "/models/qwen"}
-        ]})).unwrap();
+        ]})).unwrap().models;
         assert!(models[0].engine.pipeline);
         assert!(!models[0].engine.runahead);
         assert!(!models[1].engine.pipeline);
@@ -160,6 +210,6 @@ mod tests {
         assert!(parse(&json!({"models": [{"model": "/m", "ced": 64}]})).is_err());
         assert!(parse(&json!({"models": [{"model": "/m", "top_p": 2}]})).is_err());
         assert!(parse(&json!({"port": 8008, "models": [{"model": "/m"}]})).is_err());
-        assert_eq!(parse(&json!({"models": [{"model": "/m", "ced": "off", "lookup": "off"}]})).unwrap()[0].engine.ced, 0);
+        assert_eq!(parse(&json!({"models": [{"model": "/m", "ced": "off", "lookup": "off"}]})).unwrap().models[0].engine.ced, 0);
     }
 }

@@ -178,7 +178,7 @@ pub fn draw(buf: &mut Buffer, area: Rect, s: &Snapshot, ui: &mut Ui) {
     let head = Line::from(vec![
         text(" "),
         strong(format!("{} session{}", s.sessions, if s.sessions == 1 { "" } else { "s" })),
-        text(format!("   {:.2} / {:.1} GiB", s.kv_gib, s.kv_limit_gib)),
+        text(format!("   this model {:.2} GiB · shared {:.2} / {:.1} GiB", s.kv_gib, s.kv_total_gib.max(s.kv_gib), s.kv_limit_gib)),
         label("   reused "),
         text(pct(tot.reused_tokens as f64, tot.prompt_tokens as f64)),
         label(" of the prompt tokens   new "),

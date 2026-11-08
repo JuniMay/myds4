@@ -1634,8 +1634,10 @@ itself continued there gives, which differs from a cold prefill of the same
 tokens because decoding and prefilling round differently (on the fork
 test's conversation, logits SNR 9.5-16.5 dB, the next token the same).
 
-`--kv-cache` bounds what the states and snapshots take, apart from the
-expert cache's budget. Before a request runs, the cache checks that the
+`--kv-cache` is one total budget across every served model, apart from the
+expert cache's budget. The pool owns state handles with their model, uses
+one LRU clock for cross-model eviction, and matches prefixes only within
+the model that computed them. Before a request runs, the cache checks that the
 room its prompt needs fits: its state at the prompt's end, the prompt end's
 snapshot when it prefills (a retry of a saved prompt uses the snapshot
 there and takes none), and its branch point's. It refuses the request
@@ -1644,10 +1646,13 @@ needed: the spare snapshots first (all but each state's last prompt end and
 last branch point), of the least recently used states first, then whole
 idle states, least recently used first. A resume's source and every state a
 request decodes in are kept, and a fork marks its source used. At most 256
-states are kept.
+states are kept across the whole server. Promised snapshots remain charged
+until allocated or cancelled, so simultaneous pending prefills cannot
+reserve the same space twice. State creation and byte accounting use the
+loaded model's buffer layout even after eviction leaves no state bound.
 
-A state that decodes past its room (16,384 positions at first, then each
-doubling) is charged its new size before the pass that grows it, counting
+A state that decodes past its room (DeepSeek: 16,384 positions at first;
+Qwen: 1,024; then each doubling) is charged its new size before the pass that grows it, counting
 the pass's draft and lookup rows (`kv::Cache::grow`), and the cache frees
 room first in the same order. When only states that requests decode in are
 left, the state grows past the limit, and the server logs by how much; new
@@ -1697,6 +1702,16 @@ it decodes; it reads the engine's counters directly (`myds4_stats_get`), so
 a long prefill's progress shows while it runs. The snapshot's JSON is built
 under the status lock and written out as text after it. The tabs are
 described in [Usage](usage.md#live-view).
+
+The Memory tab shows every model together. Each tile's width follows its
+tracked weights, expert cache and allocated KV, subject to a minimum width
+for labels. Narrow terminals stack the tiles. The shared KV commitment and
+limit, system reserve target, available memory and process footprint appear
+once. Future state growth and snapshots count as committed KV until they
+are allocated or cancelled; they do not inflate the allocated-memory tiles.
+Runtime buffers outside these tracked allocations remain part of the
+separate process footprint. The other tabs show the selected model; `n`
+selects the next model.
 
 **The last minute.** The view keeps 120 samples, one per snapshot, in its
 own memory only: nothing is written to files or sent anywhere, and the

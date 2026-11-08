@@ -73,10 +73,11 @@ serves the models a JSON file lists, each with its own options under the same
 names without the dashes (`-` as `_`):
 
 ```json
-{"models": [
-  {"model": "/path/to/DeepSeek-V4.1-Flash-1017", "experts": "/path/to/UD-IQ1_M-00001-of-00004.gguf",
-   "cache": 72, "ced": 128, "kv_cache": 16},
-  {"model": "/path/to/Qwen3.8-27B-NVFP4", "draft": 1, "ctx": 65536, "kv_cache": 8}
+{"reserve": 10, "kv_cache": 24, "models": [
+  {"model": "/path/to/DeepSeek-V4.1-Flash-1017", "cache": 40, "ctx": 1048576,
+   "batch": 4, "pipeline": true, "temperature": 1, "top_p": 1, "top_k": 0},
+  {"model": "/path/to/Qwen3.8-27B-NVFP4", "draft": 1, "ctx": 262144,
+   "batch": 4, "temperature": 1, "top_p": 1, "top_k": 0}
 ]}
 ```
 
@@ -85,8 +86,31 @@ or `qwen3_5`); a family refuses options it has no use for at startup (the
 expert-cache, CED and DSpark options for a Qwen model), and the process
 loads at most one model of each family. Every model has its own name
 (`id`; by default `deepseek-v4.1-flash`, or a Qwen model's directory's name
-in lower case), context, batch, KV prefix cache (`kv_cache`), drafts and
-request defaults.
+in lower case), context, concurrency limit (`batch`), drafts and request
+defaults. `reserve` and `kv_cache` belong to the server: one available-memory
+target and one total KV budget, in GiB. Model entries containing either are
+rejected. Command-line `--reserve` and `--kv-cache` apply with either `-m`
+or `--config`; explicit command-line values override the file's globals.
+Changes require a server restart.
+
+The KV pool can spend its budget on either model. One LRU clock orders
+eviction across models: spare snapshots first, then idle states. Prefixes
+and snapshots are model-scoped, so identical token IDs in different models
+never share inference state. Admitted prefills reserve the state growth and
+snapshots they will need before another request can take that space.
+`batch` is still needed with pipeline scheduling; it caps admitted requests
+at six for DeepSeek and eight for Qwen. A larger cap does not guarantee
+higher throughput or enough KV room for every request at its maximum
+context length.
+
+Qwen3.8-27B's checkpoint declares 262,144 positions. Omitting `ctx` uses
+that limit; a smaller explicit value caps it. The example's concurrency
+settings are capacity choices, not measured co-hosting optima.
+The context cap does not preallocate its KV. A full 256K Qwen state needs
+about 17.3 GiB before snapshots; several full-length requests need a larger
+shared budget and leave less RAM for experts. The allocator charges rounded
+buffer capacity, including Qwen's initial 1,024 positions, rather than just
+the positions used so far.
 
 | Request | Answer |
 | --- | --- |
@@ -94,6 +118,14 @@ request defaults.
 | `GET /v1/models/{id}` | The model's object and its live status under `status`: what it is doing and its request, the waiting requests, its KV prefix cache's states (`sessions`), its counters (`model_decode`, `last_prefill`), its expert cache where it has one, and the process's memory. |
 | `"model"` names a served model (case does not matter) | That model answers. |
 | `"model"` names none, or no model served | With one model served, that model answers; with several, 404 that lists them. |
+
+Status reports the selected model's `kv_cache_gib`, the shared
+`kv_cache_total_gib` and `kv_cache_limit_gib`, and `kv_cache_scope: "server"`.
+`reserve_gib` is the same in every model's status. `model_memory` lists each
+model's tracked weights, experts, allocated KV and committed KV. Committed
+KV includes capacity and snapshots promised to admitted prefills. The
+process footprint is reported separately, since runtime buffers and other
+allocations are not attributed to a model's tile.
 
 **Scheduling.** The worker keeps a queue for each model (16 requests wait at
 most; more get 429) and gives every model one step a turn, in turn. A step
@@ -120,10 +152,16 @@ to whole-prompt and chunked prefill alike.
 (20 GB) stay resident while it serves (after 60 s without passes its
 buffers leave the GPU's residency set until its next pass), and DeepSeek's
 expert cache adapts around them. Its slots follow the memory available
-(with `reserve` left to other programs), and its GPU-mapped slots follow the
+(against the one `reserve` target), and its GPU-mapped slots follow the
 GPU's resident memory of all processes, which past about 55 GiB stalls the
 GPU: past that point the cache unmaps the excess within about a second, also
 while idle.
+
+The controller checks the shared reserve between model calls, about once
+a second, including while only Qwen is active. It lets the expert cache
+release memory first, then reclaims eligible idle KV and spare snapshots
+from the global pool. Loaded weights and active states remain protected;
+`reserve` is a headroom target, not a hard bound on every allocation.
 
 The allocated cache and its GPU-mapped part are separate. Qwen's resident
 weights reduce the room for mapped experts, but an unmapped expert stays
@@ -195,8 +233,8 @@ tokens the KV prefix cache reused (`prompt_cache_hit_tokens`,
    (the source's keys copied before it), or starts cold. Every prompt end
    gets a snapshot with its logits (an identical retry resumes at once), a
    prefill captures the point where its prompt parts from every state, and
-   takes one at every multiple of 2,048 positions when the budget
-   (`kv_cache`) allows, since without a replay a later prompt can only resume
+   takes one at every multiple of 2,048 positions when the shared budget
+   (`kv_cache`, across all models) allows, since without a replay a later prompt can only resume
    at a snapshot; a reply's end gets one when the budget allows. A state
    takes 314 MB plus 68 KiB a position (in rooms doubling from 1,024
    positions), a snapshot 157 MB.
@@ -268,7 +306,7 @@ it keeps reading the connection meanwhile; reads have no deadline then.
 ## The C ABI
 
 [`src/engine/engine.h`](../src/engine/engine.h) is the whole interface. Its
-version is `MYDS4_ABI = 9`. Callers must use the matching structure layouts
+version is `MYDS4_ABI = 10`. Callers must use the matching structure layouts
 and rebuild with the engine. The engine runs the models; everything about
 requests (their queues, scheduling, the KV prefix caches, the status and the
 live view's data) is the server's. Every function that runs a model or
@@ -276,7 +314,8 @@ touches states, snapshots, samplers, lookups or images runs on one thread,
 the engine thread; the log, the stop, the statistics and the tokenizers may
 be called from any thread. Its parts:
 
-- **The process.** `myds4_init(process)` installs two hooks, `on_log`, which
+- **The process.** `myds4_init(process)` sets the process-wide `reserve_gb`
+  and installs two hooks, `on_log`, which
   receives the log's lines instead of stderr (the live view's pane), and
   `on_die`, which runs before a fatal error's message (the live view gives the
   terminal back), and the stop's signal handlers, on the calling thread,
@@ -487,11 +526,23 @@ states and spare snapshots freed first, the limit exceeded only when busy
 states alone hold it), and a generation-end snapshot kept only within the
 limit. `tools/checks/state_fork_check.c` checks a fork's row
 copy and snapshot restore on host buffers, and that the bytes the cache
-charges a state are those its buffers take. With a model, the fork test
+charges a state are those its buffers take, including recreation after the
+last state is evicted. `tools/checks/qwen_state_accounting_check.c` checks
+Qwen's actual buffer capacity against its accounting. With a model, the fork test
 checks exactness: `tools/checks/prefix_fork_check.c` in the engine and
 `server/tests/prefix_fork.rs` through HTTP (see [Checks](#checks)).
 `tools/checks/attention_candidate_check.c` checks candidate-mask offsets after
 decoder compaction and across prompt batches.
+
+`server/tests/qwen.rs::models_share_one_kv_budget_and_one_reserve` loads
+native MXFP4 DeepSeek and NVFP4 Qwen in one process. It checks one 0.75 GiB
+KV budget and one 13 GiB reserve in both models' status, model-local prefix
+matching, cross-model eviction and a new DeepSeek request after eviction.
+Set `MYDS4_QWEN` and `MYDS4_CHECKPOINT` to run it. On 2026-11-07 it passed
+with 0.681 GiB committed after the final request. The Qwen MTP token/context
+limit check and DeepSeek's full-budget retry and growth checks also passed;
+the latter used UD-IQ2_XXS experts. These were correctness checks, not
+throughput comparisons. No swap-outs occurred.
 
 The server's defaults for requests that do not set a value:
 

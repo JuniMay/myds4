@@ -344,7 +344,7 @@ void image_free(Image *im);
 typedef struct {
   int ctx;            // capacity in tokens
   double budget_gb;   // expert cache budget, 0 = automatic
-  double reserve_gb;  // memory the expert cache leaves to other programs (GiB), 0 = CACHE_RESERVE_DEFAULT
+  double reserve_gb;  // standalone CLI process reserve; server leaves 0 after setting its global reserve
   int cache_half_life;  // score half-life in forward passes; 0 = default 50
   int cache_read_cost;  // weight decode eviction priorities by aligned read bytes / slot size
   int dump_fd;        // -1, or a pipe receiving per-layer streams

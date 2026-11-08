@@ -22,12 +22,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYDS4_ABI 9
+#define MYDS4_ABI 10
 
 // ---- the process ----
 
 typedef struct {
   int abi;  // MYDS4_ABI
+  double reserve_gb; // process-wide available-memory target, 0: default 10 GiB
   // The log's lines, each with its time, go to on_log instead of stderr when
   // it is set. It runs on the thread that logs, one line at a time under the
   // log's lock: it must return quickly and must not call myds4_log.
@@ -62,7 +63,6 @@ typedef struct {
   const char *experts;         // DeepSeek: a GGUF file or any shard of a set; null: the checkpoint's
   int ctx;                     // context capacity in tokens, 1 to 1,048,576
   double cache_gb;             // DeepSeek: expert cache budget in GB; 0: from available memory
-  double reserve_gb;           // DeepSeek: memory the cache leaves to other programs in GiB; 0: 10
   int cache_half_life;         // DeepSeek: in forward passes; 0: the default, 50
   int cache_read_cost;         // DeepSeek
   float substitute;            // DeepSeek: 0, exact

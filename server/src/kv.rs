@@ -1,5 +1,6 @@
-//! The KV prefix cache (docs/server.md): which attention states and snapshots
-//! the server keeps between requests, and how a prompt reuses them.
+//! One KV budget and LRU clock for all models (docs/server.md). Entries
+//! carry their model's index, so prefix matching and displayed trees stay
+//! model-local while eviction and allocation share the total budget.
 //!
 //! Rows stay in the engine's states that computed them. The cache holds plain
 //! data about them: each state's token ids (the positions whose rows it
@@ -72,6 +73,8 @@ impl Snap {
 /// One attention state as the cache sees it.
 #[derive(Debug)]
 pub struct Entry {
+    /// The model that owns these rows. Prefix matching never crosses it.
+    pub model: usize,
     /// The tokens whose rows the state holds, from position 0.
     pub tokens: Vec<i32>,
     /// A request decodes in it: its rows before its end are copyable, but it
@@ -86,6 +89,8 @@ pub struct Entry {
     /// positions before its end.
     pub stale: usize,
     pub snaps: Vec<Snap>,
+    /// Snapshots promised by an admitted prefill but not allocated yet.
+    pub pending: Vec<Snap>,
     /// Its number in the log and the live view.
     pub number: u64,
     /// The positions requests reused from it, the last 32 of them.
@@ -232,7 +237,12 @@ impl Cache {
 
     /// The bytes all states and snapshots take.
     pub fn bytes(&self) -> u64 {
-        self.entries.values().map(|e| e.bytes + e.snaps.iter().map(|s| s.bytes).sum::<u64>()).sum()
+        self.entries.values().map(|e| e.bytes + e.snaps.iter().chain(&e.pending).map(|s| s.bytes).sum::<u64>()).sum()
+    }
+
+    pub fn bytes_for(&self, model: usize) -> u64 {
+        self.entries.values().filter(|e| e.model == model)
+            .map(|e| e.bytes + e.snaps.iter().chain(&e.pending).map(|s| s.bytes).sum::<u64>()).sum()
     }
 
     fn tick(&mut self) -> u64 {
@@ -242,7 +252,10 @@ impl Cache {
 
     /// The cheapest way to resume the prompt `p` (exact, but for a replay
     /// under --ced).
-    pub fn plan(&self, p: &[i32], limits: Limits<'_>) -> Plan {
+    #[cfg(test)]
+    pub fn plan(&self, p: &[i32], limits: Limits<'_>) -> Plan { self.plan_for(0, p, limits) }
+
+    pub fn plan_for(&self, model: usize, p: &[i32], limits: Limits<'_>) -> Plan {
         let n = p.len();
         let mut best = (n, 3usize, Plan::Cold); // cost, then preference: in place, snapshot, replay, cold
         let mut branch = 0; // where the prompt parts from every state
@@ -252,6 +265,7 @@ impl Cache {
             }
         };
         for (&id, e) in &self.entries {
+            if e.model != model { continue; }
             let k = common(p, &e.tokens);
             branch = branch.max(k.min(n));
             if k == 0 {
@@ -301,7 +315,10 @@ impl Cache {
     }
 
     /// A new state's entry, empty and busy; its id.
-    pub fn add(&mut self, bytes: u64) -> Id {
+    #[cfg(test)]
+    pub fn add(&mut self, bytes: u64) -> Id { self.add_for(0, bytes) }
+
+    pub fn add_for(&mut self, model: usize, bytes: u64) -> Id {
         let id = self.next;
         self.next += 1;
         self.numbers += 1;
@@ -309,12 +326,14 @@ impl Cache {
         self.entries.insert(
             id,
             Entry {
+                model,
                 tokens: Vec::new(),
                 busy: true,
                 used,
                 bytes,
                 stale: 0,
                 snaps: Vec::new(),
+                pending: Vec::new(),
                 number: self.numbers,
                 hits: Vec::new(),
             },
@@ -334,6 +353,7 @@ impl Cache {
         e.used = used;
         e.bytes = bytes;
         e.stale = stale;
+        e.pending.clear();
         e.tokens.clear();
         e.tokens.extend_from_slice(&p[..from]);
         let (keep, dropped): (Vec<Snap>, Vec<Snap>) = e.snaps.drain(..).partition(|s| s.pos <= from);
@@ -366,10 +386,19 @@ impl Cache {
 
     pub fn add_snap(&mut self, id: Id, snap: Snap) {
         if let Some(e) = self.entries.get_mut(&id) {
+            e.pending.retain(|s| s.pos != snap.pos || s.kind != snap.kind);
             e.snaps.retain(|s| s.pos != snap.pos);
             e.snaps.push(snap);
             e.snaps.sort_by_key(|s| s.pos);
         }
+    }
+
+    pub fn reserve_snapshots(&mut self, id: Id, snapshots: Vec<Snap>) {
+        self.entries.get_mut(&id).expect("an admitted state").pending = snapshots;
+    }
+
+    pub fn clear_pending(&mut self, id: Id) {
+        if let Some(e) = self.entries.get_mut(&id) { e.pending.clear(); }
     }
 
     pub fn snap(&self, id: Id, pos: usize) -> Option<Snap> {
@@ -401,6 +430,7 @@ impl Cache {
             e.busy = false;
             e.used = used;
             e.bytes = bytes;
+            e.pending.clear();
         }
     }
 
@@ -478,20 +508,32 @@ impl Cache {
     /// What [`Cache::fit`] frees, in its order, until the room is there or
     /// nothing else can go; and whether the room is there.
     fn eviction(&self, need: u64, new_state: bool, keep: &[Id]) -> (Eviction, bool) {
+        self.eviction_under(self.limit, need, new_state, keep)
+    }
+
+    /// Release eligible KV allocations when the process-wide RAM reserve
+    /// needs room. Busy states remain protected.
+    pub fn reclaim(&mut self, bytes: u64) -> Freed {
+        let target = self.bytes().saturating_sub(bytes);
+        let (ev, _) = self.eviction_under(target, 0, false, &[]);
+        self.evict(&ev)
+    }
+
+    fn eviction_under(&self, limit: u64, need: u64, new_state: bool, keep: &[Id]) -> (Eviction, bool) {
         let mut by_use: Vec<(&Id, &Entry)> = self.entries.iter().collect();
         by_use.sort_by_key(|(_, e)| e.used);
         let mut total = self.bytes() + need;
         let mut states = self.entries.len() + usize::from(new_state);
         let mut out = Eviction::default();
         for &(&id, e) in &by_use {
-            if total <= self.limit {
+            if total <= limit {
                 break;
             }
             if keep.contains(&id) {
                 continue;
             }
             for s in Self::spare(e) {
-                if total <= self.limit {
+                if total <= limit {
                     break;
                 }
                 total -= s.bytes;
@@ -499,19 +541,19 @@ impl Cache {
             }
         }
         for &(&id, e) in &by_use {
-            if total <= self.limit && states <= self.max_states {
+            if total <= limit && states <= self.max_states {
                 break;
             }
             if keep.contains(&id) || e.busy {
                 continue;
             }
-            let held: u64 = e.snaps.iter().filter(|s| !out.snaps.contains(&(id, s.pos))).map(|s| s.bytes).sum();
+            let held: u64 = e.snaps.iter().filter(|s| !out.snaps.contains(&(id, s.pos))).chain(&e.pending).map(|s| s.bytes).sum();
             total -= e.bytes + held;
             states -= 1;
             out.snaps.retain(|&(sid, _)| sid != id);
             out.states.push(id);
         }
-        let fits = total <= self.limit && states <= self.max_states;
+        let fits = total <= limit && states <= self.max_states;
         (out, fits)
     }
 
@@ -553,8 +595,11 @@ pub struct Node {
 impl Cache {
     /// The prefix tree of the `most` most recently used states, depth first,
     /// at most `cap` nodes.
-    pub fn tree(&self, most: usize, cap: usize) -> Vec<Node> {
-        let mut set: Vec<&Entry> = self.entries.values().collect();
+    #[cfg(test)]
+    pub fn tree(&self, most: usize, cap: usize) -> Vec<Node> { self.tree_for(0, most, cap) }
+
+    pub fn tree_for(&self, model: usize, most: usize, cap: usize) -> Vec<Node> {
+        let mut set: Vec<&Entry> = self.entries.values().filter(|e| e.model == model).collect();
         set.sort_by_key(|e| std::cmp::Reverse(e.used));
         set.truncate(most);
         let mut out = Vec::new();
@@ -644,6 +689,65 @@ mod tests {
         }
         c.finish(id, 1 << 20);
         id
+    }
+
+    #[test]
+    fn models_share_the_budget_but_never_match_each_others_prefixes() {
+        let mut c = Cache::new(10, 16);
+        let a = c.add_for(0, 6);
+        c.start(a, &seq(0..100), 100, 6, 0);
+        c.finish(a, 6);
+        assert_eq!(c.plan_for(1, &seq(0..120), LIMITS), Plan::Cold);
+        let b = c.add_for(1, 3);
+        c.start(b, &seq(0..100), 100, 3, 0);
+        assert_eq!(c.bytes(), 9);
+        assert_eq!((c.bytes_for(0), c.bytes_for(1)), (6, 3));
+        let ev = c.fit(2, true, &[b]).expect("room in the shared budget");
+        assert_eq!(ev.states, vec![a]);
+        c.evict(&ev);
+        assert_eq!(c.bytes(), 3);
+        assert_eq!(c.plan_for(0, &seq(0..120), LIMITS), Plan::Cold);
+        assert!(c.tree_for(0, 24, 40).is_empty());
+        assert!(!c.tree_for(1, 24, 40).is_empty());
+    }
+
+    #[test]
+    fn growth_evicts_idle_states_of_other_models() {
+        let mut c = Cache::new(10, 16);
+        let idle = c.add_for(0, 3);
+        c.finish(idle, 3);
+        let busy = c.add_for(1, 6);
+        let (_, freed) = c.grow(busy, 9);
+        assert_eq!(freed.iter().map(|x| x.0).collect::<Vec<_>>(), vec![idle]);
+        assert_eq!(c.bytes(), 9);
+        assert!(c.entries[&busy].busy);
+    }
+
+    #[test]
+    fn admitted_snapshot_reservations_count_against_all_models() {
+        let mut c = Cache::new(8, 16);
+        let a = c.add_for(0, 5);
+        let end = Snap { pos: 100, kind: Kind::PromptEnd, bytes: 2, stale: 0 };
+        c.reserve_snapshots(a, vec![end]);
+        assert_eq!(c.bytes(), 7);
+        assert!(c.fit(2, true, &[]).is_none());
+        c.add_snap(a, end);
+        assert_eq!(c.bytes(), 7, "allocating a reserved snapshot must not charge it twice");
+        assert!(c.entries[&a].pending.is_empty());
+        c.reserve_snapshots(a, vec![Snap { pos: 50, kind: Kind::Branch, bytes: 1, stale: 0 }]);
+        c.finish(a, 5);
+        assert_eq!(c.bytes(), 7, "cancellation releases unallocated reservations");
+    }
+
+    #[test]
+    fn memory_reserve_can_reclaim_idle_kv_from_any_model() {
+        let mut c = Cache::new(100, 16);
+        let a = c.add_for(0, 4); c.finish(a, 4);
+        let b = c.add_for(1, 3);
+        let (_, freed) = c.reclaim(2);
+        assert_eq!(freed.iter().map(|x| x.0).collect::<Vec<_>>(), vec![a]);
+        assert_eq!(c.bytes(), 3);
+        assert!(c.entries[&b].busy);
     }
 
     #[test]

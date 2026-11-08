@@ -134,7 +134,8 @@ See [Models](server.md#models) for routing, scheduling and memory, and
 | `--host ADDR` | The IPv4 address to listen on (default `127.0.0.1`, this machine only). The server speaks plain HTTP: on another address, keys and conversations cross the network unencrypted. |
 | `--api-key-file FILE` | The key clients must send. |
 | `--id NAME` | The name requests give in `model` (default `deepseek-v4.1-flash`, or a Qwen model's directory's name in lower case). |
-| `--kv-cache GB` | The memory the model's KV prefix cache may take (default 8 GiB, apart from `--cache`): the attention states it keeps (55 MiB at first, up to 3.1 GiB at 1,048,576 tokens) and their snapshots (5.6 MiB each, 6.1 MiB with a prompt end's logits; more with `--draft`). Spare snapshots and then the least recently used states are dropped to make room; a request that does not fit even then is refused before anything is dropped. A decoding request whose state needs more room (past 16,384 positions, then each doubling) makes room the same way before its state grows; when only decoding states are left, the state grows past the limit and the server logs it. |
+| `--kv-cache GB` | One shared budget for every model's KV states and snapshots (default 8 GiB, apart from `--cache`). Root JSON key: `kv_cache`. Spare snapshots and then idle states are evicted across all models in LRU order. Requests that cannot fit are refused before eviction. State growth and pending snapshots are charged before allocation. If only busy states remain, a generation can grow past the limit and the server logs it. |
+| `--reserve GB` | One process-wide target for memory left available to the system, including reclaimable file pages; default 10 GiB. Root JSON key: `reserve`. The controller adapts expert memory and then idle KV against this target, regardless of which model is active. |
 | `-t T`, `--temperature T` | The temperature of requests that set none (default: the checkpoint's `generation_config.json`, else 1; 0 is greedy). |
 | `--top-p P` | The nucleus probability of requests that set none (default: `generation_config.json`'s, else 1). |
 | `--top-k K` | The top_k of requests that set none, 0 for every token (default: `generation_config.json`'s, else 0). |
@@ -143,7 +144,7 @@ See [Models](server.md#models) for routing, scheduling and memory, and
 | `--batch N` | The model's requests running together at most, up to its rows per pass (DeepSeek 6, Qwen 8; default 4). Overlapping requests share forward passes. Aggregate throughput depends on expert-cache contention and the workload (see [Performance](performance.md#concurrent-requests)). A request alone runs the same at any N. |
 | `--runahead` | Let ready concurrent requests advance while other requests' expert reads run. Groups ready requests at the same layer; each loads its own experts. Applies with two or more decoding requests; off by default. Requires no `--draft`, `--online-predictor` or `--substitute`. Context lookup remains available for a request running alone. |
 | `--pipeline` | Experimental native MXFP4 pipeline for two or more requests. Keeps request stages in flight and combines ready expert stages across layers; a lone request keeps ordinary decoding. Off by default. Requires no GGUF experts, runahead, DSpark, online predictor, substitution or dispatch profiling. JSON configuration: `"pipeline": true` on the DeepSeek model. |
-| `--tui` | A live view on the terminal in place of the log, in five tabs (see below), of one model at a time (`n` shows the next); the `q` key stops the server as Ctrl-C does. |
+| `--tui` | A live view on the terminal in place of the log, in six tabs (see below). `n` changes the model shown; the Memory tab shows all models together. `q` stops the server as Ctrl-C does. |
 | `--tui-theme auto\|light\|dark` | The live view's colors: by the terminal's background color, which the view asks the terminal for (`auto`, the default; light colors when it does not answer), or the light or dark ones. |
 | `--render FILE` | Print the prompt of a JSON test case of DeepSeek's `encoding/tests` (or a request's messages, tools, thinking mode and effort) as the server renders it, and exit; for `tools/reference/check.py encoding`. |
 
@@ -365,6 +366,11 @@ being verified; the decoding speeds count the tokens generated. The tabs:
    and each request's prefill, then its decoding.
 5. **Log:** the latest log lines; ↑↓, PgUp, PgDn and the wheel scroll
    back, Home goes to the oldest and End to the newest.
+6. **Memory:** proportional, colored tiles for every model's tracked
+   weights, expert cache and allocated KV. KV commitments include promised
+   growth and snapshots. One shared KV total and one reserve target appear
+   above the tiles. The process footprint is shown separately; untracked
+   runtime buffers are not assigned to a model. Press `6` to open this tab.
 
 ### DeepSeek Harness
 

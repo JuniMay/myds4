@@ -9,11 +9,12 @@ use std::ptr;
 
 use deepseek_recipe::stream::StreamTokenizer;
 
-const ABI: c_int = 9;
+const ABI: c_int = 10;
 
 #[repr(C)]
 struct RawProcess {
     abi: c_int,
+    reserve_gb: f64,
     on_log: Option<extern "C" fn(*const c_char)>,
     on_die: Option<extern "C" fn()>,
 }
@@ -25,7 +26,6 @@ struct RawConfig {
     experts: *const c_char,
     ctx: c_int,
     cache_gb: f64,
-    reserve_gb: f64,
     cache_half_life: c_int,
     cache_read_cost: c_int,
     substitute: f32,
@@ -243,8 +243,8 @@ fn c_string(s: &str) -> CString {
 /// log's lock, and must not call [`log`]), the stop's signal handlers and the
 /// failure hook, on this thread, which from then on is the engine's (it
 /// needs a 16 MiB stack). False when called twice.
-pub fn init(on_log: Option<extern "C" fn(*const c_char)>, on_die: Option<extern "C" fn()>) -> bool {
-    let p = RawProcess { abi: ABI, on_log, on_die };
+pub fn init(reserve_gb: f64, on_log: Option<extern "C" fn(*const c_char)>, on_die: Option<extern "C" fn()>) -> bool {
+    let p = RawProcess { abi: ABI, reserve_gb, on_log, on_die };
     unsafe { myds4_init(&p) == 0 }
 }
 
@@ -275,7 +275,6 @@ pub struct Options {
     pub experts: Option<String>,
     pub ctx: i32,
     pub cache_gb: f64,
-    pub reserve_gb: f64,
     pub cache_half_life: i32,
     pub cache_read_cost: bool,
     pub substitute: f32,
@@ -315,7 +314,6 @@ impl Model {
             experts: experts.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
             ctx: o.ctx,
             cache_gb: o.cache_gb,
-            reserve_gb: o.reserve_gb,
             cache_half_life: o.cache_half_life,
             cache_read_cost: o.cache_read_cost.into(),
             substitute: o.substitute,

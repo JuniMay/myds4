@@ -55,6 +55,14 @@ A state (`qwen_state_new`) holds one sequence:
   sequence grows (`qwen_state_reserve`);
 - the hidden of its last row (and of the saved row), the MTP head's input.
 
+The checkpoint's context limit is 262,144 tokens. The server uses that
+limit when `ctx` is omitted. Capacity grows on demand; accounting charges
+the allocated capacity, starting at 1,024 positions and doubling as needed.
+A state at the full context takes about 17.3 GiB before snapshots. The
+server's root `kv_cache` setting covers all models' states and snapshots
+together. Its root `reserve` setting leaves one shared memory target for
+the system; neither setting belongs inside a model entry.
+
 A snapshot (`qwen_snap_take`, 157 MB) holds the recurrent part and the last
 hidden at the state's position. A DeltaNet state cannot go back, so the
 server resumes a prompt in place (the state the prompt extends), from a
@@ -125,6 +133,14 @@ decoding pass and verify pass first runs the head over the keys the state
 owes (its last row's hidden with the token now run, and after a kept draft
 the saved row's too), and prompt passes fill the keys of their positions.
 Without drafts the head does not run.
+The loader still loads the MTP weights and allocates its KV layer whenever
+the checkpoint contains them, including with `draft` off.
+
+The server's `batch` caps admitted requests at eight. MTP verification is
+used when one Qwen request decodes; with several, the ordinary pass batches
+their next tokens. Raising the cap trades more state memory and latency
+for potential weight reuse. The measured pass timings below do not show
+eight rows beating four in aggregate throughput.
 
 ## Speed
 
@@ -155,6 +171,11 @@ read each row's inputs for every weight row, so more rows soon cost more
 arithmetic and cache traffic than the weights' reads.
 
 ## Checks and the reference
+
+`make build/qwen-state-accounting-check` builds a CPU-only allocation
+fixture. Its 17 checks compare the reported state size with the allocated
+buffers at startup and after capacity grows, and require every allocation
+to be freed. It loads no model weights and runs no GPU work.
 
 `build/myds4 -m DIR` takes the prompt as text (`-p` or `-f`, as one user
 turn of the checkpoint's chat template, thinking off unless `--think` is 1

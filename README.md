@@ -98,6 +98,13 @@ Chat Completions protocol and the key file's contents (see
 [Usage](docs/usage.md#deepseek-harness)). Each run takes most of the memory,
 so one runs at a time: a second waits for the first's lock.
 
+To serve DeepSeek and Qwen together, list both in `--config FILE` as shown
+in [Models](docs/server.md#models). Put `reserve` and `kv_cache` at the JSON
+root: they set one system headroom target and one KV budget for the whole
+server. Each model keeps its own context, batch limit and sampling options.
+Configuration changes require a restart. In the live view, `n` switches
+models and `6` opens Memory, with allocation tiles for all loaded models.
+
 The server and the CLI accept `--ced off|N` for approximate decoder replay
 during prefill, with `off` as the default. For example, `--ced 128` retains
 128 decoder tokens plus `max(8, lookup_depth)` rewind rows. This can change output; see the

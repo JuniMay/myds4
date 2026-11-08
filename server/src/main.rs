@@ -44,6 +44,8 @@ const USAGE: &str = "usage: myds4-server (-m MODEL [model options] | --config FI
   --serve PORT    serve OpenAI Chat Completions at http://HOST:PORT/v1 (needs MYDS4_API_KEY or --api-key-file)
   --host ADDR     the IPv4 address to serve on (default 127.0.0.1)
   --api-key-file FILE  the API key clients must send (16 to 256 characters)
+  --reserve GB    one process-wide available-memory target, 2-1024 GiB (default 10)
+  --kv-cache GB   total KV states and snapshots across all models, GiB (default 8)
   --tui           a live view in the terminal (requests, speed, experts, memory, the KV cache) instead of the
                   log on stderr; q stops the server, n shows the next model, and the last log lines print on exit
   --tui-theme T   the live view's colors: auto (default: by the terminal's background, light without an
@@ -51,7 +53,6 @@ const USAGE: &str = "usage: myds4-server (-m MODEL [model options] | --config FI
   --render FILE   print the prompt of a JSON test case of DeepSeek's encoding/tests, and exit
  a model's options:
   --id NAME       the name requests give in model (default: deepseek-v4.1-flash, or a Qwen directory's name)
-  --kv-cache GB   bound of its KV prefix cache: attention states and snapshots kept between requests (default 8)
   --batch N       its requests running together at most, at most its rows per pass (default 4)
   -t T, --temperature T  the temperature of requests that set none (default: generation_config.json's, else 1)
   --top-p P       the top_p of requests that set none, 0 to 1 (default: generation_config.json's, else 1)
@@ -65,7 +66,6 @@ const USAGE: &str = "usage: myds4-server (-m MODEL [model options] | --config FI
   --ced off|N     approximate prefill: replay N decoder tokens, 128-1048576 (default off), plus the rewind margin (8)
   --prefill-prune  skip decoder batches outside required history; CED and substitution must be off (default off)
   --cache GB      expert cache budget (default: from available memory)
-  --reserve GB    memory the expert cache leaves to other programs, 2-1024 (default 10)
   --cache-half-life N  score half-life in forward passes, 1-1000000 (default 50)
   --cache-read-cost   weight decode eviction priority by expert read bytes
   --experts GGUF  read the routed experts from a GGUF file or set of shards
@@ -92,6 +92,7 @@ fn die(message: &str) -> ! {
 struct Args {
     /// -m and its options, or --config's models.
     models: Vec<ModelConfig>,
+    budgets: config::Budgets,
     port: Option<u16>,
     host: String,
     key_file: Option<String>,
@@ -103,6 +104,7 @@ struct Args {
 fn parse(args: &[String]) -> Args {
     let mut a = Args {
         models: Vec::new(),
+        budgets: config::Budgets::default(),
         port: None,
         host: "127.0.0.1".into(),
         key_file: None,
@@ -112,6 +114,7 @@ fn parse(args: &[String]) -> Args {
     };
     let mut one: Option<ModelConfig> = None;
     let mut options: Vec<(String, Value)> = Vec::new(); // -m's options, in order
+    let mut budgets: Vec<(String, Value)> = Vec::new();
     let mut file = None;
     let mut i = 0;
     while i < args.len() {
@@ -133,6 +136,11 @@ fn parse(args: &[String]) -> Args {
                         one = Some(ModelConfig::new(v));
                     }
                     "--config" => file = Some(v.clone()),
+                    "--reserve" | "--kv-cache" => {
+                        let name = flag[2..].replace('-', "_");
+                        let value = serde_json::from_str::<Value>(v).unwrap_or(Value::Null);
+                        budgets.push((name, value));
+                    }
                     "--serve" => a.port = Some(v.parse().unwrap_or_else(|_| die(&format!("--serve: not a port: {v}")))),
                     "--host" => a.host = v.clone(),
                     "--api-key-file" => a.key_file = Some(v.clone()),
@@ -172,9 +180,14 @@ fn parse(args: &[String]) -> Args {
             if let Some((name, _)) = options.first() {
                 die(&format!("--{}: with --config, each model's options are in the file", name.replace('_', "-")));
             }
-            a.models = config::read(&f).unwrap_or_else(|e| die(&e));
+            let c = config::read(&f).unwrap_or_else(|e| die(&e));
+            a.models = c.models;
+            a.budgets = c.budgets;
         }
         (None, None) => {}
+    }
+    for (name, value) in budgets {
+        a.budgets.set(&name, &value).unwrap_or_else(|e| die(&e));
     }
     a
 }
@@ -188,11 +201,11 @@ fn one_model_takes_its_options_from_the_command_line() {
     let m = &a.models[0];
     assert!(m.engine.prefill_prune);
     assert_eq!((m.engine.lookup, m.engine.draft, m.engine.ced), (15, 2, 0));
-    assert_eq!((m.temperature, m.top_p, m.kv_gb, m.batch), (None, None, 8.0, 4));
+    assert_eq!((m.temperature, m.top_p, a.budgets.kv_gb, m.batch), (None, None, 8.0, 4));
     assert_eq!((a.port, a.tui), (Some(8008), true));
     let a = parse(&["-m", "/m/q", "-t", "0.6", "--top-k", "20", "--id", "qwen", "--kv-cache", "4"].map(String::from));
     let m = &a.models[0];
-    assert_eq!((m.temperature, m.top_k, m.id.as_deref(), m.kv_gb), (Some(0.6), Some(20), Some("qwen"), 4.0));
+    assert_eq!((m.temperature, m.top_k, m.id.as_deref(), a.budgets.kv_gb), (Some(0.6), Some(20), Some("qwen"), 4.0));
 }
 
 /// A served model: its name, its family's chat format and its settings.
@@ -433,7 +446,7 @@ fn main() {
         if served.iter().any(|s: &worker::Served| s.id.eq_ignore_ascii_case(&id)) {
             die(&format!("two models named {id}: give one an id"));
         }
-        served.push(worker::Served { id, engine: e, batch: m.batch, kv_gb: m.kv_gb });
+        served.push(worker::Served { id, engine: e, batch: m.batch });
         families.push(family);
     }
     // The live view takes the log from the start; until it is on the screen,
@@ -441,7 +454,7 @@ fn main() {
     let tui = a.tui && std::io::stderr().is_terminal();
     let (on_log, on_die): (Option<extern "C" fn(*const std::ffi::c_char)>, Option<extern "C" fn()>) =
         if tui { (Some(view::on_log), Some(view::on_die)) } else { (None, None) };
-    if !worker::start(served.clone(), on_log, on_die) {
+    if !worker::start(served.clone(), a.budgets.clone(), on_log, on_die) {
         exit(2);
     }
     let loaded = worker::models();

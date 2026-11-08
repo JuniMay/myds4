@@ -3,7 +3,7 @@
 //! terminal would. While a request decodes, the test presses the tabs' keys,
 //! scrolls a node's text with the wheel and clicks a tab, and checks what each
 //! tab draws: the expert map's request, the KV tree and a node's text, the
-//! last minute and the log; then q, and the server's exit.
+//! last minute, log and memory tiles; then q, and the server's exit.
 //!
 //! It runs only when MYDS4_CHECKPOINT (the checkpoint directory) and
 //! MYDS4_EXPERTS (a GGUF file) are set; MYDS4_SERVER picks the server
@@ -64,7 +64,9 @@ fn the_live_view_draws_every_tab_with_a_model() {
         .args(["-m", &checkpoint, "--experts", &experts, "--cache", "40", "--kv-cache", "8", "--ctx", "32768"])
         .args(["--serve", &port.to_string(), "--tui"])
         .env("MYDS4_API_KEY", &key)
+        .env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor")
+        .env_remove("NO_COLOR")
         .stdin(Stdio::from(slave.try_clone().expect("a descriptor")))
         .stdout(Stdio::from(slave.try_clone().expect("a descriptor")))
         .stderr(Stdio::from(slave))
@@ -118,6 +120,7 @@ fn the_live_view_draws_every_tab_with_a_model() {
         ("wheel", wheel, 1),
         ("minute", click, 3),
         ("log", "5", 1),
+        ("memory", "6", 1),
         ("overview", "1", 2),
     ];
     for (name, keys, wait) in steps {
@@ -143,7 +146,7 @@ fn the_live_view_draws_every_tab_with_a_model() {
         ("the view asked for the background", all.contains("\x1b]11;?")),
         ("the dark colors (the dark accent)", all.contains("125;122;255")),
         ("the mouse reported, then given back", all.contains("\x1b[?1000h") && all.contains("\x1b[?1000l")),
-        ("the tabs", tabs["overview"].contains("1 Overview") && tabs["overview"].contains("5 Log")),
+        ("the tabs", tabs["overview"].contains("1 Overview") && tabs["overview"].contains("6 Memory")),
         ("the expert map's request", tabs["experts"].contains("Request") && tabs["experts"].contains("#1 · s1")),
         ("four experts a cell at 160 columns", tabs["experts"].contains("four experts")),
         ("the KV tree's axis and session", tabs["kv"].contains("tokens") && tabs["kv"].contains("s1")),
@@ -151,6 +154,7 @@ fn the_live_view_draws_every_tab_with_a_model() {
         ("the wheel scrolled the text", tabs["wheel"].contains("lines 4–")),
         ("a click chose the last minute", tabs["minute"].contains("phase") && tabs["minute"].contains("tokens/s")),
         ("the log", tabs["log"].contains("req 1:")),
+        ("the shared memory budget and tile", tabs["memory"].contains("Shared KV budget") && tabs["memory"].contains("GiB tracked")),
         ("the server's exit status 0", status.success()),
     ];
     let failed: Vec<&str> = checks.iter().filter(|c| !c.1).map(|c| c.0).collect();

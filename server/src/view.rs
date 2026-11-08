@@ -1,5 +1,5 @@
 //! The live view (--tui): the terminal's alternate screen on stderr, from the
-//! worker's snapshot ([`crate::worker::view`]) twice a second, in five tabs:
+//! worker's snapshot ([`crate::worker::view`]) twice a second, in six tabs:
 //!
 //! 1. Overview: the requests and their decoding speed, the throughput over
 //!    the last 5 s, the last minute and since the start, the experts per
@@ -12,6 +12,8 @@
 //! 4. Last minute: the phase, the tokens/s, the SSD's reads, the hit rate and
 //!    each request, one column per snapshot.
 //! 5. Log: the latest log lines.
+//! 6. Memory: every model's allocation tiles, the process total, and the
+//!    shared KV budget and reserve.
 //!
 //! What the tabs draw of the last minute stays in the view's memory; nothing
 //! is written to files. On exit the normal screen comes back with the last log
@@ -49,6 +51,7 @@ mod experts;
 mod history;
 mod kv;
 mod minute;
+mod memory;
 mod overview;
 mod theme;
 
@@ -93,6 +96,12 @@ pub struct Snapshot {
     sessions: u64,
     kv_gib: f64,
     kv_limit_gib: f64,
+    #[serde(default)]
+    kv_total_gib: f64,
+    #[serde(default)]
+    reserve_gib: f64,
+    #[serde(default)]
+    model_memory: Vec<ModelMemory>,
     tree: Vec<Node>,
     decode: Decode,
     prompts: Prompts,
@@ -100,6 +109,16 @@ pub struct Snapshot {
     prefilled: Prefilled,
     cache: Cache,
     memory: Memory,
+}
+
+#[derive(Deserialize, Default)]
+struct ModelMemory {
+    model: String,
+    weights: u64,
+    experts: u64,
+    kv: u64,
+    kv_committed: u64,
+    tracked: u64,
 }
 
 #[derive(Deserialize, Default)]
@@ -586,6 +605,7 @@ fn draw_screen(buf: &mut Buffer, s: &Snapshot, h: &History, ui: &mut Ui, title: 
         Tab::Kv => kv::draw(buf, inner, s, ui),
         Tab::Experts => experts::draw(buf, inner, s, h, ui),
         Tab::Minute => minute::draw(buf, inner, h),
+        Tab::Memory => memory::draw(buf, inner, s),
         Tab::Log => {
             ui.page = rows.max(1);
             ui.log_back = ui.log_back.min(log.len().saturating_sub(rows));
@@ -685,7 +705,7 @@ fn scroll(ui: &mut Ui, n: isize) -> Asked {
 fn key(code: KeyCode, ui: &mut Ui, s: &Snapshot, h: &History) -> Asked {
     let page = ui.page.max(1) as isize;
     match code {
-        KeyCode::Char(d @ '1'..='5') => ui.tab = chrome::TABS[d as usize - '1' as usize].0,
+        KeyCode::Char(d @ '1'..='6') => ui.tab = chrome::TABS[d as usize - '1' as usize].0,
         KeyCode::Tab | KeyCode::BackTab => {
             let at = chrome::TABS.iter().position(|t| t.0 == ui.tab).unwrap_or(0);
             let n = chrome::TABS.len();
@@ -1020,6 +1040,36 @@ mod tests {
     }
 
     #[test]
+    fn memory_tiles_show_both_models_and_one_shared_budget() {
+        let mut s = snapshot();
+        s.model = "DeepSeek".into(); s.models = 2;
+        s.kv_gib = 1.0; s.kv_total_gib = 3.0; s.kv_limit_gib = 12.0; s.reserve_gib = 10.0;
+        let gib = 1024u64.pow(3);
+        s.memory.total = 128 * gib; s.memory.footprint = 89 * gib;
+        s.memory.free = 8 * gib; s.memory.file = 19 * gib;
+        s.model_memory = vec![
+            ModelMemory { model: "DeepSeek".into(), weights: 8*gib, experts: 56*gib, kv: gib, kv_committed: gib, tracked: 65*gib },
+            ModelMemory { model: "Qwen".into(), weights: 20*gib, experts: 0, kv: 2*gib, kv_committed: 2*gib, tracked: 22*gib },
+        ];
+        for (w, h) in [(160, 30), (80, 30), (40, 32), (12, 4)] {
+            let mut b = Buffer::empty(ratatui::layout::Rect::new(0, 0, w, h));
+            let mut ui = Ui { tab: Tab::Memory, ..Ui::default() };
+            draw_screen(&mut b, &s, &History::default(), &mut ui, "myds4", &[]);
+            if w >= 80 {
+                let screen = all(&b);
+                assert!(screen.contains("DeepSeek") && screen.contains("Qwen"), "{screen}");
+                assert!(screen.contains("3.00 / 12.00 GiB"), "{screen}");
+                assert_eq!(screen.matches("Shared KV budget").count(), 1);
+                assert!(screen.contains("65.00 GiB tracked") && screen.contains("22.00 GiB tracked"), "{screen}");
+                if std::env::var_os("MYDS4_PRINT_MEMORY_VIEW").is_some() && w == 160 { eprintln!("{screen}"); }
+            }
+        }
+        let mut ui = Ui::default();
+        key(KeyCode::Char('6'), &mut ui, &s, &History::default());
+        assert_eq!(ui.tab, Tab::Memory);
+    }
+
+    #[test]
     fn the_overview_shows_the_throughput_and_the_logs_tail() {
         let (b, _) = draw(Tab::Overview, 160, 46, |_| {});
         let screen = all(&b);
@@ -1152,7 +1202,11 @@ mod tests {
         key(KeyCode::Tab, &mut ui, &s, &h);
         assert_eq!(ui.tab, Tab::Log);
         key(KeyCode::Tab, &mut ui, &s, &h);
+        assert_eq!(ui.tab, Tab::Memory);
+        key(KeyCode::Tab, &mut ui, &s, &h);
         assert_eq!(ui.tab, Tab::Overview);
+        key(KeyCode::BackTab, &mut ui, &s, &h);
+        assert_eq!(ui.tab, Tab::Memory);
         key(KeyCode::BackTab, &mut ui, &s, &h);
         assert_eq!(ui.tab, Tab::Log);
         key(KeyCode::Up, &mut ui, &s, &h);
