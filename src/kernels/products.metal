@@ -253,3 +253,29 @@ template [[host_name("gemm_fp8")]] kernel gemm_t gemm<1>;
 template [[host_name("gemm_bf16")]] kernel gemm_t gemm<2>;
 
 template [[host_name("gemm_mxfp8")]] kernel gemm_t gemm<3>;
+
+struct InputQuant {
+  uint count, bits;
+  float scale;
+  uint pad;
+};
+kernel void quantize_input(device const float *x [[buffer(0)]], device float *out [[buffer(1)]],
+                        constant InputQuant &p [[buffer(2)]], uint i [[thread_position_in_grid]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+  if (i >= p.count)
+    return;
+  float v = x[i];
+  if (p.bits == 9) {
+    out[i] = e4m3(clamp(v / p.scale, -448.0f, 448.0f));
+  } else if (p.bits == 8) {
+    float amax = simd_max(fabs(v));
+    float scale = pow2_scale(max(amax, 0x1p-126f), 1.0f / 448.0f);
+    out[i] = bf(e4m3(clamp(v / scale, -448.0f, 448.0f)) * scale);
+  } else {
+    float value = p.scale > 0 ? v / p.scale : 0;
+    float left = simd_max(lane < 16 ? fabs(value) : 0.0f);
+    float right = simd_max(lane >= 16 ? fabs(value) : 0.0f);
+    float scale = e4m3(min((lane < 16 ? left : right) / 6, 448.0f));
+    out[i] = scale > 0 ? e2m1(clamp(value / scale, -6.0f, 6.0f)) * scale : 0;
+  }
+}

@@ -4,7 +4,7 @@
 //! models and owns the stop on SIGINT or SIGTERM; the worker (worker.rs)
 //! owns the engine thread, every model's queue, batching and requests'
 //! events, and each model's KV prefix cache (kv.rs) the states kept between
-//! requests; each model family's chat format (format/) renders its requests
+//! requests; each model family's chat adapter renders its requests
 //! and reads its replies; the live view (--tui) is view.rs.
 
 mod chat;
@@ -32,12 +32,12 @@ use axum::routing::{get, post};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::chat::{Family, deepseek, qwen};
+use crate::chat::{Family, chatml, deepseek};
 use crate::config::ModelConfig;
 
 const USAGE: &str = "usage: myds4-server [--config FILE | -m MODEL [model options]] [server options]
   Without --config or -m, read ~/.config/myds4/server.json. See docs/usage.md.
-  -m DIR          a checkpoint directory (DeepSeek V4.1 Flash, or a Qwen3.8 qwen3_5 model), its options below
+  -m DIR          a supported model checkpoint directory, with its options below
   --config FILE   server settings and models in JSON; a request's model field picks its model
   --serve PORT    override the JSON port; serve OpenAI Chat Completions at http://HOST:PORT/v1
   --host ADDR     the IPv4 address to serve on (default 127.0.0.1)
@@ -60,7 +60,8 @@ const USAGE: &str = "usage: myds4-server [--config FILE | -m MODEL [model option
   --seed N        the seed of requests that set none (default: random for each)
   --think N       thinking effort 1-100 of requests that set none; 0 turns thinking off
   --ctx N         context capacity in tokens, at most 1048576 and the model's own (default: the most)
-  --draft N       verify up to N drafts per pass, the model's own (DeepSeek's DSpark and Qwen's chained MTP: 1-5)
+  --draft N       proposals per pass: DeepSeek/Qwen MTP 0-5, Nemotron DFlash2 0-15
+  --draft-model DIR  the DFlash2 checkpoint for Nemotron drafting
   --lookup off|N  verify up to N (1-15) context-copy drafts; --draft supplies fallback
   DeepSeek only:
   --ced off|N     approximate prefill: replay N decoder tokens, 128-1048576 (default off), plus the rewind margin (8)
@@ -243,7 +244,7 @@ fn one_model_takes_its_options_from_the_command_line() {
             "--top-k",
             "20",
             "--id",
-            "qwen",
+            "chatml",
             "--kv-cache",
             "4",
         ]
@@ -252,7 +253,7 @@ fn one_model_takes_its_options_from_the_command_line() {
     let m = &a.models[0];
     assert_eq!(
         (m.temperature, m.top_k, m.id.as_deref(), a.budgets.kv_gb),
-        (Some(0.6), Some(20), Some("qwen"), 4.0)
+        (Some(0.6), Some(20), Some("chatml"), 4.0)
     );
 }
 
@@ -319,7 +320,7 @@ struct Served {
 
 enum Format {
     DeepSeek(deepseek::Defaults),
-    Qwen(qwen::Settings),
+    ChatMl(chatml::Settings),
 }
 
 /// What the handlers share.
@@ -529,14 +530,14 @@ async fn completions(
             let (cancel, rx) = submitted(p.engine_request(i, note)?)?;
             Ok::<_, chat::Error>((Prepared::DeepSeek(p), cancel, rx))
         }
-        Format::Qwen(q) => {
-            let mut p = qwen::prepare(&body, &format!("http {arrival} from {from}"), q, i)?;
+        Format::ChatMl(q) => {
+            let mut p = chatml::prepare(&body, &format!("http {arrival} from {from}"), q, i)?;
             let request = std::mem::replace(
                 &mut p.request,
                 worker::Request {
                     model: i,
                     prompt: Vec::new(),
-                    images: Vec::new(),
+                    media: Vec::new(),
                     sampling: q.sampling,
                     max_tokens: 0,
                     note: String::new(),
@@ -557,9 +558,9 @@ async fn completions(
         }
         Ok(Ok((Prepared::Qwen(p), cancel, rx))) => {
             if p.stream {
-                qwen::stream(p, cancel, rx)
+                chatml::stream(p, cancel, rx)
             } else {
-                qwen::whole(p, cancel, rx).await
+                chatml::whole(p, cancel, rx).await
             }
         }
         Ok(Err(e)) => refused(&peer, e),
@@ -573,7 +574,7 @@ async fn completions(
 
 enum Prepared {
     DeepSeek(deepseek::Prepared),
-    Qwen(qwen::Prepared),
+    Qwen(chatml::Prepared),
 }
 
 async fn not_found() -> Response {
@@ -641,10 +642,10 @@ fn main() {
         e.configure(family).unwrap_or_else(|error| die(&error));
         let id = m.id.clone().unwrap_or_else(|| match family {
             Family::DeepSeek => deepseek::MODEL_ID.into(),
-            Family::Qwen => qwen::model_id(dir),
+            Family::Qwen | Family::Nemotron => chatml::model_id(dir),
         });
-        if family == Family::Qwen {
-            e.ctx = qwen::context(dir, e.ctx as usize) as i32;
+        if family != Family::DeepSeek {
+            e.ctx = chatml::context(dir, e.ctx as usize) as i32;
         }
         if served
             .iter()
@@ -689,22 +690,30 @@ fn main() {
                 thinking: m.think != Some(0),
                 effort: m.think.filter(|&n| n > 0).unwrap_or(75),
             }),
-            Family::Qwen => {
-                let mut sampling = qwen::sampling(&s.engine.model, m.temperature, m.top_p, m.top_k);
+            Family::Qwen | Family::Nemotron => {
+                let temperature = m
+                    .temperature
+                    .or((family == &Family::Nemotron).then_some(0.0));
+                let mut sampling = chatml::sampling(&s.engine.model, temperature, m.top_p, m.top_k);
                 sampling.seed = m.seed;
                 let i = served_models.len();
-                Format::Qwen(qwen::Settings {
+                Format::ChatMl(chatml::Settings {
                     id: id.clone(),
                     ctx,
                     tokenizer: loaded[i].1,
                     sampling,
-                    think: m.think,
+                    think: m.think.or((family == &Family::Nemotron).then_some(0)),
+                    variant: if family == &Family::Nemotron {
+                        chatml::Variant::Nemotron
+                    } else {
+                        chatml::Variant::Qwen
+                    },
                 })
             }
         };
         let name = match family {
             Family::DeepSeek => "DeepSeek V4.1 Flash (myds4)".to_string(),
-            Family::Qwen => format!("{id} (myds4)"),
+            Family::Qwen | Family::Nemotron => format!("{id} (myds4)"),
         };
         engine::log(&format!(
             "serving {id} at http://{host}:{port}/v1 (context {ctx} tokens{}{})",

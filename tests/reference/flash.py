@@ -62,7 +62,7 @@ def quantize(x, kind, scale):
         code = torch.bucketize(magnitude, mid)
         ties = (code < 7) & (magnitude == mid[code.clamp_max(6)]) & ((code & 1) != 0)
         code += ties.to(code.dtype)
-        result = levels[code].copysign(values) * factor * scale
+        result = levels[code].copysign(values) * factor
     return result.reshape(x.shape).to(torch.bfloat16).float()
 
 
@@ -94,7 +94,8 @@ class Linear(nn.Module):
 
     def forward(self, x):
         values = quantize(x, self.kind, self.input_scale) if self.kind in ('n', 'm') else x.float()
-        output = F.linear(values, self.weight) * self.scale
+        scale = self.scale * (self.input_scale if self.kind == 'n' else 1)
+        output = F.linear(values, self.weight) * scale
         if self.bias is not None:
             output += self.bias
         return output.to(torch.bfloat16)

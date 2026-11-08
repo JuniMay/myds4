@@ -26,7 +26,7 @@ int main(int argc, char **argv) {
   if (count < (pipeline ? 1 : 2) || count > BATCH_ROWS) die("invalid scheduler request count");
   o.deepseek.pipeline = pipeline;
   alarm(600);
-  tk = tok_open(argv[1], deepseek_ops.image_token);
+  tk = tok_open(argv[1], deepseek_ops.media_token);
   memory_configure(model_memory_gib, 8, model_reserve_gib);
   deepseek_load(argv[1], &o);
   enum { STEPS = 4 };

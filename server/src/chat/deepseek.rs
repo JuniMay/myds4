@@ -318,7 +318,7 @@ impl Prepared {
         Ok(worker::Request {
             model,
             prompt,
-            images: self.images.clone(),
+            media: self.images.clone(),
             sampling,
             max_tokens: self.settings.max_tokens,
             note,

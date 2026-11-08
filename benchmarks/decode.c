@@ -51,7 +51,7 @@ int main(int argc, char **argv) {
     die("rows-bench takes 1 to %d rows, at least one step and no negative warm-up", BATCH_ROWS);
   if (!file != !length || length < 0) die("--text and --prompt-tokens go together");
   o.ctx = length + 4096;
-  tk = tok_open(argv[1], deepseek_ops.image_token);
+  tk = tok_open(argv[1], deepseek_ops.media_token);
   memory_configure(model_memory_gib, 8, model_reserve_gib);
   deepseek_load(argv[1], &o);
   static const char *openings[] = {"A lighthouse keeper finds a bottle.", "A baker opens a shop at dawn.",

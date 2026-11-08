@@ -26,13 +26,14 @@ Keep a regression when it proves a maintained behavior. Share fixture
 setup within a subsystem; do not retain separate experiments solely to
 preserve their former measurements.
 
-Tokenizer cases use one reference runner for both architectures. The fixtures
+Tokenizer cases use one reference runner across architectures. The fixtures
 include added tokens, round trips and pieces longer than 1,024 bytes:
 
 ```sh
 make build/tests/tokenizer-reference
 build/tests/tokenizer-reference /path/to/deepseek tests/fixtures/tokenizer_deepseek_v41.json
 build/tests/tokenizer-reference /path/to/qwen tests/fixtures/tokenizer_qwen3_5.json
+build/tests/tokenizer-reference /path/to/transcribe tests/fixtures/tokenizer_nemotron.json
 ```
 
 `build/tests/memory` checks the shared budget, unequal entry sizes, active
@@ -48,6 +49,18 @@ check, not a throughput benchmark.
 the Qwen draft head against the target logits. It also verifies every
 accepted prefix of two- through six-row batches, including the next target
 logits and the repaired draft-head history.
+
+`build/tests/nemotron` checks calibrated activation codes and Mamba2 state
+against independent CPU calculations. `build/tests/nemotron-model TARGET
+DFLASH2` compares all logits of a 16-row verification pass with sequential
+decoding. It then checks several accepted prefixes, their next target
+logits and their next draft proposals. `tests/reference/nemotron.py`
+compares selected backbone blocks with the upstream CPU implementation.
+
+`build/tests/speech-model CHECKPOINT` reads bounded audio on stdin and
+transcribes it. `--features` returns BF16 speech feature rows; `--decode`
+returns a two-word header (sample rate and count) followed by mono FP32
+samples. These modes let reference tests keep audio and features in memory.
 
 The metadata check can additionally compare two checkpoint indexes and
 DeepSeek's generated Engram map. It reads headers and tokenizer data, not

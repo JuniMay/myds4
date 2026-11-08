@@ -236,7 +236,7 @@ int main(int argc, char **argv) {
     snprintf(text, size, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher "
              "the value, the more thorough the reasoning)\n\n<｜User｜>%s<｜Assistant｜><think>", input);
   }
-  tk = tok_open(argv[1], deepseek_ops.image_token);
+  tk = tok_open(argv[1], deepseek_ops.media_token);
   int *tokens = xmalloc(32768 * sizeof(int));
   prompt_n = tok_encode_chat(tk, text, tokens, 16384);
   if (prompt_n < 2 || prompt_n >= 16384 || prompt_n + steps >= 32768 || prompt_n + bench_tokens >= 32768)

@@ -744,7 +744,7 @@ int main(int argc, char **argv) {
     else die("invalid check argument: %s", argv[i]);
   }
   if (!text || !mode) die("--text FILE and --measure or --fork is required");
-  tk = tok_open(argv[1], deepseek_ops.image_token);
+  tk = tok_open(argv[1], deepseek_ops.media_token);
   int count, *tokens = read_text(text, rendered, &count);
   if (limit > 0 && count > limit) count = limit;
   memory_configure(model_memory_gib, 8, model_reserve_gib);

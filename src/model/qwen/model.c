@@ -39,7 +39,7 @@ typedef struct {
 static TensorIndex *checkpoint;
 static WeightSet *dense;
 static QwenVision *vision;
-static const Image *images;
+static const Media *images;
 static int image_count;
 static struct {
   int layers, linear, attention, hidden, inter, vocab, nstop, stop[8];
@@ -95,7 +95,7 @@ typedef struct {
 static_assert(sizeof(Seq) == 72);
 
 static uint64_t image_embedding(int pos) {
-  return qwen_image_embedding(images, image_count, pos);
+  return media_embedding(images, image_count, pos);
 }
 
 static void positions(Seq *row, const QwenState *state, int pos, int prompt) {
@@ -254,7 +254,7 @@ static void prepare(const char *dir, int drafts) {
   K_add_norm = gpu_kernel("add_norm");
   K_concat = gpu_kernel("concat");
   K_q_half = gpu_kernel("gqa_q_half"), K_attend_prompt = gpu_kernel("gqa_prompt");
-  K_embed = gpu_kernel("qwen_embed_rows"), K_rms_norm = gpu_kernel("rms_norm"), K_l2_norm = gpu_kernel("l2_norm");
+  K_embed = gpu_kernel("embed_rows"), K_rms_norm = gpu_kernel("rms_norm"), K_l2_norm = gpu_kernel("l2_norm");
   K_conv = gpu_kernel("conv"), K_gdn_gates = gpu_kernel("gdn_gates"), K_gdn = gpu_kernel("gdn");
   K_qk_rope = gpu_kernel("qk_rope"), K_kv_store = gpu_kernel("kv_store");
   K_attend_block = gpu_kernel("gqa_block"), K_attend_combine = gpu_kernel("gqa_combine");
@@ -852,8 +852,6 @@ static const char *q_refuse(const Options *o) {
 }
 
 static int q_load(const char *dir, const Options *o) {
-  const char *why = q_refuse(o);
-  if (why) die("qwen3_5: %s", why);
   qopt = *o;
   if (!qwen_load(dir, o->draft)) return 0;
   size_t needed = mtp ? (size_t)o->draft * c.vocab : 0;
@@ -1038,12 +1036,12 @@ static int q_idle(void) {
   return 0;
 }
 
-static int q_image(Image *image) {
+static int q_image(Media *image) {
   qwen_reside(1);
   return qwen_vision_encode(vision, image);
 }
 
-static void q_images(const Image *input, int count) {
+static void q_images(const Media *input, int count) {
   images = input;
   image_count = count;
 }
@@ -1051,7 +1049,7 @@ static void q_images(const Image *input, int count) {
 static void q_chat(char *text, size_t cap, const char *prompt, int images, int think) {
   size_t at = (size_t)snprintf(text, cap, "<|im_start|>user\n");
   for (int i = 0; i < images && at < cap; i++)
-    at += (size_t)snprintf(text + at, cap - at, "<|vision_start|>" IMAGE_MARK "<|vision_end|>");
+    at += (size_t)snprintf(text + at, cap - at, "<|vision_start|>" MEDIA_MARK "<|vision_end|>");
   if (at < cap) snprintf(text + at, cap - at, "%s<|im_end|>\n<|im_start|>assistant\n%s", prompt,
                         think ? "<think>\n" : "<think>\n\n</think>\n\n");
 }
@@ -1059,7 +1057,7 @@ static void q_chat(char *text, size_t cap, const char *prompt, int images, int t
 static const char *const q_types[] = {"qwen3_5", "qwen3_5_text", 0};
 
 const ModelOps qwen_ops = {
-    .family = "Qwen3.8", .model_types = q_types, .image_token = "<|image_pad|>", .refuse = q_refuse, .load = q_load, .weight_slot = q_weight_slot, .counters = q_counters,
+    .family = "Qwen3.8", .model_types = q_types, .media_token = "<|image_pad|>", .refuse = q_refuse, .load = q_load, .weight_slot = q_weight_slot, .counters = q_counters,
     .vocab = q_vocab, .max_rows = q_max_rows,
     .max_verify = q_max_verify, .draft_block = q_draft_block, .rewind = q_rewind, .stop = q_stop,
     .prefill_rows = q_prefill_rows,
@@ -1068,4 +1066,4 @@ const ModelOps qwen_ops = {
     .snapshot_bytes = q_snapshot_bytes, .snapshot_logits = q_snapshot_logits, .prefill = q_prefill,
     .replay_rows = q_replay_rows, .replay_start = q_replay_start, .rows = q_rows, .draft = q_draft, .verify = q_verify, .accept = q_accept,
     .seek = q_seek, .idle = q_idle, .chat = q_chat,
-    .prepare_image = qwen_prepare_image, .image = q_image, .images = q_images};
+    .prepare_media = qwen_prepare_image, .encode_media = q_image, .media = q_images};

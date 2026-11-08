@@ -754,6 +754,54 @@ fn flash_images_and_reused_state() {
 }
 
 #[test]
+fn nemotron_and_qwen_reload_under_one_memory_limit() {
+    let (Ok(nemotron), Ok(draft), Some(qwen)) = (
+        std::env::var("MYDS4_NEMOTRON"),
+        std::env::var("MYDS4_DFLASH"),
+        checkpoint(),
+    ) else {
+        return;
+    };
+    let _one = one_model();
+    let mut models = vec![
+        json!({"id":"transcribe","model":nemotron,"draft":7,"draft_model":draft,"ctx":4096}),
+        json!({"id":"qwen","model":qwen,"draft":0,"ctx":4096}),
+    ];
+    if let Ok(directory) = std::env::var("MYDS4_FLASH") {
+        models.push(json!({"id":"flash","model":directory,"draft":0,"ctx":4096}));
+    }
+    let server =
+        Server::with_config(json!({"memory":22,"reserve":10,"kv_cache":6,"models":models}));
+    let mut request = body(
+        json!([{"role":"user","content":"Name two colors."}]),
+        24,
+        false,
+    );
+    request["model"] = json!("transcribe");
+    let first = server.chat(&request);
+    let mut other = body(
+        json!([{"role":"user","content":"What is two plus three? Give just the number."}]),
+        8,
+        false,
+    );
+    other["model"] = json!("qwen");
+    assert!(content(&server.chat(&other)).contains('5'));
+    let again = server.chat(&request);
+    assert_eq!(content(&first), content(&again));
+    assert!(
+        again["usage"]["prompt_cache_hit_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    );
+    std::thread::sleep(Duration::from_millis(350));
+    let status = server.get("/v1/models/transcribe");
+    let budget = &status["status"]["model_memory_budget"];
+    assert_eq!(budget["limit"].as_u64(), Some(22 << 30));
+    assert!(budget["allocated"].as_u64().unwrap() <= 22 << 30);
+}
+
+#[test]
 fn disabled_drafts_leave_mtp_unloaded() {
     let Some(dir) = checkpoint() else { return };
     let _one = one_model();

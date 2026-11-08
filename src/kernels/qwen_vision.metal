@@ -1,13 +1,5 @@
 // Qwen vision: BF16 boundaries, 72-dimensional attention heads and a
 // learned 2D position table. Host code supplies the reordered patch grid.
-kernel void qwen_embed_rows(device const ushort *embedding [[buffer(0)]], device const int *tokens [[buffer(1)]],
-                            device float *out [[buffer(2)]], constant uint &width [[buffer(3)]],
-                            device const ulong *images [[buffer(4)]], uint2 i [[thread_position_in_grid]]) {
-  if (i.x >= width) return;
-  device const ushort *row = images[i.y] ? (device const ushort *)images[i.y] : embedding + (size_t)tokens[i.y] * width;
-  out[(size_t)i.y * width + i.x] = bf16f(row[i.x]);
-}
-
 kernel void qv_pack(device const float *x [[buffer(0)]], device bfloat *y [[buffer(1)]],
                     constant uint4 &p [[buffer(2)]], uint2 i [[thread_position_in_grid]]) {
   float value = i.y < p.z && i.x < p.x ? x[(size_t)i.y * p.x + i.x] : 0;

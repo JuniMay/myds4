@@ -178,46 +178,51 @@ int tok_vocab(const Tokenizer *t);  // its highest id plus one
 // The ids of len bytes of text (NUL bytes included), at most max of them:
 // TOK_TEXT, text alone, without the added tokens' spellings (a message's
 // text); TOK_ADDED, text in which the added tokens' spellings are those
-// tokens; TOK_PROMPT, a rendered chat prompt: as TOK_ADDED, and IMAGE_MARK,
-// an image part's place, becomes the image token, whose own spelling (in a
+// tokens; TOK_PROMPT, a rendered chat prompt: as TOK_ADDED, and MEDIA_MARK,
+// a media part's place, becomes the model's placeholder, whose own spelling (in a
 // file a tool read, say) is text. The three below take a C string.
 enum { TOK_TEXT, TOK_ADDED, TOK_PROMPT };
 int tok_encode_bytes(Tokenizer *t, const char *text, size_t len, int mode, int *out, int max);
 int tok_encode_text(Tokenizer *t, const char *text, int *out, int max);
 int tok_encode(Tokenizer *t, const char *text, int *out, int max);
 int tok_encode_chat(Tokenizer *t, const char *text, int *out, int max);
-#define IMAGE_MARK "\xff"  // no valid UTF-8 text holds this byte
+#define MEDIA_MARK "\xff"  // no valid UTF-8 text holds this byte
 const char *tok_piece(const Tokenizer *t, int id, int *len);
 int tok_added(const Tokenizer *t, int id);  // one of tokenizer.json's added tokens: 2 a special one, 1 another; 0
 int tok_find(const Tokenizer *t, const char *special);              // its id; a spelling that is none ends the process
 int tok_special(const Tokenizer *t, const char *text, size_t len);  // the id of an added token's spelling, -1 for none
 
-// ---- vision.c: image decoding, resizing and token spans ----
+// ---- media inputs and encoded feature rows ----
+typedef enum { MEDIA_IMAGE, MEDIA_AUDIO } MediaKind;
 typedef struct {
-  int vh, vw;       // patch grid
-  int th, tw;       // merged feature grid
-  int ntokens, patch_stride, embedding_width;
-  uint16_t *patch;  // patch grid rows of BF16 input values
-  uint64_t hash;    // of the image file's bytes
+  MediaKind kind;
+  int ntokens, embedding_width;
+  union {
+    struct { int vh, vw, th, tw, patch_stride; uint16_t *patch; };
+    struct { int sample_rate, sample_count; float *samples; };
+  };
+  uint64_t hash;    // of the encoded file's bytes
   int start;        // the position of its span in the prompt
   uint16_t *rows;   // BF16 feature rows, after encoding
   Buf features;    // optional GPU storage owning rows
-} Image;
+} Media;
 // Decodes an image file (any format macOS reads) and prepares its patches;
 // 0 with *err if it cannot.
-int image_open(Image *im, const void *data, size_t len, const char **err);
+int image_open(Media *im, const void *data, size_t len, const char **err);
+int audio_open(Media *media, const void *data, size_t len, const char **error);
 uint8_t *image_decode_rgb(const void *data, size_t len, int *width, int *height, const char **err);
 uint8_t *image_resize_rgb(const uint8_t *pixels, int width, int height, int out_width, int out_height);
 // The image padded to the size the ViT takes (bw x bh RGB pixels) and its
 // token grid, for checks; null with *err if it cannot be decoded.
 uint8_t *image_rgb(const void *data, size_t len, int *bw, int *bh, int *th, int *tw, const char **err);
 // The model processor sets the span length. Its negative token keys depend
-// on the image bytes, so prefix reuse distinguishes different images.
-int image_span(const Image *im);
-void image_keys(const Image *im, int *keys);
-void image_rope(const Image *im, float *cs);  // per patch: the 32 cosines, then the 32 sines of its RoPE angles
-// The tokens with each model-specific placeholder replaced by its image span and
-// the images' starts set: the new count (out holds up to max of them), or
+// on the media bytes, so prefix reuse distinguishes different inputs.
+int media_span(const Media *im);
+uint64_t media_embedding(const Media *media, int count, int position);
+void media_keys(const Media *im, int *keys);
+void image_rope(const Media *im, float *cs);  // per patch: the 32 cosines, then the 32 sines of its RoPE angles
+// The tokens with each model-specific placeholder replaced by its feature span and
+// the inputs' starts set: the new count (out holds up to max of them), or
 // -1 if the tokens hold another number of placeholders than nim.
-int image_expand(const int *in, int n, Image *im, int nim, int *out, int max, int image_token);
-void image_free(Image *im);
+int media_expand(const int *in, int n, Media *im, int nim, int *out, int max, int media_token);
+void media_free(Media *im);

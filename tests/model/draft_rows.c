@@ -16,7 +16,7 @@ int main(int argc, char **argv) {
   double model_reserve_gib = 4;
   Options o = {.ctx = 4096, .dump_fd = -1, .routes_fd = -1, .quiet = 1,
                .deepseek.experts = argv[2], .draft = 2, .deepseek.draft_cache = 32};
-  tk = tok_open(argv[1], deepseek_ops.image_token);
+  tk = tok_open(argv[1], deepseek_ops.media_token);
   const char *prompt = "Write a short story about a lighthouse keeper who discovers a message in a bottle.";
   int tokens[256], n = tok_encode(tk, prompt, tokens, 256);
   memory_configure(model_memory_gib, 8, model_reserve_gib);

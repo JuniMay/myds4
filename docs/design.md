@@ -4,10 +4,11 @@
 
 | Area | Responsibility |
 | --- | --- |
-| `src/engine/` | C interface, Metal command handling, file access, tokenization, sampling and image decoding. |
+| `src/engine/` | C interface, Metal commands, file access, tokenization, sampling and media decoding. |
 | `src/model/model.*` | Model registry and common execution interface. |
 | `src/model/deepseek/` | DeepSeek layers, experts, Engram, prefill planning and concurrent schedules. |
 | `src/model/qwen/` | Qwen text layers, recurrent state, MTP and vision encoder. |
+| `src/model/nemotron/` | Transcribe's language backbone, speech encoder and DFlash2 drafter. |
 | `src/model/draft.*` | Context-copy proposal generation. |
 | `src/kernels/` | Metal numerical kernels. |
 | `server/src/chat/` | API request conversion, model prompt formatting and response decoding. |
@@ -23,8 +24,8 @@ option union. The Rust configuration uses the corresponding backend enum.
 
 Registration reads metadata and tokenizers without loading weights.
 An inference request triggers loading only for its selected model. The
-engine's process lock covers both model families. Each loaded model owns
-its tensor index; deferred vision loading uses that model's index.
+engine's process lock covers every model. Each loaded model owns its tensor
+index; deferred media encoding uses that model's index.
 
 File validation errors during loading return a service error while the
 server remains available. Fatal backend or device errors still terminate
@@ -192,12 +193,65 @@ amplify small differences in BF16 rounding across blocks. Reference checks
 therefore compare each block on identical inputs as well as final image
 features. Image outputs are not bitwise equal to the CPU reference.
 
+## Nemotron 3.5 Transcribe
+
+The language backbone has 52 blocks: 23 Mamba2 blocks, 23 MoE blocks and
+six full-attention blocks. Its hidden width is 2,688. Each MoE block selects
+six of 128 experts and also runs a shared expert. Experts use two matrix
+products with a squared ReLU between them. The attention blocks have 32
+query heads and two key/value heads, each with 128 values. They do not
+apply rotary positions; the Mamba blocks carry position-dependent history.
+
+Mamba2 keeps FP32 recurrent state and convolution history. Attention keys
+and values use BF16. The model keeps BF16 boundaries between operators
+and FP32 routing scores. FP8 projections and NVFP4 products apply the
+checkpoint's calibrated activation scales outside the matrix reduction.
+This avoids rounding a global scale into each operand before the product.
+
+The speech frontend decodes audio in memory to mono 16 kHz. It computes
+128 log-mel features from 400-sample windows with a 160-sample hop and a
+512-point Fourier transform. Its window and mel filters come from the
+checkpoint. Eight frames form one encoder input. The ASR branch has 32
+transformer blocks of width 1,280; the speaker branch has 31 blocks of
+width 512. Their outputs are combined using the checkpoint's speaker
+feature normalization and projected to the language model's width.
+
+Long recordings use 500-token encoder windows with 50 tokens of left and
+right context. Speaker history holds 188 selected feature rows and a
+40-row queue. Confidence scores, recency boosts and silence embeddings
+select the retained rows. The frontend normalizes ASR features over the
+recording before windowing. Encoded audio spans participate in prefix
+reuse through their input hashes, as images do.
+
+DFlash2 is a separately loaded six-layer BF16 draft model. It receives
+the target outputs of layers 1, 5, 19, 29, 41 and 51, counted from zero.
+It projects those features into per-layer context keys and values. A
+query contains the known next token and up to 15 masked positions.
+Grouped convolutions and bidirectional attention predict candidates; a
+small trained selector scores candidate transitions and chooses a path.
+The drafter shares the target's embeddings and output head.
+
+Target verification preserves a recurrent checkpoint after each possible
+accepted prefix. Rejected rows leave no active target or draft history.
+Verification uses the ordinary matrix-vector reduction order, sharing
+weight reads across groups of up to eight rows. Deterministic proposals
+consume the target sampler's draws in order. Drafting disabled omits its
+weights, context keys, hidden capture and extra recurrent checkpoints.
+
+The reference implementations are [NeMo Speech](https://github.com/NVIDIA-NeMo/Speech/tree/main/nemo/collections/speechlm2),
+[Nemotron-H in Transformers](https://github.com/huggingface/transformers/tree/main/src/transformers/models/nemotron_h),
+and [DFlash2 in vLLM](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen3_dflash2.py).
+
 ## Prompt formats and sampling
 
 Chat adapters translate standard API messages and tools to each model's
 prompt format and decode generated framing back into API fields. Client
 harnesses receive ordinary text, reasoning and tool-call objects. Literal
 special-token spellings inside message text remain text.
+
+Qwen and Nemotron share ChatML framing and response parsing while retaining
+their checkpoint-specific prompt templates. Nemotron's audio placement,
+tool definitions and history reasoning rules differ from Qwen's.
 
 Qwen's tool format and low/xhigh instructions are specified by the
 checkpoint template. They are model instructions, not a client-specific

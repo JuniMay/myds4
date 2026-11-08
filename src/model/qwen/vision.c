@@ -22,20 +22,11 @@ struct QwenVision {
   int pack, bias, layernorm, heads_kernel, attention, gelu, add, positions;
 };
 
-uint64_t qwen_image_embedding(const Image *images, int count, int position) {
-  for (int i = 0; i < count; i++) {
-    int row = position - images[i].start;
-    if (row >= 0 && row < images[i].ntokens)
-      return images[i].features.gpu + (size_t)row * images[i].embedding_width * 2;
-  }
-  die("no image embedding at position %d", position);
-}
-
-void qwen_image_positions(const Image *images, int count, int position, int delta, int prompt, int32_t out[3]) {
+void qwen_image_positions(const Media *images, int count, int position, int delta, int prompt, int32_t out[3]) {
   if (prompt) {
     delta = 0;
     for (int i = 0; i < count; i++) {
-      const Image *im = images + i;
+      const Media *im = images + i;
       if (position < im->start) break;
       if (position < im->start + im->ntokens) {
         int at = position - im->start, base = im->start + delta;
@@ -64,7 +55,7 @@ static uint16_t rounded(float x) {
   return (uint16_t)((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
 }
 
-int qwen_prepare_image(const char *dir, Image *im, const void *data, size_t size, const char **error) {
+int qwen_prepare_image(const char *dir, Media *im, const void *data, size_t size, const char **error) {
   int w, h;
   uint8_t *pixels = image_decode_rgb(data, size, &w, &h, error);
   if (!pixels) return 0;
@@ -235,7 +226,7 @@ static void activate(QwenVision *v, const Buf *data, int n, int exact) {
   gpu_go((n + 255) / 256, 1, 1, 256, 1, 1);
 }
 
-int qwen_vision_trace(QwenVision *v, Image *im, int trace_fd) {
+int qwen_vision_trace(QwenVision *v, Media *im, int trace_fd) {
   if (!v) die("checkpoint has no Qwen vision encoder");
   if (im->rows) return 1;
   load(v);
@@ -318,7 +309,7 @@ int qwen_vision_trace(QwenVision *v, Image *im, int trace_fd) {
   return 1;
 }
 
-int qwen_vision_encode(QwenVision *v, Image *im) { return qwen_vision_trace(v, im, -1); }
+int qwen_vision_encode(QwenVision *v, Media *im) { return qwen_vision_trace(v, im, -1); }
 
 void qwen_vision_reside(QwenVision *v, int resident) {
   if (!v) return;

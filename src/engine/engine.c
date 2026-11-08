@@ -32,9 +32,9 @@ struct myds4_model {
   atomic_int loaded;
 };
 
-struct myds4_images {
+struct myds4_media {
   myds4_model *m;
-  Image *ims;
+  Media *items;
   int n;
 };
 
@@ -99,7 +99,7 @@ static char *copy(const char *s) { return s ? strdup(s) : 0; }
 myds4_model *myds4_open(const myds4_config *c) {
   if (!initialized || !c || c->abi != MYDS4_ABI || !c->model) return NULL;
   const ModelOps *ops = model_find(c->model);
-  myds4_architecture architecture = ops == &deepseek_ops ? MYDS4_DEEPSEEK : MYDS4_QWEN;
+  myds4_architecture architecture = ops == &deepseek_ops ? MYDS4_DEEPSEEK : ops == &nemotron_ops ? MYDS4_NEMOTRON : MYDS4_QWEN;
   if (c->architecture != architecture) {
     say("%s: option group does not match checkpoint architecture", c->model);
     return NULL;
@@ -108,12 +108,13 @@ myds4_model *myds4_open(const myds4_config *c) {
   const myds4_deepseek_config *d = architecture == MYDS4_DEEPSEEK ? &c->options.deepseek : &empty;
   Options options = {.family = c->architecture, .ctx = c->ctx, .lookup = c->lookup, .dump_fd = -1, .routes_fd = -1, .quiet = 1,
     .deepseek.cache_half_life = d->cache_half_life, .deepseek.cache_read_cost = d->cache_read_cost,
-    .draft = architecture == MYDS4_DEEPSEEK ? d->draft : c->options.qwen.draft,
+    .draft = architecture == MYDS4_DEEPSEEK ? d->draft : architecture == MYDS4_NEMOTRON ? c->options.nemotron.draft : c->options.qwen.draft,
     .deepseek.draft_cache = d->draft_cache, .deepseek.predictor_state = d->predictor_state, .deepseek.substitute = d->substitute,
     .deepseek.experts = d->experts, .deepseek.online_predictor = d->online_predictor || d->predictor_state ? 64 : 0,
     .deepseek.ced = d->ced, .deepseek.prefill_prune = d->prefill_prune, .deepseek.runahead = d->runahead, .deepseek.pipeline = d->pipeline};
+  if (architecture == MYDS4_NEMOTRON) options.nemotron.draft_model = c->options.nemotron.draft_model;
   const char *bad = options.ctx < 1 || options.ctx > 1 << 20 ? "ctx takes 1 to 1048576 tokens"
-    : options.draft < 0 || options.draft > BLOCK ? "draft takes 0 to 5 proposals"
+    : options.draft < 0 || options.draft > (architecture == MYDS4_NEMOTRON ? 15 : BLOCK) ? "draft exceeds this model's proposal limit"
     : options.lookup < 0 || options.lookup > VERIFY_DRAFTS ? "lookup takes off or 1 to 15 proposals"
     : d->draft_cache && !d->draft ? "draft-cache needs draft"
     : d->draft_cache && (d->draft_cache < DRAFT_CACHE_MIN || d->draft_cache > DRAFT_EXPERTS) ? "draft-cache takes 15 to 128 slots"
@@ -131,10 +132,12 @@ myds4_model *myds4_open(const myds4_config *c) {
   atomic_init(&x->loaded, 0);
   x->ops = ops;
   x->opt = options;
-  x->opt.deepseek.predictor_state = copy(options.deepseek.predictor_state);
-  x->opt.deepseek.experts = copy(options.deepseek.experts);
+  if (architecture == MYDS4_DEEPSEEK) {
+    x->opt.deepseek.predictor_state = copy(options.deepseek.predictor_state);
+    x->opt.deepseek.experts = copy(options.deepseek.experts);
+  } else if (architecture == MYDS4_NEMOTRON) x->opt.nemotron.draft_model = copy(options.nemotron.draft_model);
   families[nfamilies++] = ops;
-  x->tk = tok_open(c->model, ops->image_token);
+  x->tk = tok_open(c->model, ops->media_token);
   x->dir = copy(c->model);
   x->m = model_create(x->dir);
   say("%s: registered %s; weights load on first inference request", c->model, ops->family);
@@ -158,10 +161,11 @@ int myds4_load(myds4_model *m) {
   }
   model_active(m->m, 1);
   atomic_store_explicit(&m->loaded, 1, memory_order_release);
-  if (!was_loaded) say("%s: %s, context %d, drafts %d, rewind margin %d, context lookup %d; prefill: ced_depth=%d (%s), dependency "
+  if (!was_loaded && m->ops == &deepseek_ops) say("%s: %s, context %d, drafts %d, rewind margin %d, context lookup %d; prefill: ced_depth=%d (%s), dependency "
       "pruning=%s",
       m->dir, m->ops->family, m->opt.ctx, m->ops->draft_block(), m->ops->rewind(), m->opt.lookup, m->opt.deepseek.ced,
       m->opt.deepseek.ced ? "approximate" : "off", m->opt.deepseek.prefill_prune ? "on" : "off");
+  else if (!was_loaded) say("%s: %s, context %d, drafts %d", m->dir, m->ops->family, m->opt.ctx, m->ops->draft_block());
   return 1;
 }
 
@@ -214,11 +218,11 @@ const float *myds4_snapshot_logits(const myds4_model *m, const myds4_snapshot *x
 // ---- running a model ----
 
 const float *myds4_prefill(myds4_model *m, myds4_state *s, const int32_t *tokens, int n, int from, int replay,
-                           int capture, myds4_snapshot **captured, myds4_prefill_info *info, const myds4_images *images) {
+                           int capture, myds4_snapshot **captured, myds4_prefill_info *info, const myds4_media *images) {
   memory_scope(&m->m->work);
   if (captured) *captured = 0;
   int start = replay && from > 0 ? m->ops->replay_start(from) : from;
-  if (m->ops->images) m->ops->images(images ? images->ims : NULL, images ? images->n : 0);
+  if (m->ops->media) m->ops->media(images ? images->items : NULL, images ? images->n : 0);
   const float *lg = m->ops->prefill(s, tokens, n, from, replay, capture, captured, 0);
   if (info) {  // the family's plan, or every row through every layer
     ModelPlan p = {.chunks = 1, .tokens = n - start, .decoder_tokens = n - start};
@@ -295,22 +299,21 @@ void myds4_lookup_feedback(myds4_lookup *x, int offered, int accepted) { context
 
 // ---- images ----
 
-myds4_images *myds4_images_open(myds4_model *m, const uint8_t *const *data, const size_t *len, int n, char *message,
+myds4_media *myds4_media_open(myds4_model *m, const uint8_t *const *data, const size_t *len, int n, char *message,
                                 size_t cap) {
   memory_scope(&m->m->work);
-  if (!m->ops->image || !m->ops->prepare_image) {
-    snprintf(message, cap, "this model has no vision encoder");
+  if (!m->ops->encode_media || !m->ops->prepare_media) {
+    snprintf(message, cap, "this model has no media encoder");
     return 0;
   }
-  myds4_images *x = xmalloc(sizeof *x);
+  myds4_media *x = xmalloc(sizeof *x);
   x->m = m;
-  x->ims = calloc((size_t)n + 1, sizeof *x->ims), x->n = 0;
-  if (!x->ims) die("out of memory");
+  x->items = xmalloc((size_t)n * sizeof *x->items), x->n = 0;
   for (int i = 0; i < n; i++) {
     const char *why;
-    if (!m->ops->prepare_image(m->dir, &x->ims[i], data[i], len[i], &why)) {
-      snprintf(message, cap, "image %d: %s", i + 1, why);
-      myds4_images_close(x);
+    if (!m->ops->prepare_media(m->dir, &x->items[i], data[i], len[i], &why)) {
+      snprintf(message, cap, "media %d: %s", i + 1, why);
+      myds4_media_close(x);
       return 0;
     }
     x->n = i + 1;
@@ -318,27 +321,27 @@ myds4_images *myds4_images_open(myds4_model *m, const uint8_t *const *data, cons
   return x;
 }
 
-int myds4_images_expand(myds4_images *x, const int32_t *in, int n, int32_t *out, int max) {
-  int token = tok_find(x->m->tk, x->m->ops->image_token);
-  return image_expand(in, n, x->ims, x->n, out, max, token);
+int myds4_media_expand(myds4_media *x, const int32_t *in, int n, int32_t *out, int max) {
+  int token = tok_find(x->m->tk, x->m->ops->media_token);
+  return media_expand(in, n, x->items, x->n, out, max, token);
 }
 
-int myds4_images_encode(myds4_images *x, int from) {
+int myds4_media_encode(myds4_media *x, int from) {
   memory_scope(&x->m->m->work);
   int encoded = 0;  // the encoder runs for the images the prefill reaches; the others are in the state's rows
   for (int i = 0; i < x->n; i++)
-    if (x->ims[i].start + image_span(&x->ims[i]) > from) {
-      if (!x->m->ops->image(&x->ims[i])) return -1;
+    if (x->items[i].start + media_span(&x->items[i]) > from) {
+      if (!x->m->ops->encode_media(&x->items[i])) return -1;
       encoded++;
     }
   return encoded;
 }
 
-void myds4_images_close(myds4_images *x) {
+void myds4_media_close(myds4_media *x) {
   if (!x) return;
-  x->m->ops->images(0, 0);
-  for (int i = 0; i < x->n; i++) image_free(&x->ims[i]);
-  free(x->ims), free(x);
+  x->m->ops->media(0, 0);
+  for (int i = 0; i < x->n; i++) media_free(&x->items[i]);
+  free(x->items), free(x);
 }
 
 // ---- statistics ----

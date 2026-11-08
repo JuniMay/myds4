@@ -27,6 +27,12 @@ static const char source[] = {
 #embed "gqa.metal"
     , '\n',
 #embed "flash.metal"
+    , '\n',
+#embed "nemotron.metal"
+    , '\n',
+#embed "speech.metal"
+    , '\n',
+#embed "dflash.metal"
 };
 
 void gpu_start(void) {

@@ -1,33 +1,4 @@
 // Qwen Flash-Next: BF16 layer boundaries, gated residual streams and routed experts.
-struct FlashNorm {
-  uint width, groups;
-  float eps;
-  uint pad;
-};
-kernel void flash_norm(device const float *x [[buffer(0)]], device const float *w [[buffer(1)]],
-                       device float *out [[buffer(2)]], constant FlashNorm &p [[buffer(3)]],
-                       uint row [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]],
-                       uint threads [[threads_per_threadgroup]]) {
-  threadgroup float partial[32];
-  float sum = 0;
-  for (uint i = t; i < p.width; i += threads) {
-    float v = x[(size_t)row * p.width + i];
-    sum += v * v;
-  }
-  float inv = rsqrt(tg_sum(sum, partial, t, threads) / p.width + p.eps);
-  for (uint i = t; i < p.width; i += threads)
-    out[(size_t)row * p.width + i] = bf(x[(size_t)row * p.width + i] * inv * w[(row % p.groups) * p.width + i]);
-}
-kernel void flash_round(device float *x [[buffer(0)]], constant uint &n [[buffer(1)]],
-                        uint i [[thread_position_in_grid]]) {
-  if (i < n)
-    x[i] = bf(x[i]);
-}
-kernel void flash_zero(device float *x [[buffer(0)]], constant uint &n [[buffer(1)]],
-                       uint i [[thread_position_in_grid]]) {
-  if (i < n)
-    x[i] = 0;
-}
 kernel void flash_embed(device const ushort *w [[buffer(0)]], device const int *tokens [[buffer(1)]],
                         device float *out [[buffer(2)]], constant uint2 &p [[buffer(3)]],
                         device const ulong *images [[buffer(4)]], uint2 i [[thread_position_in_grid]]) {
@@ -120,22 +91,12 @@ kernel void flash_route(device const float *logits [[buffer(0)]], device uint *i
       weights[row * p.chosen + k] = bf(selected[k] / (p.normalized ? total : 1.0f));
   }
 }
-struct FlashEntry {
-  uint row;
-  float weight;
-};
-kernel void flash_gather(device const float *x [[buffer(0)]], device const FlashEntry *entries [[buffer(1)]],
-                         device float *out [[buffer(2)]], constant uint2 &p [[buffer(3)]],
-                         uint i [[thread_position_in_grid]]) {
-  if (i < p.x * p.y)
-    out[i] = x[(size_t)entries[i / p.x].row * p.x + i % p.x];
-}
-kernel void flash_scatter(device const float *x [[buffer(0)]], device const FlashEntry *entries [[buffer(1)]],
+kernel void flash_scatter(device const float *x [[buffer(0)]], device const WeightedRow *entries [[buffer(1)]],
                           device float *out [[buffer(2)]], constant uint2 &p [[buffer(3)]],
                           uint i [[thread_position_in_grid]]) {
   if (i >= p.x * p.y)
     return;
-  FlashEntry e = entries[i / p.x];
+  WeightedRow e = entries[i / p.x];
   size_t at = (size_t)e.row * p.x + i % p.x;
   out[at] = bf(out[at] + bf(x[i] * e.weight));
 }
@@ -149,29 +110,6 @@ kernel void flash_kv_store(device const float *k [[buffer(0)]], device const flo
   ((device bfloat *)rows[i.y].v)[at] = bfloat(v[(size_t)i.y * p.width + i.x]);
 }
 
-struct FlashQuant {
-  uint count, bits;
-  float scale;
-  uint pad;
-};
-kernel void flash_quant(device const float *x [[buffer(0)]], device float *out [[buffer(1)]],
-                        constant FlashQuant &p [[buffer(2)]], uint i [[thread_position_in_grid]],
-                        uint lane [[thread_index_in_simdgroup]]) {
-  if (i >= p.count)
-    return;
-  float v = x[i];
-  if (p.bits == 8) {
-    float amax = simd_max(fabs(v));
-    float scale = pow2_scale(max(amax, 0x1p-126f), 1.0f / 448.0f);
-    out[i] = bf(e4m3(clamp(v / scale, -448.0f, 448.0f)) * scale);
-  } else {
-    float value = p.scale > 0 ? v / p.scale : 0;
-    float left = simd_max(lane < 16 ? fabs(value) : 0.0f);
-    float right = simd_max(lane >= 16 ? fabs(value) : 0.0f);
-    float scale = e4m3(min((lane < 16 ? left : right) / 6, 448.0f));
-    out[i] = scale > 0 ? bf(e2m1(clamp(value / scale, -6.0f, 6.0f)) * scale * p.scale) : 0;
-  }
-}
 
 kernel void flash_ple_gate(device const float *key [[buffer(0)]], device const float *query [[buffer(1)]],
                            device const float *value [[buffer(2)]], device float *out [[buffer(3)]],

@@ -45,7 +45,8 @@ of each architecture per process.
 | `batch` | Maximum admitted requests for this model; default 4, capped at 6 for DeepSeek and 8 for Qwen. |
 | `temperature`, `top_p`, `top_k`, `seed` | Defaults for requests that omit them or send null. Request values override them. `top_k: 0` uses the full vocabulary. |
 | `think` | Default reasoning effort, 0 for off and 1–100 for enabled reasoning. |
-| `draft` | Native speculative proposals: DeepSeek DSpark 0–5; Qwen3.8-27B chained MTP 0–5. Flash-Next currently requires 0. |
+| `draft` | Speculative proposals: DeepSeek DSpark 0–5; Qwen3.8-27B chained MTP 0–5; Nemotron DFlash2 0–15. Flash-Next requires 0. |
+| `draft_model` | For Nemotron with `draft` enabled, the separate DFlash2 checkpoint directory. |
 | `lookup` | `off` or 1–15 context-copy proposals, limited by the model's verification capacity. |
 
 Qwen's generation configuration supplies sampling defaults when the entry
@@ -58,6 +59,13 @@ checkpoint types are `qwen4_exp` and `qwen4_exp_text`. It supports images
 when the checkpoint contains the vision encoder. Set `draft: 0` and
 `lookup: "off"`; speculative verification is not implemented for this
 architecture. Its routed experts share the global `memory` budget.
+
+Nemotron 3.5 Transcribe uses checkpoint type `nemo_speechlm`. Its main model
+and speech encoder load on demand. The DFlash2 checkpoint is BF16 and loads
+only with `draft` enabled. Seven proposals are a useful starting point;
+the best setting depends on acceptance and transcript length. Without
+explicit sampling settings, Transcribe uses temperature 0 and reasoning
+off. API requests can override those defaults.
 
 DeepSeek-specific settings belong only to its entry:
 
@@ -136,6 +144,17 @@ The server does not fetch remote image URLs or read client-supplied local
 paths. DeepSeek and Qwen use their own image preprocessing and position
 rules. Video requests are not implemented.
 
+Transcribe accepts `input_audio` parts containing `data` (base64) and
+`format`, or `audio_url` parts containing a base64 data URL. It decodes
+formats supported by macOS, including WAV, FLAC and MP3, and resamples to
+mono 16 kHz. Recordings may be up to one hour, subject to the context and
+memory budgets. The encoder uses overlapping windows and carries speaker
+history between them. Generated speaker tags are text; separate CTC word
+alignment and timestamp metadata are not implemented. Remote audio URLs
+and client-supplied file paths are not fetched by the server.
+The HTTP request body, including base64 data, is limited to 32 MiB. Use a
+compressed audio container or the CLI for recordings that exceed that limit.
+
 ## Terminal interface
 
 `n` selects the next model. Keys 1–6 select Overview, KV cache, Experts,
@@ -155,6 +174,7 @@ server-rendered prompt. The CLI defaults to 128 generated tokens, a 16K
 context and greedy sampling. Use `-t 1 --top-p 1` for sampled generation.
 
 The CLI accepts the relevant model options above, with hyphens instead of
-underscores. `--image FILE` adds an image. `--tokenize`, `--check-prefill`,
-`--check-batch`, `--perplexity`, `--logits-fd`, `--routes-fd`, `--vision-fd`
+underscores. `--image FILE` adds an image; `--audio FILE` adds a recording
+for Transcribe. `--tokenize`, `--check-prefill`,
+`--check-batch`, `--perplexity`, `--logits-fd`, `--routes-fd`, `--features-fd`
 and `--bench` are developer diagnostics; see [Testing](testing.md).

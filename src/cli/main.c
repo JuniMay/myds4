@@ -14,7 +14,7 @@
 
 static void usage(void) {
   fputs("usage: myds4 -m MODEL [-p PROMPT | -f FILE | --tokens IDS] [options]\n"
-        "  -m MODEL      a supported DeepSeek or Qwen checkpoint directory\n"
+        "  -m MODEL      a supported model checkpoint directory\n"
         "  -n N          tokens to generate (default 128)\n"
         "  -t T, --temperature T  sampling temperature, 0 = greedy (default 0)\n"
         "  --top-p P     nucleus probability in [0, 1] (default 1, full distribution)\n"
@@ -24,7 +24,8 @@ static void usage(void) {
         "  --think N     thinking effort 1-100; 0 disables it (default off)\n"
         "  --image FILE  an image (any format macOS reads) before the prompt's text, up to 16; with --raw\n"
         "                each takes a <｜deepseek_image｜> of the prompt instead (models with a vision encoder)\n"
-        "  --vision-fd FD  write the --image images' feature rows (BF16, 5120 per token) to FD and exit\n"
+        "  --audio FILE  an audio recording for a speech model; repeat for multiple recordings\n"
+        "  --features-fd FD  write encoded BF16 feature rows to FD and exit\n"
         "  --ctx N       context capacity in tokens, at most 1048576 (default 16384)\n"
         "  --prefill-prune  skip decoder batches outside required history (default off); CED and substitution must be off\n"
         "  --ced off|N   approximate prefill: replay N decoder tokens, 128-1048576 (default off);\n"
@@ -45,8 +46,8 @@ static void usage(void) {
         "  --check-prefill  compare the prompt's batched prefill with token-by-token decoding\n"
         "  --check-batch  compare a token decoded alone with the same token decoded beside another sequence\n"
         "                (and, with --draft, in a verify pass): the logits must be equal\n"
-        "  --draft N     verify up to N (1-5) drafts per pass, the model's own (DeepSeek's DSpark: up to 5;\n"
-        "                Qwen's chained MTP: up to 5), using the requested sampler\n"
+        "  --draft N     proposals per pass: DeepSeek/Qwen MTP 0-5, Nemotron DFlash2 0-15\n"
+        "  --draft-model DIR  DFlash2 checkpoint directory for Nemotron drafting\n"
         "  --lookup off|N  verify up to N (1-15) context-copy drafts; --draft supplies fallback (default off)\n"
         "  --draft-cache N  with --draft: expert slots per stage, 15-128 (default: all 128 preloaded);\n"
         "                smaller caches load the native selections on demand, within --memory\n"
@@ -97,10 +98,16 @@ int main(int argc, char **argv) {
   int seed_set = 0;
   double memory_gb = 0, kv_gb = 8, reserve_gb = 10;
   Options o = {.ctx = 16384, .dump_fd = -1, .routes_fd = -1};
-  const char *image_path[16];
-  int nimg = 0, vision_fd = -1;
+  const char *media_path[16];
+  int nmedia = 0, vision_fd = -1, media_kind = -1;
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : 0;
+    if (!strcmp(a, "--experts") || !strcmp(a, "--ced") || !strcmp(a, "--prefill-prune") || !strcmp(a, "--substitute") ||
+        !strcmp(a, "--runahead") || !strcmp(a, "--pipeline") || !strcmp(a, "--draft-cache") || !strcmp(a, "--online-predictor") ||
+        !strcmp(a, "--predictor-state") || !strcmp(a, "--cache-half-life") || !strcmp(a, "--cache-read-cost")) {
+      if (o.family && o.family != MODEL_DEEPSEEK) die("model-specific options belong to different architectures");
+      o.family = MODEL_DEEPSEEK;
+    }
     if (!strcmp(a, "--raw")) {
       raw = 1;
       continue;
@@ -190,6 +197,10 @@ int main(int argc, char **argv) {
     else if (!strcmp(a, "--dump-fd")) o.dump_fd = atoi(v);
     else if (!strcmp(a, "--routes-fd")) o.routes_fd = atoi(v);
     else if (!strcmp(a, "--draft")) o.draft = atoi(v);
+    else if (!strcmp(a, "--draft-model")) {
+      if (o.family && o.family != MODEL_NEMOTRON) die("model-specific options belong to different architectures");
+      o.family = MODEL_NEMOTRON; o.nemotron.draft_model = v;
+    }
     else if (!strcmp(a, "--lookup")) {
       char *end;
       errno = 0;
@@ -211,22 +222,29 @@ int main(int argc, char **argv) {
     else if (!strcmp(a, "--experts")) o.deepseek.experts = v;
     else if (!strcmp(a, "--prefill")) prefill = atoi(v);
     else if (!strcmp(a, "--logits-fd")) logits_fd = atoi(v);
-    else if (!strcmp(a, "--image")) {
-      if (nimg == 16) die("at most 16 images");
-      image_path[nimg++] = v;
-    } else if (!strcmp(a, "--vision-fd")) vision_fd = atoi(v);
+    else if (!strcmp(a, "--image") || !strcmp(a, "--audio")) {
+      int kind = !strcmp(a, "--audio") ? MEDIA_AUDIO : MEDIA_IMAGE;
+      if (media_kind >= 0 && media_kind != kind) die("this model takes one media kind per request");
+      media_kind = kind;
+      if (nmedia == 16) die("at most 16 media inputs");
+      media_path[nmedia++] = v;
+    } else if (!strcmp(a, "--features-fd")) vision_fd = atoi(v);
     else usage();
   }
   if (vision_fd >= 0 && !prompt) prompt = "";
   if (!dir || (!prompt && !ids && !bench)) usage();
-  if (nimg && (ids || bench || check || check_batch || perplexity || o.dump_fd >= 0))
-    die("--image works with a prompt's generation and with --vision-fd");
+  if (nmedia && (ids || bench || check || check_batch || perplexity || o.dump_fd >= 0))
+    die("media inputs need generation or --features-fd");
   if (o.ctx < 1 || o.ctx > 1 << 20) die("--ctx takes 1 to %d tokens (the model's longest context)", 1 << 20);
-  if (o.draft < 0 || o.draft > BLOCK) die("--draft takes 1 to %d drafts", BLOCK);
+  if (o.draft < 0 || o.draft > VERIFY_DRAFTS) die("--draft takes 0 to %d drafts", VERIFY_DRAFTS);
   if (o.deepseek.draft_cache && !o.draft) die("--draft-cache needs --draft");
   if (o.deepseek.ced && (o.dump_fd >= 0 || check)) die("--dump-fd and --check-prefill require --ced off; they inspect every prompt row");
   const ModelOps *ops = model_find(dir);
-  if (nimg && !ops->image) die("--image: this model has no vision encoder");
+  if (o.family == MODEL_NEMOTRON && ops != &nemotron_ops) die("--draft-model applies to Nemotron");
+  if (o.family == MODEL_DEEPSEEK && ops != &deepseek_ops) die("these options apply to DeepSeek");
+  if (ops != &nemotron_ops && o.draft > BLOCK) die("this model accepts at most %d proposals", BLOCK);
+  const char *refusal = ops->refuse(&o); if (refusal) die("%s", refusal);
+  if (nmedia && (!ops->encode_media || (int)ops->media_kind != media_kind)) die("this model does not encode the requested media kind");
   if (bench && !ops->bench) die("--bench: this model has no kernel timings");
   if (o.deepseek.predictor_state) shutdown_watch();
   if (bench) {
@@ -238,7 +256,7 @@ int main(int argc, char **argv) {
     ops->bench();
     return complete();
   }
-  Tokenizer *tk = tok_open(dir, ops->image_token);
+  Tokenizer *tk = tok_open(dir, ops->media_token);
   int *tokens = xmalloc((size_t)o.ctx * sizeof *tokens), n = 0;
   if (ids) {
     const char *list = *ids == '@' ? read_file(ids + 1, 0) : ids, *sep = ", \t\r\n";
@@ -249,28 +267,28 @@ int main(int argc, char **argv) {
       s = end;
     }
   } else {
-    size_t len = strlen(prompt) + 512 + 128 * (size_t)nimg;
+    size_t len = strlen(prompt) + 512 + 128 * (size_t)nmedia;
     char *text = xmalloc(len);
     if (raw) snprintf(text, len, "%s", prompt);
-    else if (ops->chat) ops->chat(text, len, prompt, nimg, think);
+    else if (ops->chat) ops->chat(text, len, prompt, nmedia, think);
     else die("-p and -f: this model's chat template is not in the CLI; use --raw or --tokens");
     n = raw == 1 ? tok_encode(tk, text, tokens, o.ctx)
             : tok_encode_chat(tk, text, tokens, o.ctx); // --raw: the placeholders place images
   }
-  Image ims[16] = {0};
-  if (nimg) { // each placeholder becomes its image's span
+  Media ims[16] = {0};
+  if (nmedia) { // each placeholder becomes its image's span
     int total = n;
-    for (int i = 0; i < nimg; i++) {
+    for (int i = 0; i < nmedia; i++) {
       size_t len;
       const char *err;
-      char *d = read_file(image_path[i], &len);
-      if (!ops->prepare_image || !ops->prepare_image(dir, &ims[i], d, len, &err)) die("%s: %s", image_path[i], ops->prepare_image ? err : "this model has no image processor");
+      char *d = read_file(media_path[i], &len);
+      if (!ops->prepare_media || !ops->prepare_media(dir, &ims[i], d, len, &err)) die("%s: %s", media_path[i], ops->prepare_media ? err : "this model has no media processor");
       free(d);
-      total += image_span(&ims[i]) - 1;
+      total += media_span(&ims[i]) - 1;
     }
-    int *p = xmalloc((size_t)(total + 1) * sizeof *p), m = image_expand(tokens, n, ims, nimg, p, total, tok_find(tk, ops->image_token));
-    if (m < 0) die("the prompt holds another number of <｜deepseek_image｜> than --image images");
-    if (m > o.ctx) die("the prompt has %d tokens with its images; --ctx holds %d", m, o.ctx);
+    int *p = xmalloc((size_t)(total + 1) * sizeof *p), m = media_expand(tokens, n, ims, nmedia, p, total, tok_find(tk, ops->media_token));
+    if (m < 0) die("the prompt placeholders and media inputs differ");
+    if (m > o.ctx) die("the prompt has %d tokens with its media; --ctx holds %d", m, o.ctx);
     free(tokens), tokens = p, n = m;
   }
   if (tokenize) {
@@ -283,17 +301,18 @@ int main(int argc, char **argv) {
   if (shutdown_requested()) return complete();
   const int V = ops->vocab();
   ModelState *st = ops->state_new();
-  for (int i = 0; i < nimg; i++) {
+  for (int i = 0; i < nmedia; i++) {
     if (shutdown_requested()) return complete();
     double t = now();
-    ops->image(&ims[i]);
-    fprintf(stderr, "image %s: %d x %d patches, %d tokens, encoded in %.2f s\n", image_path[i], ims[i].vh, ims[i].vw,
-            image_span(&ims[i]), now() - t);
+    ops->encode_media(&ims[i]);
+    if (ims[i].kind == MEDIA_AUDIO) fprintf(stderr, "audio %s: %.2f seconds, %d tokens, encoded in %.2f s\n", media_path[i], (double)ims[i].sample_count / ims[i].sample_rate, media_span(&ims[i]), now() - t);
+    else fprintf(stderr, "image %s: %d x %d patches, %d tokens, encoded in %.2f s\n", media_path[i], ims[i].vh, ims[i].vw,
+            media_span(&ims[i]), now() - t);
     if (vision_fd >= 0 && write(vision_fd, ims[i].rows, (size_t)ims[i].ntokens * ims[i].embedding_width * 2) < 0)
       die("vision: write failed");
   }
   if (vision_fd >= 0) return complete();
-  if (ops->images) ops->images(ims, nimg);
+  if (ops->media) ops->media(ims, nmedia);
   if (check) { // every position's logits: the batched prefill against token-by-token decoding
     float *a = xmalloc((size_t)n * V * 4);
     ops->prefill(st, tokens, n, 0, 0, -1, 0, a);

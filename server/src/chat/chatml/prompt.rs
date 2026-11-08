@@ -28,7 +28,7 @@ const TOOL_FORMAT: &str = "\n\nIf you choose to call a function ONLY reply in th
 
 /// The markers the template writes; those the tokenizer has as added tokens
 /// become their ids.
-const MARKERS: [&str; 11] = [
+const MARKERS: [&str; 12] = [
     "<|im_start|>",
     "<|im_end|>",
     "<think>",
@@ -40,10 +40,11 @@ const MARKERS: [&str; 11] = [
     "<|vision_start|>",
     "<|image_pad|>",
     "<|vision_end|>",
+    "<|audio|>",
 ];
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ImagePart {
+pub struct MediaPart {
     pub offset: usize,
     pub bytes: Vec<u8>,
 }
@@ -53,7 +54,7 @@ pub struct ImagePart {
 pub struct Message {
     pub role: String,
     pub content: String,
-    pub images: Vec<ImagePart>,
+    pub media: Vec<MediaPart>,
     pub reasoning: String,
     pub calls: Vec<Call>,
 }
@@ -147,15 +148,15 @@ impl Prompt {
         } else {
             start + trimmed.len()
         };
-        if let Some(image) = message.images.first() {
+        if let Some(image) = message.media.first() {
             start = start.min(image.offset);
         }
-        if let Some(image) = message.images.last() {
+        if let Some(image) = message.media.last() {
             end = end.max(image.offset);
         }
         end = end.max(start);
         let mut from = start;
-        for image in &message.images {
+        for image in &message.media {
             self.content(&text[from..image.offset]);
             self.push("<|vision_start|><|image_pad|><|vision_end|>");
             from = image.offset;
@@ -199,6 +200,173 @@ pub struct Options<'a> {
 /// thinking off, its empty reasoning closed).
 pub fn render(messages: &[Message], o: &Options, t: &Tokenizer) -> Result<Vec<u32>, String> {
     build(messages, o)?.tokens(t)
+}
+
+pub fn render_nemotron(
+    messages: &[Message],
+    o: &Options,
+    t: &Tokenizer,
+) -> Result<Vec<u32>, String> {
+    build_nemotron(messages, o)?.tokens(t)
+}
+
+fn python_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Bool(true) => "True".into(),
+        Value::Bool(false) => "False".into(),
+        Value::Null => "None".into(),
+        _ => tojson(value),
+    }
+}
+
+fn extra_fields(p: &mut Prompt, object: &Value, handled: &[&str]) {
+    if let Some(object) = object.as_object() {
+        for (key, value) in object {
+            if handled.contains(&key.as_str()) {
+                continue;
+            }
+            p.push(&format!("\n<{key}>"));
+            p.content(&python_string(value));
+            p.push(&format!("</{key}>"));
+        }
+    }
+}
+
+fn build_nemotron(messages: &[Message], o: &Options) -> Result<Prompt, String> {
+    if messages.is_empty() || !messages.iter().any(|m| m.role == "user") {
+        return Err("no user message".into());
+    }
+    let mut p = Prompt::default();
+    p.push("<|im_start|>system\n");
+    let has_system = messages[0].role == "system";
+    if has_system {
+        p.content(&messages[0].content);
+    }
+    if !o.tools.is_empty() {
+        if has_system && !messages[0].content.is_empty() {
+            p.push("\n\n");
+        }
+        p.push("# Tools\n\nYou have access to the following functions:\n\n<tools>");
+        for tool in o.tools {
+            let tool = tool.get("function").unwrap_or(tool);
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or("a tool has no name")?;
+            p.push("\n<function>\n<name>");
+            p.content(name);
+            p.push("</name>");
+            if let Some(description) = tool.get("description").and_then(Value::as_str) {
+                p.push("\n<description>");
+                p.content(trim(description));
+                p.push("</description>");
+            }
+            p.push("\n<parameters>");
+            if let Some(parameters) = tool.get("parameters") {
+                if let Some(properties) = parameters.get("properties").and_then(Value::as_object) {
+                    for (name, fields) in properties {
+                        p.push("\n<parameter>\n<name>");
+                        p.content(name);
+                        p.push("</name>");
+                        for key in ["type", "description", "enum"] {
+                            if let Some(value) = fields.get(key) {
+                                p.push(&format!("\n<{key}>"));
+                                p.content(&if key == "description" {
+                                    trim(value.as_str().unwrap_or("")).into()
+                                } else if key == "enum" {
+                                    tojson(value)
+                                } else {
+                                    python_string(value)
+                                });
+                                p.push(&format!("</{key}>"));
+                            }
+                        }
+                        extra_fields(&mut p, fields, &["name", "type", "description", "enum"]);
+                        p.push("\n</parameter>");
+                    }
+                }
+                extra_fields(&mut p, parameters, &["type", "properties", "required"]);
+                if let Some(required) = parameters.get("required") {
+                    p.push("\n<required>");
+                    p.content(&tojson(required));
+                    p.push("</required>");
+                }
+            }
+            p.push("\n</parameters>");
+            extra_fields(&mut p, tool, &["type", "name", "description", "parameters"]);
+            p.push("\n</function>");
+        }
+        p.push("\n</tools>");
+        p.push(TOOL_FORMAT);
+    }
+    p.push("<|im_end|>\n");
+    let last_user = messages.iter().rposition(|m| m.role == "user").unwrap();
+    for (i, m) in messages.iter().enumerate() {
+        if i == 0 && has_system {
+            continue;
+        }
+        match m.role.as_str() {
+            "user" | "system" => {
+                p.push(&format!("<|im_start|>{}\n", m.role));
+                p.content(&m.content);
+                for (j, _) in m.media.iter().enumerate() {
+                    if !m.content.is_empty() || j > 0 {
+                        p.push(" ");
+                    }
+                    p.push("<|audio|>");
+                }
+                p.push("<|im_end|>\n");
+            }
+            "assistant" => {
+                p.push("<|im_start|>assistant\n");
+                if i < last_user || m.reasoning.is_empty() {
+                    p.push("<think></think>");
+                } else {
+                    p.push("<think>\n");
+                    p.content(&m.reasoning);
+                    p.push("</think>");
+                }
+                p.content(trim(&m.content));
+                if !m.calls.is_empty() {
+                    p.push("\n");
+                }
+                for call in &m.calls {
+                    p.push("<tool_call>\n<function=");
+                    p.content(&call.name);
+                    p.push(">\n");
+                    for (name, value) in &call.arguments {
+                        p.push("<parameter=");
+                        p.content(name);
+                        p.push(">\n");
+                        p.content(&python_string(value));
+                        p.push("\n</parameter>\n");
+                    }
+                    p.push("</function>\n</tool_call>\n");
+                }
+                p.push("<|im_end|>\n");
+            }
+            "tool" => {
+                if i == 0 || messages[i - 1].role != "tool" {
+                    p.push("<|im_start|>user\n");
+                }
+                p.push("<tool_response>\n");
+                p.content(&m.content);
+                p.push("\n</tool_response>\n");
+                if messages.get(i + 1).is_none_or(|next| next.role != "tool") {
+                    p.push("<|im_end|>\n");
+                }
+            }
+            role => return Err(format!("unsupported message role {role}")),
+        }
+    }
+    p.push("<|im_start|>assistant\n");
+    p.push(if o.thinking {
+        "<think>\n"
+    } else {
+        "<think></think>"
+    });
+    Ok(p)
 }
 
 fn build(messages: &[Message], o: &Options) -> Result<Prompt, String> {
@@ -272,7 +440,7 @@ fn build(messages: &[Message], o: &Options) -> Result<Prompt, String> {
                 for (j, call) in m.calls.iter().enumerate() {
                     p.push(if j > 0 {
                         "\n<tool_call>\n<function="
-                    } else if !content.is_empty() || !m.images.is_empty() {
+                    } else if !content.is_empty() || !m.media.is_empty() {
                         "\n\n<tool_call>\n<function="
                     } else {
                         "<tool_call>\n<function="
@@ -318,7 +486,16 @@ fn build(messages: &[Message], o: &Options) -> Result<Prompt, String> {
 /// renders.
 #[cfg(test)]
 pub fn render_text(messages: &[Message], o: &Options) -> Result<String, String> {
-    let mut p = build(messages, o)?;
+    prompt_text(build(messages, o)?)
+}
+
+#[cfg(test)]
+pub fn render_nemotron_text(messages: &[Message], o: &Options) -> Result<String, String> {
+    prompt_text(build_nemotron(messages, o)?)
+}
+
+#[cfg(test)]
+fn prompt_text(mut p: Prompt) -> Result<String, String> {
     let mut out = String::new();
     for (text, marker) in std::mem::take(&mut p.pieces) {
         out.push_str(&text);

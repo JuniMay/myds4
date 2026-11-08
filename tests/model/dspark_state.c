@@ -6,7 +6,7 @@ static Tokenizer *tk;  // the checkpoint's tokenizer
 int main(int argc, char **argv) {
   if (argc < 2 || argc > 3) die("usage: dspark-state-check CHECKPOINT [EXPERT_GGUF]");
   alarm(300);
-  tk = tok_open(argv[1], deepseek_ops.image_token);
+  tk = tok_open(argv[1], deepseek_ops.media_token);
   int tokens[2048];
   int n = tok_encode_chat(tk, "<｜begin▁of▁sentence｜><｜User｜>Write a short deterministic task scheduler. "
                          "Preserve dependency order and cancel queued work when a required input fails."

@@ -19,7 +19,7 @@
 #define RATIO 3
 #define MAX_TOKENS 1024
 #define MIN_PIXELS 295936
-#define BOMB 178956970  // Pillow refuses images of more pixels (twice Image.MAX_IMAGE_PIXELS)
+#define BOMB 178956970  // Pillow refuses images of more pixels (twice Media.MAX_IMAGE_PIXELS)
 
 // ---- decoding: the pixels as Pillow's convert("RGB") gives them ----
 
@@ -293,7 +293,7 @@ static Rgb resample(Rgb s, int w, int h) {
   return o;
 }
 
-// Image.resize: a copy at the same size; an image over 100 times taller
+// Media.resize: a copy at the same size; an image over 100 times taller
 // than wide shrinks along its height first.
 static Rgb resize(Rgb s, int w, int h) {
   if (s.h > s.w * 100 && h < s.h) {
@@ -348,13 +348,7 @@ static uint16_t bf16(float f) {
   return (uint16_t)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
 }
 
-static uint64_t mix(uint64_t x) {  // splitmix64's finalizer
-  x ^= x >> 30, x *= 0xbf58476d1ce4e5b9ull;
-  x ^= x >> 27, x *= 0x94d049bb133111ebull;
-  return x ^ (x >> 31);
-}
-
-int image_open(Image *im, const void *data, size_t len, const char **err) {
+int image_open(Media *im, const void *data, size_t len, const char **err) {
   int bw, bh;
   uint8_t *rgb = image_rgb(data, len, &bw, &bh, &im->th, &im->tw, err);
   if (!rgb) return 0;
@@ -379,33 +373,10 @@ int image_open(Image *im, const void *data, size_t len, const char **err) {
   return 1;
 }
 
-int image_span(const Image *im) { return im->ntokens; }
-
-int image_expand(const int *in, int n, Image *im, int nim, int *out, int max, int image_token) {
-  int k = 0, m = 0;
-  for (int i = 0; i < n; i++) {
-    if (in[i] != image_token) {
-      if (m < max) out[m] = in[i];
-      m++;
-      continue;
-    }
-    if (k == nim) return -1;
-    int s = image_span(&im[k]);
-    im[k].start = m;
-    if (m + s <= max) image_keys(&im[k], out + m);
-    m += s, k++;
-  }
-  return k == nim ? m : -1;
-}
-
-void image_keys(const Image *im, int *keys) {
-  for (int j = 0, n = image_span(im); j < n; j++) keys[j] = -1 - (int)(mix(im->hash + (uint64_t)j) & 0x3fffffff);
-}
-
 // vision.py get_vision_cos_sin: patch (ph, pw) turns pairs 0-15 by ph and
 // 16-31 by pw times the frequencies theta^(-2i/32), theta = 10000, all in
 // float32 as the reference computes them.
-void image_rope(const Image *im, float *cs) {
+void image_rope(const Media *im, float *cs) {
   float inv[16];
   for (int i = 0; i < 16; i++) inv[i] = 1.0f / powf(10000.0f, (float)(2 * i) / 32.0f);
   for (int ph = 0; ph < im->vh; ph++)
@@ -416,11 +387,4 @@ void image_rope(const Image *im, float *cs) {
         row[i] = (float)cos((double)a), row[32 + i] = (float)sin((double)a);
       }
     }
-}
-
-void image_free(Image *im) {
-  memory_host_free(im->patch);
-  if (im->features.obj) gpu_free(&im->features);
-  else memory_host_free(im->rows);
-  im->patch = 0, im->rows = 0;
 }

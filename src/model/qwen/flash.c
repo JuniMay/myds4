@@ -85,7 +85,7 @@ static struct {
   ModelPlan plan;
   const float *last_logits;
   QwenVision *vision;
-  const Image *image_list;
+  const Media *image_list;
   int image_count;
   int round, zero, embed, norm_group, hc_silu, hc_mix, hc_inject, swiglu, shared_sum, route, gather, scatter, quant;
   int conv_kernel, l2, gates, delta, norm_kernel, rope, store, attend, combine, ple_gate, ple_conv;
@@ -222,19 +222,19 @@ static void prepare(const char *directory) {
   gpu_start();
   linear_init();
 #define K(field, name) f.field = gpu_kernel(name)
-  K(round, "flash_round");
-  K(zero, "flash_zero");
+  K(round, "round_bf16");
+  K(zero, "clear_f32");
   K(embed, "flash_embed");
-  K(norm_group, "flash_norm");
+  K(norm_group, "group_rms_bf16");
   K(hc_silu, "flash_hc_silu");
   K(hc_mix, "flash_hc_mix");
   K(hc_inject, "flash_hc_inject");
   K(swiglu, "flash_swiglu");
   K(shared_sum, "flash_shared");
   K(route, "flash_route");
-  K(gather, "flash_gather");
+  K(gather, "gather_rows");
   K(scatter, "flash_scatter");
-  K(quant, "flash_quant");
+  K(quant, "quantize_input");
   K(conv_kernel, "conv");
   K(l2, "l2_norm");
   K(gates, "gdn_gates");
@@ -637,6 +637,7 @@ static void unary(int kernel, const Buf *x, uint32_t count) {
   gpu_go((count + 255) / 256, 1, 1, 256, 1, 1);
 }
 static void product(const Linear *m, const Buf *x, size_t xo, const Buf *y, int n, int act4, int round) {
+  Linear scaled = *m;
   const Buf *input = x;
   size_t offset = xo;
   if (m->kind == 'm' || (act4 && m->kind == 'n')) {
@@ -652,8 +653,9 @@ static void product(const Linear *m, const Buf *x, size_t xo, const Buf *y, int 
     gpu_go((p.count + 255) / 256, 1, 1, 256, 1, 1);
     input = &f.quantized;
     offset = 0;
+    if (m->kind == 'n') scaled.scale *= m->input_scale;
   }
-  linear_product(m, input, offset, y, 0, n, n > 8, &f.xb, 0);
+  linear_product(&scaled, input, offset, y, 0, n, n > 8, &f.xb, 0);
   if (round)
     unary(f.round, y, (uint32_t)(n * m->rows));
 }
@@ -1138,7 +1140,7 @@ static const float *pass(const Row *rows, int n, int logits, int prompt) {
     int pos = s->pos + repeat;
     int token = rows[r].token < 0 ? f.image_id : rows[r].token;
     ((int *)f.tokens.ptr)[r] = token;
-    ((uint64_t *)f.images.ptr)[r] = rows[r].token < 0 ? qwen_image_embedding(f.image_list, f.image_count, pos) : 0;
+    ((uint64_t *)f.images.ptr)[r] = rows[r].token < 0 ? media_embedding(f.image_list, f.image_count, pos) : 0;
     ((uint64_t *)f.ple_states.ptr)[r] = s->ple.gpu;
     seq[r] = (FlashSeq){.gdn = s->gdn.gpu,
                         .conv = s->conv.gpu,
@@ -1343,15 +1345,15 @@ static void plan(ModelPlan *out) {
 static void chat(char *out, size_t cap, const char *prompt, int images, int think) {
   size_t at = snprintf(out, cap, "<|im_start|>user\n");
   for (int i = 0; i < images && at < cap; i++)
-    at += snprintf(out + at, cap - at, "<|vision_start|>" IMAGE_MARK "<|vision_end|>");
+    at += snprintf(out + at, cap - at, "<|vision_start|>" MEDIA_MARK "<|vision_end|>");
   if (at < cap)
     snprintf(out + at, cap - at, "%s<|im_end|>\n<|im_start|>assistant\n%s", prompt,
              think ? "<think>\n" : "<think>\n\n</think>\n\n");
 }
-static int image(Image *im) {
+static int image(Media *im) {
   return qwen_vision_encode(f.vision, im);
 }
-static void images(const Image *input, int count) {
+static void images(const Media *input, int count) {
   f.image_list = input;
   f.image_count = count;
 }
@@ -1361,11 +1363,11 @@ static void active(int on) {
 static const char *const model_types[] = {"qwen4_exp", "qwen4_exp_text", NULL};
 const ModelOps flash_ops = {.family = "Qwen3.8 Flash-Next",
                             .model_types = model_types,
-                            .image_token = "<|image_pad|>",
+                            .media_token = "<|image_pad|>",
                             .active = active,
-                            .prepare_image = qwen_prepare_image,
-                            .image = image,
-                            .images = images,
+                            .prepare_media = qwen_prepare_image,
+                            .encode_media = image,
+                            .media = images,
                             .refuse = refuse,
                             .load = load,
                             .weight_slot = weight_slot,

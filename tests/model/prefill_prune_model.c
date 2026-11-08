@@ -30,7 +30,7 @@ int main(int argc, char **argv) {
     else die("invalid pruning check option");
   }
   alarm(600);
-  tk = tok_open(argv[1], deepseek_ops.image_token);
+  tk = tok_open(argv[1], deepseek_ops.media_token);
   int pattern[128], n = count ? count : longer ? 16384 + 137 : 8192;
   if (n < 2 || n + 8 > o.ctx) die("invalid fixture token count");
   int *tokens = xmalloc((size_t)o.ctx * sizeof *tokens);

@@ -101,6 +101,12 @@ static int compressed_scales(void) {
 }
 
 int main(int argc, char **argv) {
+  if (argc == 3 && !strcmp(argv[1], "--single")) {
+    TensorIndex *index = st_open(argv[2]); Tensor t = st_get(index, "fc.weight");
+    int correct = t.dtype == 'b' && t.ndim == 2 && t.shape[0] == 2688 && t.shape[1] == 16128;
+    st_close(index); puts(correct ? "single-file draft checkpoint metadata passed" : "draft tensor dimensions differ");
+    return !correct;
+  }
   if (argc == 1) return malformed_json() || compressed_scales();
   if (argc != 3) return 2;
   TensorIndex *first = st_open(argv[1]);

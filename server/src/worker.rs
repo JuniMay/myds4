@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::engine::{
-    self, CacheCounts, Images, Logits, Lookup, Model, PrefillInfo, RawSnapshot, RawState, Sampler,
+    self, CacheCounts, Logits, Lookup, Media, Model, PrefillInfo, RawSnapshot, RawState, Sampler,
 };
 use crate::kv::{self, Cache, Kind, Limits, Plan, Snap};
 
@@ -62,7 +62,7 @@ pub enum Finish {
 /// What the worker reports about a request.
 #[derive(Debug)]
 pub enum Event {
-    /// Its prefill ran: prompt tokens (images expanded), and those it reused.
+    /// Its prefill ran: prompt tokens (media expanded), and those it reused.
     Started { prompt: usize, reused: usize },
     /// The tokens one decoding step kept; never the end token.
     Tokens(Vec<u32>),
@@ -85,12 +85,12 @@ pub struct Sampling {
 }
 
 /// A request: its model (an index of [`start`]'s models), its prompt's token
-/// ids (each image's place the model's image token), its images' file bytes,
+/// ids (each image's place the model's image token), its media' file bytes,
 /// sampling and its token limit.
 pub struct Request {
     pub model: usize,
     pub prompt: Vec<i32>,
-    pub images: Vec<Vec<u8>>,
+    pub media: Vec<Vec<u8>>,
     pub sampling: Sampling,
     pub max_tokens: i64,
     /// Logged as "req ID NOTE" when the request is queued.
@@ -616,7 +616,7 @@ struct Prefill {
     origin: (usize, usize),
     replay: bool,
     kind: &'static str,
-    images: Option<Images>,
+    media: Option<Media>,
     t0: Instant,
     c0: CacheCounts,
 }
@@ -1162,25 +1162,25 @@ impl Slot {
             .collect();
     }
 
-    /// A request's start: its images and prompt checked, the KV prefix cache's
+    /// A request's start: its media and prompt checked, the KV prefix cache's
     /// plan carried out, its prefill to come (or, for the same prompt again,
     /// its first token from the prompt-end snapshot). Its plan is made here,
     /// when it is admitted, after the prefills before it.
     fn waiting_start(&mut self, s: &Shared, job: Job, memory: &mut Memory) {
         let mut prompt = job.request.prompt.clone();
-        let mut images = None;
-        if !job.request.images.is_empty() {
-            match self.model.images(&job.request.images) {
+        let mut media = None;
+        if !job.request.media.is_empty() {
+            match self.model.media(&job.request.media) {
                 Err(m) => return refuse(job, &m),
                 Ok(mut x) => match x.expand(&prompt, self.ctx + 1) {
                     Some(p) => {
                         prompt = p;
-                        images = Some(x);
+                        media = Some(x);
                     }
                     None => {
                         let m = format!(
-                            "the prompt's image places and its {} images differ",
-                            job.request.images.len()
+                            "the prompt's image places and its {} media differ",
+                            job.request.media.len()
                         );
                         return refuse(job, &m);
                     }
@@ -1302,8 +1302,8 @@ impl Slot {
             }
         ));
         let replay = matches!(plan, Plan::Replay { .. });
-        if let Some(x) = images.as_mut() {
-            // The images whose spans the prefill reaches: a replay computes again
+        if let Some(x) = media.as_mut() {
+            // The media whose spans the prefill reaches: a replay computes again
             // from its first position, before the branch point.
             let first = if replay {
                 self.model.replay_start(from)
@@ -1323,9 +1323,9 @@ impl Slot {
             };
             if encoded > 0 {
                 engine::log(&format!(
-                    "req {}: {encoded} of {} images encoded in {:.2} s",
+                    "req {}: {encoded} of {} media encoded in {:.2} s",
                     job.id,
-                    job.request.images.len(),
+                    job.request.media.len(),
                     t.elapsed().as_secs_f64()
                 ));
             }
@@ -1345,7 +1345,7 @@ impl Slot {
                 origin,
                 replay,
                 kind,
-                images,
+                media,
                 t0: now,
                 c0: self.model.stats().cache,
             }),
@@ -1434,7 +1434,7 @@ impl Slot {
         let prompt = &p.prompt[..end];
         let Some((lg, captured, info)) =
             self.model
-                .prefill(st, prompt, done, replay, inner, p.images.as_ref())
+                .prefill(st, prompt, done, replay, inner, p.media.as_ref())
         else {
             let generation = self.gens.remove(i);
             let snapshots = memory.cache.remove(generation.state);
@@ -1590,7 +1590,7 @@ impl Slot {
                 _ => 3,
             }] += 1;
         }
-        drop(p.images);
+        drop(p.media);
         g.t = self.model.sample(lg, &mut g.sampler);
         if self.served.engine.lookup > 0 {
             let mut l =

@@ -2,7 +2,8 @@
 
 Local inference on Apple silicon, with a C/Metal engine and a Rust HTTP
 server. The supported models are DeepSeek V4.1 Flash, Qwen3.8-27B NVFP4,
-and Qwen3.8 Flash-Next with NVFP4 experts and MXFP8 projections.
+Qwen3.8 Flash-Next with NVFP4 experts and MXFP8 projections, and
+Nemotron 3.5 Transcribe in NVFP4 with its optional BF16 DFlash2 drafter.
 
 The server can serve these architectures in one process. It registers their
 metadata at startup and loads each model's weights on its first inference

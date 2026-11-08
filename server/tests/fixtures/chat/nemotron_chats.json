@@ -1,0 +1,101 @@
+[
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hi"
+      }
+    ],
+    "thinking": false,
+    "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+    "messages": [
+      {
+        "role": "system",
+        "content": "Read carefully."
+      },
+      {
+        "role": "user",
+        "content": "Transcribe this."
+      }
+    ],
+    "audio": true,
+    "thinking": false,
+    "expected": "<|im_start|>system\nRead carefully.<|im_end|>\n<|im_start|>user\nTranscribe this. <|audio|><|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "First."
+      },
+      {
+        "role": "assistant",
+        "reasoning_content": "Old reasoning",
+        "content": "Done."
+      },
+      {
+        "role": "user",
+        "content": "Next."
+      }
+    ],
+    "thinking": true,
+    "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nFirst.<|im_end|>\n<|im_start|>assistant\n<think></think>Done.<|im_end|>\n<|im_start|>user\nNext.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Find x."
+      },
+      {
+        "role": "assistant",
+        "content": "Calling.",
+        "tool_calls": [
+          {
+            "function": {
+              "name": "find",
+              "arguments": {
+                "name": "x",
+                "enabled": true
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "Found."
+      }
+    ],
+    "thinking": false,
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "find",
+          "description": " Find a name. ",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "The name",
+                "enum": [
+                  "a",
+                  "b"
+                ]
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>find</name>\n<description>Find a name.</description>\n<parameters>\n<parameter>\n<name>name</name>\n<type>string</type>\n<description>The name</description>\n<enum>[\"a\", \"b\"]</enum>\n</parameter>\n<additionalProperties>False</additionalProperties>\n<required>[\"name\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nFind x.<|im_end|>\n<|im_start|>assistant\n<think></think>Calling.\n<tool_call>\n<function=find>\n<parameter=name>\nx\n</parameter>\n<parameter=enabled>\nTrue\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\nFound.\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  }
+]

@@ -230,11 +230,11 @@ const float *deepseek_forward_rows(State **st, const int *tokens, const int *pos
 void deepseek_seek(const int *tokens, int pos);
 // The vision encoder (inference/vision.py ViT and Aligner): the image's
 // feature rows into im->rows. Weights load on first use.
-int deepseek_image(Image *im);
+int deepseek_image(Media *im);
 // The images whose spans (their starts set) the prompts that deepseek_forward
-// runs next hold as negative tokens (image_keys); a span's positions may be
+// runs next hold as negative tokens (media_keys); a span's positions may be
 // in any of its batches.
-void deepseek_images(const Image *im, int n);
+void deepseek_images(const Media *im, int n);
 
 // model.c: the statistics of decoded rows and of prompt rows since start
 extern CacheStats decode_stats, prefill_stats;

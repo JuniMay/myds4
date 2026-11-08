@@ -29,7 +29,7 @@ int main(int argc, char **argv) {
     else die("invalid verification check option");
   }
   alarm(420);
-  tk = tok_open(argv[1], deepseek_ops.image_token);
+  tk = tok_open(argv[1], deepseek_ops.media_token);
   int seed[128], n = longer ? 16521 : 257;
   int *tokens = xmalloc((size_t)n * sizeof *tokens);
   int length = tok_encode(tk, " Review the queue, keep duplicate jobs, and preserve cancellation order.\n", seed, 128);

@@ -66,6 +66,7 @@ impl ModelConfig {
         };
         match name {
             "model" => e.model = text()?,
+            "draft_model" => e.set_draft_model(text()?)?,
             "id" => self.id = Some(text()?),
             "experts" => e.deepseek_mut()?.experts = Some(text()?),
             "ctx" => e.ctx = int()?,
@@ -484,6 +485,21 @@ mod tests {
             models[1].engine.backend,
             engine::BackendOptions::Qwen
         ));
+    }
+
+    #[test]
+    fn separate_draft_path_belongs_to_nemotron() {
+        let mut model = ModelConfig::new("/models/transcribe");
+        model.set("draft_model", &json!("/models/dflash2")).unwrap();
+        model.set("draft", &json!(7)).unwrap();
+        model
+            .engine
+            .configure(engine::Architecture::Nemotron)
+            .unwrap();
+        assert!(
+            matches!(&model.engine.backend, engine::BackendOptions::Nemotron { draft_model: Some(path) } if path == "/models/dflash2")
+        );
+        assert!(model.engine.configure(engine::Architecture::Qwen).is_err());
     }
 
     #[test]

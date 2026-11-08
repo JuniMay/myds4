@@ -49,7 +49,7 @@ predictor benefit or timeliness.
 | Driver | Scope |
 | --- | --- |
 | `benchmarks/compare.py` | Matched CLI control/candidate generations and output checks. |
-| `benchmarks/concurrency.py` | HTTP request throughput and latency on reconstructed Harness work. |
+| `benchmarks/concurrency.py` | HTTP throughput and latency on Harness requests or local audio fixtures. |
 | `benchmarks/turns.py` | A conversation followed by a longer tool-like input. |
 | `benchmarks/prefill.py` | CED prefill and continuation comparisons. |
 | `benchmarks/decode.c` | Batched model-row timing. |
@@ -60,6 +60,14 @@ Use each driver's `--help` for required paths and supported modes. Supply
 checkpoint and workload paths explicitly. Private Harness conversations
 and generated text stay in memory; reports should contain measurements
 and digests rather than the conversation itself.
+
+For Transcribe, use `--audio FILE` in place of `--harness-session`, and
+`--draft-model DIR` with `--draft N` to measure DFlash2. Set
+`--min-output-tokens` to suit transcripts that end before 128 tokens.
+`--kv` sets the shared KV budget. Audio comparisons use sampled requests
+at temperature and top-p 1; the production transcription default remains
+greedy. Count the entire generation interval, including the drafter;
+the target's `model_decode.seconds` excludes separate proposal work.
 
 GSM8K and HumanEval inputs live under `benchmarks/datasets/`, with their
 licenses and source metadata. HumanEval syntax or entry-point checks are

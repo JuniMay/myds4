@@ -3,11 +3,11 @@
 //! into the response. Each model family renders its own chat template and
 //! reads its own reply protocol (reasoning, tool calls): DeepSeek V4.1 through
 //! deepseek-recipe (`deepseek.rs`), Qwen3.8 through its checkpoint's template
-//! and XML tool calls (`qwen.rs`). The errors and identifiers here are both
+//! and XML tool calls (`chatml.rs`). The errors and identifiers here are both
 //! formats'.
 
+pub mod chatml;
 pub mod deepseek;
-pub mod qwen;
 
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -31,11 +31,15 @@ pub fn bad(message: impl Into<String>) -> Error {
 }
 
 pub fn image_data(url: &str) -> Result<Vec<u8>, Error> {
+    media_data(url)
+}
+
+pub fn media_data(url: &str) -> Result<Vec<u8>, Error> {
     let data =
-        data_url::DataUrl::process(url).map_err(|_| bad("images require a base64 data URL"))?;
+        data_url::DataUrl::process(url).map_err(|_| bad("media require a base64 data URL"))?;
     data.decode_to_vec()
         .map(|(bytes, _)| bytes)
-        .map_err(|_| bad("image data is not valid base64"))
+        .map_err(|_| bad("media data is not valid base64"))
 }
 
 /// Request values override model defaults; null leaves a default in place.
@@ -150,10 +154,11 @@ mod request_tests {
         let Ok(dir) = std::env::var("MYDS4_QWEN") else {
             return;
         };
-        let settings = qwen::Settings {
-            id: "qwen".into(),
+        let settings = chatml::Settings {
+            id: "chatml".into(),
             ctx: 4096,
             think: None,
+            variant: chatml::Variant::Qwen,
             tokenizer: Tokenizer::open(&dir, None),
             sampling: Sampling {
                 temperature: 1.0,
@@ -164,7 +169,7 @@ mod request_tests {
         };
         let body = json!({"messages": [{"role": "user", "content": "Hi"}]});
         let prepared =
-            qwen::prepare(&serde_json::to_vec(&body).unwrap(), "test", &settings, 0).unwrap();
+            chatml::prepare(&serde_json::to_vec(&body).unwrap(), "test", &settings, 0).unwrap();
         assert_eq!(prepared.request.sampling, settings.sampling);
         for (field, value) in [
             ("temperature", json!("wrong")),
@@ -175,7 +180,7 @@ mod request_tests {
             let mut bad = body.clone();
             bad[field] = value;
             assert!(
-                qwen::prepare(&serde_json::to_vec(&bad).unwrap(), "test", &settings, 0).is_err(),
+                chatml::prepare(&serde_json::to_vec(&bad).unwrap(), "test", &settings, 0).is_err(),
                 "accepted invalid {field}"
             );
         }
@@ -211,10 +216,11 @@ mod request_tests {
         let Ok(dir) = std::env::var("MYDS4_QWEN") else {
             return;
         };
-        let settings = qwen::Settings {
-            id: "qwen".into(),
+        let settings = chatml::Settings {
+            id: "chatml".into(),
             ctx: 4096,
             think: Some(0),
+            variant: chatml::Variant::Qwen,
             tokenizer: Tokenizer::open(&dir, None),
             sampling: Sampling {
                 temperature: 1.0,
@@ -225,7 +231,7 @@ mod request_tests {
         };
         let mut body = json!({"messages": [{"role": "user", "content": "Hi"}]});
         let prepare = |body: &serde_json::Value| {
-            qwen::prepare(&serde_json::to_vec(body).unwrap(), "test", &settings, 0).unwrap()
+            chatml::prepare(&serde_json::to_vec(body).unwrap(), "test", &settings, 0).unwrap()
         };
         assert!(
             !prepare(&body).thinking,
@@ -243,10 +249,11 @@ mod request_tests {
         ) else {
             return;
         };
-        let q = qwen::Settings {
-            id: "qwen".into(),
+        let q = chatml::Settings {
+            id: "chatml".into(),
             ctx: 4096,
             think: None,
+            variant: chatml::Variant::Qwen,
             tokenizer: Tokenizer::open(&qdir, None),
             sampling: Sampling {
                 temperature: 1.0,
@@ -274,7 +281,7 @@ mod request_tests {
             let mut body = json!({"messages": [{"role": "user", "content": "Hi"}]});
             body[key] = value;
             let bytes = serde_json::to_vec(&body).unwrap();
-            if qwen::prepare(&bytes, "test", &q, 0).is_ok() {
+            if chatml::prepare(&bytes, "test", &q, 0).is_ok() {
                 accepted.push(format!("Qwen accepted {body}"));
             }
             if deepseek::prepare(&bytes, &d, dt).is_ok() {
@@ -291,10 +298,11 @@ mod request_tests {
         };
         let tokenizer = Tokenizer::open(&dir, None);
         let image = tokenizer.special("<|image_pad|>").unwrap();
-        let settings = qwen::Settings {
-            id: "qwen".into(),
+        let settings = chatml::Settings {
+            id: "chatml".into(),
             ctx: 4096,
             think: None,
+            variant: chatml::Variant::Qwen,
             tokenizer,
             sampling: Sampling {
                 temperature: 1.0,
@@ -308,8 +316,8 @@ mod request_tests {
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
         ]}]});
         let prepared =
-            qwen::prepare(&serde_json::to_vec(&body).unwrap(), "test", &settings, 0).unwrap();
-        assert_eq!(prepared.request.images.len(), 1);
+            chatml::prepare(&serde_json::to_vec(&body).unwrap(), "test", &settings, 0).unwrap();
+        assert_eq!(prepared.request.media.len(), 1);
         assert_eq!(
             prepared
                 .request

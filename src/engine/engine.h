@@ -21,7 +21,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYDS4_ABI 14
+#define MYDS4_ABI 15
 
 // ---- the process ----
 
@@ -56,7 +56,7 @@ void myds4_log(const char *line);
 
 // ---- models ----
 
-typedef enum { MYDS4_DEEPSEEK = 1, MYDS4_QWEN = 2 } myds4_architecture;
+typedef enum { MYDS4_DEEPSEEK = 1, MYDS4_QWEN = 2, MYDS4_NEMOTRON = 3 } myds4_architecture;
 
 typedef struct {
   const char *experts;       // GGUF file or shard; null uses checkpoint experts
@@ -74,6 +74,7 @@ typedef struct {
 } myds4_deepseek_config;
 
 typedef struct { int draft; } myds4_qwen_config; // chained MTP proposals, 0 to 5
+typedef struct { int draft; const char *draft_model; } myds4_nemotron_config;
 
 // Common settings and one architecture's options. The tag must match the
 // checkpoint. Each family validates its own option group.
@@ -86,11 +87,12 @@ typedef struct {
   union {
     myds4_deepseek_config deepseek;
     myds4_qwen_config qwen;
+    myds4_nemotron_config nemotron;
   } options;
 } myds4_config;
 
 typedef struct myds4_model myds4_model;
-typedef struct myds4_images myds4_images;
+typedef struct myds4_media myds4_media;
 typedef struct myds4_sampler myds4_sampler;
 
 // Registers a checkpoint and opens its tokenizer without loading weights.
@@ -180,14 +182,14 @@ typedef struct {
 // snapshot there (DeepSeek under CED compaction). info (if not null) gets the
 // prefill's plan. The server supplies validated token IDs, positions and row
 // counts within the limits above. Prompt IDs may include the negative image
-// keys from myds4_images_expand. Logit calls return null on cancellation or
+// keys from myds4_media_expand. Logit calls return null on cancellation or
 // when the required model workspace cannot fit the shared budget.
 const float *myds4_prefill(myds4_model *m, myds4_state *s, const int32_t *tokens, int n, int from, int replay,
-                           int capture, myds4_snapshot **captured, myds4_prefill_info *info, const myds4_images *images);
+                           int capture, myds4_snapshot **captured, myds4_prefill_info *info, const myds4_media *images);
 // What a replay at k costs beyond the prompt's new rows: the rows before k it
 // computes again, per layer on average (-1: the model cannot replay); and the
 // first position it computes again, from which the prompt's images must be
-// encoded (myds4_images_encode).
+// encoded (myds4_media_encode).
 int myds4_replay_rows(const myds4_model *m, int k);
 int myds4_replay_start(const myds4_model *m, int k);
 // One token for each of count states at once (count <= myds4_max_rows(), no
@@ -227,20 +229,19 @@ int myds4_lookup_append(myds4_lookup *x, const int32_t *tokens, int n);  // 0 wh
 int myds4_lookup_propose(const myds4_lookup *x, int max, int32_t *drafts);  // how many
 void myds4_lookup_feedback(myds4_lookup *x, int offered, int accepted);
 
-// ---- images, for a model with a vision encoder ----
+// ---- encoded media ----
 
-// A prompt's images: each image place (the model's image token) becomes its
-// image's span of tokens. Null with a message for an image that cannot be
-// read, or for a model without a vision encoder.
-myds4_images *myds4_images_open(myds4_model *m, const uint8_t *const *data, const size_t *len, int n, char *message,
+// A prompt's media inputs: each placeholder becomes its feature span.
+// Null with a message when an input cannot be decoded.
+myds4_media *myds4_media_open(myds4_model *m, const uint8_t *const *data, const size_t *len, int n, char *message,
                                 size_t cap);
 // The prompt with the spans in place into out (at most max tokens): its
 // length, or -1 if its places and images differ or it does not fit.
-int myds4_images_expand(myds4_images *x, const int32_t *in, int n, int32_t *out, int max);
-// Encodes the images that positions from .. reach and gives all of them to
+int myds4_media_expand(myds4_media *x, const int32_t *in, int n, int32_t *out, int max);
+// Encodes inputs that positions from .. reach and gives all of them to
 // the model's next prefill; the count encoded.
-int myds4_images_encode(myds4_images *x, int from);
-void myds4_images_close(myds4_images *x);  // after that prefill
+int myds4_media_encode(myds4_media *x, int from);
+void myds4_media_close(myds4_media *x);  // after that prefill
 
 // ---- statistics, for the server's status ----
 

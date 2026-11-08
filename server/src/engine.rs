@@ -1,6 +1,6 @@
 //! The engine's C ABI (src/engine/engine.h) and thin safe wrappers over it.
 //! A [`Model`] is one registered checkpoint; its weights load on demand. Its
-//! functions on states, snapshots, prefill, decoding, sampling, images and
+//! functions on states, snapshots, prefill, decoding, sampling, media and
 //! routes run on the worker's engine thread only (worker.rs); the log, the
 //! stop, the statistics and the tokenizer on any thread.
 
@@ -9,7 +9,7 @@ use std::ptr;
 
 use deepseek_recipe::stream::StreamTokenizer;
 
-const ABI: c_int = 14;
+const ABI: c_int = 15;
 
 #[repr(C)]
 struct RawProcess {
@@ -45,9 +45,17 @@ struct RawQwenConfig {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+struct RawNemotronConfig {
+    draft: c_int,
+    draft_model: *const c_char,
+}
+
+#[repr(C)]
 union RawModelOptions {
     deepseek: RawDeepSeekConfig,
     qwen: RawQwenConfig,
+    nemotron: RawNemotronConfig,
 }
 
 #[repr(C)]
@@ -88,7 +96,7 @@ struct RawLookup {
 }
 
 #[repr(C)]
-struct RawImages {
+struct RawMedia {
     _opaque: [u8; 0],
 }
 
@@ -227,7 +235,7 @@ unsafe extern "C" {
         capture: c_int,
         captured: *mut *mut RawSnapshot,
         info: *mut PrefillInfo,
-        images: *const RawImages,
+        media: *const RawMedia,
     ) -> *const f32;
     fn myds4_replay_rows(m: *const RawModel, k: c_int) -> c_int;
     fn myds4_replay_start(m: *const RawModel, k: c_int) -> c_int;
@@ -279,23 +287,23 @@ unsafe extern "C" {
     fn myds4_lookup_append(x: *mut RawLookup, tokens: *const i32, n: c_int) -> c_int;
     fn myds4_lookup_propose(x: *const RawLookup, max: c_int, drafts: *mut i32) -> c_int;
     fn myds4_lookup_feedback(x: *mut RawLookup, offered: c_int, accepted: c_int);
-    fn myds4_images_open(
+    fn myds4_media_open(
         m: *mut RawModel,
         data: *const *const u8,
         len: *const usize,
         n: c_int,
         message: *mut c_char,
         cap: usize,
-    ) -> *mut RawImages;
-    fn myds4_images_expand(
-        x: *mut RawImages,
+    ) -> *mut RawMedia;
+    fn myds4_media_expand(
+        x: *mut RawMedia,
         input: *const i32,
         n: c_int,
         out: *mut i32,
         max: c_int,
     ) -> c_int;
-    fn myds4_images_encode(x: *mut RawImages, from: c_int) -> c_int;
-    fn myds4_images_close(x: *mut RawImages);
+    fn myds4_media_encode(x: *mut RawMedia, from: c_int) -> c_int;
+    fn myds4_media_close(x: *mut RawMedia);
     fn myds4_refresh_stats();
     fn myds4_stats_get(m: *const RawModel, s: *mut Stats);
     fn myds4_routes(m: *const RawModel, row: c_int, experts: *mut u16, sources: *mut u8) -> c_int;
@@ -375,6 +383,7 @@ pub fn log(line: &str) {
 pub enum Architecture {
     DeepSeek = 1,
     Qwen = 2,
+    Nemotron = 3,
 }
 
 impl Architecture {
@@ -390,6 +399,7 @@ impl Architecture {
             Some("qwen3_5" | "qwen3_5_text" | "qwen4_exp" | "qwen4_exp_text") => {
                 Ok(Architecture::Qwen)
             }
+            Some("nemo_speechlm") => Ok(Architecture::Nemotron),
             Some(t) => Err(format!(
                 "{}: model_type {t} is not one this server runs",
                 path.display()
@@ -417,6 +427,9 @@ pub enum BackendOptions {
     Unspecified,
     DeepSeek(DeepSeekOptions),
     Qwen,
+    Nemotron {
+        draft_model: Option<String>,
+    },
 }
 
 #[derive(Default, Clone, Debug, PartialEq)]
@@ -441,10 +454,18 @@ impl Options {
                 BackendOptions::DeepSeek(DeepSeekOptions::default())
             }
             (BackendOptions::Unspecified, Architecture::Qwen) => BackendOptions::Qwen,
+            (BackendOptions::Unspecified, Architecture::Nemotron) => {
+                BackendOptions::Nemotron { draft_model: None }
+            }
             (BackendOptions::DeepSeek(d), Architecture::DeepSeek) => {
                 BackendOptions::DeepSeek(d.clone())
             }
             (BackendOptions::Qwen, Architecture::Qwen) => BackendOptions::Qwen,
+            (BackendOptions::Nemotron { draft_model }, Architecture::Nemotron) => {
+                BackendOptions::Nemotron {
+                    draft_model: draft_model.clone(),
+                }
+            }
             _ => return Err("model options do not match checkpoint architecture".into()),
         };
         Ok(())
@@ -453,6 +474,18 @@ impl Options {
         match &self.backend {
             BackendOptions::DeepSeek(d) => Some(d),
             _ => None,
+        }
+    }
+    pub fn set_draft_model(&mut self, path: String) -> Result<(), String> {
+        if matches!(self.backend, BackendOptions::Unspecified) {
+            self.backend = BackendOptions::Nemotron { draft_model: None };
+        }
+        match &mut self.backend {
+            BackendOptions::Nemotron { draft_model } => {
+                *draft_model = Some(path);
+                Ok(())
+            }
+            _ => Err("draft-model applies to Nemotron".into()),
         }
     }
     pub fn deepseek_mut(&mut self) -> Result<&mut DeepSeekOptions, String> {
@@ -473,6 +506,7 @@ pub type Logits = *const f32;
 pub struct Model {
     raw: *mut RawModel,
     directory: String,
+    draft_directory: Option<String>,
     validated: std::cell::Cell<bool>,
 }
 
@@ -480,21 +514,28 @@ fn validate_weight_files(directory: &str) -> Result<(), String> {
     use std::io::Read;
     let root = std::path::Path::new(directory);
     let index = root.join("model.safetensors.index.json");
-    let bytes =
-        std::fs::read(&index).map_err(|e| format!("model weight index is unavailable: {e}"))?;
+    let bytes = if index.exists() {
+        std::fs::read(&index).map_err(|e| format!("model weight index is unavailable: {e}"))?
+    } else {
+        b"null".to_vec()
+    };
     let json: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| format!("invalid model weight index: {e}"))?;
-    let weights = json
-        .get("weight_map")
-        .and_then(serde_json::Value::as_object)
-        .filter(|m| !m.is_empty())
-        .ok_or("model weight index has no weight_map")?;
     let mut files = std::collections::BTreeMap::<&str, Vec<&str>>::new();
-    for (name, file) in weights {
-        files
-            .entry(file.as_str().ok_or("weight shard name is not text")?)
-            .or_default()
-            .push(name);
+    if json.is_null() {
+        files.insert("model.safetensors", Vec::new());
+    } else {
+        let weights = json
+            .get("weight_map")
+            .and_then(serde_json::Value::as_object)
+            .filter(|m| !m.is_empty())
+            .ok_or("model weight index has no weight_map")?;
+        for (name, file) in weights {
+            files
+                .entry(file.as_str().ok_or("weight shard name is not text")?)
+                .or_default()
+                .push(name);
+        }
     }
     for (name, tensors) in files {
         let mut file = std::fs::File::open(root.join(name))
@@ -512,6 +553,17 @@ fn validate_weight_files(directory: &str) -> Result<(), String> {
             .map_err(|e| format!("cannot read weight header {name}: {e}"))?;
         let values: serde_json::Value = serde_json::from_slice(&data)
             .map_err(|e| format!("invalid weight header {name}: {e}"))?;
+        let tensors = if tensors.is_empty() {
+            values
+                .as_object()
+                .ok_or("weight header is not an object")?
+                .keys()
+                .filter(|key| key.as_str() != "__metadata__")
+                .map(String::as_str)
+                .collect()
+        } else {
+            tensors
+        };
         for tensor in tensors {
             let offsets = values
                 .get(tensor)
@@ -539,6 +591,12 @@ impl Model {
             return None;
         }
         let model = c_string(&o.model);
+        let draft_model = match &o.backend {
+            BackendOptions::Nemotron { draft_model } => {
+                draft_model.as_ref().map(|path| c_string(path))
+            }
+            _ => None,
+        };
         let experts = o
             .deepseek()
             .and_then(|d| d.experts.as_deref())
@@ -567,6 +625,12 @@ impl Model {
             BackendOptions::Qwen => RawModelOptions {
                 qwen: RawQwenConfig { draft: o.draft },
             },
+            BackendOptions::Nemotron { .. } => RawModelOptions {
+                nemotron: RawNemotronConfig {
+                    draft: o.draft,
+                    draft_model: draft_model.as_ref().map_or(ptr::null(), |p| p.as_ptr()),
+                },
+            },
             BackendOptions::Unspecified => unreachable!("architecture resolved"),
         };
         let raw = RawConfig {
@@ -581,6 +645,10 @@ impl Model {
         (!m.is_null()).then_some(Model {
             raw: m,
             directory: o.model.clone(),
+            draft_directory: match &o.backend {
+                BackendOptions::Nemotron { draft_model } if o.draft > 0 => draft_model.clone(),
+                _ => None,
+            },
             validated: std::cell::Cell::new(false),
         })
     }
@@ -588,6 +656,9 @@ impl Model {
     pub fn load(&self) -> Result<(), String> {
         if !self.validated.get() {
             validate_weight_files(&self.directory)?;
+            if let Some(directory) = &self.draft_directory {
+                validate_weight_files(directory)?;
+            }
             self.validated.set(true);
         }
         if unsafe { myds4_load(self.raw) != 0 } {
@@ -695,7 +766,7 @@ impl Model {
         from: usize,
         replay: bool,
         capture: Option<usize>,
-        images: Option<&Images>,
+        media: Option<&Media>,
     ) -> Option<(Logits, *mut RawSnapshot, PrefillInfo)> {
         let mut captured = ptr::null_mut();
         let mut info = PrefillInfo::default();
@@ -711,7 +782,7 @@ impl Model {
                 at,
                 &mut captured,
                 &mut info,
-                images.map_or(ptr::null(), |images| images.0),
+                media.map_or(ptr::null(), |media| media.0),
             )
         };
         (!lg.is_null()).then_some((lg, captured, info))
@@ -722,7 +793,7 @@ impl Model {
         let n = unsafe { myds4_replay_rows(self.raw, k as c_int) };
         (n >= 0).then_some(n as usize)
     }
-    /// The first position a replay at k computes again: its images from there are encoded.
+    /// The first position a replay at k computes again: its media from there are encoded.
     pub fn replay_start(&self, k: usize) -> usize {
         unsafe { myds4_replay_start(self.raw, k as c_int).max(0) as usize }
     }
@@ -791,7 +862,7 @@ impl Model {
         unsafe { myds4_seek(self.raw, s, tokens.as_ptr(), pos as c_int) }
     }
 
-    // ---- sampling, images, statistics ----
+    // ---- sampling, media, statistics ----
 
     pub fn sample(&self, lg: Logits, s: &mut Sampler) -> i32 {
         unsafe { myds4_sample(self.raw, lg, s.0) }
@@ -820,17 +891,17 @@ impl Model {
         (next, accepted.max(0) as usize)
     }
 
-    /// A prompt's images, decoded, for this model's vision encoder.
-    pub fn images(&self, images: &[Vec<u8>]) -> Result<Images, String> {
-        let data: Vec<*const u8> = images.iter().map(|i| i.as_ptr()).collect();
-        let len: Vec<usize> = images.iter().map(|i| i.len()).collect();
+    /// A prompt's decoded media for this model's encoder.
+    pub fn media(&self, media: &[Vec<u8>]) -> Result<Media, String> {
+        let data: Vec<*const u8> = media.iter().map(|i| i.as_ptr()).collect();
+        let len: Vec<usize> = media.iter().map(|i| i.len()).collect();
         let mut message = [0 as c_char; 256];
         let x = unsafe {
-            myds4_images_open(
+            myds4_media_open(
                 self.raw,
                 data.as_ptr(),
                 len.as_ptr(),
-                images.len() as c_int,
+                media.len() as c_int,
                 message.as_mut_ptr(),
                 message.len(),
             )
@@ -840,7 +911,7 @@ impl Model {
                 .to_string_lossy()
                 .into_owned());
         }
-        Ok(Images(x))
+        Ok(Media(x))
     }
 
     /// Called only by the engine worker; the worker publishes copies for readers.
@@ -955,7 +1026,7 @@ impl Tokenizer {
 
     /// The text of token ids, for the live view, in runs: the added tokens
     /// each alone and marked true, the text between them, and one "[image]"
-    /// for each run of an image's key (the negative ids of [`Images::expand`]).
+    /// for each run of an image's key (the negative ids of [`Media::expand`]).
     pub fn text(&self, ids: &[i32]) -> Vec<(String, bool)> {
         let mut runs = Vec::new();
         let mut bytes = Vec::new();
@@ -1009,7 +1080,7 @@ impl StreamTokenizer for Tokenizer {
     }
 }
 
-// ---- samplers, lookups and images ----
+// ---- samplers, lookups and media ----
 
 pub struct Sampler(*mut RawSampler);
 
@@ -1063,16 +1134,16 @@ impl Drop for Lookup {
     }
 }
 
-/// A prompt's images, decoded; closed (and given back) when dropped.
-pub struct Images(*mut RawImages);
+/// A prompt's media, decoded; closed (and given back) when dropped.
+pub struct Media(*mut RawMedia);
 
-impl Images {
+impl Media {
     /// The prompt with each image place replaced by its image's span, or None
-    /// if the places and images differ or it would exceed `max` tokens.
+    /// if the places and media differ or it would exceed `max` tokens.
     pub fn expand(&mut self, prompt: &[i32], max: usize) -> Option<Vec<i32>> {
         let mut out = vec![0i32; max + 2];
         let n = unsafe {
-            myds4_images_expand(
+            myds4_media_expand(
                 self.0,
                 prompt.as_ptr(),
                 prompt.len() as c_int,
@@ -1085,10 +1156,10 @@ impl Images {
             out
         })
     }
-    /// Encodes the images that positions from `from` reach, for the next
+    /// Encodes the media that positions from `from` reach, for the next
     /// prefill; how many.
     pub fn encode(&mut self, from: usize) -> Result<usize, String> {
-        let count = unsafe { myds4_images_encode(self.0, from as c_int) };
+        let count = unsafe { myds4_media_encode(self.0, from as c_int) };
         if count < 0 {
             Err(
                 "the global model-memory budget cannot fit the image encoder and its workspace"
@@ -1100,9 +1171,9 @@ impl Images {
     }
 }
 
-impl Drop for Images {
+impl Drop for Media {
     fn drop(&mut self) {
-        unsafe { myds4_images_close(self.0) }
+        unsafe { myds4_media_close(self.0) }
     }
 }
 

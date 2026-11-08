@@ -27,15 +27,16 @@ typedef struct {
   int pipeline;               // experimental native MXFP4 stages across concurrent requests
 } DeepSeekOptions;
 typedef struct { int reserved; } QwenOptions;
+typedef struct { const char *draft_model; } NemotronOptions;
 typedef struct {
-  enum { MODEL_UNSPECIFIED, MODEL_DEEPSEEK, MODEL_QWEN } family;
+  enum { MODEL_UNSPECIFIED, MODEL_DEEPSEEK, MODEL_QWEN, MODEL_NEMOTRON } family;
   int ctx;            // capacity in tokens
   int dump_fd;        // -1, or a pipe receiving per-layer streams
   int routes_fd;      // -1, or a pipe receiving every decoded token's routes, predictions and router logits
   int draft;          // enable the model's native draft head(s)
   int lookup;         // context-copy candidates; bounded by the model's verification capacity
   int quiet;                   // no progress lines on stderr
-  union { DeepSeekOptions deepseek; QwenOptions qwen; };
+  union { DeepSeekOptions deepseek; QwenOptions qwen; NemotronOptions nemotron; };
 } Options;
 
 typedef struct ModelState ModelState;        // one sequence: a family's own state
@@ -65,7 +66,8 @@ typedef struct {
 typedef struct {
   const char *family;             // the family's name, for the log
   const char *const *model_types; // config.json model_type values it runs; null-terminated
-  const char *image_token;        // the spelling of its image token (IMAGE_MARK's), or null
+  const char *media_token;        // the model's encoded-media placeholder, or null
+  MediaKind media_kind;
   // Why the options do not suit the family (an option it has no use for), or
   // null; before load.
   const char *(*refuse)(const Options *o);
@@ -138,18 +140,16 @@ typedef struct {
   // starts (it notes its counters), at 1 after it (it prints, per token of
   // `tokens`, what it measured meanwhile). May be null.
   void (*report)(FILE *out, int at, int tokens);
-  // The vision encoder, when the model has one (null otherwise): an image's
-  // feature rows, and the images that the next prefill's image positions take.
-  int (*prepare_image)(const char *dir, Image *im, const void *data, size_t len, const char **error);
-  int (*image)(Image *im); // 0: the global model-memory pool cannot admit it
-  void (*images)(const Image *im, int n);
+  // Prepare and encode model-specific media, then bind its feature spans
+  // to the next prefill. Null callbacks mean the model accepts text only.
+  int (*prepare_media)(const char *dir, Media *im, const void *data, size_t len, const char **error);
+  int (*encode_media)(Media *im); // 0: the global model-memory pool cannot admit it
+  void (*media)(const Media *im, int n);
   // The experts row `row` of the latest decoding pass chose and where each
   // was (myds4_routes); null without routed experts.
   int (*routes)(int row, uint16_t *id, uint8_t *from);
-  // One user turn in the model's chat template, for the CLI: `images` image
-  // places, then the prompt, with thinking at effort `think` (1 to 100) or
-  // off (0). Null when the CLI cannot render this model's chat.
-  void (*chat)(char *text, size_t cap, const char *prompt, int images, int think);
+  // Render one CLI user turn with media placeholders and the chosen reasoning effort.
+  void (*chat)(char *text, size_t cap, const char *prompt, int media_count, int think);
   // The CLI's --bench: the kernels timed on the model's own matrices; or null.
   void (*bench)(void);
 } ModelOps;
@@ -170,4 +170,4 @@ int model_load(Model *model, const Options *options);
 void model_active(Model *model, int active);
 Model *model_open(const char *dir, const Options *o);
 
-extern const ModelOps deepseek_ops, qwen_ops, flash_ops;
+extern const ModelOps deepseek_ops, qwen_ops, flash_ops, nemotron_ops;

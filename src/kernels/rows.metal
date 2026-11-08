@@ -2,13 +2,6 @@
 // gated, or after a residual add), L2 normalization of heads, concatenation,
 // SiLU times a second input, and the residual add.
 
-// Row t of x: the embedding of token tok[t] (BF16 rows of n) as floats.
-kernel void embed_rows(device const ushort *E [[buffer(0)]], device const int *tok [[buffer(1)]],
-                       device float *x [[buffer(2)]], constant uint &n [[buffer(3)]],
-                       uint2 g [[thread_position_in_grid]]) {
-  if (g.x < n) x[(size_t)g.y * n + g.x] = bf16f(E[(size_t)tok[g.y] * n + g.x]);
-}
-
 struct Norm { uint n; float eps; float scale; uint gate; };
 
 // Row r of n values: y = x / sqrt(mean(x^2) + eps) * w * scale, and with
@@ -116,4 +109,53 @@ kernel void silu_mul(device const float *g [[buffer(0)]], device const float *u 
 kernel void add(device float *x [[buffer(0)]], device const float *r [[buffer(1)]], constant uint &n [[buffer(2)]],
                 uint i [[thread_position_in_grid]]) {
   if (i < n) x[i] += r[i];
+}
+
+struct GroupRms {
+  uint width, groups;
+  float eps;
+  uint pad;
+};
+kernel void group_rms_bf16(device const float *x [[buffer(0)]], device const float *w [[buffer(1)]],
+                       device float *out [[buffer(2)]], constant GroupRms &p [[buffer(3)]],
+                       uint row [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]],
+                       uint threads [[threads_per_threadgroup]]) {
+  threadgroup float partial[32];
+  float sum = 0;
+  for (uint i = t; i < p.width; i += threads) {
+    float v = x[(size_t)row * p.width + i];
+    sum += v * v;
+  }
+  float inv = rsqrt(tg_sum(sum, partial, t, threads) / p.width + p.eps);
+  for (uint i = t; i < p.width; i += threads)
+    out[(size_t)row * p.width + i] = bf(x[(size_t)row * p.width + i] * inv * w[(row % p.groups) * p.width + i]);
+}
+kernel void round_bf16(device float *x [[buffer(0)]], constant uint &n [[buffer(1)]],
+                        uint i [[thread_position_in_grid]]) {
+  if (i < n)
+    x[i] = bf(x[i]);
+}
+kernel void clear_f32(device float *x [[buffer(0)]], constant uint &n [[buffer(1)]],
+                       uint i [[thread_position_in_grid]]) {
+  if (i < n)
+    x[i] = 0;
+}
+
+struct WeightedRow {
+  uint row;
+  float weight;
+};
+kernel void gather_rows(device const float *x [[buffer(0)]], device const WeightedRow *entries [[buffer(1)]],
+                         device float *out [[buffer(2)]], constant uint2 &p [[buffer(3)]],
+                         uint i [[thread_position_in_grid]]) {
+  if (i < p.x * p.y)
+    out[i] = x[(size_t)entries[i / p.x].row * p.x + i % p.x];
+}
+
+kernel void embed_rows(device const ushort *embedding [[buffer(0)]], device const int *tokens [[buffer(1)]],
+                            device float *out [[buffer(2)]], constant uint &width [[buffer(3)]],
+                            device const ulong *images [[buffer(4)]], uint2 i [[thread_position_in_grid]]) {
+  if (i.x >= width) return;
+  device const ushort *row = images[i.y] ? (device const ushort *)images[i.y] : embedding + (size_t)tokens[i.y] * width;
+  out[(size_t)i.y * width + i.x] = bf16f(row[i.x]);
 }

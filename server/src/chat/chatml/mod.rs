@@ -15,7 +15,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use self::decoder::{Decoder, Piece};
-use self::prompt::{self as template, Call, ImagePart, Message, Options};
+use self::prompt::{self as template, Call, MediaPart, Message, Options};
 use super::{Error, bad, error, error_json, response_id};
 use crate::engine::Tokenizer;
 use crate::worker::{self, Event, Finish, Sampling};
@@ -28,6 +28,13 @@ pub struct Settings {
     pub tokenizer: Tokenizer,
     pub sampling: Sampling,
     pub think: Option<u32>,
+    pub variant: Variant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Variant {
+    Qwen,
+    Nemotron,
 }
 
 /// The context a model serves: the configured one, at most its
@@ -37,7 +44,10 @@ pub fn context(dir: &str, ctx: usize) -> usize {
         .ok()
         .and_then(|t| serde_json::from_slice(&t).ok())
         .unwrap_or(Value::Null);
-    let text = config.get("text_config").unwrap_or(&config);
+    let text = config
+        .get("text_config")
+        .or_else(|| config.get("llm_config"))
+        .unwrap_or(&config);
     let most = text
         .get("max_position_embeddings")
         .and_then(Value::as_u64)
@@ -73,19 +83,22 @@ pub fn sampling(
     }
 }
 
-fn content_of(content: Option<&Value>) -> Result<(String, Vec<ImagePart>), Error> {
+fn content_of(
+    content: Option<&Value>,
+    variant: Variant,
+) -> Result<(String, Vec<MediaPart>), Error> {
     match content {
         None | Some(Value::Null) => Ok((String::new(), Vec::new())),
         Some(Value::String(s)) => Ok((s.clone(), Vec::new())),
         Some(Value::Array(parts)) => {
             let mut out = String::new();
-            let mut images = Vec::new();
+            let mut media = Vec::new();
             for p in parts {
                 match p.get("type").and_then(Value::as_str) {
                     Some("text") | None if p.get("text").is_some() => {
                         out.push_str(p.get("text").and_then(Value::as_str).unwrap_or(""))
                     }
-                    Some("image_url") => {
+                    Some("image_url") if variant == Variant::Qwen => {
                         let image = p
                             .get("image_url")
                             .ok_or_else(|| bad("image_url is missing"))?;
@@ -93,16 +106,48 @@ fn content_of(content: Option<&Value>) -> Result<(String, Vec<ImagePart>), Error
                             .as_str()
                             .or_else(|| image.get("url").and_then(Value::as_str))
                             .ok_or_else(|| bad("image_url requires a URL"))?;
-                        images.push(ImagePart {
+                        media.push(MediaPart {
                             offset: out.len(),
                             bytes: super::image_data(url)?,
+                        });
+                    }
+                    Some("audio_url") if variant == Variant::Nemotron => {
+                        let audio = p
+                            .get("audio_url")
+                            .ok_or_else(|| bad("audio_url is missing"))?;
+                        let url = audio
+                            .as_str()
+                            .or_else(|| audio.get("url").and_then(Value::as_str))
+                            .ok_or_else(|| bad("audio_url requires a data URL"))?;
+                        media.push(MediaPart {
+                            offset: out.len(),
+                            bytes: super::media_data(url)?,
+                        });
+                    }
+                    Some("input_audio") if variant == Variant::Nemotron => {
+                        let audio = p
+                            .get("input_audio")
+                            .ok_or_else(|| bad("input_audio is missing"))?;
+                        let format = audio.get("format").and_then(Value::as_str).unwrap_or("wav");
+                        if !matches!(format, "wav" | "mp3" | "flac" | "ogg" | "aac" | "m4a") {
+                            return Err(bad("unsupported input_audio format"));
+                        }
+                        let data = audio
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| bad("input_audio requires base64 data"))?;
+                        media.push(MediaPart {
+                            offset: out.len(),
+                            bytes: super::media_data(&format!(
+                                "data:audio/{format};base64,{data}"
+                            ))?,
                         });
                     }
                     Some(t) => return Err(bad(format!("unsupported content type {t}"))),
                     None => return Err(bad("a content part without a type")),
                 }
             }
-            Ok((out, images))
+            Ok((out, media))
         }
         Some(_) => Err(bad(
             "a message's content must be a string or an array of parts",
@@ -110,30 +155,38 @@ fn content_of(content: Option<&Value>) -> Result<(String, Vec<ImagePart>), Error
     }
 }
 
-fn messages(list: &[Value]) -> Result<Vec<Message>, Error> {
+fn messages_for(list: &[Value], variant: Variant) -> Result<Vec<Message>, Error> {
     let mut out: Vec<Message> = Vec::new();
     for (i, m) in list.iter().enumerate() {
         let role = m
             .get("role")
             .and_then(Value::as_str)
             .ok_or(bad(format!("message {i} has no role")))?;
-        let (content, images) = content_of(m.get("content"))?;
-        if !images.is_empty() && matches!(role, "system" | "developer") {
-            return Err(bad("system messages cannot contain images"));
+        let (content, media) = content_of(m.get("content"), variant)?;
+        if !media.is_empty() && matches!(role, "system" | "developer") {
+            return Err(bad("system messages cannot contain media"));
         }
-        let role = match role {
-            // the template takes one system message, first: the leading
-            // system and developer messages join, later ones speak as the user
-            "system" | "developer" if out.iter().all(|x| x.role == "system") => {
-                if let Some(first) = out.first_mut() {
-                    first.content = format!("{}\n\n{}", first.content, content);
-                    continue;
-                }
-                "system"
+        let role = if variant == Variant::Nemotron {
+            match role {
+                "system" | "developer" => "system",
+                r @ ("user" | "assistant" | "tool") => r,
+                r => return Err(bad(format!("message {i}: unsupported role {r:?}"))),
             }
-            "system" | "developer" => "user",
-            r @ ("user" | "assistant" | "tool") => r,
-            r => return Err(bad(format!("message {i}: unsupported role {r:?}"))),
+        } else {
+            match role {
+                // the template takes one system message, first: the leading
+                // system and developer messages join, later ones speak as the user
+                "system" | "developer" if out.iter().all(|x| x.role == "system") => {
+                    if let Some(first) = out.first_mut() {
+                        first.content = format!("{}\n\n{}", first.content, content);
+                        continue;
+                    }
+                    "system"
+                }
+                "system" | "developer" => "user",
+                r @ ("user" | "assistant" | "tool") => r,
+                r => return Err(bad(format!("message {i}: unsupported role {r:?}"))),
+            }
         };
         let reasoning = m
             .get("reasoning_content")
@@ -179,7 +232,7 @@ fn messages(list: &[Value]) -> Result<Vec<Message>, Error> {
         out.push(Message {
             role: role.into(),
             content,
-            images,
+            media,
             reasoning,
             calls,
         });
@@ -264,14 +317,19 @@ pub fn prepare(body: &[u8], note: &str, m: &Settings, slot: usize) -> Result<Pre
         .get("messages")
         .and_then(Value::as_array)
         .ok_or(bad("messages must be an array"))?;
-    let msgs = messages(list)?;
+    let msgs = messages_for(list, m.variant)?;
     let tools: Vec<Value> = match root.get("tools") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(t)) => t.clone(),
         Some(_) => return Err(bad("tools must be an array")),
     };
     let (on, effort) = thinking(&root, m.think)?;
-    let prompt = template::render(
+    let render = if m.variant == Variant::Nemotron {
+        template::render_nemotron
+    } else {
+        template::render
+    };
+    let prompt = render(
         &msgs,
         &Options {
             tools: &tools,
@@ -282,9 +340,9 @@ pub fn prepare(body: &[u8], note: &str, m: &Settings, slot: usize) -> Result<Pre
     )
     .map_err(bad)?;
     let message_count = msgs.len();
-    let images: Vec<_> = msgs
+    let media: Vec<_> = msgs
         .into_iter()
-        .flat_map(|m| m.images)
+        .flat_map(|m| m.media)
         .map(|image| image.bytes)
         .collect();
     let max_tokens = super::completion_limit(&root, m.ctx as i64)?;
@@ -313,7 +371,7 @@ pub fn prepare(body: &[u8], note: &str, m: &Settings, slot: usize) -> Result<Pre
         request: worker::Request {
             model: slot,
             prompt,
-            images,
+            media: media,
             sampling,
             max_tokens: max_tokens as i64,
             note,
@@ -640,6 +698,9 @@ pub async fn whole(
 
 #[cfg(test)]
 mod tests {
+    fn messages(list: &[serde_json::Value]) -> Result<Vec<super::template::Message>, super::Error> {
+        super::messages_for(list, super::Variant::Qwen)
+    }
     use super::*;
 
     fn reply_with_stops(stop: &[&str]) -> Reply {
@@ -781,6 +842,36 @@ mod tests {
             )
             .unwrap();
             assert_eq!(got, case["rendered"].as_str().unwrap(), "case {i}");
+        }
+    }
+
+    #[test]
+    fn nemotron_matches_checkpoint_template() {
+        let cases: Vec<Value> = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/chat/nemotron_chats.json"
+        ))
+        .unwrap();
+        for (i, case) in cases.iter().enumerate() {
+            let mut messages =
+                messages_for(case["messages"].as_array().unwrap(), Variant::Nemotron).unwrap();
+            if case["audio"].as_bool().unwrap_or(false) {
+                let last = messages.last_mut().unwrap();
+                last.media.push(MediaPart {
+                    offset: last.content.len(),
+                    bytes: Vec::new(),
+                });
+            }
+            let tools = case["tools"].as_array().cloned().unwrap_or_default();
+            let got = template::render_nemotron_text(
+                &messages,
+                &Options {
+                    tools: &tools,
+                    thinking: case["thinking"].as_bool().unwrap(),
+                    effort: "medium",
+                },
+            )
+            .unwrap();
+            assert_eq!(got, case["expected"].as_str().unwrap(), "case {i}");
         }
     }
 

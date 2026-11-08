@@ -53,6 +53,11 @@ WeightSet *weights_cached(WeightSet *backbone, WeightCache *cache, const char *n
   cache->capacity++;
   return set;
 }
+WeightSet *weights_dependent(WeightSet *backbone, const char *name) {
+  WeightSet *set = xmalloc(sizeof *set);
+  memory_slot_init(&set->slot, backbone->slot.account, &backbone->slot, name, unload, set);
+  return set;
+}
 MemorySlot *weights_slot(WeightSet *set) { return &set->slot; }
 uint64_t weights_required(const WeightSet *set) { return set ? set->required + set->scratch : 0; }
 uint64_t weights_resident_bytes(const WeightSet *set) { return set && memory_ready(&set->slot) ? set->slot.payload : 0; }

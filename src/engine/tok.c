@@ -49,9 +49,9 @@ struct Tokenizer {
   int *piece_len, nvocab;
   Key *added;     // the added tokens' spellings
   unsigned char *special;  // each added token's tokenizer.json "special"
-  int nadded, image;  // image: the image token's id (IMAGE_MARK's), or -1
+  int nadded, image;  // image: the image token's id (MEDIA_MARK's), or -1
   URegularExpression *split[SPLITS];
-  int nsplit, nfc;
+  int nsplit, nfc, ignore_merges;
   pthread_mutex_t lock;  // encoding's scratch below
   int *sym, *prv, *nxt, cap_bpe, nheap;
   Pair *heap;
@@ -149,9 +149,11 @@ static void pipeline(Tokenizer *t, const Json *root, const char *path) {
     free(u);
   }
   const Json *model = json_get(root, "model");
+  const Json *ignore = json_get(model, "ignore_merges");
+  t->ignore_merges = ignore && ignore->type == J_BOOL && ignore->num;
   if (!is_str(json_get(model, "type"), "BPE") || !is_false(json_get(model, "byte_fallback")) ||
       !is_empty(json_get(model, "continuing_subword_prefix")) || !is_empty(json_get(model, "end_of_word_suffix")) ||
-      !is_false(json_get(model, "fuse_unk")) || !is_false(json_get(model, "ignore_merges")) ||
+      !is_false(json_get(model, "fuse_unk")) ||
       !is_empty(json_get(model, "unk_token")))
     die("%s: BPE settings this tokenizer does not run", path);
 }
@@ -322,6 +324,13 @@ static void offer(Tokenizer *t, int i) {
 // merge applies. A heap keeps a long piece at O(n log n).
 static int bpe(Tokenizer *t, const char *s, int n, int *out, int max) {
   if (n <= 0) return 0;
+  if (t->ignore_merges) {
+    int id = lookup(t, s, n);
+    if (id >= 0) {
+      if (max < 1) die("prompt too long");
+      out[0] = id; return 1;
+    }
+  }
   if (n > t->cap_bpe) {
     t->cap_bpe = n;
     t->sym = realloc(t->sym, n * sizeof *t->sym), t->prv = realloc(t->prv, n * sizeof *t->prv);
@@ -400,14 +409,14 @@ static int encode_text(Tokenizer *t, const char *text, int len, int *out, int ma
 }
 
 // TOK_TEXT: text alone; TOK_ADDED: the added tokens' spellings are those
-// tokens; TOK_PROMPT: also IMAGE_MARK is the image token, and the image
+// tokens; TOK_PROMPT: also MEDIA_MARK is the image token, and the image
 // token's own spelling is text (a rendered prompt).
 static int encode(Tokenizer *t, const char *text, int len, int *out, int max, int mode) {
   int n = 0, start = 0;
   pthread_mutex_lock(&t->lock);
   for (int i = 0; mode && i < len;) {
     int best = -1, id, skip;
-    if (mode == TOK_PROMPT && text[i] == IMAGE_MARK[0]) {
+    if (mode == TOK_PROMPT && text[i] == MEDIA_MARK[0]) {
       if (t->image < 0) die("an image's place in a prompt for a model without images");
       id = t->image, skip = 1;
     } else {

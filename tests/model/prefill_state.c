@@ -6,7 +6,7 @@ static Tokenizer *tk;  // the checkpoint's tokenizer
 int main(int argc, char **argv) {
   if (argc < 2 || argc > 3) die("usage: prefill-state-check CHECKPOINT [EXPERT_GGUF]");
   alarm(180);
-  tk = tok_open(argv[1], deepseek_ops.image_token);
+  tk = tok_open(argv[1], deepseek_ops.media_token);
   int pattern[64], tokens[256];
   int pn = tok_encode(tk, " alpha beta gamma delta epsilon", pattern, 64);
   if (!pn) die("empty pattern");

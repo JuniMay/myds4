@@ -1,11 +1,11 @@
 .DEFAULT_GOAL := build/myds4
 CC = clang
 CFLAGS = -std=c23 -O2 -Wall -Wextra -Wno-unused-parameter -Isrc/engine $(shell pkg-config --cflags yyjson libjpeg)
-LDLIBS = -framework Metal -framework Foundation -framework IOKit -framework ImageIO -framework CoreGraphics -framework Accelerate -lobjc -licucore \
+LDLIBS = -framework Metal -framework Foundation -framework IOKit -framework ImageIO -framework CoreGraphics -framework AudioToolbox -framework Accelerate -lobjc -licucore \
          $(shell pkg-config --libs yyjson libjpeg)
-MODEL_HEADERS = src/model/linear.h src/engine/memory.h src/model/weights.h src/model/deepseek/model.h src/engine/myds4.h src/model/model.h src/model/qwen/model.h src/model/qwen/vision.h src/model/deepseek/engram.h src/model/deepseek/learning.h src/model/draft.h src/model/deepseek/prefill.h src/model/deepseek/expert_tasks.h
+MODEL_HEADERS = src/model/nemotron/dflash.h src/model/nemotron/audio.h src/model/linear.h src/engine/memory.h src/model/weights.h src/model/deepseek/model.h src/engine/myds4.h src/model/model.h src/model/qwen/model.h src/model/qwen/vision.h src/model/deepseek/engram.h src/model/deepseek/learning.h src/model/draft.h src/model/deepseek/prefill.h src/model/deepseek/expert_tasks.h
 KERNELS = src/kernels/formats.metal src/kernels/kernels.metal src/kernels/gguf_grids.metal src/kernels/gguf.metal \
-          src/kernels/vision.metal src/kernels/qwen_vision.metal src/kernels/rows.metal src/kernels/products.metal src/kernels/deltanet.metal src/kernels/gqa.metal src/kernels/flash.metal src/kernels/expert_tasks.metal
+          src/kernels/vision.metal src/kernels/qwen_vision.metal src/kernels/rows.metal src/kernels/products.metal src/kernels/deltanet.metal src/kernels/gqa.metal src/kernels/flash.metal src/kernels/nemotron.metal src/kernels/speech.metal src/kernels/dflash.metal src/kernels/expert_tasks.metal
 
 build/myds4: src/cli/main.c build/libmyds4.a $(MODEL_HEADERS)
 	@mkdir -p $(dir $@)
@@ -13,7 +13,7 @@ build/myds4: src/cli/main.c build/libmyds4.a $(MODEL_HEADERS)
 
 # The engine behind src/engine/engine.h, for the Rust server (server/): the sources
 # of build/myds4 without those in src/cli/, and with engine.c.
-LIB_SRC = src/model/qwen/flash.c src/model/linear.c src/engine/memory.c src/model/weights.c src/model/model.c src/model/deepseek/model.c src/model/deepseek/engram.c src/model/qwen/model.c src/model/qwen/vision.c src/kernels/library.c src/engine/io.c src/engine/gpu.c src/engine/tok.c src/engine/util.c src/engine/vision.c src/model/deepseek/predictor.c src/model/deepseek/learning.c src/model/draft.c src/engine/sample.c src/engine/engine.c
+LIB_SRC = src/model/nemotron/dflash.c src/model/nemotron/audio.c src/engine/media.c src/engine/audio.c src/model/nemotron/model.c src/model/qwen/flash.c src/model/linear.c src/engine/memory.c src/model/weights.c src/model/model.c src/model/deepseek/model.c src/model/deepseek/engram.c src/model/qwen/model.c src/model/qwen/vision.c src/kernels/library.c src/engine/io.c src/engine/gpu.c src/engine/tok.c src/engine/util.c src/engine/vision.c src/model/deepseek/predictor.c src/model/deepseek/learning.c src/model/draft.c src/engine/sample.c src/engine/engine.c
 LIB_OBJ = $(LIB_SRC:src/%.c=build/lib/%.o)
 
 build/lib/%.o: src/%.c $(MODEL_HEADERS) src/engine/engine.h
@@ -52,7 +52,7 @@ EXTRA_CPU = memory metadata qwen-state-accounting attention-candidate prefill-pr
 
 test: $(CPU_CHECKS) $(addprefix build/tests/,$(EXTRA_CPU)) build/myds4-server
 	@set -e; for test in $(EXTRA_CPU); do ./build/tests/$$test; done
-	env -u MYDS4_QWEN -u MYDS4_FLASH -u MYDS4_CHECKPOINT -u MYDS4_EXPERTS $(MAKE) server-check
+	env -u MYDS4_QWEN -u MYDS4_FLASH -u MYDS4_NEMOTRON -u MYDS4_DFLASH -u MYDS4_CHECKPOINT -u MYDS4_EXPERTS $(MAKE) server-check
 
 # ---- CPU checks: no model, and no Metal device unless noted ----
 
@@ -71,6 +71,18 @@ build/tests/qwen-mtp: tests/model/qwen_mtp.c build/libmyds4.a $(MODEL_HEADERS)
 build/tests/flash-model: tests/model/flash.c build/libmyds4.a $(MODEL_HEADERS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/model/flash.c build/libmyds4.a $(LDLIBS)
+
+build/tests/nemotron: tests/gpu/nemotron.c build/libmyds4.a $(MODEL_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -o $@ tests/gpu/nemotron.c build/libmyds4.a $(LDLIBS)
+
+build/tests/speech-model: tests/model/speech.c build/libmyds4.a $(MODEL_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -o $@ tests/model/speech.c build/libmyds4.a $(LDLIBS)
+
+build/tests/nemotron-model: tests/model/nemotron.c build/libmyds4.a $(MODEL_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -o $@ tests/model/nemotron.c build/libmyds4.a $(LDLIBS)
 
 build/tests/metadata: tests/unit/checkpoint.c build/libmyds4.a $(MODEL_HEADERS)
 	@mkdir -p $(dir $@)

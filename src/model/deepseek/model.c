@@ -2194,7 +2194,7 @@ static struct {
   Buf patch_b, norm, a1_b, a2_b;
   VitBlock b[32];
 } vit;
-static const Image *imgs;  // the prompt's images (deepseek_images)
+static const Media *imgs;  // the prompt's images (deepseek_images)
 static int nimgs;
 
 // The vision encoder's weights (0.97 GB) load at the first image.
@@ -2260,7 +2260,7 @@ static void vit_gelu_row(void *ctx, size_t r) {
   for (int i = 0; i < DIM; i++) g[i] = bf_cpu((float)(0.5 * g[i] * (1 + erf(g[i] / sqrt(2.0)))));
 }
 
-int deepseek_image(Image *im) {
+int deepseek_image(Media *im) {
   if (im->rows) return 1;
   vit_prepare();
   uint32_t n = (uint32_t)(im->vh * im->vw), L = (uint32_t)(im->th * im->tw);
@@ -2338,15 +2338,15 @@ int deepseek_image(Image *im) {
   return 1;
 }
 
-void deepseek_images(const Image *im, int n) { imgs = im, nimgs = n; }
+void deepseek_images(const Media *im, int n) { imgs = im, nimgs = n; }
 
 // The embedding of prompt position pos inside an image span
 // (merge_image_embeddings): the delimiters' learned rows, or the image's
 // feature rows in reading order.
 static const uint16_t *image_row(int pos) {
   for (int i = 0; i < nimgs; i++) {
-    const Image *im = &imgs[i];
-    int j = pos - im->start, n = image_span(im);
+    const Media *im = &imgs[i];
+    int j = pos - im->start, n = media_span(im);
     if (j < 0 || j >= n) continue;
     if (j == 0) return (const uint16_t *)(image_markers[0].ptr + image_markers[0].off);
     if (j == n - 1) return (const uint16_t *)(image_markers[1].ptr + image_markers[1].off);
@@ -3578,7 +3578,7 @@ static void ds_report(FILE *out, int at, int tokens) {
 
 static void ds_chat(char *text, size_t cap, const char *prompt, int images, int think) {
   char user[16 * 32 + 1] = "";
-  for (int i = 0; i < images && i < 16; i++) strcat(user, IMAGE_MARK "\n\n");  // each image's place, then the text
+  for (int i = 0; i < images && i < 16; i++) strcat(user, MEDIA_MARK "\n\n");  // each image's place, then the text
   if (think)
     snprintf(text, cap,
              "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: %d (range 1-100, the higher "
@@ -3589,12 +3589,12 @@ static void ds_chat(char *text, size_t cap, const char *prompt, int images, int 
 
 static const char *const ds_types[] = {"deepseek_v41", 0};
 
-static int ds_prepare_image(const char *dir, Image *im, const void *data, size_t len, const char **error) {
+static int ds_prepare_image(const char *dir, Media *im, const void *data, size_t len, const char **error) {
   return image_open(im, data, len, error);
 }
 
 const ModelOps deepseek_ops = {
-    .family = "DeepSeek V4.1", .model_types = ds_types, .image_token = "<｜deepseek_image｜>", .refuse = ds_refuse,
+    .family = "DeepSeek V4.1", .model_types = ds_types, .media_token = "<｜deepseek_image｜>", .refuse = ds_refuse,
     .load = ds_load, .weight_slot = ds_weight_slot, .active = cache_active, .counters = ds_counters, .cache_bytes = cache_bytes, .plan = ds_plan, .routes = deepseek_routes, .vocab = ds_vocab,
     .max_rows = ds_max_rows, .max_verify = ds_max_verify, .draft_block = ds_draft_block, .rewind = ds_rewind,
     .prefill_rows = ds_prefill_rows,
@@ -3603,5 +3603,5 @@ const ModelOps deepseek_ops = {
     .snapshot_free = ds_snapshot_free, .snapshot_bytes = ds_snapshot_bytes, .snapshot_logits = ds_snapshot_logits,
     .prefill = ds_prefill, .replay_rows = deepseek_replay_rows, .replay_start = deepseek_replay_start,
     .rows = ds_rows, .draft = ds_draft, .verify = ds_verify, .accept = ds_accept, .seek = ds_seek, .idle = ds_idle,
-    .finish = ds_finish, .report = ds_report, .prepare_image = ds_prepare_image, .image = deepseek_image, .images = deepseek_images, .chat = ds_chat,
+    .finish = ds_finish, .report = ds_report, .prepare_media = ds_prepare_image, .encode_media = deepseek_image, .media = deepseek_images, .chat = ds_chat,
     .bench = deepseek_bench};

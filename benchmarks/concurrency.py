@@ -1,10 +1,11 @@
-"""Compare server throughput on concurrent DSH requests over HTTP.
+"""Compare HTTP throughput on Harness requests or audio recordings.
 
 One server runs at a time. Prompts, answers and diagnostics stay in memory;
 the optional report stores counts, timings and response digests. Tool calls
 produced by the model are never executed.
 """
 import argparse
+import base64
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -42,6 +43,21 @@ def stop(process):
 
 def requests(args):
     bodies, identities = [], []
+    if args.audio:
+        for i, path in enumerate(args.audio):
+            data = path.read_bytes()
+            if len(data) > 20 << 20:
+                raise ValueError('one audio fixture exceeds 20 MiB')
+            body = {'model': args.checkpoint.name.lower(), 'messages': [{'role': 'user', 'content': [
+                {'type': 'text', 'text': 'Transcribe the following audio.'},
+                {'type': 'input_audio', 'input_audio': {'format': path.suffix.lstrip('.').lower() or 'wav',
+                                                      'data': base64.b64encode(data).decode()}}]}],
+                'max_tokens': args.tokens, 'temperature': 1, 'top_p': 1, 'seed': 12345 + i,
+                'chat_template_kwargs': {'enable_thinking': False}, 'stream': True,
+                'stream_options': {'include_usage': True}}
+            bodies.append(json.dumps(body).encode())
+            identities.append({'audio': path.name, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+        return bodies, identities
     for seq in args.before_seq:
         body = harness_request(args.harness_session, seq)
         body.update(max_tokens=args.tokens, temperature=1, top_p=1, seed=12345,
@@ -64,7 +80,8 @@ def requests(args):
 
 def run(args, mode, bodies, runahead=0, pipeline=0):
     batch = int(mode)
-    guard = wait_for_gpu(args.memory + 4, 60, args.reserve, desktop=True, quiet_cpu=True)
+    kv = getattr(args, 'kv', 4)
+    guard = wait_for_gpu(args.memory + kv, 60, args.reserve, desktop=True, quiet_cpu=True)
     baseline = guard["samples"][-1]["memory"]
     if baseline["available_gib"] < 10 or guard["samples"][-1]["device_percent"] > 35:
         raise RuntimeError("HTTP comparison needs 10 GiB available and GPU use at most 35 percent")
@@ -75,11 +92,13 @@ def run(args, mode, bodies, runahead=0, pipeline=0):
     env = {k: v for k, v in os.environ.items() if not k.startswith("MYDS4_")}
     env.update(MYDS4_API_KEY=key, MYDS4_LOCK=str(ROOT / "build/myds4.lock"))
     command = [str(args.binary), "-m", str(args.checkpoint), "--serve", str(port), "--ctx", str(args.context),
-               "--memory", str(args.memory), "--reserve", str(args.reserve), "--kv-cache", "4", "--batch", str(batch),
+               "--memory", str(args.memory), "--reserve", str(args.reserve), "--kv-cache", str(kv), "--batch", str(batch),
                "--temperature", "1", "--top-p", "1", "--top-k", "0", "--seed", "12345",
                "--draft", str(getattr(args, "draft", 0))]
     if runahead:
         command += ["--runahead"]
+    if getattr(args, 'draft_model', None):
+        command += ['--draft-model', str(args.draft_model)]
     if pipeline:
         command += ["--pipeline"]
     if args.prefill_prune:
@@ -254,7 +273,8 @@ def run(args, mode, bodies, runahead=0, pipeline=0):
         valid = (not failures and not counters["cache_shrank"] and
                  final["expert_cache"]["slots"] >= counters["maximum_cache_slots"] and
                  final["expert_cache"].get("slots_released") == initial["expert_cache"].get("slots_released") == 0 and
-                 0 < final["model_memory_budget"]["allocated"] <= final["model_memory_budget"]["limit"] and generated >= 128 * len(bodies))
+                 0 < final["model_memory_budget"]["allocated"] <= final["model_memory_budget"]["limit"] and
+                 all(r['usage']['completion_tokens'] >= getattr(args, 'min_output_tokens', 128) for r in outputs))
         if batch > 1 and len(bodies) > 1 and not seen_batches:
             valid = False
         if initial.get("runahead") != bool(runahead):
@@ -290,7 +310,9 @@ def run(args, mode, bodies, runahead=0, pipeline=0):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--harness-session", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--harness-session", type=Path)
+    source.add_argument("--audio", type=Path, nargs='+', help="local speech fixtures for Transcribe")
     parser.add_argument("--before-seq", type=int, nargs="+", default=[35, 88])
     parser.add_argument("--binary", type=Path, default=ROOT / "build/myds4-server")
     parser.add_argument("--run-binaries", type=Path, nargs="+",
@@ -302,10 +324,13 @@ def main():
     parser.add_argument("--tokens", type=int, default=512)
     parser.add_argument("--context", type=int, default=65536)
     parser.add_argument("--memory", type=float, default=56)
-    parser.add_argument("--reserve", type=float, default=4)
+    parser.add_argument("--kv", type=float, default=4, help="shared KV budget in GiB")
+    parser.add_argument("--min-output-tokens", type=int, default=128, help="minimum completed output per request for a valid run")
+    parser.add_argument("--reserve", type=float, default=10)
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--prefill-prune", action="store_true")
     parser.add_argument("--draft", type=int, default=0)
+    parser.add_argument("--draft-model", type=Path, help="separate draft checkpoint when the architecture uses one")
     parser.add_argument("--describe", action="store_true")
     parser.add_argument("--results", type=Path)
     args = parser.parse_args()
@@ -315,7 +340,8 @@ def main():
         args.pipeline = [0] * len(args.modes)
     if not (1 <= len(args.before_seq) <= 6 and len(set(args.before_seq)) == len(args.before_seq)
             and 128 <= args.tokens <= 2048 and 16384 <= args.context <= 131072 and 16 <= args.memory <= 80
-            and 0 <= args.draft <= 5 and 4 <= args.reserve <= 16 and 120 <= args.timeout <= 1800 and len(args.modes) <= 6
+            and 0 <= args.draft <= (15 if args.draft_model else 5) and 1 <= args.min_output_tokens <= args.tokens
+            and 1 <= args.kv <= 24 and 4 <= args.reserve <= 16 and 120 <= args.timeout <= 1800 and len(args.modes) <= 6
             and len(args.runahead) == len(args.modes) and all(n in (0, 1) for n in args.runahead)
             and len(args.pipeline) == len(args.modes) and all(n in (0, 1) for n in args.pipeline)
             and all(re.fullmatch(r"[1246]", s) for s in args.modes)):
@@ -329,7 +355,9 @@ def main():
     run_hashes = [hashlib.sha256(p.read_bytes()).hexdigest() for p in run_binaries]
     bodies, identities = requests(args)
     settings = {"requests": identities, "tokens": args.tokens, "context": args.context, "model_memory_gib": args.memory,
-                "reserve_gib": args.reserve, "prefill_prune": args.prefill_prune, "temperature": 1, "top_p": 1,
+                "reserve_gib": args.reserve, "kv_gib": args.kv, "draft": args.draft,
+                "draft_model": args.draft_model.name if args.draft_model else None,
+                "prefill_prune": args.prefill_prune, "temperature": 1, "top_p": 1,
                 "seed": 12345, "binary_sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest(),
                 "checkpoint": args.checkpoint.name, "experts": args.experts.name if args.experts else None}
     if args.run_binaries:
@@ -338,7 +366,7 @@ def main():
     print("SESSION_SETTINGS " + json.dumps(settings), flush=True)
     if args.describe:
         return
-    report = {"schema_version": 2, "scope": "Concurrent reconstructed DSH requests in fixed admission order; generated tools not executed. "
+    report = {"schema_version": 2, "scope": "HTTP requests in fixed admission order; generated tools not executed. "
               "Response identity covers returned text/reasoning/tool arguments, excluding generated call IDs. "
               "Decode throughput uses engine rows and wall-time counters. Logged prefill durations include waiting "
               "behind other admitted prefills and must not be subtracted from total request wall time.", "settings": settings, "runs": []}

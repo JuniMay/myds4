@@ -27,6 +27,7 @@ fn main() {
         "IOKit",
         "ImageIO",
         "CoreGraphics",
+        "AudioToolbox",
         "Accelerate",
     ] {
         println!("cargo:rustc-link-lib=framework={framework}");

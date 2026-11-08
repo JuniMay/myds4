@@ -222,34 +222,25 @@ static Entry *slot(const TensorIndex *index, const char *name) {
   return &index->table[i];
 }
 
-TensorIndex *st_open(const char *dir) {
-  char path[4096];
-  snprintf(path, sizeof path, "%s/model.safetensors.index.json", dir);
-  char *text = read_file(path, 0);
-  Json *root = json_parse(text), *idx = json_get(root, "weight_map");
-  if (!idx) die("%s has no weight_map", path);
+static Json *tensor_header(const char *path, int *fd, uint64_t *bytes) {
+  *fd = open(path, O_RDONLY);
+  if (*fd < 0 || pread(*fd, bytes, 8, 0) != 8) die("cannot read %s", path);
+  char *text = xmalloc(*bytes + 1);
+  if (pread(*fd, text, *bytes, 8) != (ssize_t)*bytes) die("cannot read %s", path);
+  Json *header = json_parse(text); free(text); fcntl(*fd, F_NOCACHE, 1); return header;
+}
+
+static TensorIndex *tensor_index(size_t count) {
   TensorIndex *index = xmalloc(sizeof *index);
   index->capacity = 1;
-  while (index->capacity < 2 * (size_t)idx->n) index->capacity *= 2;
+  while (index->capacity < 2 * count) index->capacity *= 2;
   index->table = xmalloc(index->capacity * sizeof *index->table);
-  index->fds = xmalloc((size_t)idx->n * sizeof *index->fds);
-  const char **done = xmalloc((size_t)idx->n * sizeof *done);
-  int ndone = 0;
-  for (int i = 0; i < idx->n; i++) {
-    const char *file = idx->kid[i].s;
-    int seen = 0;
-    for (int j = 0; j < ndone; j++) seen |= !strcmp(done[j], file);
-    if (seen) continue;
-    done[ndone++] = file;
-    snprintf(path, sizeof path, "%s/%s", dir, file);
-    int fd = open(path, O_RDONLY);
-    uint64_t n;
-    if (fd < 0 || pread(fd, &n, 8, 0) != 8) die("cannot read %s", path);
-    index->fds[index->nfiles++] = fd;
-    char *h = xmalloc(n + 1);
-    if (pread(fd, h, n, 8) != (ssize_t)n) die("cannot read %s", path);
-    fcntl(fd, F_NOCACHE, 1);
-    Json *hdr = json_parse(h);
+  index->fds = xmalloc(count * sizeof *index->fds);
+  return index;
+}
+
+static void index_tensors(TensorIndex *index, Json *hdr, int fd, uint64_t n) {
+  index->fds[index->nfiles++] = fd;
     for (int k = 0; k < hdr->n; k++) {
       Json *e = &hdr->kid[k];
       if (!strcmp(e->key, "__metadata__")) continue;
@@ -269,12 +260,31 @@ TensorIndex *st_open(const char *dir) {
       t->ndim = sh->n;
       for (int d = 0; d < sh->n && d < 4; d++) t->shape[d] = (int64_t)sh->kid[d].num;
     }
-    json_free(hdr);
-    free(h);
+  json_free(hdr);
+}
+
+TensorIndex *st_open(const char *dir) {
+  char path[4096];
+  snprintf(path, sizeof path, "%s/model.safetensors.index.json", dir);
+  if (access(path, R_OK)) {
+    snprintf(path, sizeof path, "%s/model.safetensors", dir);
+    int fd; uint64_t bytes; Json *header = tensor_header(path, &fd, &bytes);
+    TensorIndex *index = tensor_index(header->n);
+    index_tensors(index, header, fd, bytes); return index;
   }
-  json_free(root);
-  free(text), free(done);
-  return index;
+  char *text = read_file(path, NULL); Json *root = json_parse(text), *map = json_get(root, "weight_map");
+  if (!map) die("%s has no weight_map", path);
+  TensorIndex *index = tensor_index(map->n);
+  const char **done = xmalloc((size_t)map->n * sizeof *done); int files = 0;
+  for (int i = 0; i < map->n; i++) {
+    const char *file = map->kid[i].s; int seen = 0;
+    for (int j = 0; j < files; j++) seen |= !strcmp(done[j], file);
+    if (seen) continue;
+    done[files++] = file; snprintf(path, sizeof path, "%s/%s", dir, file);
+    int fd; uint64_t bytes; Json *header = tensor_header(path, &fd, &bytes);
+    index_tensors(index, header, fd, bytes);
+  }
+  json_free(root); free(text); free(done); return index;
 }
 
 void st_close(TensorIndex *index) {

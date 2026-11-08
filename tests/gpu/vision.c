@@ -73,7 +73,7 @@ int main(int argc, char **argv) {
     if (input.n + (size_t)n > 8u << 20) die("image fixture exceeds 8 MiB");
     str_put(&input, buffer, (size_t)n);
   }
-  Image image = {0}; const char *error;
+  Media image = {0}; const char *error;
   if (!qwen_prepare_image(argv[1], &image, input.p, input.n, &error)) die("%s", error);
   char path[4096]; snprintf(path, sizeof path, "%s/config.json", argv[1]);
   char *text = read_file(path, NULL); Json *root = json_parse(text);
@@ -92,6 +92,6 @@ int main(int argc, char **argv) {
     while (bytes) { ssize_t done = write(fd, p, bytes); if (done <= 0) die("feature pipe closed"); p += done; bytes -= (size_t)done; }
   }
   printf("vision: %d x %d patches, %d feature rows, %d values per row\n", image.vh, image.vw, image.ntokens, image.embedding_width);
-  image_free(&image); qwen_vision_close(vision); st_close(index); free(input.p);
+  media_free(&image); qwen_vision_close(vision); st_close(index); free(input.p);
   return 0;
 }

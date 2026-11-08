@@ -5,7 +5,7 @@
 
 #include "model.h"
 
-static const ModelOps *const families[] = {&deepseek_ops, &qwen_ops, &flash_ops};
+static const ModelOps *const families[] = {&deepseek_ops, &qwen_ops, &flash_ops, &nemotron_ops};
 
 const ModelOps *model_find(const char *dir) {
   char path[1024];
@@ -37,7 +37,7 @@ int model_load(Model *m, const Options *o) {
   lock_model();
   memory_scope(&m->work);
   Options options = *o;
-  options.family = m->ops == &deepseek_ops ? MODEL_DEEPSEEK : MODEL_QWEN;
+  options.family = m->ops == &deepseek_ops ? MODEL_DEEPSEEK : m->ops == &nemotron_ops ? MODEL_NEMOTRON : MODEL_QWEN;
   return m->ops->load(m->dir, &options);
 }
 

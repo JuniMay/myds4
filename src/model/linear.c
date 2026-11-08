@@ -55,6 +55,7 @@ void linear_load(WeightSet *weights, Linear *m, TensorIndex *index, const char *
     if (s.dtype == 'f' && s.size == 4) {
       m->kind = '8';
       m->scale = scalar(s);
+      if (st_has(index, "%s.input_scale", stem)) m->input_scale = scalar(st_get(index, "%s.input_scale", stem));
     } else {
       if ((s.dtype != 'e' && s.dtype != 'u') || s.size != (size_t)m->rows * m->cols / 32)
         die("%s: MXFP8 scales must hold one exponent per 32 values", stem);

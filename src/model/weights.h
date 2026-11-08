@@ -14,6 +14,7 @@ enum { WEIGHT_ADD = 1, WEIGHT_EXP = 2 };
 
 WeightSet *weights_new(MemoryAccount *account, const char *name);
 WeightSet *weights_cached(WeightSet *backbone, WeightCache *cache, const char *name);
+WeightSet *weights_dependent(WeightSet *backbone, const char *name);
 MemorySlot *weights_slot(WeightSet *set);
 uint64_t weights_required(const WeightSet *set);
 uint64_t weights_resident_bytes(const WeightSet *set);
