@@ -559,13 +559,15 @@ static int nrows, prompt_pass;
 
 // y (rows of m->rows values) = m x for the n rows of x: in a prompt pass on
 // the matrix units, else with the row kernels.
-static void mv(const Mat *m, const Buf *x, size_t xo, const Buf *y, size_t yo, int n) {
+static void product(const Mat *m, const Buf *x, size_t xo, const Buf *y, size_t yo, int n, int staged) {
   int f = m->kind == 'n' ? 0 : m->kind == '8' ? 1 : 2;
   if (prompt_pass) {
     uint32_t k = (uint32_t)m->cols, kl[2] = {k, k};  // x_bf16's row strides of XB and x; k % 512 == 0 (mat)
-    gpu_kern(K_x_bf16);
-    gpu_buf(0, x, xo), gpu_buf(1, &XB, 0), gpu_bytes(2, kl, sizeof kl);
-    gpu_go(k / 256, (uint32_t)n, 1, 64, 1, 1);
+    if (!staged) {
+      gpu_kern(K_x_bf16);
+      gpu_buf(0, x, xo), gpu_buf(1, &XB, 0), gpu_bytes(2, kl, sizeof kl);
+      gpu_go(k / 256, (uint32_t)n, 1, 64, 1, 1);
+    }
     MMp p = {(uint32_t)n, (uint32_t)m->rows, k, 0, m->scale, 0, 0, 0};
     gpu_kern(K_mm[f]);
     gpu_buf(0, &m->w, 0), gpu_buf(1, m->kind == 'n' ? &m->s : &m->w, 0);
@@ -578,6 +580,10 @@ static void mv(const Mat *m, const Buf *x, size_t xo, const Buf *y, size_t yo, i
   gpu_buf(0, &m->w, 0), gpu_buf(1, m->kind == 'n' ? &m->s : &m->w, 0);
   gpu_buf(2, x, xo), gpu_buf(3, y, yo), gpu_bytes(4, &p, sizeof p);
   gpu_go((uint32_t)(m->rows + 7) / 8, 1, 1, 256, 1, 1);
+}
+
+static void mv(const Mat *m, const Buf *x, size_t xo, const Buf *y, size_t yo, int n) {
+  product(m, x, xo, y, yo, n, 0);
 }
 
 static void norm(const Buf *x, size_t xo, const Buf *w, const Buf *y, size_t yo, int rows, int n, const Buf *gate) {
@@ -607,7 +613,7 @@ static void add_norm(const Buf *w, int n) {
 // prompt pass the two products on the matrix units and then swiglu.
 static void gate_up(const Layer *y, int n) {
   if (prompt_pass || y->gate.kind != y->up.kind || y->gate.rows != y->up.rows || y->gate.cols != y->up.cols) {
-    mv(&y->gate, &XN, 0, &GT, 0, n), mv(&y->up, &XN, 0, &UP, 0, n);
+    mv(&y->gate, &XN, 0, &GT, 0, n), product(&y->up, &XN, 0, &UP, 0, n, 1);
     elementwise(K_swiglu, &GT, &UP, &HH, (uint32_t)(c.inter * n));
     return;
   }
@@ -625,8 +631,8 @@ static void gate_up(const Layer *y, int n) {
 static void deltanet(const Layer *y) {
   int n = nrows;
   uint32_t keys = (uint32_t)(c.key_heads * c.key_dim);
-  mv(&y->qkv, &XN, 0, &QKV, 0, n), mv(&y->z, &XN, 0, &Z, 0, n);
-  mv(&y->a, &XN, 0, &A_, 0, n), mv(&y->b, &XN, 0, &B_, 0, n);
+  mv(&y->qkv, &XN, 0, &QKV, 0, n), product(&y->z, &XN, 0, &Z, 0, n, 1);
+  product(&y->a, &XN, 0, &A_, 0, n, 1), product(&y->b, &XN, 0, &B_, 0, n, 1);
   Convp cp = {(uint32_t)c.channels, (uint32_t)n, (uint32_t)y->index, 0};
   gpu_kern(K_conv);
   gpu_buf(0, &QKV, 0), gpu_buf(1, &CO, 0), gpu_buf(2, &y->conv, 0), gpu_buf(3, seqbuf, 0);
@@ -664,7 +670,7 @@ static int one_sequence(int n) {
 
 static void attention(const Layer *y) {
   int n = nrows;
-  mv(&y->q, &XN, 0, &QG, 0, n), mv(&y->k, &XN, 0, &KK, 0, n), mv(&y->v, &XN, 0, &VV, 0, n);
+  mv(&y->q, &XN, 0, &QG, 0, n), product(&y->k, &XN, 0, &KK, 0, n, 1), product(&y->v, &XN, 0, &VV, 0, n, 1);
   Rope qr = {(uint32_t)c.heads, (uint32_t)c.head_dim, (uint32_t)c.rot, (uint32_t)(2 * c.head_dim), c.theta, c.eps, (uint32_t)c.rope_h, (uint32_t)c.rope_w};
   Rope kr = {(uint32_t)c.kv_heads, (uint32_t)c.head_dim, (uint32_t)c.rot, (uint32_t)c.head_dim, c.theta, c.eps, (uint32_t)c.rope_h, (uint32_t)c.rope_w};
   gpu_kern(K_qk_rope);
@@ -753,8 +759,6 @@ static Seq mtp_seq(const QwenState *s, int pos, int prompt) {
 
 static const float *pass(const QwenRow *rows, int n, int logits, int prompt) {
   qwen_reside(1);
-  if (n < 1 || n > (prompt ? PF : ROWS) || logits < 0 || logits > n || logits > ROWS)
-    die("qwen: %d rows (%d with logits)", n, logits);
   int32_t *tok = (int32_t *)TOK.ptr;
   uint64_t *emb = (uint64_t *)EMB.ptr;
   seqbuf = &SEQ, seq = (Seq *)SEQ.ptr;
@@ -762,9 +766,6 @@ static const float *pass(const QwenRow *rows, int n, int logits, int prompt) {
   for (int i = 0, k = 0; i < n; i++) {
     QwenState *s = rows[i].state;
     k = i > 0 && rows[i - 1].state == s ? k + 1 : 0;
-    for (int j = 0; k == 0 && j < i; j++)
-      if (rows[j].state == s) die("qwen: a state's rows apart in one pass");
-    if ((!prompt && rows[i].token < 0) || rows[i].token >= c.vocab) die("qwen: token %d outside the vocabulary", rows[i].token);
     int pos = s->pos + k;
     if (pos >= s->cap) qwen_state_reserve(s, pos + 1);
     tok[i] = rows[i].token < 0 ? 0 : rows[i].token;
@@ -868,8 +869,6 @@ static const float *pass(const QwenRow *rows, int n, int logits, int prompt) {
 // consecutive positions. Returns each row's draft logits.
 const float *qwen_mtp(const QwenMtpRow *rows, int n, int logits) {
   qwen_reside(1);
-  if (!mtp) die("qwen: the checkpoint has no MTP head");
-  if (n < 1 || n > ROWS || logits < 0 || logits > n) die("qwen: %d MTP rows (%d with logits)", n, logits);
   static GpuCopy cp[ROWS];
   size_t hb = hid_bytes();
   int32_t *tm = (int32_t *)TOKM.ptr;

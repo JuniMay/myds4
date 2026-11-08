@@ -108,7 +108,9 @@ and subsequent decoding speed even when prefill is faster.
 The supported NVFP4 checkpoint has 64 text layers: 48 gated DeltaNet layers
 and 16 full-attention layers. Its text width is 5,120. MLP and output-head
 weights use NVFP4; attention projections use FP8; other weights retain their
-stored types. The engine currently keeps text activations in FP32.
+stored types. The engine currently keeps text activations in FP32. Prefill converts an
+input to BF16 once for projections that share it and uses up to 1,024 rows
+per chunk, reducing the chunk when the shared memory budget requires it.
 
 DeltaNet keeps a recurrent matrix and convolution history. Full attention
 keeps FP16 keys and values. Capacity starts at 1,024 positions and doubles

@@ -10,7 +10,7 @@
 #include <stdint.h>
 
 #define QWEN_ROWS 8       // most rows per qwen_forward (the kernels' TM)
-#define QWEN_PREFILL 512  // most rows per qwen_prefill
+#define QWEN_PREFILL 1024  // most rows per qwen_prefill
 
 // Loads the checkpoint directory's config.json and weights (all resident on
 // the GPU). The MTP head is loaded only when drafts is nonzero.

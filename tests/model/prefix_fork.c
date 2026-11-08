@@ -733,7 +733,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--rendered")) rendered = 1;
     else if (!strcmp(argv[i], "--experts") && i + 1 < argc) o.deepseek.experts = argv[++i];
     else if (!strcmp(argv[i], "--draft") && i + 1 < argc) o.draft = atoi(argv[++i]), o.deepseek.draft_cache = o.draft ? 32 : 0;
-    else if (!strcmp(argv[i], "--memory") && i + 1 < argc) o"--ced") && i + 1 < argc) o.deepseek.ced = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--memory") && i + 1 < argc) model_memory_gib = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--ced") && i + 1 < argc) o.deepseek.ced = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--random") && i + 1 < argc) randoms = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--at") && i + 1 < argc && nonly < 64) only[nonly++] = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--prompt-only")) prompt_only = 1;

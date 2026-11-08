@@ -39,7 +39,8 @@ int main(int argc, char **argv) {
   Options o = {.ctx = 4096, .quiet = 1, .dump_fd = -1, .routes_fd = -1};
   for (int i = 3; i < argc; i++) {
     if (!strcmp(argv[i], "--experts") && i + 1 < argc) o.deepseek.experts = argv[++i];
-    else if (!strcmp(argv[i], "--memory") && i + 1 < argc) o"--steps") && i + 1 < argc) steps = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--memory") && i + 1 < argc) model_memory_gib = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--steps") && i + 1 < argc) steps = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--warm") && i + 1 < argc) warm = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--text") && i + 1 < argc) file = argv[++i];
     else if (!strcmp(argv[i], "--prompt-tokens") && i + 1 < argc) length = atoi(argv[++i]);

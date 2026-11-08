@@ -76,7 +76,8 @@ def run(args, mode, bodies, runahead=0, pipeline=0):
     env.update(MYDS4_API_KEY=key, MYDS4_LOCK=str(ROOT / "build/myds4.lock"))
     command = [str(args.binary), "-m", str(args.checkpoint), "--serve", str(port), "--ctx", str(args.context),
                "--memory", str(args.memory), "--reserve", str(args.reserve), "--kv-cache", "4", "--batch", str(batch),
-               "--temperature", "1", "--top-p", "1", "--seed", "12345"]
+               "--temperature", "1", "--top-p", "1", "--top-k", "0", "--seed", "12345",
+               "--draft", str(getattr(args, "draft", 0))]
     if runahead:
         command += ["--runahead"]
     if pipeline:
@@ -244,6 +245,7 @@ def run(args, mode, bodies, runahead=0, pipeline=0):
             outputs = [f.result() for f in futures]
         elapsed = time.monotonic() - began
         counters["request_running"] = False
+        time.sleep(.4)  # counters are published at most four times per second
         final = model_status(call)
         generated = sum(r["usage"]["completion_tokens"] for r in outputs)
         prefill = sum(prefill_times)
@@ -252,7 +254,7 @@ def run(args, mode, bodies, runahead=0, pipeline=0):
         valid = (not failures and not counters["cache_shrank"] and
                  final["expert_cache"]["slots"] >= counters["maximum_cache_slots"] and
                  final["expert_cache"].get("slots_released") == initial["expert_cache"].get("slots_released") == 0 and
-                 final["expert_cache"]["gib"] > 0 and generated >= 128 * len(bodies))
+                 0 < final["model_memory_budget"]["allocated"] <= final["model_memory_budget"]["limit"] and generated >= 128 * len(bodies))
         if batch > 1 and len(bodies) > 1 and not seen_batches:
             valid = False
         if initial.get("runahead") != bool(runahead):
@@ -271,7 +273,8 @@ def run(args, mode, bodies, runahead=0, pipeline=0):
                 "compressed_input_gib": counters.get("compressed_input_gib", 0),
                 "observed_peak_compressor_gib": counters.get("observed_peak_compressor_gib", baseline.get("compressor_gib", 0)),
                 "timing_cpu_peak": counters["timing_cpu_peak"], "startup_cpu_peak": counters["startup_cpu_peak"],
-                "maximum_cache_slots": counters["maximum_cache_slots"], "failures": failures}
+                "maximum_cache_slots": counters["maximum_cache_slots"], "failures": failures,
+                "summary": [line for line in recent_log if any(word in line for word in ("tokens/s", "sampling temperature"))]}
     except Exception:
         print("SESSION_ERROR " + json.dumps({"mode": mode, "pipeline": pipeline,
               "failures": failures, "return_code": process.poll(), "recent_log": list(recent_log)}), flush=True)
@@ -302,6 +305,7 @@ def main():
     parser.add_argument("--reserve", type=float, default=4)
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--prefill-prune", action="store_true")
+    parser.add_argument("--draft", type=int, default=0)
     parser.add_argument("--describe", action="store_true")
     parser.add_argument("--results", type=Path)
     args = parser.parse_args()
@@ -311,7 +315,7 @@ def main():
         args.pipeline = [0] * len(args.modes)
     if not (1 <= len(args.before_seq) <= 6 and len(set(args.before_seq)) == len(args.before_seq)
             and 128 <= args.tokens <= 2048 and 16384 <= args.context <= 131072 and 16 <= args.memory <= 80
-            and 4 <= args.reserve <= 16 and 120 <= args.timeout <= 1800 and len(args.modes) <= 6
+            and 0 <= args.draft <= 5 and 4 <= args.reserve <= 16 and 120 <= args.timeout <= 1800 and len(args.modes) <= 6
             and len(args.runahead) == len(args.modes) and all(n in (0, 1) for n in args.runahead)
             and len(args.pipeline) == len(args.modes) and all(n in (0, 1) for n in args.pipeline)
             and all(re.fullmatch(r"[1246]", s) for s in args.modes)):
