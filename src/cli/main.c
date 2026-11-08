@@ -345,7 +345,8 @@ int main(int argc, char **argv) {
       if (shutdown_requested()) return complete();
       ops->snapshot_restore(st, at[0]);
       int rows[VERIFY_DRAFTS + 1] = {next[0]}, d = 0;
-      ops->draft(st, next[0], n, rows + 1, k);
+      Sampler greedy = {.temp = 0, .top_p = 1};
+      ops->draft(st, next[0], n, rows + 1, k, &greedy);
       const float *v = ops->verify(st, rows, k + 1, n);
       for (int j = 0; j < V; j++) d += v[j] != alone[j];
       printf("a verify pass of %d drafts against the token alone: %d of %d first-row logits differ\n", k, d, V);
@@ -408,6 +409,7 @@ int main(int argc, char **argv) {
     // Target samples confirm a prefix and supply the next token, consuming
     // exactly the draws used by ordinary sampling.
     int rows[VERIFY_DRAFTS + 1] = {t}, k = 0, a = 0, next;
+    const double *proposal_probabilities = NULL;
     int room = ntokens - gen - 1;
     if (room > o.ctx - pos - 1) room = o.ctx - pos - 1;
     if (room > verify_rows - 1) room = verify_rows - 1;
@@ -424,11 +426,11 @@ int main(int argc, char **argv) {
       lookup_offered += k;
     } else {
       k = drafts < room ? drafts : room;
-      if (k) ops->draft(st, t, pos, rows + 1, k);
+      if (k) proposal_probabilities = ops->draft(st, t, pos, rows + 1, k, &sampler);
     }
     if (k > 0) {
       logits = ops->verify(st, rows, k + 1, pos);
-      next = sample_verify(logits, V, rows + 1, k, ops->stop, &sampler, &a);
+      next = sample_verify_probabilities(logits, V, rows + 1, k, proposal_probabilities, ops->stop, &sampler, &a);
       ops->accept(st, rows, a + 1, pos);
       logits += (size_t)a * V;
       passes++, accepted += a;

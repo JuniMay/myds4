@@ -21,7 +21,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYDS4_ABI 13
+#define MYDS4_ABI 14
 
 // ---- the process ----
 
@@ -91,6 +91,7 @@ typedef struct {
 
 typedef struct myds4_model myds4_model;
 typedef struct myds4_images myds4_images;
+typedef struct myds4_sampler myds4_sampler;
 
 // Registers a checkpoint and opens its tokenizer without loading weights.
 // Null for invalid settings or a second registration of the same family.
@@ -194,8 +195,9 @@ int myds4_replay_start(const myds4_model *m, int k);
 const float *myds4_rows(myds4_model *m, myds4_state **states, const int32_t *tokens, const int32_t *pos, int count);
 // The model's drafts: n <= myds4_draft_block() drafts after token at pos of
 // s. A verify pass of count rows from pos (the token, then its drafts):
-// rows of logits. myds4_accept keeps the first n of the rows.
-void myds4_draft(myds4_model *m, myds4_state *s, int32_t token, int pos, int32_t *drafts, int n);
+// rows of logits. myds4_accept keeps the first n of the rows. Draft returns
+// sampled proposal probabilities, or null for deterministic proposals.
+const double *myds4_draft(myds4_model *m, myds4_state *s, int32_t token, int pos, int32_t *drafts, int n, myds4_sampler *sampler);
 const float *myds4_verify(myds4_model *m, myds4_state *s, const int32_t *rows, int count, int pos);
 void myds4_accept(myds4_model *m, myds4_state *s, const int32_t *rows, int n, int pos);
 // s's token history at pos from the tokens before it (DeepSeek's Engram).
@@ -203,7 +205,6 @@ void myds4_seek(myds4_model *m, myds4_state *s, const int32_t *tokens, int pos);
 
 // ---- sampling ----
 
-typedef struct myds4_sampler myds4_sampler;
 // Null for invalid settings: temperature must be finite and nonnegative (0
 // is greedy), top_p in [0, 1], top_k nonnegative (0: every token). Without
 // seed_set the seed is random.
@@ -212,8 +213,8 @@ void myds4_sampler_free(myds4_sampler *s);
 int32_t myds4_sample(const myds4_model *m, const float *logits, myds4_sampler *s);
 // Rows of logits for the token and its n drafts: the next token, and in
 // *accepted how many drafts it kept; a token that ends a reply ends the kept
-// ones.
-int32_t myds4_sample_verify(const myds4_model *m, const float *logits, const int32_t *drafts, int n, myds4_sampler *s,
+// ones. q is the draft result, or null for deterministic context-copy proposals.
+int32_t myds4_sample_verify(const myds4_model *m, const float *logits, const int32_t *drafts, int n, const double *q, myds4_sampler *s,
                             int *accepted);
 
 // ---- context-copy drafts (lookup) ----

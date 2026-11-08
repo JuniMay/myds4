@@ -3493,9 +3493,10 @@ static const float *ds_rows(ModelState *const *states, const int *tokens, const 
   return deepseek_forward_rows((State **)states, tokens, pos, m);
 }
 
-static void ds_draft(ModelState *s, int token, int pos, int *drafts, int n) {
+static const double *ds_draft(ModelState *s, int token, int pos, int *drafts, int n, Sampler *sampler) {
   use(s);
   deepseek_draft(token, pos, drafts, n);
+  return NULL;
 }
 static const float *ds_verify(ModelState *s, const int *tokens, int m, int pos) {
   if (!prepare_rows(m, 0)) return NULL;

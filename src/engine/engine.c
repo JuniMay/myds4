@@ -19,6 +19,10 @@
 #include "../model/model.h"
 #include "../model/draft.h"
 
+struct myds4_sampler {
+  Sampler sp;
+};
+
 struct myds4_model {
   Model *m;
   const ModelOps *ops;
@@ -236,9 +240,9 @@ const float *myds4_rows(myds4_model *m, myds4_state **states, const int32_t *tok
   return m->ops->rows(states, tokens, pos, count);
 }
 
-void myds4_draft(myds4_model *m, myds4_state *s, int32_t token, int pos, int32_t *drafts, int n) {
+const double *myds4_draft(myds4_model *m, myds4_state *s, int32_t token, int pos, int32_t *drafts, int n, myds4_sampler *sampler) {
   memory_scope(&m->m->work);
-  m->ops->draft(s, token, pos, drafts, n);
+  return m->ops->draft(s, token, pos, drafts, n, &sampler->sp);
 }
 
 const float *myds4_verify(myds4_model *m, myds4_state *s, const int32_t *rows, int count, int pos) {
@@ -255,9 +259,6 @@ void myds4_seek(myds4_model *m, myds4_state *s, const int32_t *tokens, int pos) 
 
 // ---- sampling ----
 
-struct myds4_sampler {
-  Sampler sp;
-};
 
 myds4_sampler *myds4_sampler_new(double temperature, double top_p, int top_k, uint64_t seed, int seed_set) {
   Sampler sp = {.temp = temperature, .top_p = top_p, .top_k = top_k};
@@ -275,9 +276,9 @@ int32_t myds4_sample(const myds4_model *m, const float *logits, myds4_sampler *s
   return sample_token(logits, m->ops->vocab(), &s->sp);
 }
 
-int32_t myds4_sample_verify(const myds4_model *m, const float *logits, const int32_t *drafts, int n, myds4_sampler *s,
+int32_t myds4_sample_verify(const myds4_model *m, const float *logits, const int32_t *drafts, int n, const double *q, myds4_sampler *s,
                             int *accepted) {
-  return sample_verify(logits, m->ops->vocab(), drafts, n, m->ops->stop, &s->sp, accepted);
+  return sample_verify_probabilities(logits, m->ops->vocab(), drafts, n, q, m->ops->stop, &s->sp, accepted);
 }
 
 // ---- context-copy drafts ----

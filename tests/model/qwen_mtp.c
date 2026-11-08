@@ -38,7 +38,8 @@ int main(int argc, char **argv) {
     for (int accepted = 1; accepted <= rows; accepted++) {
       ops->snapshot_restore(state, start);
       int proposals[5];
-      ops->draft(state, tokens[0], count, proposals, rows - 1);
+      Sampler greedy = {.temp = 0, .top_p = 1};
+      ops->draft(state, tokens[0], count, proposals, rows - 1, &greedy);
       logits = ops->verify(state, tokens, rows, count);
       CHECK(!memcmp(logits, target, (size_t)rows * row_bytes));
       ops->accept(state, tokens, accepted, count);

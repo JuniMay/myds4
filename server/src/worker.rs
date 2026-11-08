@@ -1799,15 +1799,16 @@ impl Slot {
             let model = self.model.clone();
             let g = &mut self.gens[gi];
             let (next, a) = if k > 0 {
-                if proposal == 0 {
-                    let mut d = vec![0i32; k];
-                    model.draft(st, g.t, g.pos, &mut d);
-                    rows.extend_from_slice(&d);
-                }
+                let probabilities = if proposal == 0 {
+                    rows.resize(k + 1, 0);
+                    model.draft(st, g.t, g.pos, &mut rows[1..], &mut g.sampler)
+                } else {
+                    std::ptr::null()
+                };
                 let lg = model
                     .verify(st, &rows, g.pos)
                     .expect("a verify pass in the limits");
-                let (next, a) = model.sample_verify(lg, &rows[1..], &mut g.sampler);
+                let (next, a) = model.sample_verify(lg, &rows[1..], probabilities, &mut g.sampler);
                 g.draft_passes += 1;
                 g.draft_accepted += a;
                 model.accept(st, &rows[..a + 1], g.pos);

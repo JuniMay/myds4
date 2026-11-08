@@ -9,7 +9,7 @@ use std::ptr;
 
 use deepseek_recipe::stream::StreamTokenizer;
 
-const ABI: c_int = 13;
+const ABI: c_int = 14;
 
 #[repr(C)]
 struct RawProcess {
@@ -244,7 +244,8 @@ unsafe extern "C" {
         pos: c_int,
         drafts: *mut i32,
         n: c_int,
-    );
+        sampler: *mut RawSampler,
+    ) -> *const f64;
     fn myds4_verify(
         m: *mut RawModel,
         s: *mut RawState,
@@ -268,6 +269,7 @@ unsafe extern "C" {
         logits: *const f32,
         drafts: *const i32,
         n: c_int,
+        q: *const f64,
         s: *mut RawSampler,
         accepted: *mut c_int,
     ) -> i32;
@@ -735,7 +737,14 @@ impl Model {
         };
         (!lg.is_null()).then_some(lg)
     }
-    pub fn draft(&self, s: *mut RawState, token: i32, pos: usize, drafts: &mut [i32]) {
+    pub fn draft(
+        &self,
+        s: *mut RawState,
+        token: i32,
+        pos: usize,
+        drafts: &mut [i32],
+        sampler: &mut Sampler,
+    ) -> *const f64 {
         unsafe {
             myds4_draft(
                 self.raw,
@@ -744,6 +753,7 @@ impl Model {
                 pos as c_int,
                 drafts.as_mut_ptr(),
                 drafts.len() as c_int,
+                sampler.0,
             )
         }
     }
@@ -781,7 +791,13 @@ impl Model {
     }
     /// Rows of logits for a token and its drafts: the next token, and how many
     /// drafts it kept; a token that ends a reply ends the kept ones.
-    pub fn sample_verify(&self, lg: Logits, drafts: &[i32], s: &mut Sampler) -> (i32, usize) {
+    pub fn sample_verify(
+        &self,
+        lg: Logits,
+        drafts: &[i32],
+        q: *const f64,
+        s: &mut Sampler,
+    ) -> (i32, usize) {
         let mut accepted = 0;
         let next = unsafe {
             myds4_sample_verify(
@@ -789,6 +805,7 @@ impl Model {
                 lg,
                 drafts.as_ptr(),
                 drafts.len() as c_int,
+                q,
                 s.0,
                 &mut accepted,
             )

@@ -161,6 +161,36 @@ int main(void) {
   expect("top-k draws only among the k highest-ranked tokens, the last of them included", within && seen_last);
   expect("top-k of 1 is greedy", greedy);
   expect("top-k of the whole vocabulary draws as without top-k", unrestricted);
+  // The first emitted speculative token must follow p, even when q differs.
+  float p_logits[6] = {logf(.6f), logf(.3f), logf(.1f), logf(.6f), logf(.3f), logf(.1f)};
+  float q_logits[3] = {logf(.2f), logf(.7f), logf(.1f)};
+  Sampler sampled = {.temp = 1, .top_p = 1};
+  sampler_seed(&sampled, 71823);
+  int frequency[3] = {0}, accepts = 0;
+  for (int i = 0; i < 100000; i++) {
+    double q[3];
+    int proposed = sample_proposal(q_logits, 3, &sampled, q), kept;
+    int next = sample_verify_probabilities(p_logits, 3, &proposed, 1, q, NULL, &sampled, &kept);
+    frequency[kept ? proposed : next]++;
+    accepts += kept;
+  }
+  expect("sampled proposals preserve target probabilities", fabs(frequency[0] / 100000.0 - .6) < .006 &&
+         fabs(frequency[1] / 100000.0 - .3) < .006 && fabs(frequency[2] / 100000.0 - .1) < .006);
+  expect("acceptance equals the distribution overlap", fabs(accepts / 100000.0 - .6) < .006);
+  int all_kept = 1, disjoint = 1;
+  for (int i = 0; i < 1000; i++) {
+    double q[3];
+    int proposed = sample_proposal(p_logits, 3, &sampled, q), kept;
+    sample_verify_probabilities(p_logits, 3, &proposed, 1, q, NULL, &sampled, &kept);
+    all_kept &= kept == 1;
+    Sampler restricted = {.temp = 1, .top_p = 1, .top_k = 1};
+    sampler_seed(&restricted, 1234 + i);
+    proposed = sample_proposal(q_logits, 3, &restricted, q);
+    int next = sample_verify_probabilities(p_logits, 3, &proposed, 1, q, NULL, &restricted, &kept);
+    disjoint &= proposed == 1 && kept == 0 && next == 0;
+  }
+  expect("identical proposal distributions are always accepted", all_kept);
+  expect("disjoint proposal support returns target support", disjoint);
   fprintf(stderr, "sampling: %d/%d CPU checks passed\n", checks - failures, checks);
   return failures != 0;
 }

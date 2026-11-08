@@ -16,7 +16,7 @@ void shutdown_watch(void); // SIGINT/SIGTERM request a stop; handlers do no I/O
 int shutdown_requested(void);
 void shutdown_request(void); // a stop, as SIGINT and SIGTERM request one
 // Sampling workspaces belong to the single model thread. Each non-greedy
-// token consumes one draw, including tokens used to verify draft proposals.
+// ordinary token consumes one draw. Sampled proposals and acceptance use additional draws.
 typedef struct {
   double temp, top_p;
   unsigned short seed[3];
@@ -26,6 +26,9 @@ int sampler_valid(const Sampler *s);
 void sampler_seed(Sampler *s, uint64_t seed);
 int sample_argmax(const float *logits, int count);
 int sample_token(const float *logits, int count, Sampler *s);
+int sample_proposal(const float *logits, int count, Sampler *s, double *out);
+int sample_verify_probabilities(const float *logits, int count, const int *drafts, int ndraft,
+                                const double *q, int (*stop)(int token), Sampler *s, int *accepted);
 // logits contains ndraft + 1 rows of count values; drafts contains ndraft
 // tokens. The sampler is independent of the model's verification row limit.
 // stop (or null): whether a token ends the reply, which also ends the kept drafts

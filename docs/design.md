@@ -127,7 +127,11 @@ Target verification processes the proposals together with the current token.
 It saves the recurrent state after each possible accepted prefix. Rejection
 selects the matching checkpoint without replaying the target layers. The
 draft head then replaces speculative keys with keys from accepted target
-hiddens. Target sampling keeps the same output distribution and random stream.
+hiddens. Greedy verification keeps the target's token sequence. For sampled
+requests, the head samples proposals using the request's temperature and
+probability filters. Probability-ratio acceptance and residual correction
+preserve the target distribution; proposal and acceptance draws change the
+random stream relative to ordinary sampling.
 With `draft: 0`, draft weights, attention rows and prefill work are omitted.
 Multiple active requests use ordinary batched decoding instead. Larger draft
 depths allocate more recurrent checkpoints in the separate KV budget.
@@ -163,9 +167,13 @@ wire protocol. The adapters are checked against reference prompt fixtures.
 
 A common sampler handles temperature, top-k, top-p and seeded randomness.
 A request overrides configured defaults; absent and null values preserve
-them. Draft verification samples from the target model and accepts only a
-matching proposal prefix. Context lookup generates proposals from prior
-tokens and has no authority to accept them.
+them. Deterministic proposals, including context lookup and DSpark, keep a
+matching prefix of target samples. Qwen MTP can supply sampled proposals
+and their probabilities. These use probability-ratio acceptance; a rejected
+proposal samples from the positive part of the target distribution minus
+the proposal distribution. Both methods preserve the target distribution.
+Context lookup generates proposals from prior tokens and has no authority
+to accept them.
 
 ## Numerical contract
 

@@ -902,6 +902,8 @@ const float *qwen_prefill(const QwenRow *rows, int n, int logits) { return pass(
 // ---- the model interface (model.h) ----
 
 static Options qopt;
+static double *proposal_probabilities;
+static size_t proposal_capacity;
 static const float *last_logits;  // what the last call returned, for a snapshot's logits
 static double last_pass;          // when the last pass ran (now())
 enum { RELEASE_AFTER = 60 };      // seconds without passes before the buffers leave the residency set
@@ -923,6 +925,13 @@ static int q_load(const char *dir, const Options *o) {
   if (why) die("qwen3_5: %s", why);
   qopt = *o;
   if (!qwen_load(dir, o->draft)) return 0;
+  size_t needed = mtp ? (size_t)o->draft * c.vocab : 0;
+  if (needed > proposal_capacity) {
+    double *next = memory_host_resize(proposal_probabilities, needed * sizeof *next);
+    if (!next) return 0;
+    proposal_probabilities = next;
+    proposal_capacity = needed;
+  }
   last_pass = now();
   counted.dense_bytes = weights_resident_bytes(dense);
   return 1;
@@ -1038,10 +1047,10 @@ static const float *q_rows(ModelState *const *states, const int *tokens, const i
   return last_logits = decoded(qwen_forward(rows, m, m), m, t0, g0);
 }
 
-static void q_draft(ModelState *st, int token, int pos, int *drafts, int n) {
+static const double *q_draft(ModelState *st, int token, int pos, int *drafts, int n, Sampler *sampler) {
   QwenState *s = (QwenState *)st;
   qwen_state_reserve(s, pos + n + 1);
-  drafts[0] = sample_argmax(mtp_fill(s, token, 1), c.vocab);
+  drafts[0] = sample_proposal(mtp_fill(s, token, 1), c.vocab, sampler, proposal_probabilities);
   for (int i = 1; i < n; i++) {
     // The preceding draft head's hidden predicts the next target hidden.
     GpuCopy copy = {&X, &HB, 0, 0, hid_bytes()};
@@ -1053,8 +1062,9 @@ static void q_draft(ModelState *st, int token, int pos, int *drafts, int n) {
     gpu_copies(&copy, 1);
     mtp_rows(1, 1);
     gpu_commit(); gpu_sync();
-    drafts[i] = sample_argmax((const float *)LOGITS.ptr, c.vocab);
+    drafts[i] = sample_proposal((const float *)LOGITS.ptr, c.vocab, sampler, proposal_probabilities + (size_t)i * c.vocab);
   }
+  return sampler->temp > 0 ? proposal_probabilities : NULL;
 }
 
 static const float *q_verify(ModelState *st, const int *tokens, int m, int pos) {

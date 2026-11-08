@@ -117,7 +117,8 @@ typedef struct {
   // Drafts: up to draft_block() drafts after token at pos (every position
   // before it having run); a verify pass of m rows from pos (the token, then
   // its drafts) returns each row's logits, and accept keeps the first n.
-  void (*draft)(ModelState *s, int token, int pos, int *drafts, int n);
+  // Returns sampled proposal probabilities (n vocabulary rows), or null for deterministic proposals.
+  const double *(*draft)(ModelState *s, int token, int pos, int *drafts, int n, Sampler *sampler);
   const float *(*verify)(ModelState *s, const int *tokens, int m, int pos);
   void (*accept)(ModelState *s, const int *tokens, int n, int pos);
   // The state's token history at pos from the tokens before it, where the
