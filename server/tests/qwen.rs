@@ -216,11 +216,11 @@ fn a_prefill_cancelled_midway_leaves_a_state_that_resumes_where_it_ends() {
         {"role": "user", "content": "Now name three vegetables, in one line."}
     ]);
     let (n1, reference) = {
-        let s = Server::start(&dir, &[]);
+        let s = Server::start(&dir, &["--kv-cache", "12"]);
         let a = s.chat(&body(first.clone(), 1, false));
         (a["usage"]["prompt_tokens"].as_i64().unwrap(), s.chat(&body(second.clone(), 24, false)))
     };
-    let s = Server::start(&dir, &[]);
+    let s = Server::start(&dir, &["--kv-cache", "12"]);
     s.post(&body(first, 24, true), Some(Duration::from_secs(2)));
     std::thread::sleep(Duration::from_secs(20)); // the server notices, and ends the request between passes
     let warm = s.chat(&body(second, 24, false));

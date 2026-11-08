@@ -834,7 +834,11 @@ static int q_prefill_rows(void) { return PF; }
 
 static ModelState *q_state_new(void) { return (ModelState *)qwen_state_new(); }
 static void q_state_free(ModelState *s) { qwen_state_free((QwenState *)s); }
-static size_t q_state_bytes(const ModelState *s, int positions) { return qwen_state_bytes(positions); }
+static size_t q_state_bytes(const ModelState *s, int positions) {
+  int cap = s ? ((const QwenState *)s)->cap : 1024;
+  while (cap < positions) cap *= 2;
+  return qwen_state_bytes(cap);
+}
 static void q_state_copy(ModelState *dst, const ModelState *src, int positions) {
   qwen_state_copy((QwenState *)dst, (const QwenState *)src, positions);
 }

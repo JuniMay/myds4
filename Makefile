@@ -82,6 +82,10 @@ build/state-fork-check: tools/checks/state_fork_check.c $(SRC) $(MODEL_HEADERS) 
 state-fork-check: build/state-fork-check
 	./build/state-fork-check
 
+build/qwen-state-accounting-check: tools/checks/qwen_state_accounting_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/checks/qwen_state_accounting_check.c $(filter-out src/cli/main.c src/model/qwen.c,$(SRC)) $(LDLIBS)
+
 build/verification-schedule-check: tools/checks/verification_schedule_check.c $(SRC) $(MODEL_HEADERS) $(KERNELS) data/engram.bin
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/verification_schedule_check.c $(filter-out src/cli/main.c src/model/deepseek.c,$(SRC)) $(LDLIBS)
