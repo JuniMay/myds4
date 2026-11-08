@@ -22,7 +22,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYDS4_ABI 10
+#define MYDS4_ABI 11
 
 // ---- the process ----
 
@@ -56,7 +56,7 @@ void myds4_log(const char *line);
 // ---- models ----
 
 // A model's settings: the server's per-model options. Options a model's
-// family has no use for must stay 0: myds4_load refuses them.
+// family has no use for must stay 0: myds4_open refuses them.
 typedef struct {
   int abi;                     // MYDS4_ABI
   const char *model;           // the checkpoint directory
@@ -79,11 +79,12 @@ typedef struct {
 
 typedef struct myds4_model myds4_model;
 
-// Loads a checkpoint (its family from config.json's model_type) and its
-// tokenizer, on the engine thread, after myds4_init. Null, with a message on
-// stderr, for invalid settings or a second model of a family already loaded;
-// a checkpoint that cannot be loaded ends the process (after on_die).
-myds4_model *myds4_load(const myds4_config *c);
+// Registers a checkpoint and opens its tokenizer without loading weights.
+// Null for invalid settings or a second registration of the same family.
+myds4_model *myds4_open(const myds4_config *c);
+// Loads the registered model on the engine thread, once, at first inference.
+int myds4_load(myds4_model *m);
+int myds4_loaded(const myds4_model *m);
 
 // After the last request: what the model saves or reports on exit.
 void myds4_finish(myds4_model *m);

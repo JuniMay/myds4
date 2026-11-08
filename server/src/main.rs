@@ -476,9 +476,8 @@ fn main() {
         let format = match family {
             Family::DeepSeek => Format::DeepSeek(deepseek::Defaults {
                 id: id.clone(),
-                temperature: m.temperature.unwrap_or(1.0),
-                top_p: m.top_p.unwrap_or(1.0),
-                seed: m.seed,
+                sampling: worker::Sampling { temperature: m.temperature.unwrap_or(1.0), top_p: m.top_p.unwrap_or(1.0),
+                                             top_k: m.top_k.unwrap_or(0), seed: m.seed },
                 thinking: m.think != Some(0),
                 effort: m.think.filter(|&n| n > 0).unwrap_or(75),
             }),

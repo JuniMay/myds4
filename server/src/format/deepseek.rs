@@ -44,9 +44,7 @@ const RECIPE_MODEL: &str = "DeepSeek-V4.1-Flash";
 #[derive(Clone)]
 pub struct Defaults {
     pub id: String,
-    pub temperature: f64,
-    pub top_p: f64,
-    pub seed: Option<u64>,
+    pub sampling: Sampling,
     pub thinking: bool,
     pub effort: u32,
 }
@@ -65,9 +63,7 @@ fn encoding() -> &'static DeepseekV41Encoding {
 /// What the server reads from a request itself, before recipe converts the
 /// rest.
 struct Settings {
-    temperature: f64,
-    top_p: f64,
-    seed: Option<u64>,
+    sampling: Sampling,
     max_tokens: i64,
     model: String,
     effort: Option<u32>,  // None: thinking off
@@ -106,22 +102,8 @@ fn effort_of(v: Option<&Value>, default: u32) -> u32 {
 /// or reads otherwise (docs/server.md, Compatibility steps), and takes out the
 /// settings the server reads itself.
 fn compatible(root: &mut Map<String, Value>, d: &Defaults) -> Result<Settings, Error> {
-    let number = |v: Option<Value>, default: f64| match v {
-        None | Some(Value::Null) => Ok(default),
-        Some(Value::Number(n)) => n.as_f64().ok_or(()),
-        Some(_) => Err(()),
-    };
-    let sampling = "temperature must be a finite nonnegative number and top_p must be in [0, 1]";
-    let temperature = number(root.remove("temperature"), d.temperature).map_err(|()| bad(sampling))?;
-    let top_p = number(root.remove("top_p"), d.top_p).map_err(|()| bad(sampling))?;
-    if !temperature.is_finite() || temperature < 0.0 || !(0.0..=1.0).contains(&top_p) {
-        return Err(bad(sampling));
-    }
-    let seed = match root.remove("seed") {
-        None | Some(Value::Null) => d.seed,
-        Some(Value::Number(n)) => Some(n.as_u64().ok_or_else(|| bad("seed must be a nonnegative integer"))?),
-        Some(_) => return Err(bad("seed must be a nonnegative integer")),
-    };
+    let sampling = super::sampling(root, d.sampling)?;
+    for key in ["temperature", "top_p", "top_k", "seed"] { root.remove(key); }
     let limit = |v: Option<Value>| match v {
         Some(Value::Number(n)) => n.as_f64().map(|f| f as i64),
         _ => None,
@@ -210,7 +192,7 @@ fn compatible(root: &mut Map<String, Value>, d: &Defaults) -> Result<Settings, E
             }
         }
     }
-    Ok(Settings { temperature, top_p, seed, max_tokens, model, effort: thinking.then_some(effort) })
+    Ok(Settings { sampling, max_tokens, model, effort: thinking.then_some(effort) })
 }
 
 // ---- conversion and rendering ----
@@ -293,7 +275,7 @@ impl Prepared {
         if places != self.images.len() {
             return Err(bad(format!("the prompt has {places} image places and {} images", self.images.len())));
         }
-        let sampling = Sampling { temperature: self.settings.temperature, top_p: self.settings.top_p, top_k: 0, seed: self.settings.seed };
+        let sampling = self.settings.sampling;
         Ok(worker::Request { model, prompt, images: self.images.clone(), sampling, max_tokens: self.settings.max_tokens, note })
     }
 
@@ -579,7 +561,7 @@ pub fn render_file(path: &str) -> i32 {
     }
     let mut urls = Vec::new();
     mark_images(&mut root["messages"], &mut urls);
-    let defaults = Defaults { id: MODEL_ID.into(), temperature: 0.0, top_p: 1.0, seed: None, thinking: false, effort: 75 };
+    let defaults = Defaults { id: MODEL_ID.into(), sampling: Sampling { temperature: 0.0, top_p: 1.0, top_k: 0, seed: None }, thinking: false, effort: 75 };
     let r = match render(root, &defaults) {
         Ok(r) => r,
         Err(e) => {
@@ -618,7 +600,7 @@ mod tests {
     use super::*;
 
     fn defaults() -> Defaults {
-        Defaults { id: MODEL_ID.into(), temperature: 1.0, top_p: 1.0, seed: None, thinking: true, effort: 75 }
+        Defaults { id: MODEL_ID.into(), sampling: Sampling { temperature: 1.0, top_p: 1.0, top_k: 0, seed: None }, thinking: true, effort: 75 }
     }
 
     fn settings(v: Value) -> (Map<String, Value>, Settings) {
@@ -640,7 +622,7 @@ mod tests {
             ],
             "thinking": true, "reasoning_effort": 62, "temperature": 0, "top_p": 0, "seed": 7,
         }));
-        assert_eq!((s.temperature, s.top_p, s.seed, s.effort), (0.0, 0.0, Some(7), Some(62)));
+        assert_eq!((s.sampling.temperature, s.sampling.top_p, s.sampling.seed, s.effort), (0.0, 0.0, Some(7), Some(62)));
         assert_eq!(s.max_tokens, DEFAULT_MAX_TOKENS);
         assert_eq!(s.model, MODEL_ID);
         assert_eq!(root["model"], RECIPE_MODEL);

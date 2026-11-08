@@ -104,7 +104,7 @@ int main(void) {
     }
   }
   cache_reserve(4);
-  cache_init(56ull << 30, LAYERS);
+  cache_init(NULL, 56ull << 30, LAYERS);
   expect("initial capacity uses file cache to fit the requested 56 GiB", cap == (int)((56ull << 30) / SLOT_SIZE));
   expect("initial capacity respects the configured upper bound", cap <= max_slots);
   const char *names[] = {"low free pages with ample file cache do not shrink", "calm growth uses available file cache",

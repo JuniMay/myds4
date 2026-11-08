@@ -1,5 +1,5 @@
 //! The engine's C ABI (src/engine/engine.h) and thin safe wrappers over it.
-//! A [`Model`] is one loaded checkpoint of any family the engine runs. Its
+//! A [`Model`] is one registered checkpoint; its weights load on demand. Its
 //! functions on states, snapshots, prefill, decoding, sampling, images and
 //! routes run on the worker's engine thread only (worker.rs); the log, the
 //! stop, the statistics and the tokenizer on any thread.
@@ -9,7 +9,7 @@ use std::ptr;
 
 use deepseek_recipe::stream::StreamTokenizer;
 
-const ABI: c_int = 10;
+const ABI: c_int = 11;
 
 #[repr(C)]
 struct RawProcess {
@@ -158,7 +158,9 @@ unsafe extern "C" {
     fn myds4_stopping() -> c_int;
     fn myds4_request_stop();
     fn myds4_log(line: *const c_char);
-    fn myds4_load(c: *const RawConfig) -> *mut RawModel;
+    fn myds4_open(c: *const RawConfig) -> *mut RawModel;
+    fn myds4_load(m: *mut RawModel) -> c_int;
+    fn myds4_loaded(m: *const RawModel) -> c_int;
     fn myds4_finish(m: *mut RawModel);
     fn myds4_idle(m: *mut RawModel) -> c_int;
     fn myds4_max_rows(m: *const RawModel) -> c_int;
@@ -292,7 +294,7 @@ pub struct Options {
 /// Logits of one row or more, valid until the next call that runs a model.
 pub type Logits = *const f32;
 
-/// A loaded model.
+/// A registered model whose weights may still be unloaded.
 pub struct Model(*mut RawModel);
 
 // Safety: the engine's tokenizer and statistics functions take any thread
@@ -302,9 +304,8 @@ unsafe impl Send for Model {}
 unsafe impl Sync for Model {}
 
 impl Model {
-    /// Loads a checkpoint on the engine thread, after [`init`]; None for
-    /// invalid settings (the engine says why on stderr).
-    pub fn load(o: &Options) -> Option<Model> {
+    /// Registers metadata and tokenizer without loading weights.
+    pub fn open(o: &Options) -> Option<Model> {
         let model = c_string(&o.model);
         let experts = o.experts.as_deref().map(c_string);
         let state = o.predictor_state.as_deref().map(c_string);
@@ -327,9 +328,12 @@ impl Model {
             runahead: o.runahead.into(),
             pipeline: o.pipeline.into(),
         };
-        let m = unsafe { myds4_load(&raw) };
+        let m = unsafe { myds4_open(&raw) };
         (!m.is_null()).then_some(Model(m))
     }
+
+    pub fn load(&self) -> bool { unsafe { myds4_load(self.0) != 0 } }
+    pub fn loaded(&self) -> bool { unsafe { myds4_loaded(self.0) != 0 } }
 
     /// After the last request: what the model saves or reports on exit.
     pub fn finish(&self) {

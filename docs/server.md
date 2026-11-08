@@ -31,7 +31,8 @@ Flash, whose requests take DeepSeek's
 
 - **The engine thread** (`worker::start` creates it with a 16 MiB stack;
   `myds4_init` gives it the user-interactive QoS class). It loads every
-  model and then runs the worker loop ([Models](#models)). Every engine call
+  model's metadata and tokenizer, then runs the worker loop. Weights load
+  only on that model's first inference request. Every engine call
   that runs a model happens on this thread, so every model's passes go
   through one GPU command queue: `gpu.c` keeps its command buffers and an
   autorelease pool per thread, and each model family's work buffers are its
@@ -100,6 +101,10 @@ position: `--serve`, `--host`, `--api-key-file`, `--tui` or `--no-tui`,
 `--tui-theme`, `--reserve` and `--kv-cache`. With `--config`, model settings
 stay in the file. Configuration changes require a restart.
 
+Both model adapters use the same sampling validation. A request's
+`temperature`, `top_p`, `top_k` and `seed` override its model's defaults;
+an absent or null value keeps the default. Invalid values are rejected.
+
 A checkpoint's `config.json` tells its family (`model_type` `deepseek_v41`,
 or `qwen3_5`); a family refuses options it has no use for at startup (the
 expert-cache, CED and DSpark options for a Qwen model), and the process
@@ -116,6 +121,13 @@ eviction across models: spare snapshots first, then idle states. Prefixes
 and snapshots are model-scoped, so identical token IDs in different models
 never share inference state. Admitted prefills reserve the state growth and
 snapshots they will need before another request can take that space.
+
+Startup and model-list/status requests load no model weights. Each model's
+first inference request loads that model on the engine thread. The model's
+status exposes `loaded`; another model stays unloaded until requested.
+Both families acquire the same process inference lock at weight loading.
+Each loaded model owns its checkpoint tensor index, including the index
+used later when its vision encoder first runs.
 `batch` is still needed with pipeline scheduling; it caps admitted requests
 at six for DeepSeek and eight for Qwen. A larger cap does not guarantee
 higher throughput or enough KV room for every request at its maximum
@@ -324,7 +336,7 @@ it keeps reading the connection meanwhile; reads have no deadline then.
 ## The C ABI
 
 [`src/engine/engine.h`](../src/engine/engine.h) is the whole interface. Its
-version is `MYDS4_ABI = 10`. Callers must use the matching structure layouts
+version is `MYDS4_ABI = 11`. Callers must use the matching structure layouts
 and rebuild with the engine. The engine runs the models; everything about
 requests (their queues, scheduling, the KV prefix caches, the status and the
 live view's data) is the server's. Every function that runs a model or
@@ -340,13 +352,16 @@ be called from any thread. Its parts:
   which from then on is the engine's. `myds4_stopping()` reports a requested
   stop, `myds4_request_stop()` requests one, and `myds4_log(line)` writes a
   line to the log with the time.
-- **Models.** `myds4_load(config)` takes one model's options
+- **Models.** `myds4_open(config)` takes one model's options
   (`myds4_config`: the checkpoint, the context, the drafts and lookups, and
   DeepSeek's `experts`, cache settings, `substitute`, `draft_cache`, online
   predictor, `ced`, `prefill_prune`, `runahead` and `pipeline`) and returns the model,
   its family from `config.json`; a family refuses options it has no use for,
-  and the process holds one model of each family. A DeepSeek model waits for
-  the model lock (`myds4.lock` beside the executable, or `$MYDS4_LOCK`).
+  and the process holds one model of each family. Registration opens only
+  metadata and the tokenizer. `myds4_load(model)` loads weights for first
+  inference, and `myds4_loaded(model)` reports whether it has done so.
+  Both families acquire the process model lock at loading (`myds4.lock`
+  beside the executable, or `$MYDS4_LOCK`).
   `myds4_finish(model)` saves what the model keeps (the predictor state), and
   `myds4_idle(model)` lets it give memory back while it runs no request.
 - **Limits.** For each model: the rows of different states one decoding pass
@@ -592,7 +607,7 @@ recipe's form:
 - any `model` name, or none, is served; recipe converts with its V4.1 name,
   and responses report the request's name (`deepseek-v4.1-flash` without
   one);
-- `temperature`, `top_p` and `seed` are read by the server (a finite
+- `temperature`, `top_p`, `top_k` and `seed` are read by the server (a finite
   nonnegative temperature, top_p from 0 to 1, a nonnegative integer seed),
   and removed before conversion. recipe would
   refuse a temperature above 2 and a top_p of 0, and would set the

@@ -80,10 +80,10 @@ int main(int argc, char **argv) {
   alarm(120);
   gpu_init(source, sizeof source);
   up = gpu_kernel("moe_up"), down = gpu_kernel("moe_down"), multi = gpu_kernel("moe_tasks");
-  st_open(argv[1]);
+  TensorIndex *index = st_open(argv[1]);
   // Only 24 experts are allocated and read, about 453 MB. The cache limit
   // reserves metadata, not buffers for unused slots.
-  cache_reserve(16), cache_init(16ull << 30, LAYERS);
+  cache_reserve(16), cache_init(index, 16ull << 30, LAYERS);
   const int layers[JOBS] = {3, 11, 23, 37};
   tasks = zeros(JOBS * sizeof(MoeTask)), dummy = zeros(16);
   for (int i = 0; i < JOBS; i++) {

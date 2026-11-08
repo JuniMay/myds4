@@ -202,13 +202,7 @@ pub fn prepare(body: &[u8], note: &str, m: &Settings, slot: usize) -> Result<Pre
     let prompt = template::render(&msgs, &Options { tools: &tools, thinking: on, effort }, &m.tokenizer).map_err(bad)?;
     let int = |k: &str| root.get(k).and_then(Value::as_u64);
     let max_tokens = int("max_completion_tokens").or(int("max_tokens")).map_or(m.ctx, |v| v as usize);
-    let num = |k: &str| root.get(k).and_then(Value::as_f64);
-    let sampling = Sampling {
-        temperature: num("temperature").unwrap_or(m.sampling.temperature),
-        top_p: num("top_p").unwrap_or(m.sampling.top_p),
-        top_k: int("top_k").map_or(m.sampling.top_k, |v| v as u32),
-        seed: int("seed"),
-    };
+    let sampling = super::sampling(&root, m.sampling)?;
     let stop = match root.get("stop") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::String(s)) => vec![s.clone()],

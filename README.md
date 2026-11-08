@@ -109,6 +109,10 @@ server. Each model keeps its own context, batch limit and sampling options.
 Configuration changes require a restart. In the live view, `n` switches
 models and `6` opens Memory, with allocation tiles for all loaded models.
 
+The server registers configured models at startup and loads each model's
+weights only for its first inference request. Listing models does not load
+their weights.
+
 The server and the CLI accept `--ced off|N` for approximate decoder replay
 during prefill, with `off` as the default. For example, `--ced 128` retains
 128 decoder tokens plus `max(8, lookup_depth)` rewind rows. This can change output; see the

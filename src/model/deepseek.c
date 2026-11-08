@@ -29,6 +29,7 @@
 _Alignas(8) static const unsigned char engram_data[] = {
 #embed "../../data/engram.bin"
 };
+static TensorIndex *checkpoint;
 static const int64_t *const engram_mult = (const int64_t *)engram_data;
 static const int64_t *const engram_primes = (const int64_t *)engram_data + 8;
 static const int64_t *const engram_offsets = (const int64_t *)engram_data + 56;
@@ -307,11 +308,11 @@ static Buf vec(Tensor t) {
 static Lin lin(const char *stem) {
   char name[256];
   snprintf(name, sizeof name, "%s.weight", stem);
-  Tensor t = st_get("%s", name);
+  Tensor t = st_get(checkpoint, "%s", name);
   Lin l = {.w = load(t), .n = (int)t.shape[0], .k = (int)t.shape[1]};
   if (t.dtype == '8') {
     snprintf(name, sizeof name, "%s.scale", stem);
-    l.s = load(st_get("%s", name));
+    l.s = load(st_get(checkpoint, "%s", name));
   }
   return l;
 }
@@ -421,7 +422,7 @@ static void request_capacity(int rows) {
 static void load_block(Layer *y, const char *prefix) {
   char s[128];
 #define LIN(field, name) snprintf(s, sizeof s, "%s.%s", prefix, name), y->field = lin(s)
-#define VEC(field, name) y->field = vec(st_get("%s.%s", prefix, name))
+#define VEC(field, name) y->field = vec(st_get(checkpoint, "%s.%s", prefix, name))
   LIN(wq_a, "attn.wq_a"), LIN(wq_b, "attn.wq_b"), LIN(wkv, "attn.wkv");
   LIN(wo_a, "attn.wo_a"), LIN(wo_b, "attn.wo_b"), LIN(gate, "ffn.gate");
   y->wo_a.group = ORANK;
@@ -429,7 +430,7 @@ static void load_block(Layer *y, const char *prefix) {
   VEC(attn_norm, "attn_norm.weight"), VEC(ffn_norm, "ffn_norm.weight");
   VEC(q_norm, "attn.q_norm.weight"), VEC(kv_norm, "attn.kv_norm.weight");
   VEC(sink, "attn.attn_sink"), VEC(gate_bias, "ffn.gate.bias");
-  if (st_has("%s.ffn.gate.bias_vl", prefix)) VEC(gate_bias_vl, "ffn.gate.bias_vl");
+  if (st_has(checkpoint, "%s.ffn.gate.bias_vl", prefix)) VEC(gate_bias_vl, "ffn.gate.bias_vl");
   else y->gate_bias_vl = y->gate_bias;
   VEC(hc_attn_fn, "hc_attn_fn"), VEC(hc_attn_base, "hc_attn_base"), VEC(hc_attn_scale, "hc_attn_scale");
   VEC(hc_ffn_fn, "hc_ffn_fn"), VEC(hc_ffn_base, "hc_ffn_base"), VEC(hc_ffn_scale, "hc_ffn_scale");
@@ -457,12 +458,12 @@ static void predictor_identity(uint8_t result[32]) {
   identity_number(&hash, INTER);
   identity_number(&hash, head_q6.obj != NULL);
   for (int l = 0; l < LAYERS; l++) {
-    Tensor gate = st_get("layers.%d.ffn.gate.weight", l);
+    Tensor gate = st_get(checkpoint, "layers.%d.ffn.gate.weight", l);
     identity_number(&hash, (uint64_t)gate.dtype);
     identity_number(&hash, gate.size);
     CC_SHA256_Update(&hash, L[l].gate.w.ptr + L[l].gate.w.off, (CC_LONG)gate.size);
     if (L[l].gate.s.obj) {
-      Tensor scale = st_get("layers.%d.ffn.gate.scale", l);
+      Tensor scale = st_get(checkpoint, "layers.%d.ffn.gate.scale", l);
       identity_number(&hash, scale.size);
       CC_SHA256_Update(&hash, L[l].gate.s.ptr + L[l].gate.s.off, (CC_LONG)scale.size);
     } else identity_number(&hash, 0);
@@ -491,7 +492,6 @@ void deepseek_save_predictor(void) {
 
 void deepseek_load(const char *dir, const Options *options) {
   if (options->ced && options->dump_fd >= 0) die("per-layer dumps require --ced off");
-  lock_model();
   opt = *options;
   runahead_enabled = opt.runahead;
   pipeline_enabled = opt.pipeline;
@@ -518,7 +518,7 @@ void deepseek_load(const char *dir, const Options *options) {
   K(route), K(engram_rows), K(engram_gate), K(copy_rows), K(copy_keys), K(attend_m), K(hc_mean), K(markov), K(argmax);
   K(cand_topk), K(x_bf16), K(q_rope);
   K(vit_bias), K(vit_norm), K(vit_rope), K(vit_heads), K(vit_attn), K(vit_swiglu), K(vit_add), K(vit_unfold);
-  st_open(dir);
+  checkpoint = st_open(dir);
   double t0 = now();
   static const uint8_t ratios[LAYERS] = {0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
                                          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
@@ -556,18 +556,18 @@ void deepseek_load(const char *dir, const Options *options) {
     if (y->index_source) LIN(i_wq_b, "attn.indexer.wq_b"), LIN(i_wproj, "attn.indexer.weights_proj");
     if (l == 1 || l == 14) {
       LIN(e_wkv, "engram.wkv");
-      Buf qw = vec(st_get("%s.engram.q_weight", prefix)), kw = vec(st_get("%s.engram.k_weight", prefix));
+      Buf qw = vec(st_get(checkpoint, "%s.engram.q_weight", prefix)), kw = vec(st_get(checkpoint, "%s.engram.k_weight", prefix));
       y->e_qk = gpu_alloc(HC * DIM * 4);
       for (int i = 0; i < HC * DIM; i++) ((float *)y->e_qk.ptr)[i] = ((float *)qw.ptr)[i] * ((float *)kw.ptr)[i];
       gpu_free(&qw), gpu_free(&kw);
-      y->e_codes = st_get("layers.%d.engram.embed.weight", l);
-      y->e_scales = st_get("layers.%d.engram.embed.scale", l);
+      y->e_codes = st_get(checkpoint, "layers.%d.engram.embed.weight", l);
+      y->e_scales = st_get(checkpoint, "layers.%d.engram.embed.scale", l);
     }
     if (!opt.quiet) fprintf(stderr, "\rloading layer %d/%d", l + 1, LAYERS);
   }
   head = lin("head");
-  final_norm = vec(st_get("norm.weight"));
-  embed_t = st_get("embed.weight");
+  final_norm = vec(st_get(checkpoint, "norm.weight"));
+  embed_t = st_get(checkpoint, "embed.weight");
   if (opt.draft) {
     for (int d = 0; d < DRAFTS; d++) {
       char prefix[32];
@@ -575,10 +575,10 @@ void deepseek_load(const char *dir, const Options *options) {
       load_block(&D[d], prefix);
     }
     main_proj = lin("mtp.0.main_proj");
-    main_norm = vec(st_get("mtp.0.main_norm.weight"));
-    draft_norm = vec(st_get("mtp.2.norm.weight"));
-    markov_embed = load(st_get("mtp.2.markov_head.embed.weight"));
-    markov_head = load(st_get("mtp.2.markov_head.head.weight"));
+    main_norm = vec(st_get(checkpoint, "mtp.0.main_norm.weight"));
+    draft_norm = vec(st_get(checkpoint, "mtp.2.norm.weight"));
+    markov_embed = load(st_get(checkpoint, "mtp.2.markov_head.embed.weight"));
+    markov_head = load(st_get(checkpoint, "mtp.2.markov_head.head.weight"));
   }
   cs_base = rope_table(ctx, 10000, 0);
   cs_comp = rope_table(ctx, 160000, 1);
@@ -622,7 +622,7 @@ void deepseek_load(const char *dir, const Options *options) {
   cache_retention(opt.cache_half_life, opt.cache_read_cost);
   if (opt.reserve_gb) cache_reserve(opt.reserve_gb); // standalone CLI; the server sets the process reserve once
   cache_draft_limit(opt.draft_cache);
-  cache_init(opt.budget_gb > 0 ? (uint64_t)(opt.budget_gb * GiB) : 0, opt.draft ? CACHE_LAYERS : LAYERS);
+  cache_init(checkpoint, opt.budget_gb > 0 ? (uint64_t)(opt.budget_gb * GiB) : 0, opt.draft ? CACHE_LAYERS : LAYERS);
 #ifdef MYDS4_PREDICT_PROBE
   if (predict_probe_enabled()) {
     float read_bytes[LAYERS][EXPERTS];
@@ -2161,29 +2161,29 @@ static int nimgs;
 static void vit_load(void) {
   if (vit.loaded) return;
   char s[96];
-  Tensor t = st_get("vision.patch_embed.proj.weight");
+  Tensor t = st_get(checkpoint, "vision.patch_embed.proj.weight");
   Buf raw = load(t);
   vit.patch = (Lin){.w = zeros((size_t)1024 * VIT_K * 2), .n = 1024, .k = VIT_K};
   for (int r = 0; r < 1024; r++)
     memcpy((uint16_t *)vit.patch.w.ptr + (size_t)r * VIT_K, (uint16_t *)(raw.ptr + raw.off) + (size_t)r * 588, 588 * 2);
   gpu_free(&raw);
-  vit.patch_b = vec(st_get("vision.patch_embed.proj.bias"));
+  vit.patch_b = vec(st_get(checkpoint, "vision.patch_embed.proj.bias"));
   for (int l = 0; l < 32; l++) {
     VitBlock *b = &vit.b[l];
     snprintf(s, sizeof s, "vision.blocks.%d.attn.wqkv", l), b->qkv = lin(s);
     snprintf(s, sizeof s, "vision.blocks.%d.attn.wo", l), b->o = lin(s);
     snprintf(s, sizeof s, "vision.blocks.%d.mlp.w1", l), b->w1 = lin(s);
     snprintf(s, sizeof s, "vision.blocks.%d.mlp.w2", l), b->w2 = lin(s);
-    b->b_qkv = vec(st_get("vision.blocks.%d.attn.wqkv.bias", l)), b->b_o = vec(st_get("vision.blocks.%d.attn.wo.bias", l));
-    b->norm1 = vec(st_get("vision.blocks.%d.norm1.weight", l)), b->norm2 = vec(st_get("vision.blocks.%d.norm2.weight", l));
+    b->b_qkv = vec(st_get(checkpoint, "vision.blocks.%d.attn.wqkv.bias", l)), b->b_o = vec(st_get(checkpoint, "vision.blocks.%d.attn.wo.bias", l));
+    b->norm1 = vec(st_get(checkpoint, "vision.blocks.%d.norm1.weight", l)), b->norm2 = vec(st_get(checkpoint, "vision.blocks.%d.norm2.weight", l));
   }
-  vit.norm = vec(st_get("vision.norm.weight"));
-  vit.a1 = lin("aligner.w1"), vit.a1_b = vec(st_get("aligner.w1.bias"));
-  vit.a2 = lin("aligner.w2"), vit.a2_b = vec(st_get("aligner.w2.bias"));
+  vit.norm = vec(st_get(checkpoint, "vision.norm.weight"));
+  vit.a1 = lin("aligner.w1"), vit.a1_b = vec(st_get(checkpoint, "aligner.w1.bias"));
+  vit.a2 = lin("aligner.w2"), vit.a2_b = vec(st_get(checkpoint, "aligner.w2.bias"));
   const char *name[3] = {"image_start", "image_end", "image_newline"};
   uint16_t *row[3] = {vit.start, vit.end, vit.newline};
   for (int i = 0; i < 3; i++) {
-    Buf r = load(st_get("%s", name[i]));
+    Buf r = load(st_get(checkpoint, "%s", name[i]));
     memcpy(row[i], r.ptr + r.off, DIM * 2);
     gpu_free(&r);
   }

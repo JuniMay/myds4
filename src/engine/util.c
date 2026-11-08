@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <yyjson.h>
 
 #include "myds4.h"
 
@@ -85,6 +86,8 @@ void str_printf(Str *s, const char *fmt, ...) {
 // memory: an exclusive lock (flock, as lockf(1) takes it) on myds4.lock
 // beside the executable, or on $MYDS4_LOCK, held until the process ends.
 void lock_model(void) {
+  static int owner = -1;
+  if (owner >= 0) return;
   char exe[PATH_MAX], real[PATH_MAX], path[PATH_MAX + 16];
   uint32_t n = sizeof exe;
   if (getenv("MYDS4_LOCK")) snprintf(path, sizeof path, "%s", getenv("MYDS4_LOCK"));
@@ -96,6 +99,7 @@ void lock_model(void) {
     fprintf(stderr, "myds4: another process holds %s; waiting for it to end\n", path);
     if (flock(fd, LOCK_EX)) die("cannot lock %s", path);
   }
+  owner = fd;
 }  // the descriptor stays open: the lock lasts as long as the process
 
 // Base64 (RFC 4648, also its URL alphabet), up to padding, skipping
@@ -133,104 +137,78 @@ char *read_file(const char *path, size_t *len) {
   return p;
 }
 
-// ---- JSON: parsed in place; strings are unescaped into the source text ----
+// ---- JSON documents: each parsed tree owns its strings and storage ----
 
-static char *jp;
+typedef struct { Json root; yyjson_doc *source; } JsonDocument;
 
-static void skip(void) {
-  while (*jp == ' ' || *jp == '\n' || *jp == '\r' || *jp == '\t') jp++;
-}
-
-static int utf8(char *o, unsigned c) {
-  if (c < 0x80) return o[0] = c, 1;
-  if (c < 0x800) return o[0] = 0xC0 | c >> 6, o[1] = 0x80 | (c & 63), 2;
-  if (c < 0x10000)
-    return o[0] = 0xE0 | c >> 12, o[1] = 0x80 | (c >> 6 & 63), o[2] = 0x80 | (c & 63), 3;
-  o[0] = 0xF0 | c >> 18, o[1] = 0x80 | (c >> 12 & 63), o[2] = 0x80 | (c >> 6 & 63);
-  return o[3] = 0x80 | (c & 63), 4;
-}
-
-static const char *jstring(int *n) {
-  char *o = ++jp, *start = o;
-  while (*jp != '"') {
-    if (*jp != '\\') { *o++ = *jp++; continue; }
-    char e = *++jp;
-    jp++;
-    if (e == 'u') {
-      unsigned c = strtoul((char[5]){jp[0], jp[1], jp[2], jp[3], 0}, 0, 16);
-      jp += 4;
-      if (c >= 0xD800 && c < 0xDC00 && jp[0] == '\\' && jp[1] == 'u') {
-        unsigned lo = strtoul((char[5]){jp[2], jp[3], jp[4], jp[5], 0}, 0, 16);
-        c = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00);
-        jp += 6;
+static void json_value(Json *out, yyjson_val *value) {
+  if (yyjson_is_obj(value) || yyjson_is_arr(value)) {
+    int object = yyjson_is_obj(value);
+    size_t count = object ? yyjson_obj_size(value) : yyjson_arr_size(value);
+    if (count > INT_MAX) die("JSON container is too large");
+    out->type = object ? J_OBJ : J_ARR;
+    out->n = (int)count;
+    out->kid = xmalloc(count * sizeof *out->kid);
+    size_t i, maximum;
+    yyjson_val *key, *child;
+    if (object) {
+      yyjson_obj_foreach(value, i, maximum, key, child) {
+        json_value(&out->kid[i], child);
+        out->kid[i].key = yyjson_get_str(key);
       }
-      o += utf8(o, c);
     } else {
-      *o++ = e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e == 'b' ? '\b'
-           : e == 'f' ? '\f' : e;
+      yyjson_arr_foreach(value, i, maximum, child) json_value(&out->kid[i], child);
     }
-  }
-  jp++;
-  *n = o - start;
-  *o = 0;
-  return start;
-}
-
-static void jvalue(Json *v) {
-  skip();
-  memset(v, 0, sizeof *v);
-  if (*jp == '{' || *jp == '[') {
-    int obj = *jp++ == '{', cap = 8;
-    v->type = obj ? J_OBJ : J_ARR;
-    v->kid = xmalloc(cap * sizeof(Json));
-    for (skip(); *jp != '}' && *jp != ']'; skip()) {
-      if (*jp == ',') { jp++; continue; }
-      if (v->n == cap) v->kid = realloc(v->kid, (cap *= 2) * sizeof(Json));
-      const char *key = 0;
-      int kn;
-      if (obj) {
-        skip();
-        key = jstring(&kn);
-        skip();
-        jp++;  // ':'
-      }
-      jvalue(&v->kid[v->n]);
-      v->kid[v->n++].key = key;
-    }
-    jp++;
-  } else if (*jp == '"') {
-    v->type = J_STR;
-    v->s = jstring(&v->n);
-  } else if (*jp == 't' || *jp == 'f') {
-    v->type = J_BOOL;
-    v->num = *jp == 't';
-    jp += *jp == 't' ? 4 : 5;
-  } else if (*jp == 'n') {
-    jp += 4;
-  } else {
-    v->type = J_NUM;
-    v->num = strtod(jp, &jp);
+  } else if (yyjson_is_str(value)) {
+    size_t length = yyjson_get_len(value);
+    if (length > INT_MAX) die("JSON string is too large");
+    out->type = J_STR, out->n = (int)length, out->s = yyjson_get_str(value);
+  } else if (yyjson_is_bool(value)) {
+    out->type = J_BOOL, out->num = yyjson_get_bool(value);
+  } else if (yyjson_is_num(value)) {
+    out->type = J_NUM, out->num = yyjson_get_num(value);
   }
 }
 
 Json *json_parse(char *text) {
-  Json *v = xmalloc(sizeof *v);
-  jp = text;
-  jvalue(v);
-  return v;
+  yyjson_read_err error;
+  yyjson_doc *source = yyjson_read_opts(text, strlen(text), 0, NULL, &error);
+  if (!source) die("invalid JSON at byte %zu: %s", error.pos, error.msg);
+  JsonDocument *doc = xmalloc(sizeof *doc);
+  doc->source = source;
+  json_value(&doc->root, yyjson_doc_get_root(source));
+  return &doc->root;
 }
 
-Json *json_get(const Json *o, const char *key) {
-  for (int i = 0; o && i < o->n; i++)
-    if (o->kid[i].key && !strcmp(o->kid[i].key, key)) return &o->kid[i];
-  return 0;
+Json *json_get(const Json *object, const char *key) {
+  if (!object || object->type != J_OBJ) return NULL;
+  for (int i = 0; i < object->n; i++)
+    if (!strcmp(object->kid[i].key, key)) return &object->kid[i];
+  return NULL;
+}
+
+static void json_children_free(Json *value) {
+  if (value->type == J_OBJ || value->type == J_ARR)
+    for (int i = 0; i < value->n; i++) json_children_free(&value->kid[i]);
+  free(value->kid);
+}
+
+void json_free(Json *root) {
+  if (!root) return;
+  JsonDocument *doc = (JsonDocument *)root;
+  json_children_free(root);
+  yyjson_doc_free(doc->source);
+  free(doc);
 }
 
 // ---- safetensors: every tensor of every shard, by name ----
 
 typedef struct { const char *name; Tensor t; } Entry;
-static Entry *table;
-static size_t nentries, tcap;
+struct TensorIndex {
+  Entry *table;
+  size_t capacity;
+  int *fds, nfiles;
+};
 
 static uint64_t hash(const char *s) {
   uint64_t h = 1469598103934665603ull;
@@ -238,21 +216,24 @@ static uint64_t hash(const char *s) {
   return h;
 }
 
-static Entry *slot(const char *name) {
-  size_t i = hash(name) & (tcap - 1);
-  while (table[i].name && strcmp(table[i].name, name)) i = (i + 1) & (tcap - 1);
-  return &table[i];
+static Entry *slot(const TensorIndex *index, const char *name) {
+  size_t i = hash(name) & (index->capacity - 1);
+  while (index->table[i].name && strcmp(index->table[i].name, name)) i = (i + 1) & (index->capacity - 1);
+  return &index->table[i];
 }
 
-void st_open(const char *dir) {
+TensorIndex *st_open(const char *dir) {
   char path[4096];
   snprintf(path, sizeof path, "%s/model.safetensors.index.json", dir);
-  Json *idx = json_get(json_parse(read_file(path, 0)), "weight_map");
+  char *text = read_file(path, 0);
+  Json *root = json_parse(text), *idx = json_get(root, "weight_map");
   if (!idx) die("%s has no weight_map", path);
-  tcap = 1;
-  while (tcap < 2 * (size_t)idx->n) tcap *= 2;
-  table = xmalloc(tcap * sizeof *table);
-  const char *done[256];
+  TensorIndex *index = xmalloc(sizeof *index);
+  index->capacity = 1;
+  while (index->capacity < 2 * (size_t)idx->n) index->capacity *= 2;
+  index->table = xmalloc(index->capacity * sizeof *index->table);
+  index->fds = xmalloc((size_t)idx->n * sizeof *index->fds);
+  const char **done = xmalloc((size_t)idx->n * sizeof *done);
   int ndone = 0;
   for (int i = 0; i < idx->n; i++) {
     const char *file = idx->kid[i].s;
@@ -264,6 +245,7 @@ void st_open(const char *dir) {
     int fd = open(path, O_RDONLY);
     uint64_t n;
     if (fd < 0 || pread(fd, &n, 8, 0) != 8) die("cannot read %s", path);
+    index->fds[index->nfiles++] = fd;
     char *h = xmalloc(n + 1);
     if (pread(fd, h, n, 8) != (ssize_t)n) die("cannot read %s", path);
     fcntl(fd, F_NOCACHE, 1);
@@ -271,10 +253,10 @@ void st_open(const char *dir) {
     for (int k = 0; k < hdr->n; k++) {
       Json *e = &hdr->kid[k];
       if (!strcmp(e->key, "__metadata__")) continue;
-      Entry *en = slot(e->key);
+      Entry *en = slot(index, e->key);
       if (en->name) continue;
-      en->name = e->key;
-      nentries++;
+      en->name = strdup(e->key);
+      if (!en->name) die("out of memory for tensor name");
       const char *dt = json_get(e, "dtype")->s;
       Json *sh = json_get(e, "shape"), *of = json_get(e, "data_offsets");
       Tensor *t = &en->t;
@@ -286,31 +268,39 @@ void st_open(const char *dir) {
       t->ndim = sh->n;
       for (int d = 0; d < sh->n && d < 4; d++) t->shape[d] = (int64_t)sh->kid[d].num;
     }
+    json_free(hdr);
+    free(h);
   }
+  json_free(root);
+  free(text), free(done);
+  return index;
 }
 
-static const char *format(const char *fmt, va_list ap) {
-  static char name[256];
-  vsnprintf(name, sizeof name, fmt, ap);
-  return name;
+void st_close(TensorIndex *index) {
+  if (!index) return;
+  for (size_t i = 0; i < index->capacity; i++) free((char *)index->table[i].name);
+  for (int i = 0; i < index->nfiles; i++) close(index->fds[i]);
+  free(index->table), free(index->fds), free(index);
 }
 
-Tensor st_get(const char *fmt, ...) {
+Tensor st_get(const TensorIndex *index, const char *fmt, ...) {
+  char name[256];
   va_list ap;
   va_start(ap, fmt);
-  const char *name = format(fmt, ap);
+  vsnprintf(name, sizeof name, fmt, ap);
   va_end(ap);
-  Entry *e = slot(name);
+  Entry *e = slot(index, name);
   if (!e->name) die("checkpoint has no tensor %s", name);
   return e->t;
 }
 
-int st_has(const char *fmt, ...) {
+int st_has(const TensorIndex *index, const char *fmt, ...) {
+  char name[256];
   va_list ap;
   va_start(ap, fmt);
-  const char *name = format(fmt, ap);
+  vsnprintf(name, sizeof name, fmt, ap);
   va_end(ap);
-  return slot(name)->name != 0;
+  return slot(index, name)->name != 0;
 }
 
 // ---- GGUF: the header's key-value pairs (skipped, but for the data

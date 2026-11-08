@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <sys/qos.h>
 #include <sys/time.h>
@@ -22,6 +23,8 @@ struct myds4_model {
   const ModelOps *ops;
   Tokenizer *tk;
   Options opt;
+  char *dir;
+  atomic_int loaded;
 };
 
 static myds4_process proc;
@@ -82,7 +85,7 @@ void myds4_request_stop(void) { shutdown_request(); }
 
 static char *copy(const char *s) { return s ? strdup(s) : 0; }
 
-myds4_model *myds4_load(const myds4_config *c) {
+myds4_model *myds4_open(const myds4_config *c) {
   const char *bad = !initialized                    ? "the engine is not initialized (myds4_init)"
                   : !c || c->abi != MYDS4_ABI       ? "the engine's interface version differs from the caller's"
                   : !c->model                       ? "no checkpoint directory"
@@ -112,6 +115,7 @@ myds4_model *myds4_load(const myds4_config *c) {
       return 0;
     }
   myds4_model *x = xmalloc(sizeof *x);
+  atomic_init(&x->loaded, 0);
   x->ops = ops;
   x->opt = (Options){.ctx = c->ctx, .budget_gb = c->cache_gb,
                      .cache_half_life = c->cache_half_life, .cache_read_cost = c->cache_read_cost, .dump_fd = -1,
@@ -128,19 +132,30 @@ myds4_model *myds4_load(const myds4_config *c) {
   }
   families[nfamilies++] = ops;
   x->tk = tok_open(c->model, ops->image_token);
-  x->m = model_open(copy(c->model), &x->opt);
-  say("%s: %s, context %d, drafts %d, rewind margin %d, context lookup %d; prefill: ced_depth=%d (%s), dependency "
-      "pruning=%s",
-      c->model, ops->family, c->ctx, ops->draft_block(), ops->rewind(), c->lookup, c->ced,
-      c->ced ? "approximate" : "off", c->prefill_prune ? "on" : "off");
+  x->dir = copy(c->model);
+  say("%s: registered %s; weights load on first inference request", c->model, ops->family);
   return x;
 }
 
+int myds4_loaded(const myds4_model *m) { return atomic_load_explicit(&m->loaded, memory_order_acquire); }
+
+int myds4_load(myds4_model *m) {
+  if (myds4_loaded(m)) return 1;
+  m->m = model_open(m->dir, &m->opt);
+  atomic_store_explicit(&m->loaded, 1, memory_order_release);
+  say("%s: %s, context %d, drafts %d, rewind margin %d, context lookup %d; prefill: ced_depth=%d (%s), dependency "
+      "pruning=%s",
+      m->dir, m->ops->family, m->opt.ctx, m->ops->draft_block(), m->ops->rewind(), m->opt.lookup, m->opt.ced,
+      m->opt.ced ? "approximate" : "off", m->opt.prefill_prune ? "on" : "off");
+  return 1;
+}
+
 void myds4_finish(myds4_model *m) {
-  if (m->ops->finish) m->ops->finish();
+  if (myds4_loaded(m) && m->ops->finish) m->ops->finish();
 }
 
 int myds4_idle(myds4_model *m) {
+  if (!myds4_loaded(m)) return 0;
   // the expert cache (io.c) is the slots of the model with routed experts;
   // another model's idle returns 0 and leaves the cache as it is
   ModelCounters c;
@@ -151,7 +166,7 @@ int myds4_idle(myds4_model *m) {
 }
 
 int myds4_max_rows(const myds4_model *m) { return m->ops->max_rows(); }
-int myds4_draft_block(const myds4_model *m) { return m->ops->draft_block(); }
+int myds4_draft_block(const myds4_model *m) { return myds4_loaded(m) ? m->ops->draft_block() : m->opt.draft; }
 int myds4_max_verify(const myds4_model *m) { return m->ops->max_verify(); }
 int myds4_rewind(const myds4_model *m) { return m->ops->rewind(); }
 int myds4_vocab(const myds4_model *m) { return m->ops->vocab(); }
@@ -343,8 +358,8 @@ int myds4_routes(const myds4_model *m, int row, uint16_t *experts, uint8_t *sour
 void myds4_stats_get(const myds4_model *m, myds4_stats *s) {
   MemInfo mi;
   mem_info(&mi);
-  ModelCounters c;
-  m->ops->counters(&c);
+  ModelCounters c = {0};
+  if (myds4_loaded(m)) m->ops->counters(&c);
   *s = (myds4_stats){.decode = counts(&c.decode), .prefill = counts(&c.prefill), .decode_rows = c.decode_rows,
                      .prefill_rows = c.prefill_rows, .decode_seconds = c.decode_seconds,
                      .decode_gpu_seconds = c.decode_gpu_seconds, .prefill_layer = c.prefill_layer,

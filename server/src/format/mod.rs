@@ -29,6 +29,27 @@ pub fn bad(message: impl Into<String>) -> Error {
     Error { status: StatusCode::BAD_REQUEST, message: message.into() }
 }
 
+/// Request values override model defaults; null leaves a default in place.
+pub fn sampling(root: &serde_json::Map<String, serde_json::Value>, defaults: crate::worker::Sampling) -> Result<crate::worker::Sampling, Error> {
+    use serde_json::Value;
+    let number = |key: &str, default: f64| match root.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(value) => value.as_f64().filter(|v| v.is_finite()).ok_or_else(|| bad(format!("{key} must be a finite number"))),
+    };
+    let integer = |key: &str, default: Option<u64>| match root.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| bad(format!("{key} must be a nonnegative integer"))),
+    };
+    let temperature = number("temperature", defaults.temperature)?;
+    let top_p = number("top_p", defaults.top_p)?;
+    if temperature < 0.0 || !(0.0..=1.0).contains(&top_p) {
+        return Err(bad("temperature must be nonnegative and top_p must be in [0, 1]"));
+    }
+    let top_k = integer("top_k", Some(defaults.top_k as u64))?.unwrap_or(0);
+    if top_k > i32::MAX as u64 { return Err(bad("top_k exceeds the engine's integer range")); }
+    Ok(crate::worker::Sampling { temperature, top_p, top_k: top_k as u32, seed: integer("seed", defaults.seed)? })
+}
+
 pub fn error_json(kind: &str, message: &str) -> String {
     json!({"error": {"message": message, "type": kind, "code": null}}).to_string()
 }
@@ -64,5 +85,40 @@ impl Family {
             Some(t) => Err(format!("{}: model_type {t} is not one this server runs", path.display())),
             None => Err(format!("{}: no model_type", path.display())),
         }
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+    use crate::{engine::Tokenizer, worker::Sampling};
+
+    #[test]
+    fn qwen_sampling_settings_use_defaults_and_validate_overrides() {
+        let Ok(dir) = std::env::var("MYDS4_QWEN") else { return };
+        let settings = qwen::Settings {
+            id: "qwen".into(), ctx: 4096, tokenizer: Tokenizer::open(&dir, None),
+            sampling: Sampling { temperature: 1.0, top_p: 1.0, top_k: 20, seed: Some(73) },
+        };
+        let body = json!({"messages": [{"role": "user", "content": "Hi"}]});
+        let prepared = qwen::prepare(&serde_json::to_vec(&body).unwrap(), "test", &settings, 0).unwrap();
+        assert_eq!(prepared.request.sampling, settings.sampling);
+        for (field, value) in [("temperature", json!("wrong")), ("top_p", json!(2)), ("top_k", json!(-1)), ("seed", json!(-1))] {
+            let mut bad = body.clone(); bad[field] = value;
+            assert!(qwen::prepare(&serde_json::to_vec(&bad).unwrap(), "test", &settings, 0).is_err(), "accepted invalid {field}");
+        }
+    }
+
+    #[test]
+    fn deepseek_sampling_settings_keep_requested_top_k() {
+        let Ok(dir) = std::env::var("MYDS4_CHECKPOINT") else { return };
+        let tokenizer = Tokenizer::open(&dir, Some(deepseek::IMAGE));
+        let defaults = deepseek::Defaults { id: "deepseek".into(),
+            sampling: Sampling { temperature: 1.0, top_p: 1.0, top_k: 20, seed: Some(73) }, thinking: false, effort: 75 };
+        let body = json!({"messages": [{"role": "user", "content": "Hi"}], "top_k": 31});
+        let prepared = deepseek::prepare(&serde_json::to_vec(&body).unwrap(), &defaults, tokenizer).unwrap();
+        let request = prepared.engine_request(0, "test".into()).unwrap();
+        assert_eq!(request.sampling.top_k, 31);
+        assert_eq!(request.sampling.seed, Some(73));
     }
 }

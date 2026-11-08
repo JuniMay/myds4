@@ -380,3 +380,45 @@ fn models_share_one_kv_budget_and_one_reserve() {
     assert!((total - parts).abs() <= 0.002 && total <= 0.751);
     eprintln!("shared KV: {total:.3} GiB of 0.75; reserve 13 GiB; cross-model eviction passed");
 }
+
+#[test]
+fn registered_models_have_no_loaded_weights_before_inference() {
+    let (Some(qwen), Ok(deepseek)) = (checkpoint(), std::env::var("MYDS4_CHECKPOINT")) else { return };
+    let _one = one_model();
+    let s = Server::with_config(json!({"reserve": 10, "kv_cache": 2, "models": [
+        {"model": deepseek, "id": "deepseek-idle", "cache": 20, "ctx": 4096},
+        {"model": qwen, "id": "qwen-idle", "ctx": 4096}
+    ]}));
+    let models = s.get("/v1/models");
+    assert_eq!(models["data"].as_array().unwrap().len(), 2);
+    for id in ["deepseek-idle", "qwen-idle"] {
+        let status = s.get(&format!("/v1/models/{id}"));
+        for model in status["status"]["model_memory"].as_array().unwrap() {
+            assert_eq!(model["weights"], 0, "startup loaded weights: {model}");
+            assert_eq!(model["experts"], 0, "startup allocated expert weights: {model}");
+        }
+    }
+}
+
+#[test]
+fn first_inference_loads_only_the_selected_model() {
+    let (Some(qwen), Ok(deepseek)) = (checkpoint(), std::env::var("MYDS4_CHECKPOINT")) else { return };
+    let _one = one_model();
+    let s = Server::with_config(json!({"reserve": 10, "kv_cache": 2, "models": [
+        {"model": deepseek, "id": "deepseek-lazy", "cache": 20, "ctx": 4096},
+        {"model": qwen, "id": "qwen-lazy", "ctx": 4096}
+    ]}));
+    for (id, text) in [("qwen-lazy", "Name one fruit."), ("deepseek-lazy", "Name one color.")] {
+        let mut request = body(json!([{"role": "user", "content": text}]), 8, false);
+        request["model"] = json!(id);
+        assert!(!content(&s.chat(&request)).trim().is_empty());
+        let status = s.get(&format!("/v1/models/{id}"));
+        assert_eq!(status["status"]["loaded"], true);
+        if id == "qwen-lazy" {
+            let other = s.get("/v1/models/deepseek-lazy");
+            assert_eq!(other["status"]["loaded"], false);
+            let models = other["status"]["model_memory"].as_array().unwrap();
+            assert_eq!(models.iter().find(|m| m["model"] == "deepseek-lazy").unwrap()["weights"], 0);
+        }
+    }
+}

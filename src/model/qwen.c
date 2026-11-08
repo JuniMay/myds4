@@ -39,6 +39,7 @@ typedef struct {
   Buf q_norm, k_norm;  // plus 1
 } Layer;
 
+static TensorIndex *checkpoint;
 static struct {
   int layers, linear, attention, hidden, inter, vocab, nstop, stop[8];
   int heads, kv_heads, head_dim, rot;
@@ -145,7 +146,7 @@ static Buf upload(Tensor t) {
 
 // A BF16 or FP32 vector as FP32, plus `add`.
 static Buf vec(const char *name, float add) {
-  Tensor t = st_get("%s", name);
+  Tensor t = st_get(checkpoint, "%s", name);
   int n = t.dtype == 'b' ? (int)(t.size / 2) : (int)(t.size / 4);
   if (t.dtype != 'b' && t.dtype != 'f') die("%s: not BF16 or FP32", name);
   Buf raw = upload(t), b = own(gpu_alloc((size_t)n * 4));
@@ -158,7 +159,7 @@ static Buf vec(const char *name, float add) {
 }
 
 static float scalar(const char *name) {
-  Tensor t = st_get("%s", name);
+  Tensor t = st_get(checkpoint, "%s", name);
   float v;
   if (t.dtype != 'f' || t.size != 4 || pread(t.fd, &v, 4, (off_t)t.off) != 4) die("%s is not an FP32 scalar", name);
   return v;
@@ -167,13 +168,13 @@ static float scalar(const char *name) {
 static Mat mat(const char *stem) {
   char name[256];
   snprintf(name, sizeof name, "%s.weight", stem);
-  Tensor t = st_get("%s", name);
+  Tensor t = st_get(checkpoint, "%s", name);
   Mat m = {.rows = (int)t.shape[0], .scale = 1};
   if (t.dtype == 'u') {  // NVFP4: two codes a byte
     m.kind = 'n', m.cols = (int)t.shape[1] * 2;
     m.w = upload(t);
     snprintf(name, sizeof name, "%s.weight_scale", stem);
-    m.s = upload(st_get("%s", name));
+    m.s = upload(st_get(checkpoint, "%s", name));
     snprintf(name, sizeof name, "%s.weight_scale_2", stem);
     m.scale = scalar(name);
   } else if (t.dtype == '8') {
@@ -254,11 +255,11 @@ void qwen_load(const char *dir) {
   K_attend_block = gpu_kernel("gqa_block"), K_attend_combine = gpu_kernel("gqa_combine");
   K_swiglu = gpu_kernel("silu_mul"), K_add = gpu_kernel("add");
 
-  st_open(dir);
+  checkpoint = st_open(dir);
   double t0 = now();
   const char *m = "model.language_model";
   char p[256], n[256];
-  embed_w = upload(st_get("%s.embed_tokens.weight", m));
+  embed_w = upload(st_get(checkpoint, "%s.embed_tokens.weight", m));
   snprintf(n, sizeof n, "%s.norm.weight", m);
   final_norm = vec(n, 1);
   head = mat("lm_head");
@@ -298,7 +299,7 @@ void qwen_load(const char *dir) {
         die("layer %d: attention projections of unexpected sizes", l);
     }
   }
-  mtp = st_has("mtp.fc.weight");
+  mtp = st_has(checkpoint, "mtp.fc.weight");
   if (mtp) {
     mtp_fc = mat("mtp.fc");
     mtp_norm_e = vec("mtp.pre_fc_norm_embedding.weight", 1), mtp_norm_h = vec("mtp.pre_fc_norm_hidden.weight", 1);

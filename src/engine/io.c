@@ -562,17 +562,17 @@ static void release(int i) {
   cache_stats.evictions++;
 }
 
-void cache_init(uint64_t budget, int layers) {
+void cache_init(TensorIndex *index, uint64_t budget, int layers) {
   if (!retention_growth) cache_retention(0, 0);
   const char *observe = getenv("MYDS4_PREFETCH_METRICS");
   pf_enabled = observe && *observe && strcmp(observe, "0");
   memset(where, 0xff, sizeof where);
   for (int l = 0; l < CACHE_LAYERS; l++)
     for (int e = 0; !expert_spans[l] && e < (l < LAYERS ? EXPERTS : DRAFT_EXPERTS); e++) {
-      Tensor w = l < LAYERS ? st_get("layers.%d.ffn.experts.%d.w1.weight", l, e)
-                            : st_get("mtp.%d.ffn.experts.%d.w1.weight", l - LAYERS, e);
-      Tensor s = l < LAYERS ? st_get("layers.%d.ffn.experts.%d.w1.scale", l, e)
-                            : st_get("mtp.%d.ffn.experts.%d.w1.scale", l - LAYERS, e);
+      Tensor w = l < LAYERS ? st_get(index, "layers.%d.ffn.experts.%d.w1.weight", l, e)
+                            : st_get(index, "mtp.%d.ffn.experts.%d.w1.weight", l - LAYERS, e);
+      Tensor s = l < LAYERS ? st_get(index, "layers.%d.ffn.experts.%d.w1.scale", l, e)
+                            : st_get(index, "mtp.%d.ffn.experts.%d.w1.scale", l - LAYERS, e);
       expert_span[l][e][0] = (FileSpan){w.fd, w.off, EXPERT_W};
       expert_span[l][e][1] = (FileSpan){s.fd, s.off, EXPERT_S};
       if (e == (l < LAYERS ? EXPERTS : DRAFT_EXPERTS) - 1) expert_spans[l] = 2;

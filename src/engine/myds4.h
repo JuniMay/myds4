@@ -97,6 +97,7 @@ struct Json {
 };
 Json *json_parse(char *text);
 Json *json_get(const Json *obj, const char *key);
+void json_free(Json *root); // releases the tree and its strings
 
 typedef struct { // one tensor of the checkpoint
   int fd;
@@ -105,9 +106,11 @@ typedef struct { // one tensor of the checkpoint
   int64_t shape[4];
   int ndim;
 } Tensor;
-void st_open(const char *dir);
-Tensor st_get(const char *fmt, ...);
-int st_has(const char *fmt, ...);
+typedef struct TensorIndex TensorIndex;
+TensorIndex *st_open(const char *dir);
+Tensor st_get(const TensorIndex *index, const char *fmt, ...);
+int st_has(const TensorIndex *index, const char *fmt, ...);
+void st_close(TensorIndex *index); // only after every tensor user has finished
 
 // GGUF files (llama.cpp's format), for --experts: a tensor's ggml type,
 // dimensions (fastest first) and absolute offset. gguf_open takes one file
@@ -215,7 +218,7 @@ enum { CACHE_RESERVE_DEFAULT = 10, CACHE_RESERVE_MIN = 2, CACHE_RESERVE_MAX = 10
 // less the reserve, gives slots back when the available memory falls below
 // it and grows only while 4 GiB more than it is available.
 void cache_reserve(double gib);
-void cache_init(uint64_t budget, int layers);
+void cache_init(TensorIndex *index, uint64_t budget, int layers);
 // Bounded draft pools are demand-only. Finish prior GPU use of a stage's
 // buffers before cache_load/cache_request may replace their experts.
 // The model thread owns cache mutations and slot lifetimes. Read-only

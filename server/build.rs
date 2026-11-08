@@ -21,12 +21,12 @@ fn main() {
     }
     println!("cargo:rustc-link-lib=objc");
     println!("cargo:rustc-link-lib=icucore"); // the tokenizer's regexes and NFC
-    // libjpeg-turbo, found through pkg-config as the Makefile finds it.
+    // The native parser and image decoder use the same libraries as Make.
     let libs = Command::new("pkg-config")
-        .args(["--libs", "libjpeg"])
+        .args(["--libs", "yyjson", "libjpeg"])
         .output()
         .expect("pkg-config runs");
-    assert!(libs.status.success(), "pkg-config finds no libjpeg (brew install jpeg-turbo)");
+    assert!(libs.status.success(), "pkg-config requires yyjson and libjpeg");
     for flag in String::from_utf8_lossy(&libs.stdout).split_whitespace() {
         if let Some(dir) = flag.strip_prefix("-L") {
             println!("cargo:rustc-link-search=native={dir}");

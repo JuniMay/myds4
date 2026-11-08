@@ -45,6 +45,10 @@ server-check: build/libmyds4.a
 
 # ---- CPU checks: no model, and no Metal device unless noted ----
 
+build/tests/metadata: tools/checks/checkpoint_check.c src/model/model.c src/engine/util.c $(MODEL_HEADERS)
+	@mkdir -p build/tests
+	$(CC) $(CFLAGS) -o $@ tools/checks/checkpoint_check.c src/model/model.c src/engine/util.c $(shell pkg-config --libs yyjson)
+
 build/activation-format-check: tools/checks/activation_format_check.c tools/reference/activation_format.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/checks/activation_format_check.c

@@ -1,5 +1,5 @@
-//! The server's worker (docs/server.md): one engine thread that loads every
-//! model and makes every engine call, so that all models' passes go through
+//! One engine thread registers the configured models and loads each model
+//! on its first inference request. It makes every engine call, so passes use
 //! one GPU command queue. HTTP handlers submit requests, each to its model,
 //! to a bounded queue (at most [`WAITING`] wait per model) and get their
 //! events back on a channel.
@@ -285,8 +285,8 @@ pub fn models() -> Vec<(String, Arc<Model>, Served)> {
     shared().models.iter().map(|m| (m.served.id.clone(), m.model.clone(), m.served.clone())).collect()
 }
 
-/// Starts the worker's engine thread, which initializes the engine and loads
-/// every model; returns once it takes requests, or false when a model's
+/// Registers model metadata on the engine thread without loading weights.
+/// Returns once it takes requests, or false when a model's
 /// settings are invalid (the engine says why on stderr).
 pub fn start(served: Vec<Served>, budgets: crate::config::Budgets, on_log: Option<extern "C" fn(*const std::ffi::c_char)>, on_die: Option<extern "C" fn()>) -> bool {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -300,7 +300,7 @@ pub fn start(served: Vec<Served>, budgets: crate::config::Budgets, on_log: Optio
             }
             let mut models = Vec::new();
             for s in &served {
-                let Some(m) = Model::load(&s.engine) else {
+                let Some(m) = Model::open(&s.engine) else {
                     let _ = tx.send(false);
                     return;
                 };
@@ -457,6 +457,7 @@ pub fn status(model: usize) -> Value {
     let p = &st.prefill;
     let o = &m.served.engine;
     json!({
+        "loaded": m.model.loaded(),
         "phase": if st.phase.is_empty() { "idle" } else { st.phase },
         "phase_seconds": round(st.since.map_or(0.0, |t| (now - t).as_secs_f64()), 1), "decoding": st.active,
         "request": st.request, "prompt_tokens": st.prompt, "reused_tokens": st.reused, "generated_tokens": st.generated,
@@ -707,15 +708,6 @@ impl Worker {
             .map(|(index, m)| {
                 let model = m.model.clone();
                 let served = m.served.clone();
-                engine::log(&format!(
-                    "{}: shares the {:.1} GiB KV budget; a state takes {:.0} MiB at first, {:.2} GiB at {} tokens; a snapshot {:.1} MiB",
-                    served.id,
-                    s.budgets.kv_gb,
-                    model.state_bytes(std::ptr::null(), 0) as f64 / 1048576.0,
-                    model.state_bytes(std::ptr::null(), served.engine.ctx as usize) as f64 / GIB,
-                    served.engine.ctx,
-                    model.snapshot_bytes(true) as f64 / 1048576.0
-                ));
                 Slot {
                     index,
                     ctx: served.engine.ctx as usize,
@@ -866,6 +858,15 @@ impl Slot {
                 engine::log(&format!("req {}: client gone while waiting", job.id));
                 end_waiting(job, Finish::Cancelled);
             } else {
+                if !self.model.loaded() {
+                    self.set_status(s, "loading");
+                    if !self.model.load() {
+                        refuse(job, "the model could not be loaded");
+                        continue;
+                    }
+                    self.per_row = self.model.stats().experts_per_row.max(0) as usize;
+                    engine::log(&format!("{}: loaded; shares the {:.1} GiB KV budget", self.served.id, s.budgets.kv_gb));
+                }
                 self.waiting_start(s, job, memory);
             }
         }
