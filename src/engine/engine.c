@@ -172,11 +172,9 @@ void myds4_finish(myds4_model *m) {
 int myds4_idle(myds4_model *m) {
   if (!atomic_load_explicit(&m->loaded, memory_order_acquire)) return 0;
   memory_scope(&m->m->work);
-  // the expert cache (io.c) is the slots of the model with routed experts;
-  // another model's idle returns 0 and leaves the cache as it is
   ModelCounters c;
   m->ops->counters(&c);
-  int before = c.experts_per_row ? cache_slots() : 0, after = m->ops->idle();
+  int before = c.cache_slots, after = m->ops->idle();
   if (after < before) say("idle: memory short, expert cache %d -> %d slots", before, after);
   return after;
 }
@@ -369,6 +367,8 @@ void myds4_refresh_stats(void) {
     .swapouts = mi.swapouts, .pressure = mi.pressure};
 }
 
+uint64_t myds4_reclaim(uint64_t bytes) { return memory_reclaim(bytes); }
+
 void myds4_stats_get(const myds4_model *m, myds4_stats *s) {
   ModelCounters c = {0};
   if (atomic_load_explicit(&m->loaded, memory_order_acquire)) m->ops->counters(&c);
@@ -386,13 +386,12 @@ void myds4_stats_get(const myds4_model *m, myds4_stats *s) {
   MemoryUsage memory = memory_usage();
   s->model_memory_limit = memory.limit; s->model_memory_used = memory.allocated;
   s->model_memory_committed = memory.committed; s->model_memory_peak = memory.peak;
-  s->kv_allocated = memory.kv; s->model_workspace = m->m->work.payload;
-  if (c.experts_per_row) {  // the expert cache serves this model
-    s->cache = counts(&cache_stats);
-    s->slots = cache_slots(), s->mapped = cache_mapped(), s->cap = cache_cap(), s->max_slots = cache_max();
-    s->experts = c.layers * EXPERTS, s->slot_bytes = cache_slot_bytes(), s->cache_bytes = cache_bytes();
-    s->uncached_bytes = cache_uncached_bytes(&s->uncached);
-  }
+  s->kv_allocated = memory.kv;
+  s->model_workspace = m->m->memory.bytes - c.dense_bytes - c.cache_bytes;
+  s->cache = counts(&c.cache);
+  s->slots = c.cache_slots; s->mapped = c.mapped; s->cap = c.cap; s->max_slots = c.max_slots;
+  s->experts = c.experts; s->slot_bytes = c.slot_bytes; s->cache_bytes = c.cache_bytes;
+  s->uncached_bytes = c.uncached_bytes; s->uncached = c.uncached;
 }
 
 // ---- tokenizers, from any thread ----

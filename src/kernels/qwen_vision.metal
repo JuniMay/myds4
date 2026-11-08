@@ -9,8 +9,13 @@ kernel void qwen_embed_rows(device const ushort *embedding [[buffer(0)]], device
 }
 
 kernel void qv_pack(device const float *x [[buffer(0)]], device bfloat *y [[buffer(1)]],
-                    constant uint3 &p [[buffer(2)]], uint2 i [[thread_position_in_grid]]) {
-  if (i.x < p.y) y[(size_t)i.y * p.y + i.x] = i.y < p.z && i.x < p.x ? bfloat(x[(size_t)i.y * p.x + i.x]) : bfloat(0);
+                    constant uint4 &p [[buffer(2)]], uint2 i [[thread_position_in_grid]]) {
+  float value = i.y < p.z && i.x < p.x ? x[(size_t)i.y * p.x + i.x] : 0;
+  if (p.w) {
+    float scale = pow2_scale(max(simd_max(fabs(value)), 0x1p-126f), 1.0f / 448.0f);
+    value = e4m3(clamp(value / scale, -448.0f, 448.0f)) * scale;
+  }
+  if (i.x < p.y) y[(size_t)i.y * p.y + i.x] = bfloat(value);
 }
 
 kernel void qv_bias(device float *x [[buffer(0)]], device const bfloat *bias [[buffer(1)]],

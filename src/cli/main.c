@@ -14,7 +14,7 @@
 
 static void usage(void) {
   fputs("usage: myds4 -m MODEL [-p PROMPT | -f FILE | --tokens IDS] [options]\n"
-        "  -m MODEL      a checkpoint directory: DeepSeek V4.1 Flash, or a Qwen3.8 qwen3_5 model\n"
+        "  -m MODEL      a supported DeepSeek or Qwen checkpoint directory\n"
         "  -n N          tokens to generate (default 128)\n"
         "  -t T, --temperature T  sampling temperature, 0 = greedy (default 0)\n"
         "  --top-p P     nucleus probability in [0, 1] (default 1, full distribution)\n"
@@ -81,7 +81,9 @@ static double sampling_option(const char *name, const char *value, double upper)
 }
 
 // Whether the model reads routed experts through the expert cache.
-static int cached(void) { return cache_slots() > 0; }
+static ModelCounters counters(void) { ModelCounters c; model->ops->counters(&c); return c; }
+static int cached(void) { return counters().experts_per_row > 0; }
+static uint64_t model_cache_bytes(void) { return model->ops->cache_bytes ? model->ops->cache_bytes() : 0; }
 
 int main(int argc, char **argv) {
   // Interactive work: the scheduler and the GPU's arbitration favor it over
@@ -287,7 +289,7 @@ int main(int argc, char **argv) {
     ops->image(&ims[i]);
     fprintf(stderr, "image %s: %d x %d patches, %d tokens, encoded in %.2f s\n", image_path[i], ims[i].vh, ims[i].vw,
             image_span(&ims[i]), now() - t);
-    if (vision_fd >= 0 && write(vision_fd, ims[i].rows, (size_t)ims[i].th * ims[i].tw * DIM * 2) < 0)
+    if (vision_fd >= 0 && write(vision_fd, ims[i].rows, (size_t)ims[i].ntokens * ims[i].embedding_width * 2) < 0)
       die("vision: write failed");
   }
   if (vision_fd >= 0) return complete();
@@ -363,7 +365,7 @@ int main(int argc, char **argv) {
     const float *lg = prefill > 1 ? ops->prefill(st, tokens, prefill, 0, 0, -1, 0, 0) : 0; // after token prefill - 1
     double nll = 0, t0 = now();
     int top = 0, steps = 0, scored = 0;
-    CacheStats c0 = cache_stats;
+    CacheStats c0 = counters().cache;
     for (int i = prefill; i < n && !shutdown_requested(); i++, lg = 0) {
       int p = i - 1;
       if (!lg) lg = ops->rows(&st, tokens + p, &p, 1), steps++;
@@ -380,20 +382,20 @@ int main(int argc, char **argv) {
              scored, top);
     else if (shutdown_requested()) fprintf(stderr, "perplexity interrupted before scoring\n");
     fprintf(stderr, "%.2f tokens/s; %.1f experts substituted per token\n", steps / (now() - t0),
-            (cache_stats.substituted - c0.substituted) / (double)(steps ? steps : 1));
+            (counters().cache.substituted - c0.substituted) / (double)(steps ? steps : 1));
     if (cached()) cache_metrics_report(stderr);
     return complete();
   }
   Sampler sampler = {.temp = temp, .top_p = top_p};
   if (seed_set) sampler_seed(&sampler, seed);
   else arc4random_buf(sampler.seed, sizeof sampler.seed);
-  CacheStats c0 = cache_stats;
+  CacheStats c0 = counters().cache;
   uint64_t swap0 = mem_swapouts(), comp0 = mem_compressions();
   double g0 = gpu_busy, t0 = now();
   const float *logits = ops->prefill(st, tokens, n, 0, 0, -1, 0, 0);
   if (ops->report) ops->report(stderr, 0, n);
   double t1 = now();
-  CacheStats c1 = cache_stats;
+  CacheStats c1 = counters().cache;
   const char *prof = getenv("MYDS4_PROFILE");
   if (!prof || strcmp(prof, "prefill")) gpu_profile_reset(); // a profile covers decoding, or the prefill
   double g1 = gpu_busy;
@@ -403,7 +405,7 @@ int main(int argc, char **argv) {
   lookup = o.lookup ? context_lookup_new(o.ctx) : NULL;
   if (o.lookup && (!lookup || !context_lookup_append(lookup, tokens, n))) die("cannot initialize context lookup");
   int lookup_attempts = 0, lookup_passes = 0, lookup_offered = 0, lookup_kept = 0;
-  uint64_t cache_start = cache_bytes(), cache_min = cache_start, cache_max = cache_start;
+  uint64_t cache_start = model_cache_bytes(), cache_min = cache_start, cache_max = cache_start;
   while (gen < ntokens && pos < o.ctx && !ops->stop(t) && !shutdown_requested()) {
     // A verification pass runs the current token and its proposed successors.
     // Target samples confirm a prefix and supply the next token, consuming
@@ -443,7 +445,7 @@ int main(int argc, char **argv) {
       if (lookup) context_lookup_feedback(lookup, k, a);
       lookup_kept += a;
     }
-    uint64_t current_cache = cache_bytes();
+    uint64_t current_cache = model_cache_bytes();
     if (current_cache < cache_min) cache_min = current_cache;
     if (current_cache > cache_max) cache_max = current_cache;
     int i = 0;
@@ -470,7 +472,8 @@ int main(int argc, char **argv) {
   if (o.lookup)
     fprintf(stderr, "{\"context_lookup\":{\"attempts\":%d,\"passes\":%d,\"offered\":%d,\"accepted\":%d}}\n",
             lookup_attempts, lookup_passes, lookup_offered, lookup_kept);
-  CacheStats c2 = cache_stats;
+  ModelCounters final_counts = counters();
+  CacheStats c2 = final_counts.cache;
   double g2 = gpu_busy;
   fputc('\n', stdout);
   if (cached()) {
@@ -490,7 +493,7 @@ int main(int argc, char **argv) {
             "compressed by the system meanwhile, this process's memory compressed at most %.0f MiB\n",
             n, t1 - t0, n / (t1 - t0), 100 * hit1, (c1.bytes - c0.bytes) / 1e9, c1.read_s - c0.read_s, g1 - g0, gen,
             t2 - t1, gen / (t2 - t1), 100 * hit2, (c2.bytes - c1.bytes) / 1e9, c2.read_s - c1.read_s, g2 - g1,
-            cache_slots(), cache_bytes() / (1024.0 * 1024 * 1024), (unsigned long long)c2.evictions,
+            final_counts.cache_slots, final_counts.cache_bytes / (1024.0 * 1024 * 1024), (unsigned long long)c2.evictions,
             mem_available() / (1024.0 * 1024 * 1024), mem_footprint() / (1024.0 * 1024 * 1024),
             mem_gpu() / (1024.0 * 1024 * 1024), (unsigned long long)(mem_swapouts() - swap0),
             (unsigned long long)(mem_compressions() - comp0), mem_compressed(1) / (1024.0 * 1024));

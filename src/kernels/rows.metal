@@ -37,7 +37,8 @@ kernel void rms_norm(device const float *x [[buffer(0)]], device const float *w 
     float v = xr[i] * r * w[i];
     if (p.gate) {
       float g = z[(size_t)row * p.n + i];
-      v *= g * sigm(g);
+      if (p.gate == 2) v = bf(bf(xr[i] * r) * w[i]) * sigm(g);
+      else v *= g * sigm(g);
     }
     yr[i] = v;
   }

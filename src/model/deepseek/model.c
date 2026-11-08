@@ -3519,6 +3519,11 @@ static void ds_counters(ModelCounters *c) {
                        .decode_gpu_seconds = decode_gpu_s, .prefill_layer = prefill_layer, .prefill_rows_now = prefill_n,
                        .layers = LAYERS, .experts_per_row = LAYERS * TOPK, .dense_bytes = weights_resident_bytes(core_weights) + weights_resident_bytes(vision_weights),
                        .decode = decode_stats, .prefill = prefill_stats};
+  c->cache = cache_stats;
+  c->cache_bytes = cache_bytes(); c->slot_bytes = cache_slot_bytes();
+  c->cache_slots = cache_slots(); c->mapped = cache_mapped();
+  c->cap = cache_cap(); c->max_slots = cache_max(); c->experts = LAYERS * EXPERTS;
+  c->uncached_bytes = cache_uncached_bytes(&c->uncached);
 }
 
 static void ds_plan(ModelPlan *p) {
@@ -3590,7 +3595,7 @@ static int ds_prepare_image(const char *dir, Image *im, const void *data, size_t
 
 const ModelOps deepseek_ops = {
     .family = "DeepSeek V4.1", .model_types = ds_types, .image_token = "<｜deepseek_image｜>", .refuse = ds_refuse,
-    .load = ds_load, .weight_slot = ds_weight_slot, .active = cache_active, .counters = ds_counters, .plan = ds_plan, .routes = deepseek_routes, .vocab = ds_vocab,
+    .load = ds_load, .weight_slot = ds_weight_slot, .active = cache_active, .counters = ds_counters, .cache_bytes = cache_bytes, .plan = ds_plan, .routes = deepseek_routes, .vocab = ds_vocab,
     .max_rows = ds_max_rows, .max_verify = ds_max_verify, .draft_block = ds_draft_block, .rewind = ds_rewind,
     .prefill_rows = ds_prefill_rows,
     .stop = ds_stop, .state_new = ds_state_new, .state_free = ds_state_free, .state_bytes = ds_state_bytes,

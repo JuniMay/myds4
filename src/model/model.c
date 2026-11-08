@@ -5,7 +5,7 @@
 
 #include "model.h"
 
-static const ModelOps *const families[] = {&deepseek_ops, &qwen_ops};
+static const ModelOps *const families[] = {&deepseek_ops, &qwen_ops, &flash_ops};
 
 const ModelOps *model_find(const char *dir) {
   char path[1024];

@@ -45,13 +45,19 @@ of each architecture per process.
 | `batch` | Maximum admitted requests for this model; default 4, capped at 6 for DeepSeek and 8 for Qwen. |
 | `temperature`, `top_p`, `top_k`, `seed` | Defaults for requests that omit them or send null. Request values override them. `top_k: 0` uses the full vocabulary. |
 | `think` | Default reasoning effort, 0 for off and 1–100 for enabled reasoning. |
-| `draft` | Native speculative proposals: DeepSeek DSpark 0–5; Qwen chained MTP 0–5. |
+| `draft` | Native speculative proposals: DeepSeek DSpark 0–5; Qwen3.8-27B chained MTP 0–5. Flash-Next currently requires 0. |
 | `lookup` | `off` or 1–15 context-copy proposals, limited by the model's verification capacity. |
 
 Qwen's generation configuration supplies sampling defaults when the entry
 omits them. Set temperature and top-p explicitly to 1 when that is the
 wanted policy. A batch limit is a concurrency cap, not a promise that all
 requests fit at their maximum context length.
+
+Flash-Next uses the same model entry and Qwen chat format. Its supported
+checkpoint types are `qwen4_exp` and `qwen4_exp_text`. It supports images
+when the checkpoint contains the vision encoder. Set `draft: 0` and
+`lookup: "off"`; speculative verification is not implemented for this
+architecture. Its routed experts share the global `memory` budget.
 
 DeepSeek-specific settings belong only to its entry:
 

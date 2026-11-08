@@ -156,6 +156,42 @@ reference diagnostic retains a stricter 30 dB SNR and 0.999 cosine threshold;
 not every image currently meets it. Image support should not be described
 as bitwise equivalent to the CPU reference. Video input is not implemented.
 
+## Qwen3.8 Flash-Next
+
+Flash-Next uses 48 text layers, width 2,560 and four residual streams.
+Gated hyper-connections mix those streams before attention and feed-forward
+work. There are 36 DeltaNet layers and 12 sparse-attention layers. Each
+layer selects 10 of 512 routed experts and also evaluates a shared expert.
+The second layer adds the checkpoint's hashed n-gram embeddings and their
+convolution state.
+
+The engine reads NVFP4 expert weights and decodes their compressed scale
+bytes losslessly. Dense MXFP8 projections use groups of 32 values. Routed
+NVFP4 products quantize activations with the checkpoint's input scales.
+Text buffers carry BF16-rounded values between operators; recurrent state
+and reductions use FP32. The DeltaNet output gate is sigmoid.
+
+Sparse attention scores complete groups of four historical keys. It
+selects at most 512 groups and includes the incomplete causal tail. The
+state retains BF16 attention keys and values, compressed index keys,
+positions, recurrent matrices, convolution histories and n-gram history.
+Snapshots retain the rolling state needed to fork a conversation.
+
+Experts are independent entries in the shared model-memory pool. Selected
+experts stay pinned through their GPU work; their backbone is retained
+until its dependent entries have been released. The initial implementation
+loads selected misses before executing each layer's routed work. It does
+not yet overlap these loads with expert computation. Prefill uses adaptive
+chunks of up to 128 rows. Decoding batches up to eight request rows.
+Flash-Next MTP and context-copy verification are not implemented.
+
+The shared Qwen vision encoder reconstructs its quantized matrices in BF16
+when an image first loads the encoder. Those weights and its workspace
+remain inside the model-memory budget. MXFP8 activation quantization can
+amplify small differences in BF16 rounding across blocks. Reference checks
+therefore compare each block on identical inputs as well as final image
+features. Image outputs are not bitwise equal to the CPU reference.
+
 ## Prompt formats and sampling
 
 Chat adapters translate standard API messages and tools to each model's

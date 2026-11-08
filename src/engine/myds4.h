@@ -58,7 +58,7 @@ void json_free(Json *root); // releases the tree and its strings
 typedef struct { // one tensor of the checkpoint
   int fd;
   uint64_t off, size;
-  int dtype;  // 'b' bf16, 'f' f32, '8' fp8 e4m3, 'e' e8m0, 'i' packed e2m1 (I8), 'u' U8 (packed NVFP4)
+  int dtype;  // 'b' BF16, 'f' F32, '8' E4M3, 'e' E8M0, 'i' I8, 'u' U8, 'U' U32, 'l' I64
   int64_t shape[4];
   int ndim;
 } Tensor;

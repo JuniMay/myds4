@@ -140,11 +140,29 @@ static void host_and_gpu_payloads_share_the_budget(void) {
   CHECK(memory_usage().allocated == 0 && memory_usage().kv == 0 && memory_usage().committed == 0);
 }
 
+static void ram_reserve_reclaims_idle_entries(void) {
+  memory_init(120);
+  MemoryAccount moe, dense;
+  memory_account_init(&moe, "MoE"); memory_account_init(&dense, "dense");
+  Entry core, a, b, fixed;
+  entry(&core, &moe, NULL, 20, 1); core.slot.touched = -1000;
+  entry(&a, &moe, &core, 8, 2); entry(&b, &moe, &core, 12, 3);
+  entry(&fixed, &dense, NULL, 60, 4); memory_pin(&fixed.slot, 1);
+  uint64_t peak = memory_usage().peak;
+  CHECK(memory_reclaim(19) == 20);
+  CHECK(a.evicted == 1 && b.evicted == 1 && core.evicted == 0);
+  CHECK(memory_reclaim(100) == 20);
+  CHECK(core.evicted == 1 && fixed.evicted == 0 && order[2] == 1);
+  CHECK(memory_usage().allocated == 60 && memory_usage().peak == peak);
+  CHECK(memory_reclaim(1) == 0);
+}
+
 int main(void) {
   void (*cases[])(void) = {different_sizes_and_dependency_order, dense_weights_are_one_entry,
     pinned_entries_and_kv_are_separate, active_minimum_cannot_overcommit,
     speculative_reads_do_not_evict_weights, combined_admission_refuses_without_partial_eviction,
-    cached_bytes_can_fund_a_promised_workspace, host_and_gpu_payloads_share_the_budget};
+    cached_bytes_can_fund_a_promised_workspace, host_and_gpu_payloads_share_the_budget,
+    ram_reserve_reclaims_idle_entries};
   int failed = 0;
   for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
     pid_t child = fork();

@@ -218,39 +218,79 @@ def vision_reference(directory, image_bytes, binary):
     if len(image_bytes) > 8 * 1024 * 1024:
         raise ValueError("reference image exceeds 8 MiB")
     root = Path(directory)
-    config = Qwen3_5VisionConfig(**json.loads((root / "config.json").read_text())["vision_config"])
+    settings = json.loads((root / "config.json").read_text())
+    flash = settings['model_type'] == 'qwen4_exp'
+    if flash:
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpVisionConfig, Qwen4ExpVisionModel
+        from flash import Checkpoint, Linear, assign
+        config_class, model_class = Qwen4ExpVisionConfig, Qwen4ExpVisionModel
+    else:
+        config_class, model_class = Qwen3_5VisionConfig, Qwen3_5VisionModel
+    config = config_class(**settings['vision_config'])
     config._attn_implementation = "sdpa"
     torch.set_num_threads(4)
     processor = AutoImageProcessor.from_pretrained(root, backend="pil", local_files_only=True)
     inputs = processor(images=Image.open(io.BytesIO(image_bytes)).convert("RGB"), return_tensors="pt")
     index = json.loads((root / "model.safetensors.index.json").read_text())["weight_map"]
     with torch.device("meta"):
-        model = Qwen3_5VisionModel(config)
+        model = model_class(config)
     # Non-persistent RoPE buffers are computed on the CPU by the reference
     # constructor; checkpoint parameters are assigned without random weights.
     model.rotary_pos_emb = type(model.rotary_pos_emb)(config)
     state = {}
-    for shard in sorted({v for k, v in index.items() if k.startswith("model.visual.")}):
-        with safe_open(root / shard, framework="pt", device="cpu") as weights:
-            for name in weights.keys():
-                if name.startswith("model.visual."):
-                    state[name[len("model.visual."):]] = weights.get_tensor(name)
-    model.load_state_dict(state, assign=True, strict=True)
+    if flash:
+        checkpoint = Checkpoint(root)
+        for name, child in list(model.named_modules()):
+            if isinstance(child, torch.nn.Linear):
+                parent, _, key = name.rpartition('.')
+                setattr(model.get_submodule(parent) if parent else model, key, Linear(checkpoint, 'model.visual.' + name))
+        for name, parameter in list(model.named_parameters()):
+            if parameter.is_meta:
+                assign(model, name, checkpoint.tensor('model.visual.' + name))
+    else:
+        for shard in sorted({v for k, v in index.items() if k.startswith("model.visual.")}):
+            with safe_open(root / shard, framework="pt", device="cpu") as weights:
+                for name in weights.keys():
+                    if name.startswith("model.visual."):
+                        state[name[len("model.visual."):]] = weights.get_tensor(name)
+        model.load_state_dict(state, assign=True, strict=True)
     model.eval()
+    metadata = []
+    if flash:
+        patches = int(inputs['image_grid_thw'].prod(-1).sum())
+        if patches > 1024:
+            raise ValueError('per-block vision reference checks allow at most 1024 patches')
+        for block in model.blocks:
+            block.register_forward_pre_hook(lambda m, a, k: metadata.append(dict(k)), with_kwargs=True)
     began = time.monotonic()
     with torch.inference_mode():
         expected = model(inputs["pixel_values"].to(torch.bfloat16), inputs["image_grid_thw"]).pooler_output.float().numpy().copy()
     cpu_seconds = time.monotonic() - began
     grid = inputs["image_grid_thw"].tolist()
-    del model, state, inputs
+    del state, inputs
     gc.collect()
 
     ready = wait_for_gpu(24, 60, reserve_gib=10)
-    result = guarded_process([str(binary), str(root), "1"], os.environ.copy(), 120,
+    command = [str(binary), str(root), '1'] + (['trace'] if flash else [])
+    result = guarded_process(command, os.environ.copy(), 120,
                              ready["samples"][-1]["memory"], input_data=image_bytes, allow_cpu_helpers=True)
     if result.returncode:
         raise RuntimeError(result.stderr.decode(errors="replace")[-2000:])
     raw = result.stdout
+    local_snr = []
+    if flash:
+        count = patches * config.hidden_size
+        trace_bytes = (config.depth + 1) * count * 4
+        trace = numpy.frombuffer(raw[:trace_bytes], dtype='<f4').reshape(config.depth + 1, patches, config.hidden_size)
+        with torch.inference_mode():
+            for layer in range(config.depth):
+                given = torch.from_numpy(trace[layer].copy()).to(torch.bfloat16)
+                reference = model.blocks[layer](given, **metadata[layer]).float().numpy()
+                difference = trace[layer + 1].astype(numpy.float64) - reference
+                local_snr.append(float(10 * numpy.log10(numpy.square(reference).sum() /
+                                                        max(numpy.square(difference).sum(), 1e-300))))
+        raw = raw[trace_bytes:]
+    del model
     size = expected.size * 2
     if len(raw) < size:
         raise RuntimeError("native vision output is truncated")
@@ -262,10 +302,16 @@ def vision_reference(directory, image_bytes, binary):
     noise = numpy.square(error).sum()
     snr = float(10 * numpy.log10(signal / max(noise, 1e-300)))
     cosine = float(numpy.dot(actual.ravel(), expected.ravel()) / (numpy.linalg.norm(actual) * numpy.linalg.norm(expected)))
-    print(json.dumps({"reference": "Hugging Face Qwen3_5VisionModel, CPU BF16 SDPA", "grid": grid,
+    print(json.dumps({"reference": model_class.__name__ + ", CPU BF16 SDPA", "grid": grid,
                       "shape": list(expected.shape), "snr_db": snr, "cosine": cosine,
                       "max_abs_error": float(numpy.max(numpy.abs(error))), "reference_seconds": cpu_seconds}))
-    if snr < 30 or cosine < 0.999:
+    if flash:
+        print(json.dumps({'block_snr_db': local_snr}))
+        # MXFP8 activations can cross quantization boundaries after BF16 rounding.
+        # Check every block on the same input as well as the accumulated output.
+        if min(local_snr) < 45 or snr < 20 or cosine < 0.995:
+            raise RuntimeError('quantized vision block or complete features differ beyond tolerance')
+    elif snr < 30 or cosine < 0.999:
         raise RuntimeError("vision features differ beyond the reference check's tolerance")
 
 

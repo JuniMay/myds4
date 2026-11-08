@@ -7,6 +7,7 @@
 #include "model.h"
 #include "vision.h"
 #include "../weights.h"
+#include "../linear.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -21,13 +22,7 @@
 #define PF QWEN_PREFILL
 #define BLK 256  // positions per attention block (gqa.metal's BLK)
 
-// A matrix: NVFP4 ('n': codes and E4M3 scales), FP8 ('8') or BF16 ('b'),
-// times scale.
-typedef struct {
-  Buf w, s;
-  float scale;
-  int rows, cols, kind;
-} Mat;
+typedef Linear Mat;
 
 typedef struct {
   int linear, index;  // DeltaNet or attention layer, and its index among those
@@ -72,7 +67,7 @@ static Buf QH;  // a prompt pass's queries as FP16, by head
 static Buf PART, ML;  // attention blocks' partial sums, for states of up to `blocks` * BLK positions
 static int blocks;
 static int workspace_rows;
-static int K_mv1[3], K_mvr[3], K_mm[3], K_gate_up[3], K_add_norm, K_x_bf16, K_concat, K_q_half, K_attend_prompt, K_embed, K_rms_norm, K_l2_norm, K_conv, K_gdn_gates, K_gdn, K_qk_rope, K_kv_store, K_attend_block,
+static int K_gate_up[3], K_add_norm, K_concat, K_q_half, K_attend_prompt, K_embed, K_rms_norm, K_l2_norm, K_conv, K_gdn_gates, K_gdn, K_qk_rope, K_kv_store, K_attend_block,
     K_attend_combine, K_swiglu, K_add;
 
 struct QwenState {
@@ -100,28 +95,11 @@ typedef struct {
 static_assert(sizeof(Seq) == 72);
 
 static uint64_t image_embedding(int pos) {
-  for (int i = 0; i < image_count; i++) {
-    const Image *im = &images[i];
-    int row = pos - im->start;
-    if (row >= 0 && row < im->ntokens && im->features.obj)
-      return im->features.gpu + (size_t)row * im->embedding_width * 2;
-  }
-  die("no image embedding at position %d", pos);
+  return qwen_image_embedding(images, image_count, pos);
 }
 
 static void positions(Seq *row, const QwenState *state, int pos, int prompt) {
-  int delta = prompt ? 0 : state->rope_delta;
-  if (prompt) for (int i = 0; i < image_count; i++) {
-    const Image *im = &images[i];
-    if (pos < im->start) break;
-    if (pos < im->start + im->ntokens) {
-      int at = pos - im->start, base = im->start + delta;
-      row->rope_t = base, row->rope_h = base + at / im->tw, row->rope_w = base + at % im->tw;
-      return;
-    }
-    delta += (im->th > im->tw ? im->th : im->tw) - im->ntokens;
-  }
-  row->rope_t = row->rope_h = row->rope_w = pos + delta;
+  qwen_image_positions(images, image_count, pos, state->rope_delta, prompt, &row->rope_t);
 }
 
 // The engine's buffers, so that an idle model can leave the GPU's residency
@@ -170,37 +148,7 @@ static void vec(Buf *target, const char *name, float add) {
   weights_vector(dense, target, st_get(checkpoint, "%s", name), add, WEIGHT_ADD);
 }
 
-static float scalar(const char *name) {
-  Tensor t = st_get(checkpoint, "%s", name);
-  float v;
-  if (t.dtype != 'f' || t.size != 4 || pread(t.fd, &v, 4, (off_t)t.off) != 4) die("%s is not an FP32 scalar", name);
-  return v;
-}
-
-static void mat(Mat *matrix, const char *stem) {
-  char name[256];
-  snprintf(name, sizeof name, "%s.weight", stem);
-  Tensor tensor = st_get(checkpoint, "%s", name);
-  *matrix = (Mat){.rows = (int)tensor.shape[0], .scale = 1};
-  if (tensor.dtype == 'u') {
-    matrix->kind = 'n', matrix->cols = (int)tensor.shape[1] * 2;
-    upload(&matrix->w, tensor);
-    snprintf(name, sizeof name, "%s.weight_scale", stem);
-    upload(&matrix->s, st_get(checkpoint, "%s", name));
-    snprintf(name, sizeof name, "%s.weight_scale_2", stem);
-    matrix->scale = scalar(name);
-  } else if (tensor.dtype == '8') {
-    matrix->kind = '8', matrix->cols = (int)tensor.shape[1];
-    upload(&matrix->w, tensor);
-    snprintf(name, sizeof name, "%s.weight_scale", stem);
-    matrix->scale = scalar(name);
-  } else if (tensor.dtype == 'b') {
-    matrix->kind = 'b', matrix->cols = (int)tensor.shape[1];
-    upload(&matrix->w, tensor);
-  } else die("%s: unsupported weight type", name);
-  if (matrix->cols % 512 || matrix->rows % 4)
-    die("%s: %d x %d, not 4-row and 512-column multiples", name, matrix->rows, matrix->cols);
-}
+static void mat(Mat *matrix, const char *stem) { linear_load(dense, matrix, checkpoint, stem); }
 
 static Buf zeros(size_t n) {
   Buf b = own(gpu_alloc(n));
@@ -301,12 +249,10 @@ static void prepare(const char *dir, int drafts) {
   if (!types || types->type != J_ARR || types->n != c.layers) die("%s: no layer_types", path);
 
   gpu_start();
-  K_mv1[0] = gpu_kernel("mv1_nvfp4"), K_mv1[1] = gpu_kernel("mv1_fp8"), K_mv1[2] = gpu_kernel("mv1_bf16");
-  K_mvr[0] = gpu_kernel("mvr_nvfp4"), K_mvr[1] = gpu_kernel("mvr_fp8"), K_mvr[2] = gpu_kernel("mvr_bf16");
+  linear_init();
   K_gate_up[0] = gpu_kernel("gate_up_nvfp4"), K_gate_up[1] = gpu_kernel("gate_up_fp8"), K_gate_up[2] = gpu_kernel("gate_up_bf16");
   K_add_norm = gpu_kernel("add_norm");
-  K_mm[0] = gpu_kernel("gemm_nvfp4"), K_mm[1] = gpu_kernel("gemm_fp8"), K_mm[2] = gpu_kernel("gemm_bf16");
-  K_x_bf16 = gpu_kernel("x_bf16"), K_concat = gpu_kernel("concat");
+  K_concat = gpu_kernel("concat");
   K_q_half = gpu_kernel("gqa_q_half"), K_attend_prompt = gpu_kernel("gqa_prompt");
   K_embed = gpu_kernel("qwen_embed_rows"), K_rms_norm = gpu_kernel("rms_norm"), K_l2_norm = gpu_kernel("l2_norm");
   K_conv = gpu_kernel("conv"), K_gdn_gates = gpu_kernel("gdn_gates"), K_gdn = gpu_kernel("gdn");
@@ -563,26 +509,7 @@ static int nrows, prompt_pass;
 // y (rows of m->rows values) = m x for the n rows of x: in a prompt pass on
 // the matrix units, else with the row kernels.
 static void product(const Mat *m, const Buf *x, size_t xo, const Buf *y, size_t yo, int n, int staged) {
-  int f = m->kind == 'n' ? 0 : m->kind == '8' ? 1 : 2;
-  if (prompt_pass) {
-    uint32_t k = (uint32_t)m->cols, kl[2] = {k, k};  // x_bf16's row strides of XB and x; k % 512 == 0 (mat)
-    if (!staged) {
-      gpu_kern(K_x_bf16);
-      gpu_buf(0, x, xo), gpu_buf(1, &XB, 0), gpu_bytes(2, kl, sizeof kl);
-      gpu_go(k / 256, (uint32_t)n, 1, 64, 1, 1);
-    }
-    MMp p = {(uint32_t)n, (uint32_t)m->rows, k, 0, m->scale, 0, 0, 0};
-    gpu_kern(K_mm[f]);
-    gpu_buf(0, &m->w, 0), gpu_buf(1, m->kind == 'n' ? &m->s : &m->w, 0);
-    gpu_buf(2, &XB, 0), gpu_buf(3, y, yo), gpu_bytes(4, &p, sizeof p);
-    gpu_go((uint32_t)(m->rows + 63) / 64, (uint32_t)(n + 127) / 128, 1, 128, 1, 1);
-    return;
-  }
-  Mv p = {(uint32_t)m->rows, (uint32_t)m->cols, (uint32_t)n, m->scale};
-  gpu_kern(n == 1 ? K_mv1[f] : K_mvr[f]);
-  gpu_buf(0, &m->w, 0), gpu_buf(1, m->kind == 'n' ? &m->s : &m->w, 0);
-  gpu_buf(2, x, xo), gpu_buf(3, y, yo), gpu_bytes(4, &p, sizeof p);
-  gpu_go((uint32_t)(m->rows + 7) / 8, 1, 1, 256, 1, 1);
+  linear_product(m, x, xo, y, yo, n, prompt_pass, &XB, staged);
 }
 
 static void mv(const Mat *m, const Buf *x, size_t xo, const Buf *y, size_t yo, int n) {

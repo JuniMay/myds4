@@ -14,7 +14,7 @@ struct Seq {
   int rope_t, rope_h, rope_w, pad;
 };
 
-struct Conv { uint channels, n, layer, pad; };
+struct Conv { uint channels, n, layer, bf16; };
 
 // The causal depthwise convolution (kernel 4) of channel c over the rows'
 // projected q, k and v, then silu. A sequence's 3 previous inputs move on by
@@ -36,7 +36,8 @@ kernel void conv(device const float *in [[buffer(0)]], device float *out [[buffe
     }
     float x = in[(size_t)t * C + c];
     float v = w0 * s0 + w1 * s1 + w2 * s2 + w3 * x;
-    out[(size_t)t * C + c] = v * sigm(v);
+    if (p.bf16) v = bf(v);
+    out[(size_t)t * C + c] = p.bf16 ? bf(v * sigm(v)) : v * sigm(v);
     s0 = s1, s1 = s2, s2 = x;
     if (rows[t].conv_save) {
       device float *sv = rows[t].conv_save + lo;

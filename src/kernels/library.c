@@ -25,6 +25,8 @@ static const char source[] = {
 #embed "deltanet.metal"
     , '\n',
 #embed "gqa.metal"
+    , '\n',
+#embed "flash.metal"
 };
 
 void gpu_start(void) {

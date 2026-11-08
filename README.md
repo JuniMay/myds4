@@ -1,10 +1,10 @@
 # myds4
 
 Local inference on Apple silicon, with a C/Metal engine and a Rust HTTP
-server. The supported models are DeepSeek V4.1 Flash and Qwen3.8-27B in
-NVIDIA's NVFP4 format.
+server. The supported models are DeepSeek V4.1 Flash, Qwen3.8-27B NVFP4,
+and Qwen3.8 Flash-Next with NVFP4 experts and MXFP8 projections.
 
-The server can serve both models in one process. It registers their
+The server can serve these architectures in one process. It registers their
 metadata at startup and loads each model's weights on its first inference
 request. Every model has its own request queue and state; memory reserve
 and KV-cache budgets are shared. The model-memory ceiling covers all

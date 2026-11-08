@@ -7,7 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 
-typedef struct { Buf w, b; int rows, cols, stride; } Linear;
+typedef struct { Buf w, b; int rows, cols, stride, quantize; float scale; } Linear;
 typedef struct { Linear qkv, projection, up, down; Buf norm[2], bias[2]; } Block;
 enum { VX, VN, VQKV, VA, VF, VP, VR, VH, VB, WORK_BUFFERS };
 struct QwenVision {
@@ -21,6 +21,32 @@ struct QwenVision {
   Buf work[WORK_BUFFERS];
   int pack, bias, layernorm, heads_kernel, attention, gelu, add, positions;
 };
+
+uint64_t qwen_image_embedding(const Image *images, int count, int position) {
+  for (int i = 0; i < count; i++) {
+    int row = position - images[i].start;
+    if (row >= 0 && row < images[i].ntokens)
+      return images[i].features.gpu + (size_t)row * images[i].embedding_width * 2;
+  }
+  die("no image embedding at position %d", position);
+}
+
+void qwen_image_positions(const Image *images, int count, int position, int delta, int prompt, int32_t out[3]) {
+  if (prompt) {
+    delta = 0;
+    for (int i = 0; i < count; i++) {
+      const Image *im = images + i;
+      if (position < im->start) break;
+      if (position < im->start + im->ntokens) {
+        int at = position - im->start, base = im->start + delta;
+        out[0] = base; out[1] = base + at / im->tw; out[2] = base + at % im->tw;
+        return;
+      }
+      delta += (im->th > im->tw ? im->th : im->tw) - im->ntokens;
+    }
+  }
+  out[0] = out[1] = out[2] = position + delta;
+}
 
 static int number(const Json *config, const char *key, int fallback) {
   const Json *v = json_get(config, key);
@@ -133,9 +159,23 @@ static void linear(QwenVision *v, Linear *target, const char *prefix) {
   char name[256]; snprintf(name, sizeof name, "%s.weight", prefix);
   Tensor tensor = st_get(v->index, "%s", name);
   target->rows = (int)tensor.shape[0];
-  target->cols = (int)(tensor.size / 2 / target->rows);
+  target->cols = (int)(tensor.size / target->rows / (tensor.dtype == 'b' ? 2 : 1));
+  if (tensor.dtype == 'u') target->cols *= 2;
   target->stride = (target->cols + 63) / 64 * 64;
-  weight(v, &target->w, name, target->stride);
+  target->scale = 1;
+  if (tensor.dtype == 'b') weight(v, &target->w, name, target->stride);
+  else {
+    Tensor scales = st_get(v->index, "%s.weight_scale", prefix);
+    int kind = tensor.dtype == 'u' ? 'n' : scales.dtype == 'u' || scales.dtype == 'e' ? 'm' : '8';
+    target->quantize = kind == 'm';
+    if (kind == 'n') {
+      Tensor global = st_get(v->index, "%s.weight_scale_2", prefix);
+      if (pread(global.fd, &target->scale, 4, global.off) != 4) die("cannot read vision scale");
+    } else if (kind == '8') {
+      if (pread(scales.fd, &target->scale, 4, scales.off) != 4) die("cannot read vision scale");
+    }
+    weights_expanded(v->weights, &target->w, tensor, scales, kind, target->cols, target->stride);
+  }
   snprintf(name, sizeof name, "%s.bias", prefix); weight(v, &target->b, name, 0);
 }
 
@@ -167,11 +207,11 @@ static void load(QwenVision *v) {
 
 static void matrix(QwenVision *v, const Linear *l, const Buf *input, const Buf *out, int n, int packed) {
   if (!packed) {
-    uint32_t shape[3] = {(uint32_t)l->cols, (uint32_t)l->stride, (uint32_t)n};
+    uint32_t shape[4] = {(uint32_t)l->cols, (uint32_t)l->stride, (uint32_t)n, (uint32_t)l->quantize};
     gpu_kern(v->pack); gpu_buf(0, input, 0); gpu_buf(1, &v->work[VB], 0); gpu_bytes(2, shape, sizeof shape);
     gpu_go((l->stride + 255) / 256, (n + 127) / 128 * 128, 1, 256, 1, 1);
   }
-  struct { uint32_t m, n, k, pad; float scale; uint32_t pad2[3]; } p = {(uint32_t)n, (uint32_t)l->rows, (uint32_t)l->stride, 0, 1, {0}};
+  struct { uint32_t m, n, k, pad; float scale; uint32_t pad2[3]; } p = {(uint32_t)n, (uint32_t)l->rows, (uint32_t)l->stride, 0, l->scale, {0}};
   gpu_kern(gpu_kernel("gemm_bf16")); gpu_buf(0, &l->w, 0); gpu_buf(1, &l->w, 0);
   gpu_buf(2, packed ? input : &v->work[VB], 0); gpu_buf(3, out, 0); gpu_bytes(4, &p, sizeof p);
   gpu_go((l->rows + 63) / 64, (n + 127) / 128, 1, 128, 1, 1);
@@ -195,7 +235,7 @@ static void activate(QwenVision *v, const Buf *data, int n, int exact) {
   gpu_go((n + 255) / 256, 1, 1, 256, 1, 1);
 }
 
-int qwen_vision_encode(QwenVision *v, Image *im) {
+int qwen_vision_trace(QwenVision *v, Image *im, int trace_fd) {
   if (!v) die("checkpoint has no Qwen vision encoder");
   if (im->rows) return 1;
   load(v);
@@ -250,6 +290,7 @@ int qwen_vision_encode(QwenVision *v, Image *im) {
   uint32_t count = (uint32_t)n * width;
   gpu_kern(v->positions); gpu_buf(0, &v->work[VX], 0); gpu_buf(1, &v->work[VP], 0); gpu_bytes(2, &count, 4);
   gpu_go((count + 255) / 256, 1, 1, 256, 1, 1);
+  if (trace_fd >= 0) { gpu_commit(); gpu_sync(); write(trace_fd, v->work[VX].ptr, (size_t)n * width * 4); gpu_begin(); }
   for (int layer = 0; layer < v->depth; layer++) {
     Block *b = &v->blocks[layer];
     norm(v, &v->work[VX], &b->norm[0], &b->bias[0], &v->work[VN], n);
@@ -263,11 +304,12 @@ int qwen_vision_encode(QwenVision *v, Image *im) {
     norm(v, &v->work[VX], &b->norm[1], &b->bias[1], &v->work[VN], n);
     matrix(v, &b->up, &v->work[VN], &v->work[VF], n, 0); activate(v, &v->work[VF], n * v->intermediate, 0);
     matrix(v, &b->down, &v->work[VF], &v->work[VN], n, 0); add(v, &v->work[VX], &v->work[VN], n);
+    if (trace_fd >= 0) { gpu_commit(); gpu_sync(); write(trace_fd, v->work[VX].ptr, (size_t)n * width * 4); gpu_begin(); }
   }
   norm(v, &v->work[VX], &v->norm, &v->norm_bias, &v->work[VN], n);
   matrix(v, &v->merge[0], &v->work[VN], &v->work[VF], n / 4, 0); activate(v, &v->work[VF], n * width, 1);
   matrix(v, &v->merge[1], &v->work[VF], &v->work[VP], n / 4, 0);
-  uint32_t shape[3] = {(uint32_t)v->output, (uint32_t)v->output, (uint32_t)im->ntokens};
+  uint32_t shape[4] = {(uint32_t)v->output, (uint32_t)v->output, (uint32_t)im->ntokens, 0};
   gpu_kern(v->pack); gpu_buf(0, &v->work[VP], 0); gpu_buf(1, &im->features, 0); gpu_bytes(2, shape, sizeof shape);
   gpu_go((v->output + 255) / 256, im->ntokens, 1, 256, 1, 1);
   gpu_commit(); gpu_sync();
@@ -275,6 +317,8 @@ int qwen_vision_encode(QwenVision *v, Image *im) {
   memory_pin(weights, 0); memory_pin(&v->workspace, 0);
   return 1;
 }
+
+int qwen_vision_encode(QwenVision *v, Image *im) { return qwen_vision_trace(v, im, -1); }
 
 void qwen_vision_reside(QwenVision *v, int resident) {
   if (!v) return;

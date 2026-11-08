@@ -857,6 +857,7 @@ impl Worker {
             // Released expert pages can take a moment to reach the VM
             // counters. Do not free the same deficit twice in this turn.
             let deficit = reserve.saturating_sub(available).saturating_sub(released);
+            let deficit = deficit.saturating_sub(engine::reclaim(deficit));
             if deficit > 0 {
                 let (snaps, states) = self.memory.cache.reclaim(deficit);
                 self.memory.free(snaps, states);

@@ -61,6 +61,7 @@ MemorySlot *memory_scope(MemorySlot *slot);
 MemorySlot *memory_current(void);
 MemorySlot *memory_shared(void);
 uint64_t memory_room(const MemoryAccount *account);
+uint64_t memory_reclaim(uint64_t bytes); // release idle entries, respecting active allocations and dependencies
 void *memory_host_alloc(size_t bytes, int kv); // zeroed; null when the budget refuses it
 void *memory_host_required(size_t bytes, int kv);
 void *memory_host_resize(void *pointer, size_t bytes);

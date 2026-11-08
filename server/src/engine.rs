@@ -190,6 +190,7 @@ unsafe extern "C" {
     fn myds4_active(m: *mut RawModel, active: c_int);
     fn myds4_finish(m: *mut RawModel);
     fn myds4_idle(m: *mut RawModel) -> c_int;
+    fn myds4_reclaim(bytes: u64) -> u64;
     fn myds4_max_rows(m: *const RawModel) -> c_int;
     fn myds4_draft_block(m: *const RawModel) -> c_int;
     fn myds4_max_verify(m: *const RawModel) -> c_int;
@@ -351,6 +352,10 @@ pub fn refresh_stats() {
     unsafe { myds4_refresh_stats() };
 }
 
+pub fn reclaim(bytes: u64) -> u64 {
+    unsafe { myds4_reclaim(bytes) }
+}
+
 /// Requests the stop as SIGINT does (the worker notices it within a second,
 /// or at once through worker::request_stop).
 pub fn request_stop() {
@@ -382,7 +387,9 @@ impl Architecture {
             serde_json::from_slice(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         match config.get("model_type").and_then(serde_json::Value::as_str) {
             Some("deepseek_v41") => Ok(Architecture::DeepSeek),
-            Some("qwen3_5" | "qwen3_5_text") => Ok(Architecture::Qwen),
+            Some("qwen3_5" | "qwen3_5_text" | "qwen4_exp" | "qwen4_exp_text") => {
+                Ok(Architecture::Qwen)
+            }
             Some(t) => Err(format!(
                 "{}: model_type {t} is not one this server runs",
                 path.display()

@@ -704,6 +704,56 @@ fn vision_distinguishes_images_and_reuses_a_conversation_with_mtp() {
 }
 
 #[test]
+fn flash_images_and_reused_state() {
+    let Ok(dir) = std::env::var("MYDS4_FLASH") else {
+        return;
+    };
+    let _one = one_model();
+    let server = Server::start(
+        &dir,
+        &[
+            "--ctx",
+            "4096",
+            "--draft",
+            "0",
+            "--memory",
+            "32",
+            "--kv-cache",
+            "2",
+        ],
+    );
+    let red = "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGP4z8AARwzEcQCukw/x0F8jngAAAABJRU5ErkJggg==";
+    let blue = "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGNgYPiPhIjiAACOsw/xs6MvMwAAAABJRU5ErkJggg==";
+    for (image, color) in [(red, "red"), (blue, "blue")] {
+        let message = json!({"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{image}")}},
+            {"type": "text", "text": "What single color fills this image? Reply with the color name only."}
+        ]});
+        let reply = server.chat(&body(json!([message.clone()]), 16, false));
+        let answer = content(&reply);
+        assert!(
+            answer.to_lowercase().contains(color),
+            "{color} image: {answer}"
+        );
+        let followup = server.chat(&body(
+            json!([
+                message, {"role": "assistant", "content": answer},
+                {"role": "user", "content": "Repeat the color name."}
+            ]),
+            16,
+            false,
+        ));
+        assert!(content(&followup).to_lowercase().contains(color));
+        assert!(
+            followup["usage"]["prompt_cache_hit_tokens"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+        );
+    }
+}
+
+#[test]
 fn disabled_drafts_leave_mtp_unloaded() {
     let Some(dir) = checkpoint() else { return };
     let _one = one_model();

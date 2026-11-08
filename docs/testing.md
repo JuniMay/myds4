@@ -37,6 +37,8 @@ build/tests/tokenizer-reference /path/to/qwen tests/fixtures/tokenizer_qwen3_5.j
 
 `build/tests/memory` checks the shared budget, unequal entry sizes, active
 pins, expert-before-backbone eviction and separate KV storage.
+It also checks reclaiming idle entries for the shared RAM reserve without
+discarding pinned weights or inflating recorded peak memory.
 `build/tests/memory-model CHECKPOINT MEMORY_GIB` evicts a real model's
 weights, retains its KV state and compares every next-token logit after
 reloading. Its competing reservation is synthetic; it is a correctness
@@ -76,6 +78,19 @@ The vision check compares bounded activation and attention fixtures. Given
 a Qwen checkpoint argument it reads an image on stdin and encodes it.
 An optional output descriptor receives feature bytes; ordinary output is
 a short shape report.
+
+`build/tests/flash-model CHECKPOINT --long` checks a color response, complete
+logits after state restoration, and state forks beyond the sparse indexer's
+2,048-token selection budget. `tests/reference/flash.py --checkpoint DIR
+--layer N` compares a requested text block with Transformers using the same
+input and only that block's selected experts.
+
+The image reference mode in `tests/reference/qwen.py` also accepts Flash-Next.
+It keeps per-block traces in memory, limits those fixtures to 1,024 patches,
+and requires at least 45 dB SNR for each block on identical inputs. Its
+complete quantized-encoder limits are 20 dB SNR and 0.995 cosine similarity.
+These are numerical regression limits, not evidence of downstream image
+quality. The existing Qwen3.8-27B limits remain 30 dB and 0.999.
 
 For HTTP tests, set `MYDS4_QWEN` to Qwen's checkpoint and
 `MYDS4_CHECKPOINT` to DeepSeek's. Set `MYDS4_EXPERTS` only for tests that

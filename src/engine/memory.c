@@ -133,6 +133,42 @@ static uint64_t reclaimable(MemorySlot *const *wanted, const uint64_t *sizes, si
 
 static int fits(uint64_t extra) { return usage.committed <= usage.limit && extra <= usage.limit - usage.committed; }
 
+static MemorySlot *victim(MemorySlot *const *wanted, const uint64_t *sizes, size_t n,
+                          MemoryAdmission mode, uint64_t need) {
+  MemorySlot *best = NULL;
+  double rank = INFINITY;
+  for (MemorySlot *s = entries; s; s = s->next) {
+    if (!evictable(s, wanted, n, mode) || has_children(s)) continue;
+    uint64_t useful = reclaim_room(s->account, wanted, sizes, n);
+    if (!useful) continue;
+    if (useful > s->bytes) useful = s->bytes;
+    if (useful > need) useful = need;
+    double age = fmax(0, now() - s->touched), score = exp(-age / 30) * (double)s->bytes / useful;
+    if (!best || score < rank) best = s, rank = score;
+  }
+  return best;
+}
+
+static void release_entry(MemorySlot *slot) {
+  slot->evict(slot->context);
+  if (slot->payload) die("memory eviction retained its payload");
+  change(slot, 0);
+  memory_publish(slot, 0);
+  usage.evictions++;
+}
+
+uint64_t memory_reclaim(uint64_t bytes) {
+  uint64_t before = usage.allocated;
+  while (before - usage.allocated < bytes) {
+    MemorySlot *slot = victim(NULL, NULL, 0, MEMORY_REQUIRED, bytes - (before - usage.allocated));
+    if (!slot) break;
+    release_entry(slot);
+  }
+  uint64_t freed = before - usage.allocated;
+  if (freed && collect_released) collect_released();
+  return freed;
+}
+
 int memory_admit(MemorySlot *const *wanted, const uint64_t *sizes, size_t n, MemoryAdmission mode) {
   int evicted = 0;
   uint64_t extra = growth(wanted, sizes, n);
@@ -143,25 +179,10 @@ int memory_admit(MemorySlot *const *wanted, const uint64_t *sizes, size_t n, Mem
     return 0;
   }
   while (!fits(extra)) {
-    MemorySlot *best = NULL;
-    double rank = INFINITY;
     uint64_t need = extra - (usage.limit - usage.committed);
-    for (MemorySlot *s = entries; s; s = s->next) {
-      if (!evictable(s, wanted, n, mode) || has_children(s)) continue;
-      uint64_t useful = reclaim_room(s->account, wanted, sizes, n);
-      if (!useful) continue;
-      if (useful > s->bytes) useful = s->bytes;
-      if (useful > need) useful = need;
-      // Older entries go first. Avoid discarding a large group for a tiny gain.
-      double age = fmax(0, now() - s->touched), score = exp(-age / 30) * (double)s->bytes / useful;
-      if (!best || score < rank) best = s, rank = score;
-    }
+    MemorySlot *best = victim(wanted, sizes, n, mode, need);
     if (!best) die("memory reservation changed during eviction");
-    best->evict(best->context);
-    if (best->payload) die("memory eviction retained its payload");
-    change(best, 0);
-    memory_publish(best, 0);
-    usage.evictions++;
+    release_entry(best);
     evicted = 1;
     extra = growth(wanted, sizes, n);
   }

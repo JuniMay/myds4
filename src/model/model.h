@@ -50,6 +50,9 @@ typedef struct {
   int layers, experts_per_row;          // 0 without routed experts
   uint64_t dense_bytes;                 // the weights always resident
   CacheStats decode, prefill;           // the expert cache's, of decoded rows and of prompt rows
+  CacheStats cache;
+  uint64_t cache_bytes, slot_bytes, uncached_bytes;
+  int cache_slots, mapped, cap, max_slots, experts, uncached;
 } ModelCounters;
 
 // The last prefill's plan: its chunks, the rows it ran (from its first row),
@@ -70,6 +73,7 @@ typedef struct {
   MemorySlot *(*weight_slot)(void); // one reloadable dense-weight group
   void (*active)(int active); // pin request resources; release idle guarantees
   void (*counters)(ModelCounters *c);
+  uint64_t (*cache_bytes)(void); // current expert payload; null for a dense model
   void (*plan)(ModelPlan *p);  // the last prefill's, when the family plans its own; or null
   // Limits after loading: the vocabulary; rows of different states one
   // decoding pass takes; rows one verify pass takes (the token and its
@@ -166,4 +170,4 @@ int model_load(Model *model, const Options *options);
 void model_active(Model *model, int active);
 Model *model_open(const char *dir, const Options *o);
 
-extern const ModelOps deepseek_ops, qwen_ops;
+extern const ModelOps deepseek_ops, qwen_ops, flash_ops;

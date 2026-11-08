@@ -40,6 +40,17 @@ template <> inline void chunk<2>(device const uchar *W, device const uchar *S, u
   w[0] = bf16x4(a.xy), w[1] = bf16x4(a.zw), w[2] = bf16x4(b.xy), w[3] = bf16x4(b.zw);
 }
 
+// MXFP8 keeps an E8M0 exponent for each group of 32 E4M3 values.
+inline float exponent_scale(uchar code) {
+  return code == 0 ? 0x1p-127f : as_type<float>(uint(code) << 23);
+}
+template <> inline void chunk<3>(device const uchar *W, device const uchar *S, uint row, uint cols, uint c,
+                                 thread float4 *w) {
+  chunk<1>(W, S, row, cols, c, w);
+  float scale = exponent_scale(S[(size_t)row * (cols / 32) + c / 2]);
+  for (uint i = 0; i < 4; i++) w[i] *= scale;
+}
+
 // y[t][r] = scale * sum_c W[r][c] x[t][c] for the n rows t of x: a
 // simdgroup a weight row, 8 a threadgroup. Lane l takes the 16-value chunks
 // l, l + 32, ... of the row, each chunk's products summed as four float4
@@ -135,6 +146,9 @@ template [[host_name("mvr_bf16")]] kernel mvr_t mvr<2>;
 template [[host_name("mv1_nvfp4")]] kernel mv1_t mv1<0>;
 template [[host_name("mv1_fp8")]] kernel mv1_t mv1<1>;
 template [[host_name("mv1_bf16")]] kernel mv1_t mv1<2>;
+template [[host_name("mv1_mxfp8")]] kernel mv1_t mv1<3>;
+template [[host_name("mvr_mxfp8")]] kernel mvr_t mvr<3>;
+template [[host_name("gate_up_mxfp8")]] kernel gate_up_t gate_up<3>;
 
 // ---- matrices times a prompt's rows, on the matrix units ----
 //
@@ -162,9 +176,10 @@ inline void tile_load(device const uchar *W, device const uchar *S, uint n0, uin
     q[0] = in ? *(device const uint4 *)(W + (size_t)r * (k / 2) + c / 2) : uint4(0);
     sc[0] = in ? fp8(S[(size_t)r * (k / 16) + c / 16]) : 0.0f;
     sc[1] = in ? fp8(S[(size_t)r * (k / 16) + c / 16 + 1]) : 0.0f;
-  } else if (F == 1) {  // FP8: 32 bytes
+  } else if (F == 1 || F == 3) {  // FP8: 32 bytes
     device const uint4 *p = (device const uint4 *)(W + (size_t)r * k + c);
     q[0] = in ? p[0] : uint4(0), q[1] = in ? p[1] : uint4(0);
+    if (F == 3) sc[0] = in ? exponent_scale(S[(size_t)r * (k / 32) + c / 32]) : 0.0f;
   } else {  // BF16: 64 bytes
     device const uint4 *p = (device const uint4 *)(W + (size_t)r * k * 2 + c * 2);
     for (uint i = 0; i < 4; i++) q[i] = in ? p[i] : uint4(0);
@@ -182,9 +197,9 @@ inline void tile_store(threadgroup bfloat *ws, thread const uint4 *q, thread con
       d[2 * b] = bfloat4(float4(fp4(w & 15), fp4((w >> 4) & 15), fp4((w >> 8) & 15), fp4((w >> 12) & 15)) * s);
       d[2 * b + 1] = bfloat4(float4(fp4((w >> 16) & 15), fp4((w >> 20) & 15), fp4((w >> 24) & 15), fp4(w >> 28)) * s);
     }
-  } else if (F == 1) {
+  } else if (F == 1 || F == 3) {
     uint u[8] = {q[0].x, q[0].y, q[0].z, q[0].w, q[1].x, q[1].y, q[1].z, q[1].w};
-    for (uint b = 0; b < 8; b++) d[b] = bfloat4(e4m3x4(u[b]));
+    for (uint b = 0; b < 8; b++) d[b] = bfloat4(e4m3x4(u[b]) * (F == 3 ? sc[0] : 1.0f));
   } else {
     threadgroup uint4 *e = (threadgroup uint4 *)d;
     for (uint i = 0; i < 4; i++) e[i] = q[i];
@@ -236,3 +251,5 @@ typedef decltype(gemm<0>) gemm_t;
 template [[host_name("gemm_nvfp4")]] kernel gemm_t gemm<0>;
 template [[host_name("gemm_fp8")]] kernel gemm_t gemm<1>;
 template [[host_name("gemm_bf16")]] kernel gemm_t gemm<2>;
+
+template [[host_name("gemm_mxfp8")]] kernel gemm_t gemm<3>;

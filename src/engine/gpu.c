@@ -17,11 +17,11 @@ extern void objc_autoreleasePoolPop(void *);
 #define S(name) sel_registerName(name)
 #define MSG(type, ...) ((type)objc_msgSend)(__VA_ARGS__)
 
-static id dev, queue, event, cb, enc, last, resident, pipes[128], done[4096];
+static id dev, queue, event, cb, enc, last, resident, pipes[512], done[4096];
 static int resident_dirty;
 static int ndone, current, profile;
-static double prof_s[128];
-static long prof_n[128];
+static double prof_s[512];
+static long prof_n[512];
 static id used[1024];  // resources made resident in the current encoder
 static unsigned long used_usage[1024];
 static int nused;
@@ -31,7 +31,7 @@ double gpu_busy, gpu_gap;
 long gpu_gaps;
 
 static int npipes;
-static const char *names[128];
+static const char *names[512];
 static uint64_t signaled;
 static void *pool;
 static SEL s_pipe, s_buf, s_bytes, s_use, s_dispatch;

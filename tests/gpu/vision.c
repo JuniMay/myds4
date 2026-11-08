@@ -78,13 +78,15 @@ int main(int argc, char **argv) {
   char path[4096]; snprintf(path, sizeof path, "%s/config.json", argv[1]);
   char *text = read_file(path, NULL); Json *root = json_parse(text);
   TensorIndex *index = st_open(argv[1]);
-  QwenVision *vision = qwen_vision_open(index, json_get(root, "vision_config"));
+  const Json *config = json_get(root, "vision_config");
+  int width = (int)json_get(config, "out_hidden_size")->num;
+  QwenVision *vision = qwen_vision_open(index, config);
   json_free(root); free(text);
-  qwen_vision_encode(vision, &image);
-  if (image.ntokens != image.th * image.tw || image.embedding_width != 5120 || !image.rows) return 1;
+  qwen_vision_trace(vision, &image, argc == 4 ? atoi(argv[2]) : -1);
+  if (image.ntokens != image.th * image.tw || image.embedding_width != width || !image.rows) return 1;
   for (size_t i = 0; i < (size_t)image.ntokens * image.embedding_width; i++)
     if ((image.rows[i] & 0x7f80u) == 0x7f80u) die("nonfinite vision feature");
-  if (argc == 3) {
+  if (argc >= 3) {
     int fd = atoi(argv[2]); size_t bytes = (size_t)image.ntokens * image.embedding_width * 2;
     const char *p = (const char *)image.rows;
     while (bytes) { ssize_t done = write(fd, p, bytes); if (done <= 0) die("feature pipe closed"); p += done; bytes -= (size_t)done; }

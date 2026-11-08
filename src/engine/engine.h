@@ -108,6 +108,7 @@ void myds4_finish(myds4_model *m);
 // other programs if they need it. The model's expert cache slots after it (0
 // without one).
 int myds4_idle(myds4_model *m);
+uint64_t myds4_reclaim(uint64_t bytes);
 
 // The model's limits: rows of different states that myds4_rows takes at
 // once, the drafts per pass it makes itself (the selected model options' draft field, at most its

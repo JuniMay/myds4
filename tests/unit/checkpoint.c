@@ -2,6 +2,7 @@
 // This reads safetensors headers only; no weights or GPU work are needed.
 #include "myds4.h"
 #include "../../src/model/model.h"
+#include "../../src/model/weights.h"
 #include "../../src/model/deepseek/engram.h"
 #include <fcntl.h>
 #include <sys/file.h>
@@ -74,8 +75,33 @@ static int malformed_json(void) {
   return 0;
 }
 
+static int compressed_scales(void) {
+  enum { ROWS = 32, COLS = 40, STRIDE = 16 + 8 * COLS };
+  uint8_t fixed[2 * STRIDE] = {0}, expected[ROWS * COLS], decoded[ROWS * COLS];
+  for (int row = 0; row < ROWS; row++) {
+    uint8_t *slab = fixed + row / 16 * STRIDE;
+    slab[row % 16] = (uint8_t)(80 + row);
+    for (int col = 0; col < COLS; col++) {
+      unsigned code = (unsigned)(row * 7 + col * 3) % 16;
+      slab[16 + row % 16 * (COLS / 2) + col / 2] |= code << (4 * (col % 2));
+      expected[row * COLS + col] = (uint8_t)(80 + row + code);
+    }
+  }
+  uint32_t exceptions[] = {(254u << 24), (3u << 24) | (17 * COLS + 39)};
+  expected[0] = 254; expected[17 * COLS + 39] = 3;
+  if (!weights_csf_decode(decoded, fixed, sizeof fixed, exceptions, 2, ROWS, COLS) ||
+      memcmp(decoded, expected, sizeof expected)) return 1;
+  if (weights_csf_decode(decoded, fixed, sizeof fixed - 1, exceptions, 2, ROWS, COLS)) return 1;
+  exceptions[1] = ROWS * COLS;
+  if (weights_csf_decode(decoded, fixed, sizeof fixed, exceptions, 2, ROWS, COLS)) return 1;
+  fixed[0] = 241;
+  if (weights_csf_decode(decoded, fixed, sizeof fixed, NULL, 0, ROWS, COLS)) return 1;
+  puts("compressed scale format: row bases, nibble order, exceptions and malformed streams checked");
+  return 0;
+}
+
 int main(int argc, char **argv) {
-  if (argc == 1) return malformed_json();
+  if (argc == 1) return malformed_json() || compressed_scales();
   if (argc != 3) return 2;
   TensorIndex *first = st_open(argv[1]);
   Tensor before = st_get(first, "vision.patch_embed.proj.weight");

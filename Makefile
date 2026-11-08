@@ -3,9 +3,9 @@ CC = clang
 CFLAGS = -std=c23 -O2 -Wall -Wextra -Wno-unused-parameter -Isrc/engine $(shell pkg-config --cflags yyjson libjpeg)
 LDLIBS = -framework Metal -framework Foundation -framework IOKit -framework ImageIO -framework CoreGraphics -framework Accelerate -lobjc -licucore \
          $(shell pkg-config --libs yyjson libjpeg)
-MODEL_HEADERS = src/engine/memory.h src/model/weights.h src/model/deepseek/model.h src/engine/myds4.h src/model/model.h src/model/qwen/model.h src/model/qwen/vision.h src/model/deepseek/engram.h src/model/deepseek/learning.h src/model/draft.h src/model/deepseek/prefill.h src/model/deepseek/expert_tasks.h
+MODEL_HEADERS = src/model/linear.h src/engine/memory.h src/model/weights.h src/model/deepseek/model.h src/engine/myds4.h src/model/model.h src/model/qwen/model.h src/model/qwen/vision.h src/model/deepseek/engram.h src/model/deepseek/learning.h src/model/draft.h src/model/deepseek/prefill.h src/model/deepseek/expert_tasks.h
 KERNELS = src/kernels/formats.metal src/kernels/kernels.metal src/kernels/gguf_grids.metal src/kernels/gguf.metal \
-          src/kernels/vision.metal src/kernels/qwen_vision.metal src/kernels/rows.metal src/kernels/products.metal src/kernels/deltanet.metal src/kernels/gqa.metal src/kernels/expert_tasks.metal
+          src/kernels/vision.metal src/kernels/qwen_vision.metal src/kernels/rows.metal src/kernels/products.metal src/kernels/deltanet.metal src/kernels/gqa.metal src/kernels/flash.metal src/kernels/expert_tasks.metal
 
 build/myds4: src/cli/main.c build/libmyds4.a $(MODEL_HEADERS)
 	@mkdir -p $(dir $@)
@@ -13,7 +13,7 @@ build/myds4: src/cli/main.c build/libmyds4.a $(MODEL_HEADERS)
 
 # The engine behind src/engine/engine.h, for the Rust server (server/): the sources
 # of build/myds4 without those in src/cli/, and with engine.c.
-LIB_SRC = src/engine/memory.c src/model/weights.c src/model/model.c src/model/deepseek/model.c src/model/deepseek/engram.c src/model/qwen/model.c src/model/qwen/vision.c src/kernels/library.c src/engine/io.c src/engine/gpu.c src/engine/tok.c src/engine/util.c src/engine/vision.c src/model/deepseek/predictor.c src/model/deepseek/learning.c src/model/draft.c src/engine/sample.c src/engine/engine.c
+LIB_SRC = src/model/qwen/flash.c src/model/linear.c src/engine/memory.c src/model/weights.c src/model/model.c src/model/deepseek/model.c src/model/deepseek/engram.c src/model/qwen/model.c src/model/qwen/vision.c src/kernels/library.c src/engine/io.c src/engine/gpu.c src/engine/tok.c src/engine/util.c src/engine/vision.c src/model/deepseek/predictor.c src/model/deepseek/learning.c src/model/draft.c src/engine/sample.c src/engine/engine.c
 LIB_OBJ = $(LIB_SRC:src/%.c=build/lib/%.o)
 
 build/lib/%.o: src/%.c $(MODEL_HEADERS) src/engine/engine.h
@@ -52,7 +52,7 @@ EXTRA_CPU = memory metadata qwen-state-accounting attention-candidate prefill-pr
 
 test: $(CPU_CHECKS) $(addprefix build/tests/,$(EXTRA_CPU)) build/myds4-server
 	@set -e; for test in $(EXTRA_CPU); do ./build/tests/$$test; done
-	env -u MYDS4_QWEN -u MYDS4_CHECKPOINT -u MYDS4_EXPERTS $(MAKE) server-check
+	env -u MYDS4_QWEN -u MYDS4_FLASH -u MYDS4_CHECKPOINT -u MYDS4_EXPERTS $(MAKE) server-check
 
 # ---- CPU checks: no model, and no Metal device unless noted ----
 
@@ -68,14 +68,18 @@ build/tests/qwen-mtp: tests/model/qwen_mtp.c build/libmyds4.a $(MODEL_HEADERS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/model/qwen_mtp.c build/libmyds4.a $(LDLIBS)
 
+build/tests/flash-model: tests/model/flash.c build/libmyds4.a $(MODEL_HEADERS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -o $@ tests/model/flash.c build/libmyds4.a $(LDLIBS)
+
 build/tests/metadata: tests/unit/checkpoint.c build/libmyds4.a $(MODEL_HEADERS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/unit/checkpoint.c build/libmyds4.a $(LDLIBS)
 
 
-build/tests/vision: tests/gpu/vision.c src/model/qwen/vision.c src/model/qwen/vision.h src/engine/vision.c src/engine/util.c src/engine/gpu.c src/kernels/library.c $(MODEL_HEADERS) $(KERNELS)
+build/tests/vision: tests/gpu/vision.c build/libmyds4.a $(MODEL_HEADERS)
 	@mkdir -p build/tests
-	$(CC) $(CFLAGS) -o $@ tests/gpu/vision.c src/model/qwen/vision.c src/model/weights.c src/engine/vision.c src/engine/util.c src/engine/gpu.c src/kernels/library.c src/engine/memory.c $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ tests/gpu/vision.c build/libmyds4.a $(LDLIBS)
 
 build/tests/activation-format: tests/unit/activation_format.c tests/reference/activations.h
 	@mkdir -p $(dir $@)
