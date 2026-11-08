@@ -122,7 +122,9 @@ units and different operand rounding from one-row decoding. Therefore
 reusing decoded state need not equal a cold prefill of the same text.
 
 With drafting enabled, the MTP head proposes up to five additional tokens.
-Each draft head output supplies the hidden input for the next proposal.
+The first proposal uses the target hidden after final normalization. Each
+subsequent proposal uses the preceding MTP head output after its own final
+normalization.
 Target verification processes the proposals together with the current token.
 It saves the recurrent state after each possible accepted prefix. Rejection
 selects the matching checkpoint without replaying the target layers. The

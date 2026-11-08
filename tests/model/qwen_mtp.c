@@ -3,8 +3,42 @@
 #include "../../src/model/qwen/model.h"
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define CHECK(x) do { if (!(x)) die("Qwen MTP check: %s", #x); } while (0)
+
+static Buf read_tensor(Tensor tensor) {
+  Buf result = gpu_alloc(tensor.size);
+  size_t done = 0;
+  while (done < tensor.size) {
+    ssize_t n = pread(tensor.fd, result.ptr + done, tensor.size - done, tensor.off + done);
+    CHECK(n > 0);
+    done += (size_t)n;
+  }
+  return result;
+}
+
+static void check_hidden(const char *directory, ModelState *state, const float *expected) {
+  TensorIndex *index = st_open(directory);
+  Tensor weight = st_get(index, "lm_head.weight");
+  Buf w = read_tensor(weight), scale = read_tensor(st_get(index, "lm_head.weight_scale"));
+  Buf factor = read_tensor(st_get(index, "lm_head.weight_scale_2"));
+  unsigned rows = (unsigned)weight.shape[0], cols = (unsigned)weight.shape[1] * 2;
+  Buf x = gpu_alloc(cols * sizeof(float)), y = gpu_alloc(rows * sizeof(float));
+  memcpy(x.ptr, qwen_state_hidden((QwenState *)state), cols * sizeof(float));
+  struct { uint32_t rows, cols, n; float scale; } args = {rows, cols, 1, *(float *)factor.ptr};
+  gpu_begin(); gpu_kern(gpu_kernel("mv1_nvfp4"));
+  gpu_buf(0, &w, 0); gpu_buf(1, &scale, 0); gpu_buf(2, &x, 0); gpu_buf(3, &y, 0);
+  gpu_bytes(4, &args, sizeof args);
+  gpu_go((rows + 7) / 8, 1, 1, 256, 1, 1);
+  gpu_commit(); gpu_sync();
+  size_t different = 0;
+  for (unsigned i = 0; i < rows; i++) different += memcmp(y.ptr + i * 4, expected + i, 4) != 0;
+  printf("MTP hidden through the output head: %zu/%u logits differ\n", different, rows);
+  CHECK(different == 0);
+  gpu_free(&w); gpu_free(&scale); gpu_free(&factor); gpu_free(&x); gpu_free(&y);
+  st_close(index);
+}
 
 int main(int argc, char **argv) {
   if (argc != 2) die("usage: qwen-mtp CHECKPOINT");
@@ -19,6 +53,7 @@ int main(int argc, char **argv) {
   int count = tok_encode(tokenizer, "Write a Python function that counts the words in a line.", prompt, 128);
   ModelState *state = ops->state_new();
   const float *logits = ops->prefill(state, prompt, count, 0, 0, -1, NULL, NULL);
+  check_hidden(argv[1], state, logits);
   size_t row_bytes = (size_t)ops->vocab() * sizeof(float);
   float *target = xmalloc(7 * row_bytes), *draft = xmalloc(7 * row_bytes);
   int tokens[8];

@@ -42,6 +42,11 @@ weights, retains its KV state and compares every next-token logit after
 reloading. Its competing reservation is synthetic; it is a correctness
 check, not a throughput benchmark.
 
+`build/tests/qwen-mtp CHECKPOINT` checks the normalized hidden supplied to
+the Qwen draft head against the target logits. It also verifies every
+accepted prefix of two- through six-row batches, including the next target
+logits and the repaired draft-head history.
+
 The metadata check can additionally compare two checkpoint indexes and
 DeepSeek's generated Engram map. It reads headers and tokenizer data, not
 model weights:

@@ -463,6 +463,7 @@ void qwen_state_free(QwenState *s) {
 }
 
 int qwen_state_pos(const QwenState *s) { return s->pos; }
+const float *qwen_state_hidden(const QwenState *s) { return (const float *)s->hid[s->cur].ptr; }
 
 // Copies the keys and values of positions [0, n) of every attention layer
 // between caches of capacities `from` and `to`.
@@ -730,7 +731,7 @@ static void mtp_rows(int m, int logits) {
   gpu_buf(4, &EMBM, 0);
   gpu_go((hidden + 255) / 256, (uint32_t)m, 1, 256, 1, 1);
   norm(&X, 0, &mtp_norm_e, &XN, 0, m, c.hidden, 0);
-  norm(&HB, 0, &mtp_norm_h, &HH, 0, m, c.hidden, 0);  // the hidden before the final norm
+  norm(&HB, 0, &mtp_norm_h, &HH, 0, m, c.hidden, 0);  // the target hidden after its final norm
   gpu_kern(K_concat);  // [embedding | hidden] a row
   gpu_buf(0, &XN, 0), gpu_buf(1, &HH, 0), gpu_buf(2, &EH, 0), gpu_bytes(3, &hidden, 4);
   gpu_go((2 * hidden + 255) / 256, (uint32_t)m, 1, 256, 1, 1);
@@ -801,13 +802,16 @@ static const float *pass(const QwenRow *rows, int n, int logits, int prompt) {
     if (l + 1 < c.layers) add_norm(&L[l + 1].in_norm, n);
     else elementwise(K_add, &X, &R, 0, hidden * n);
   }
-  if (logits) {  // the head with the row kernels: at most ROWS rows
-    size_t first = (size_t)(n - logits) * c.hidden * 4;
-    norm(&X, first, &final_norm, &XN, first, logits, c.hidden, 0);
-    int was = prompt_pass;
-    prompt_pass = 0;
-    mv(&head, &XN, first, &LOGITS, 0, logits);
-    prompt_pass = was;
+  if (logits || mtp) {
+    int normalized = mtp ? n : logits;
+    size_t first = (size_t)(n - normalized) * c.hidden * 4;
+    norm(&X, first, &final_norm, &XN, first, normalized, c.hidden, 0);
+    if (logits) {
+      int was = prompt_pass;
+      prompt_pass = 0;
+      mv(&head, &XN, (size_t)(n - logits) * c.hidden * 4, &LOGITS, 0, logits);
+      prompt_pass = was;
+    }
   }
   if (mtp) {
     static GpuCopy cp[2 * PF];
@@ -832,7 +836,7 @@ static const float *pass(const QwenRow *rows, int n, int logits, int prompt) {
           sm[m] = mtp_seq(s, p0 - 1, 1), m++;
         }
         for (int r = i; r + 1 < j; r++) {
-          cp[m] = (GpuCopy){&X, &HB, (size_t)r * hb, (size_t)m * hb, hb};
+          cp[m] = (GpuCopy){&XN, &HB, (size_t)r * hb, (size_t)m * hb, hb};
           tm[m] = rows[r + 1].token < 0 ? 0 : rows[r + 1].token;
           ((uint64_t *)EMBM.ptr)[m] = rows[r + 1].token < 0 ? image_embedding(p0 + r + 1 - i) : 0;
           sm[m] = mtp_seq(s, p0 + (r - i), 1), m++;
@@ -841,11 +845,11 @@ static const float *pass(const QwenRow *rows, int n, int logits, int prompt) {
       }
       if (m) gpu_copies(cp, m);
     }
-    // each state's last hidden, and a saved row's, after the copies above read the old one
+    // Each target hidden is normalized before the MTP head consumes it.
     for (int i = 0; i < n; i++) {
       QwenState *s = rows[i].state;
-      if (i + 1 == n || rows[i + 1].state != s) cp[mm++] = (GpuCopy){&X, &s->hid[s->cur], (size_t)i * hb, 0, hb};
-      if (rows[i].save) cp[mm++] = (GpuCopy){&X, &s->hid[rows[i].save - 1], (size_t)i * hb, 0, hb};
+      if (i + 1 == n || rows[i + 1].state != s) cp[mm++] = (GpuCopy){&XN, &s->hid[s->cur], (size_t)i * hb, 0, hb};
+      if (rows[i].save) cp[mm++] = (GpuCopy){&XN, &s->hid[rows[i].save - 1], (size_t)i * hb, 0, hb};
     }
     gpu_copies(cp, mm);
     if (m) mtp_rows(m, 0);
@@ -1053,7 +1057,7 @@ static const double *q_draft(ModelState *st, int token, int pos, int *drafts, in
   drafts[0] = sample_proposal(mtp_fill(s, token, 1), c.vocab, sampler, proposal_probabilities);
   for (int i = 1; i < n; i++) {
     // The preceding draft head's hidden predicts the next target hidden.
-    GpuCopy copy = {&X, &HB, 0, 0, hid_bytes()};
+    GpuCopy copy = {&XN, &HB, 0, 0, hid_bytes()};
     ((int32_t *)TOKM.ptr)[0] = drafts[i - 1];
     ((uint64_t *)EMBM.ptr)[0] = 0;
     ((Seq *)SEQM.ptr)[0] = mtp_seq(s, pos + i - 1, 0);

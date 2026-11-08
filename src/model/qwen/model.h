@@ -29,6 +29,8 @@ QwenState *qwen_state_new(void);
 void qwen_state_free(QwenState *s);
 // The positions the state has run (its next row's position).
 int qwen_state_pos(const QwenState *s);
+// The last target hidden supplied to the draft head, after final normalization.
+const float *qwen_state_hidden(const QwenState *s);
 // Bytes the state takes with room for `positions` positions.
 uint64_t qwen_state_bytes(int positions);
 // Makes room for `positions` positions, keeping the keys of those run.
