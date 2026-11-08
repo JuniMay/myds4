@@ -139,7 +139,7 @@ def gpu_activity():
             "gpu_client_pids": sorted(clients)}
 
 
-def gpu_snapshot(cache_gib, reserve_gib=10, desktop=False, quiet_cpu=False):
+def gpu_snapshot(memory_gib, reserve_gib=10, desktop=False, quiet_cpu=False):
     activity = gpu_activity()
     background = []
     busy = process_snapshot(allow_cpu_helpers=desktop, background=background,
@@ -153,17 +153,15 @@ def gpu_snapshot(cache_gib, reserve_gib=10, desktop=False, quiet_cpu=False):
         reasons.append("another compute process is present")
     if quiet_cpu and sum(p["cpu_percent"] for p in background) > 100:
         reasons.append("background CPU builds exceed one CPU core")
-    # Aggregate activity cannot identify a model job. Desktop studies record
-    # it and rely on process/ownership checks and the shared model lock.
-    if not desktop and device > 20:
-        reasons.append("GPU device activity exceeds 20 percent")
+    # Check device load as well as process ownership and the shared model lock.
+    if device > 35:
+        reasons.append("GPU device activity exceeds 35 percent")
     if resident > 8:
         reasons.append("another workload retains more than 8 GiB of GPU memory")
-    # Dense weights, DSpark and working buffers have stayed below 14 GiB in
-    # the bounded checks. Keep the requested engine reserve in addition.
-    required_available = cache_gib + 14 + reserve_gib
+    # Callers include the expected KV and process overhead in memory_gib.
+    required_available = memory_gib + reserve_gib
     if memory["available_gib"] < required_available:
-        reasons.append("insufficient available memory for cache, runtime and reserve")
+        reasons.append("insufficient available memory for the process and reserve")
     if not on_ac:
         reasons.append("large model tests require AC power")
     return {"device_percent": device, "renderer_percent": renderer, "gpu_resident_gib": round(resident, 2),
@@ -173,13 +171,13 @@ def gpu_snapshot(cache_gib, reserve_gib=10, desktop=False, quiet_cpu=False):
             "background_cpu_helpers": background, "reasons": reasons}
 
 
-def wait_for_gpu(cache_gib, timeout, reserve_gib=10, desktop=False, quiet_cpu=False):
+def wait_for_gpu(memory_gib, timeout, reserve_gib=10, desktop=False, quiet_cpu=False):
     until = time.monotonic() + timeout
     quiet = []
     announced = False
     while True:
         try:
-            state = gpu_snapshot(cache_gib, reserve_gib, desktop, quiet_cpu)
+            state = gpu_snapshot(memory_gib, reserve_gib, desktop, quiet_cpu)
         except (subprocess.SubprocessError, OSError, ValueError) as error:
             raise GPUUnavailable("GPU preflight inspection failed") from error
         if state["reasons"]:

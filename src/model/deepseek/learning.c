@@ -1,5 +1,6 @@
 // Recursive least-squares fitting and forecast evaluation.
 #include "learning.h"
+#include "../../engine/memory.h"
 #define ACCELERATE_NEW_LAPACK
 #include <Accelerate/Accelerate.h>
 #include <errno.h>
@@ -21,7 +22,7 @@ void op_die(const char *s) {
 }
 void *op_allocate(size_t n) {
   if (n > 128u * 1024 * 1024) op_die("individual allocation exceeds128 MiB");
-  void *p = calloc(1, n ? n : 1);
+  void *p = memory_host_alloc(n, 0);
   if (!p) op_die("allocation failed");
   return p;
 }
@@ -62,10 +63,10 @@ OpPair op_create_pair(int e, int r, uint64_t seed) {
   return p;
 }
 void op_free_pair(OpPair *p) {
-  free(p->a);
-  free(p->b);
-  free(p->p);
-  free(p->bias);
+  memory_host_free(p->a);
+  memory_host_free(p->b);
+  memory_host_free(p->p);
+  memory_host_free(p->bias);
 }
 OpWork op_create_work(int e, int r) {
   OpWork w = {0};
@@ -81,15 +82,15 @@ OpWork op_create_work(int e, int r) {
   return w;
 }
 void op_free_work(OpWork *w) {
-  free(w->features);
-  free(w->phi);
-  free(w->keys);
-  free(w->scores);
-  free(w->vector);
-  free(w->error);
-  free(w->next_b);
-  free(w->next_p);
-  free(w->ids);
+  memory_host_free(w->features);
+  memory_host_free(w->phi);
+  memory_host_free(w->keys);
+  memory_host_free(w->scores);
+  memory_host_free(w->vector);
+  memory_host_free(w->error);
+  memory_host_free(w->next_b);
+  memory_host_free(w->next_p);
+  memory_host_free(w->ids);
 }
 float op_key(float v, float bias) { return sqrtf(fmaxf(v, 0) + log1pf(expf(-fabsf(v)))) + bias; }
 double op_key_double(double v, double bias) { return sqrt(fmax(v, 0) + log1p(exp(-fabs(v)))) + bias; }

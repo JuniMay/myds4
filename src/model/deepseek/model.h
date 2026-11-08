@@ -52,6 +52,10 @@ void cache_retention(int half_life, int read_cost);
 // other programs, 0 for the default. The cache starts within available memory
 // less the reserve, gives slots back when the available memory falls below
 // it and grows only while 4 GiB more than it is available.
+void cache_memory(MemorySlot *backbone);
+void cache_active(int active);
+void cache_working_rows(int rows);
+uint64_t cache_required(TensorIndex *index, int layers);
 void cache_init(TensorIndex *index, uint64_t budget, int layers);
 // Bounded draft pools are demand-only. Finish prior GPU use of a stage's
 // buffers before cache_load/cache_request may replace their experts.
@@ -139,7 +143,7 @@ int online_predictor_load(const char *path, char *error, size_t capacity); // 1 
 int online_predictor_save(const char *path, char *error, size_t capacity); // 1 saved, -1 error
 int online_predictor_dirty(void);
 void deepseek_save_predictor(void);
-void deepseek_load(const char *dir, const Options *o);
+int deepseek_load(const char *dir, const Options *o);
 // Runs the tokens at positions pos.. and returns the logits of the last one.
 const float *deepseek_forward(const int *tokens, int n, int pos);
 typedef struct {
@@ -226,7 +230,7 @@ const float *deepseek_forward_rows(State **st, const int *tokens, const int *pos
 void deepseek_seek(const int *tokens, int pos);
 // The vision encoder (inference/vision.py ViT and Aligner): the image's
 // feature rows into im->rows. Weights load on first use.
-void deepseek_image(Image *im);
+int deepseek_image(Image *im);
 // The images whose spans (their starts set) the prompts that deepseek_forward
 // runs next hold as negative tokens (image_keys); a span's positions may be
 // in any of its batches.

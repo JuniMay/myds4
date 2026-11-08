@@ -366,8 +366,8 @@ int image_open(Image *im, const void *data, size_t len, const char **err) {
   // the pixels as float32 in [-1, 1], rounded to BF16; a patch's channel c
   // at 196 c + 14 i + j (x.reshape(3, vh, 14, vw, 14).permute(1, 3, 0, 2, 4))
   size_t n = (size_t)im->vh * im->vw;
-  im->patch = calloc(n * VIT_K, 2);
-  if (!im->patch) die("out of memory");
+  im->patch = memory_host_alloc(n * VIT_K * 2, 0);
+  if (!im->patch) { free(rgb); *err = "model-memory budget cannot fit the image patches"; return 0; }
   for (int y = 0; y < bh; y++)
     for (int x = 0; x < bw; x++)
       for (int c = 0; c < 3; c++) {
@@ -419,8 +419,8 @@ void image_rope(const Image *im, float *cs) {
 }
 
 void image_free(Image *im) {
-  free(im->patch);
+  memory_host_free(im->patch);
   if (im->features.obj) gpu_free(&im->features);
-  else free(im->rows);
+  else memory_host_free(im->rows);
   im->patch = 0, im->rows = 0;
 }

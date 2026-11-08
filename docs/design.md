@@ -28,14 +28,18 @@ its tensor index; deferred vision loading uses that model's index.
 
 File validation errors during loading return a service error while the
 server remains available. Fatal backend or device errors still terminate
-the process. Model weights currently remain loaded for the process lifetime.
+the process. Model metadata remains registered. Weight groups can be unloaded under
+memory pressure and restored from the same checkpoint. Dense weights are
+one cache entry per model; expert entries depend on the MoE backbone, so
+experts leave before routers, attention and shared weights.
 
 ## Scheduling and state
 
 The worker gives each model a turn. It admits requests up to that model's
 batch limit, advances prefill, then advances decoding. Qwen prefill uses
-bounded chunks. DeepSeek prefill currently plans the whole remaining
-prompt in one call, so a long call can delay another model's turn.
+bounded chunks. DeepSeek plans the remaining prompt in one call and adapts its internal
+chunk size to the model-memory budget. Such a call can still delay another
+model's turn. Qwen also adapts its prefill rows and workspace to the budget.
 
 A request owns a state while it runs. The shared KV pool keeps completed
 states and snapshots for prefix reuse. It compares token histories at any
@@ -54,9 +58,9 @@ source remain protected. The configured limit may be exceeded by active
 state growth when nothing idle remains to evict.
 
 Each stored sequence owns its native state, snapshots and model handle.
-Eviction drops those resources together. Engine methods reject calls from
-another thread. HTTP handlers and the terminal read statistics published
-between engine calls; they do not read mutable backend counters.
+Eviction drops those resources together. Rust ownership keeps native model handles on the engine thread. HTTP
+handlers and the terminal receive copied statistics, without sharing the
+native model handle or checking thread identity on each call.
 
 Each prefill call receives its own image context. Image preprocessing and
 feature storage belong to the request; model-specific position state is

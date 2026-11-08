@@ -8,8 +8,8 @@ archive of experimental runs.
 
 ## Comparable runs
 
-Every result must identify the model, weight format, configured and actual
-expert-cache size, context, prompt, generated-token count, request count,
+Every result must identify the model, weight format, global model-memory and KV budgets, actual
+expert-cache size, peak process footprint, context, prompt, generated-token count, request count,
 sampling settings, drafts, approximations, binary and measurement scope.
 Use a real workload appropriate to the proposed change. A small kernel
 check establishes only that kernel's behavior.

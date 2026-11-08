@@ -721,8 +721,10 @@ static int fork_test(const int *prompt, int n, int randoms) {
 }
 
 int main(int argc, char **argv) {
-  if (argc < 4) die("usage: prefix-fork-check CHECKPOINT --text FILE [--rendered] [--experts GGUF] [--draft N] [--cache GB] [--ced N] [--limit N] (--measure | --fork [--random N] [--at P]... [--prompt-only] [--suffix N])");
-  Options o = {.ctx = 32768, .deepseek.budget_gb = 40, .reserve_gb = 4, .dump_fd = -1, .routes_fd = -1, .quiet = 1};
+  if (argc < 4) die("usage: prefix-fork-check CHECKPOINT --text FILE [--rendered] [--experts GGUF] [--draft N] [--memory GB] [--ced N] [--limit N] (--measure | --fork [--random N] [--at P]... [--prompt-only] [--suffix N])");
+  double model_memory_gib = 40;
+  double model_reserve_gib = 4;
+  Options o = {.ctx = 32768, .dump_fd = -1, .routes_fd = -1, .quiet = 1};
   const char *text = 0;
   int mode = 0, rendered = 0, randoms = 16, limit = 0;
   for (int i = 2; i < argc; i++) {
@@ -731,8 +733,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--rendered")) rendered = 1;
     else if (!strcmp(argv[i], "--experts") && i + 1 < argc) o.deepseek.experts = argv[++i];
     else if (!strcmp(argv[i], "--draft") && i + 1 < argc) o.draft = atoi(argv[++i]), o.deepseek.draft_cache = o.draft ? 32 : 0;
-    else if (!strcmp(argv[i], "--cache") && i + 1 < argc) o.deepseek.budget_gb = atof(argv[++i]);
-    else if (!strcmp(argv[i], "--ced") && i + 1 < argc) o.deepseek.ced = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--memory") && i + 1 < argc) o"--ced") && i + 1 < argc) o.deepseek.ced = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--random") && i + 1 < argc) randoms = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--at") && i + 1 < argc && nonly < 64) only[nonly++] = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--prompt-only")) prompt_only = 1;
@@ -745,6 +746,7 @@ int main(int argc, char **argv) {
   tk = tok_open(argv[1], deepseek_ops.image_token);
   int count, *tokens = read_text(text, rendered, &count);
   if (limit > 0 && count > limit) count = limit;
+  memory_configure(model_memory_gib, 8, model_reserve_gib);
   deepseek_load(argv[1], &o);
   return mode == 1 ? measure(tokens, count, rendered) : fork_test(tokens, count, randoms);
 }

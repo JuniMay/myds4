@@ -42,6 +42,7 @@ const USAGE: &str = "usage: myds4-server [--config FILE | -m MODEL [model option
   --serve PORT    override the JSON port; serve OpenAI Chat Completions at http://HOST:PORT/v1
   --host ADDR     the IPv4 address to serve on (default 127.0.0.1)
   --api-key-file FILE  the API key clients must send (16 to 256 characters)
+  --memory GB     one model-memory budget for every model, excluding KV (default: automatic)
   --reserve GB    one process-wide available-memory target, 2-1024 GiB (default 10)
   --kv-cache GB   total KV states and snapshots across all models, GiB (default 8)
   --tui           a live view in the terminal (requests, speed, experts, memory, the KV cache) instead of the
@@ -64,7 +65,6 @@ const USAGE: &str = "usage: myds4-server [--config FILE | -m MODEL [model option
   DeepSeek only:
   --ced off|N     approximate prefill: replay N decoder tokens, 128-1048576 (default off), plus the rewind margin (8)
   --prefill-prune  skip decoder batches outside required history; CED and substitution must be off (default off)
-  --cache GB      expert cache budget (default: from available memory)
   --cache-half-life N  score half-life in forward passes, 1-1000000 (default 50)
   --cache-read-cost   weight decode eviction priority by expert read bytes
   --experts GGUF  read the routed experts from a GGUF file or set of shards
@@ -127,7 +127,7 @@ fn parse(args: &[String]) -> Args {
                         one = Some(ModelConfig::new(v));
                     }
                     "--config" => file = Some(v.into()),
-                    "--reserve" | "--kv-cache" => {
+                    "--memory" | "--reserve" | "--kv-cache" => {
                         let name = flag[2..].replace('-', "_");
                         let value = serde_json::from_str::<Value>(v).unwrap_or(Value::Null);
                         budgets.push((name, value));
@@ -492,10 +492,6 @@ fn submitted(
             status: StatusCode::TOO_MANY_REQUESTS,
             message: m,
         },
-        worker::SubmitError::Invalid(m) => chat::Error {
-            status: StatusCode::BAD_REQUEST,
-            message: m,
-        },
     })
 }
 
@@ -700,7 +696,7 @@ fn main() {
                 Format::Qwen(qwen::Settings {
                     id: id.clone(),
                     ctx,
-                    tokenizer: loaded[i].1.tokenizer(),
+                    tokenizer: loaded[i].1,
                     sampling,
                     think: m.think,
                 })
@@ -717,17 +713,13 @@ fn main() {
             } else {
                 ""
             },
-            if loaded[served_models.len()].1.draft_block() > 0 {
-                ", drafts"
-            } else {
-                ""
-            }
+            if s.engine.draft > 0 { ", drafts" } else { "" }
         ));
         served_models.push(Served {
             id,
             name,
             ctx,
-            tokenizer: loaded[served_models.len()].1.tokenizer(),
+            tokenizer: loaded[served_models.len()].1,
             format,
         });
     }

@@ -11,8 +11,10 @@ int main(int argc, char **argv) {
   int pn = tok_encode(tk, " alpha beta gamma delta epsilon", pattern, 64);
   if (!pn) die("empty pattern");
   for (int i = 0; i < 256; i++) tokens[i] = pattern[i % pn];
-  Options o = {.ctx = 2048, .deepseek.budget_gb = 20, .reserve_gb = 4,
-               .deepseek.experts = argc == 3 ? argv[2] : NULL, .dump_fd = -1, .routes_fd = -1, .quiet = 1};
+  double model_memory_gib = 20;
+  double model_reserve_gib = 4;
+  Options o = {.ctx = 2048, .deepseek.experts = argc == 3 ? argv[2] : NULL, .dump_fd = -1, .routes_fd = -1, .quiet = 1};
+  memory_configure(model_memory_gib, 8, model_reserve_gib);
   deepseek_load(argv[1], &o);
   deepseek_forward(tokens, 256, 0);
   const uint16_t *all = (const uint16_t *)WIN.ptr;

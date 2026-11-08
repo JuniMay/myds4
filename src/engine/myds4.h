@@ -74,18 +74,25 @@ void gguf_open(const char *path);
 int gguf_get(const char *name, Gguf *t);  // 0 if absent
 
 // ---- gpu.c: Metal through the Objective-C runtime ----
+struct MemorySlot;
 typedef struct {
   void *obj;     // id<MTLBuffer>
   uint8_t *ptr;  // CPU address of offset 0
   uint64_t gpu;  // GPU address of offset 0
   size_t size;
   uint32_t off;  // byte offset of the payload inside the buffer
+  struct MemorySlot *memory;
+  size_t allocated;
+  int kv;
 } Buf;
 void gpu_init(const char *source, size_t len);
 void gpu_start(void);  // gpu_init with every model's kernels (src/kernels/library.c), once per process
 int gpu_kernel(const char *name);
 Buf gpu_alloc(size_t size);  // resident from the start
 Buf gpu_new(size_t size);    // outside the residency set
+Buf gpu_try_new(size_t size, int admission); // empty when the model-memory pool refuses it
+Buf gpu_alloc_kv(size_t size); // charged only to the separate KV pool
+size_t gpu_allocation_size(size_t size);
 void gpu_free(Buf *b);
 // Membership of a buffer in the residency set of every command buffer; the
 // changes apply at gpu_residency_commit (gpu_alloc commits its own), which
@@ -123,6 +130,7 @@ extern long gpu_gaps;    // of those gaps, the ones longer than 100 us
 void io_read(int fd, uint64_t off, uint64_t len, Buf *dst);  // aligned, uncached
 // Rows rows[i] of rowbytes each from a table at base, packed into dst.
 void io_rows(int fd, uint64_t base, uint32_t rowbytes, const int64_t *rows, int n, uint8_t *dst);
+uint64_t io_rows_workspace(int rows);
 uint64_t mem_available(void);
 int mem_pressure(void);  // 1 normal, 2 warn, 4 critical
 typedef struct {
@@ -133,6 +141,7 @@ typedef struct {
   int pressure;                           // as mem_pressure
 } MemInfo;
 void mem_info(MemInfo *m);
+int memory_configure(double model_gib, double kv_gib, double reserve_gib);
 int64_t mem_gpu_limit(void);  // the GPU's resident-memory limit (INT64_MAX: none)
 uint64_t mem_gpu(void);       // the GPU driver's resident memory for all processes
 int64_t mem_gpu_room(void);   // how far it is below the point where the GPU stalls (INT64_MAX: none)

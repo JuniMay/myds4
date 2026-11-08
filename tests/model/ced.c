@@ -195,7 +195,7 @@ int main(int argc, char **argv) {
   int compare_compact = 0;
   int runtime_ced = 0;
   int dspark_depth = 0;
-  double cache_gib = 20, reserve_gib = 4;
+  double memory_gib = 20, reserve_gib = 4;
   const char *experts = NULL;
   for (int i = 3; i < argc; i++) {
     if (!strcmp(argv[i], "--chat")) mode = 1;
@@ -210,7 +210,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--describe")) describe_only = 1;
     else if (!strcmp(argv[i], "--compact")) ced_check_compact = 1;
     else if (!strcmp(argv[i], "--dspark") && i + 1 < argc) dspark_depth = atoi(argv[++i]);
-    else if (!strcmp(argv[i], "--cache") && i + 1 < argc) cache_gib = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--memory") && i + 1 < argc) memory_gib = atof(argv[++i]);
     else if (!strcmp(argv[i], "--reserve") && i + 1 < argc) reserve_gib = atof(argv[++i]);
     else if (!strcmp(argv[i], "--bench") && i + 1 < argc) bench_tokens = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--keep") && i + 1 < argc) keep_setting = atoi(argv[++i]);
@@ -227,7 +227,7 @@ int main(int argc, char **argv) {
   if (bench_tokens < -1 || bench_tokens > 4096 ||
       keep_setting < 0 || (keep_setting && keep_setting < WINDOW) || compare_compact < 0 ||
       (compare_compact && compare_compact < WINDOW)) die("invalid benchmark or replay bounds");
-  if (!isfinite(cache_gib) || cache_gib < 16 || cache_gib > 80 || !isfinite(reserve_gib) ||
+  if (!isfinite(memory_gib) || memory_gib < 16 || memory_gib > 80 || !isfinite(reserve_gib) ||
       reserve_gib < 2 || reserve_gib > 16) die("invalid cache or reserve budget");
   char *input = read_input(argv[2]), *text = input;
   if (mode == 0) {
@@ -247,14 +247,17 @@ int main(int argc, char **argv) {
                       compare_compact ? "compact decoder execution versus the same full-shape attention mask" :
                       "full-shape decoder attention mask; numerical study, not CED speed measurement";
   printf("{\"ced_setup\":{\"prompt_tokens\":%d,\"requested_steps\":%d,\"temperature\":1,\"top_p\":1,"
-         "\"seed\":12345,\"cache_gib\":%.9g,\"reserve_gib\":%.9g,\"draft\":%d,\"substitution\":false,"
-         "\"scope\":\"%s\"}}\n", prompt_n, steps, cache_gib, reserve_gib, dspark_depth, scope);
+         "\"seed\":12345,\"memory_gib\":%.9g,\"reserve_gib\":%.9g,\"draft\":%d,\"substitution\":false,"
+         "\"scope\":\"%s\"}}\n", prompt_n, steps, memory_gib, reserve_gib, dspark_depth, scope);
   fflush(stdout);
   if (describe_only) return 0;
   alarm(600);
-  Options o = {.ctx = 32768, .deepseek.budget_gb = cache_gib, .reserve_gb = reserve_gib, .deepseek.experts = experts,
+  double model_memory_gib = memory_gib;
+  double model_reserve_gib = reserve_gib;
+  Options o = {.ctx = 32768, .deepseek.experts = experts,
                .draft = dspark_depth, .deepseek.draft_cache = dspark_depth ? 32 : 0,
                .dump_fd = -1, .routes_fd = -1, .quiet = 1, .deepseek.ced = runtime_ced};
+  memory_configure(model_memory_gib, 8, model_reserve_gib);
   deepseek_load(argv[1], &o);
   if (bench_tokens >= 0) {
     benchmark(tokens, bench_tokens, keep_setting);

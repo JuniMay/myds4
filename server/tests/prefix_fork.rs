@@ -152,8 +152,8 @@ impl Server {
             &s.checkpoint,
             "--experts",
             &s.experts,
-            "--cache",
-            "40",
+            "--memory",
+            "56",
             "--kv-cache",
             "8",
         ]

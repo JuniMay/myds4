@@ -9,11 +9,11 @@
 // and a family's buffers are its own.
 #pragma once
 #include "myds4.h"
+#include "../engine/memory.h"
 
 // Common execution settings and family-specific options. The family is
 // resolved from the checkpoint before loading.
 typedef struct {
-  double budget_gb;   // expert cache budget, 0 = automatic
   int cache_half_life;  // score half-life in forward passes; 0 = default 50
   int cache_read_cost;  // weight decode eviction priorities by aligned read bytes / slot size
   int draft_cache;    // draft expert slots per stage; 0 = all 128 preloaded
@@ -30,7 +30,6 @@ typedef struct { int reserved; } QwenOptions;
 typedef struct {
   enum { MODEL_UNSPECIFIED, MODEL_DEEPSEEK, MODEL_QWEN } family;
   int ctx;            // capacity in tokens
-  double reserve_gb;  // standalone CLI process reserve; server leaves 0 after setting its global reserve
   int dump_fd;        // -1, or a pipe receiving per-layer streams
   int routes_fd;      // -1, or a pipe receiving every decoded token's routes, predictions and router logits
   int draft;          // enable the model's native draft head(s)
@@ -67,7 +66,9 @@ typedef struct {
   // Why the options do not suit the family (an option it has no use for), or
   // null; before load.
   const char *(*refuse)(const Options *o);
-  void (*load)(const char *dir, const Options *o);
+  int (*load)(const char *dir, const Options *o);
+  MemorySlot *(*weight_slot)(void); // one reloadable dense-weight group
+  void (*active)(int active); // pin request resources; release idle guarantees
   void (*counters)(ModelCounters *c);
   void (*plan)(ModelPlan *p);  // the last prefill's, when the family plans its own; or null
   // Limits after loading: the vocabulary; rows of different states one
@@ -135,7 +136,7 @@ typedef struct {
   // The vision encoder, when the model has one (null otherwise): an image's
   // feature rows, and the images that the next prefill's image positions take.
   int (*prepare_image)(const char *dir, Image *im, const void *data, size_t len, const char **error);
-  void (*image)(Image *im);
+  int (*image)(Image *im); // 0: the global model-memory pool cannot admit it
   void (*images)(const Image *im, int n);
   // The experts row `row` of the latest decoding pass chose and where each
   // was (myds4_routes); null without routed experts.
@@ -151,12 +152,17 @@ typedef struct {
 typedef struct {
   const ModelOps *ops;
   const char *dir;
+  MemoryAccount memory;
+  MemorySlot work;
 } Model;
 
 // The family that runs the checkpoint directory dir (its config.json's
 // model_type), and the model of dir, loaded. Both end the process with a
 // message when no family runs it.
 const ModelOps *model_find(const char *dir);
+Model *model_create(const char *dir);
+int model_load(Model *model, const Options *options);
+void model_active(Model *model, int active);
 Model *model_open(const char *dir, const Options *o);
 
 extern const ModelOps deepseek_ops, qwen_ops;

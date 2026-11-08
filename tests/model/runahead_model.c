@@ -13,7 +13,9 @@ static size_t differences(const void *a, const void *b, size_t bytes) {
 int main(int argc, char **argv) {
   if (argc < 2) die("usage: runahead-model-check CHECKPOINT [--pipeline] [--long] [--requests N] [--experts GGUF]");
   int count = 4, length = 257, pipeline = 0;
-  Options o = {.ctx = 32768, .deepseek.budget_gb = 20, .reserve_gb = 4, .quiet = 1, .dump_fd = -1, .routes_fd = -1};
+  double model_memory_gib = 20;
+  double model_reserve_gib = 4;
+  Options o = {.ctx = 32768, .quiet = 1, .dump_fd = -1, .routes_fd = -1};
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--long")) length = 16521;
     else if (!strcmp(argv[i], "--pipeline")) pipeline = 1;
@@ -25,6 +27,7 @@ int main(int argc, char **argv) {
   o.deepseek.pipeline = pipeline;
   alarm(600);
   tk = tok_open(argv[1], deepseek_ops.image_token);
+  memory_configure(model_memory_gib, 8, model_reserve_gib);
   deepseek_load(argv[1], &o);
   enum { STEPS = 4 };
   State *states[FEW];

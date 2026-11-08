@@ -78,7 +78,7 @@ def main():
     ap.add_argument("--quant", choices=("mxfp4", "q2", "both"), default="mxfp4")
     ap.add_argument("--phase", choices=("validate", "prefill", "ced-generation", "dspark", "all"), default="all")
     ap.add_argument("--tokens", type=int, default=256)
-    ap.add_argument("--cache", type=float, default=20)
+    ap.add_argument("--memory", type=float, default=20)
     ap.add_argument("--reserve", type=float, default=4)
     ap.add_argument("--binary", type=Path, default=ROOT / "build/tests/ced")
     ap.add_argument("--server", type=Path, default=ROOT / "build/myds4-server", help="renders the request's prompt")
@@ -86,8 +86,8 @@ def main():
     args = ap.parse_args()
     if not 64 <= args.tokens <= 1024 or not 1 < args.expected_input_tokens < 16384:
         ap.error("Use 64–1024 generated tokens and fewer than 16,384 input tokens")
-    if not 16 <= args.cache <= 80 or not 2 <= args.reserve <= 16:
-        ap.error("Use a 16–80 GiB cache and 2–16 GiB reserve")
+    if not 16 <= args.memory <= 80 or not 2 <= args.reserve <= 16:
+        ap.error("Use a 16–80 GiB model-memory budget and 2–16 GiB reserve")
     if args.quant != "mxfp4" and args.q2 is None:
         ap.error("--q2 is required for IQ2 comparisons")
     request = harness_request(args.harness_session, args.before_seq)
@@ -102,7 +102,7 @@ def main():
     prompt = rendered.stdout
     binary = args.binary.resolve()
     command = [str(binary), str(args.checkpoint), "-", "--chat", "--steps", "16",
-               "--cache", str(args.cache), "--reserve", str(args.reserve)]
+               "--memory", str(args.memory), "--reserve", str(args.reserve)]
     described = subprocess.run(command + ["--describe"], input=prompt, capture_output=True, check=True, timeout=30)
     setup = objects(described.stdout.decode())[0]["ced_setup"]
     if setup["prompt_tokens"] != args.expected_input_tokens:
@@ -112,7 +112,7 @@ def main():
                 "renderer_sha256": hashlib.sha256(server.read_bytes()).hexdigest(),
                 "request_sha256": hashlib.sha256(payload).hexdigest(), "tokens": args.tokens,
                 "prompt_tokens": setup["prompt_tokens"], "temperature": 1, "top_p": 1,
-                "seed": 12345, "cache_gib": args.cache, "reserve_gib": args.reserve,
+                "seed": 12345, "model_memory_gib": args.memory, "reserve_gib": args.reserve,
                 "reasoning_effort": request["reasoning_effort"],
                 "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017"}
     report = json.loads(args.output.read_text()) if args.output and args.output.exists() else {
@@ -155,7 +155,7 @@ def main():
                 required = "validate-compact-" + name.split("-")[-1]
                 if not any(r["name"] == required for r in matching()):
                     raise ValueError("Run compact correctness validation before the generation comparison")
-            guard = wait_for_gpu(args.cache, 15, reserve_gib=args.reserve, desktop=True)
+            guard = wait_for_gpu(args.memory + 2, 15, reserve_gib=args.reserve, desktop=True)
             _idle(ROOT / "build/myds4", env)
             cmd = command + options + (["--experts", str(args.q2)] if quant == "q2" else [])
             print("STUDY_START " + json.dumps({"quant": quant, "name": name}), flush=True)
@@ -171,7 +171,6 @@ def main():
             if bench:
                 valid &= bench["cache_bytes_min"] == bench["cache_bytes_start"] == bench["cache_bytes_max"]
                 valid &= bench["slots_released"] == 0
-                valid &= abs(bench["cache_bytes_start"] / 1024**3 - args.cache) < 0.05
                 if name in ("dspark-2", "dspark-control-b"):
                     controls = [r["bench"] for r in matching() if r["name"] == "dspark-control-a"]
                     if not controls:

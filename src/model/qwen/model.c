@@ -6,6 +6,7 @@
 // implementation (MLX's qwen3_5).
 #include "model.h"
 #include "vision.h"
+#include "../weights.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -41,6 +42,7 @@ typedef struct {
 } Layer;
 
 static TensorIndex *checkpoint;
+static WeightSet *dense;
 static QwenVision *vision;
 static const Image *images;
 static int image_count;
@@ -69,6 +71,7 @@ static Buf HB, TOKM, EMBM, SEQM, EH;
 static Buf QH;  // a prompt pass's queries as FP16, by head
 static Buf PART, ML;  // attention blocks' partial sums, for states of up to `blocks` * BLK positions
 static int blocks;
+static int workspace_rows;
 static int K_mv1[3], K_mvr[3], K_mm[3], K_gate_up[3], K_add_norm, K_x_bf16, K_concat, K_q_half, K_attend_prompt, K_embed, K_rms_norm, K_l2_norm, K_conv, K_gdn_gates, K_gdn, K_qk_rope, K_kv_store, K_attend_block,
     K_attend_combine, K_swiglu, K_add;
 
@@ -151,6 +154,7 @@ void qwen_reside(int on) {
   if (on == resident) return;
   gpu_sync();
   for (int i = 0; i < nowned; i++) gpu_resident(&owned[i], on);
+  weights_reside(dense, on);
   qwen_vision_reside(vision, on);
   gpu_residency_commit();
   resident = on;
@@ -162,33 +166,10 @@ static double num(const Json *o, const char *key) {
   return v->num;
 }
 
-static uint64_t weight_bytes;  // the weights uploaded
+static void upload(Buf *target, Tensor tensor) { weights_tensor(dense, target, tensor, 0); }
 
-static Buf upload(Tensor t) {
-  Buf b = own(gpu_alloc(t.size));
-  weight_bytes += t.size;
-  size_t done = 0;
-  while (done < t.size) {  // macOS refuses reads above INT_MAX bytes
-    size_t want = t.size - done < (1u << 30) ? t.size - done : (1u << 30);
-    ssize_t n = pread(t.fd, b.ptr + done, want, (off_t)(t.off + done));
-    if (n <= 0) die("cannot read a tensor");
-    done += (size_t)n;
-  }
-  return b;
-}
-
-// A BF16 or FP32 vector as FP32, plus `add`.
-static Buf vec(const char *name, float add) {
-  Tensor t = st_get(checkpoint, "%s", name);
-  int n = t.dtype == 'b' ? (int)(t.size / 2) : (int)(t.size / 4);
-  if (t.dtype != 'b' && t.dtype != 'f') die("%s: not BF16 or FP32", name);
-  Buf raw = upload(t), b = own(gpu_alloc((size_t)n * 4));
-  float *f = (float *)b.ptr;
-  for (int i = 0; i < n; i++)
-    f[i] = (t.dtype == 'b' ? (union { uint32_t u; float f; }){(uint32_t)((uint16_t *)raw.ptr)[i] << 16}.f
-                           : ((float *)raw.ptr)[i]) + add;
-  unown(&raw);
-  return b;
+static void vec(Buf *target, const char *name, float add) {
+  weights_vector(dense, target, st_get(checkpoint, "%s", name), add, WEIGHT_ADD);
 }
 
 static float scalar(const char *name) {
@@ -198,37 +179,41 @@ static float scalar(const char *name) {
   return v;
 }
 
-static Mat mat(const char *stem) {
+static void mat(Mat *matrix, const char *stem) {
   char name[256];
   snprintf(name, sizeof name, "%s.weight", stem);
-  Tensor t = st_get(checkpoint, "%s", name);
-  Mat m = {.rows = (int)t.shape[0], .scale = 1};
-  if (t.dtype == 'u') {  // NVFP4: two codes a byte
-    m.kind = 'n', m.cols = (int)t.shape[1] * 2;
-    m.w = upload(t);
+  Tensor tensor = st_get(checkpoint, "%s", name);
+  *matrix = (Mat){.rows = (int)tensor.shape[0], .scale = 1};
+  if (tensor.dtype == 'u') {
+    matrix->kind = 'n', matrix->cols = (int)tensor.shape[1] * 2;
+    upload(&matrix->w, tensor);
     snprintf(name, sizeof name, "%s.weight_scale", stem);
-    m.s = upload(st_get(checkpoint, "%s", name));
+    upload(&matrix->s, st_get(checkpoint, "%s", name));
     snprintf(name, sizeof name, "%s.weight_scale_2", stem);
-    m.scale = scalar(name);
-  } else if (t.dtype == '8') {
-    m.kind = '8', m.cols = (int)t.shape[1];
-    m.w = upload(t);
+    matrix->scale = scalar(name);
+  } else if (tensor.dtype == '8') {
+    matrix->kind = '8', matrix->cols = (int)tensor.shape[1];
+    upload(&matrix->w, tensor);
     snprintf(name, sizeof name, "%s.weight_scale", stem);
-    m.scale = scalar(name);
-  } else if (t.dtype == 'b') {
-    m.kind = 'b', m.cols = (int)t.shape[1];
-    m.w = upload(t);
-  } else {
-    die("%s: unsupported weight type", name);
-  }
-  if (m.cols % 512 || m.rows % 4) die("%s: %d x %d, not 4-row and 512-column multiples", name, m.rows, m.cols);
-  return m;
+    matrix->scale = scalar(name);
+  } else if (tensor.dtype == 'b') {
+    matrix->kind = 'b', matrix->cols = (int)tensor.shape[1];
+    upload(&matrix->w, tensor);
+  } else die("%s: unsupported weight type", name);
+  if (matrix->cols % 512 || matrix->rows % 4)
+    die("%s: %d x %d, not 4-row and 512-column multiples", name, matrix->rows, matrix->cols);
 }
 
 static Buf zeros(size_t n) {
   Buf b = own(gpu_alloc(n));
   memset(b.ptr, 0, n);
   return b;
+}
+
+static Buf kv_zeros(size_t bytes) {
+  Buf buffer = own(gpu_alloc_kv(bytes));
+  memset(buffer.ptr, 0, bytes);
+  return buffer;
 }
 
 static void grow_blocks(int cap) {
@@ -241,7 +226,38 @@ static void grow_blocks(int cap) {
   ML = zeros((size_t)ROWS * c.heads * blocks * 8);
 }
 
-void qwen_load(const char *dir, int drafts) {
+static uint64_t workspace(int rows, int position, int allocate) {
+  uint64_t bytes = 0;
+  int capacity = (rows + 127) / 128 * 128;
+  if (capacity < 128) capacity = 128;
+  int keys = 4096;
+  while (keys < position) keys *= 2;
+  int parts = keys / BLK > blocks ? keys / BLK : blocks;
+#define W(buffer, amount) do { size_t size = (amount); bytes += gpu_allocation_size(size); if (allocate && buffer.size != size) { unown(&buffer); buffer = zeros(size); } } while (0)
+  size_t r = capacity * 4, vd = (size_t)c.value_heads * c.value_dim;
+  W(TOK, capacity * 4); W(EMB, capacity * 8); W(EMBM, capacity * 8); W(SEQ, capacity * sizeof(Seq));
+  int widest = c.inter > 2 * c.hidden ? c.inter : 2 * c.hidden;  // 2 * hidden: the MTP head's fc
+  if (vd > (size_t)widest) widest = (int)vd;
+  W(XB, (size_t)capacity * widest * 2);
+  W(X, r * c.hidden); W(XN, r * c.hidden); W(R, r * c.hidden);
+  W(QKV, r * c.channels); W(CO, r * c.channels); W(Z, r * vd); W(GO, r * vd); W(GN, r * vd);
+  W(A_, r * c.value_heads); W(B_, r * c.value_heads); W(G, r * c.value_heads);
+  W(BETA, r * c.value_heads);
+  W(QG, r * 2 * c.heads * c.head_dim); W(KK, r * c.kv_heads * c.head_dim);
+  W(VV, r * c.kv_heads * c.head_dim); W(Q, r * c.heads * c.head_dim); W(KR, r * c.kv_heads * c.head_dim);
+  W(AO, r * c.heads * c.head_dim);
+  W(GT, r * c.inter); W(UP, r * c.inter); W(HH, r * c.inter);
+  W(LOGITS, (size_t)ROWS * 4 * c.vocab);
+  W(HB, r * c.hidden); W(TOKM, capacity * 4); W(SEQM, capacity * sizeof(Seq)); W(EH, r * 2 * c.hidden);
+  W(QH, (size_t)c.heads * capacity * c.head_dim * 2);
+  W(PART, (size_t)ROWS * c.heads * parts * c.head_dim * 4);
+  W(ML, (size_t)ROWS * c.heads * parts * 8);
+  if (allocate) { blocks = parts; workspace_rows = capacity; }
+#undef W
+  return bytes;
+}
+
+static void prepare(const char *dir, int drafts) {
   char path[4096];
   snprintf(path, sizeof path, "%s/config.json", dir);
   char *text = read_file(path, 0);
@@ -301,14 +317,14 @@ void qwen_load(const char *dir, int drafts) {
   K_swiglu = gpu_kernel("silu_mul"), K_add = gpu_kernel("add");
 
   checkpoint = st_open(dir);
+  dense = weights_new(memory_current()->account, "Qwen dense weights");
   vision = qwen_vision_open(checkpoint, json_get(root, "vision_config"));
-  double t0 = now();
   const char *m = "model.language_model";
   char p[256], n[256];
-  embed_w = upload(st_get(checkpoint, "%s.embed_tokens.weight", m));
+  upload(&embed_w, st_get(checkpoint, "%s.embed_tokens.weight", m));
   snprintf(n, sizeof n, "%s.norm.weight", m);
-  final_norm = vec(n, 1);
-  head = mat("lm_head");
+  vec(&final_norm, n, 1);
+  mat(&head, "lm_head");
   L = calloc((size_t)c.layers, sizeof *L);
   for (int l = 0; l < c.layers; l++) {
     Layer *y = &L[l];
@@ -316,70 +332,92 @@ void qwen_load(const char *dir, int drafts) {
     y->linear = !strcmp(kind, "linear_attention");
     if (!y->linear && strcmp(kind, "full_attention")) die("layer %d: unknown type %s", l, kind);
     y->index = y->linear ? c.linear++ : c.attention++;
-    snprintf(n, sizeof n, "%s.layers.%d.input_layernorm.weight", m, l), y->in_norm = vec(n, 1);
-    snprintf(n, sizeof n, "%s.layers.%d.post_attention_layernorm.weight", m, l), y->post_norm = vec(n, 1);
-    snprintf(p, sizeof p, "%s.layers.%d.mlp.gate_proj", m, l), y->gate = mat(p);
-    snprintf(p, sizeof p, "%s.layers.%d.mlp.up_proj", m, l), y->up = mat(p);
-    snprintf(p, sizeof p, "%s.layers.%d.mlp.down_proj", m, l), y->down = mat(p);
+    snprintf(n, sizeof n, "%s.layers.%d.input_layernorm.weight", m, l), vec(&y->in_norm, n, 1);
+    snprintf(n, sizeof n, "%s.layers.%d.post_attention_layernorm.weight", m, l), vec(&y->post_norm, n, 1);
+    snprintf(p, sizeof p, "%s.layers.%d.mlp.gate_proj", m, l), mat(&y->gate, p);
+    snprintf(p, sizeof p, "%s.layers.%d.mlp.up_proj", m, l), mat(&y->up, p);
+    snprintf(p, sizeof p, "%s.layers.%d.mlp.down_proj", m, l), mat(&y->down, p);
     if (y->linear) {
-      snprintf(p, sizeof p, "%s.layers.%d.linear_attn.in_proj_qkv", m, l), y->qkv = mat(p);
-      snprintf(p, sizeof p, "%s.layers.%d.linear_attn.in_proj_z", m, l), y->z = mat(p);
-      snprintf(p, sizeof p, "%s.layers.%d.linear_attn.in_proj_a", m, l), y->a = mat(p);
-      snprintf(p, sizeof p, "%s.layers.%d.linear_attn.in_proj_b", m, l), y->b = mat(p);
-      snprintf(p, sizeof p, "%s.layers.%d.linear_attn.out_proj", m, l), y->out = mat(p);
-      snprintf(n, sizeof n, "%s.layers.%d.linear_attn.conv1d.weight", m, l), y->conv = vec(n, 0);
-      snprintf(n, sizeof n, "%s.layers.%d.linear_attn.A_log", m, l), y->A = vec(n, 0);
-      for (int h = 0; h < c.value_heads; h++) ((float *)y->A.ptr)[h] = expf(((float *)y->A.ptr)[h]);
-      snprintf(n, sizeof n, "%s.layers.%d.linear_attn.dt_bias", m, l), y->dt_bias = vec(n, 0);
-      snprintf(n, sizeof n, "%s.layers.%d.linear_attn.norm.weight", m, l), y->norm = vec(n, 0);
+      snprintf(p, sizeof p, "%s.layers.%d.linear_attn.in_proj_qkv", m, l), mat(&y->qkv, p);
+      snprintf(p, sizeof p, "%s.layers.%d.linear_attn.in_proj_z", m, l), mat(&y->z, p);
+      snprintf(p, sizeof p, "%s.layers.%d.linear_attn.in_proj_a", m, l), mat(&y->a, p);
+      snprintf(p, sizeof p, "%s.layers.%d.linear_attn.in_proj_b", m, l), mat(&y->b, p);
+      snprintf(p, sizeof p, "%s.layers.%d.linear_attn.out_proj", m, l), mat(&y->out, p);
+      snprintf(n, sizeof n, "%s.layers.%d.linear_attn.conv1d.weight", m, l), vec(&y->conv, n, 0);
+      snprintf(n, sizeof n, "%s.layers.%d.linear_attn.A_log", m, l);
+      weights_vector(dense, &y->A, st_get(checkpoint, "%s", n), 0, WEIGHT_ADD | WEIGHT_EXP);
+      snprintf(n, sizeof n, "%s.layers.%d.linear_attn.dt_bias", m, l), vec(&y->dt_bias, n, 0);
+      snprintf(n, sizeof n, "%s.layers.%d.linear_attn.norm.weight", m, l), vec(&y->norm, n, 0);
       if (y->qkv.rows != c.channels || y->z.rows != c.value_heads * c.value_dim || y->a.rows != c.value_heads)
         die("layer %d: DeltaNet projections of unexpected sizes", l);
     } else {
-      snprintf(p, sizeof p, "%s.layers.%d.self_attn.q_proj", m, l), y->q = mat(p);
-      snprintf(p, sizeof p, "%s.layers.%d.self_attn.k_proj", m, l), y->k = mat(p);
-      snprintf(p, sizeof p, "%s.layers.%d.self_attn.v_proj", m, l), y->v = mat(p);
-      snprintf(p, sizeof p, "%s.layers.%d.self_attn.o_proj", m, l), y->o = mat(p);
-      snprintf(n, sizeof n, "%s.layers.%d.self_attn.q_norm.weight", m, l), y->q_norm = vec(n, 1);
-      snprintf(n, sizeof n, "%s.layers.%d.self_attn.k_norm.weight", m, l), y->k_norm = vec(n, 1);
+      snprintf(p, sizeof p, "%s.layers.%d.self_attn.q_proj", m, l), mat(&y->q, p);
+      snprintf(p, sizeof p, "%s.layers.%d.self_attn.k_proj", m, l), mat(&y->k, p);
+      snprintf(p, sizeof p, "%s.layers.%d.self_attn.v_proj", m, l), mat(&y->v, p);
+      snprintf(p, sizeof p, "%s.layers.%d.self_attn.o_proj", m, l), mat(&y->o, p);
+      snprintf(n, sizeof n, "%s.layers.%d.self_attn.q_norm.weight", m, l), vec(&y->q_norm, n, 1);
+      snprintf(n, sizeof n, "%s.layers.%d.self_attn.k_norm.weight", m, l), vec(&y->k_norm, n, 1);
       if (y->q.rows != 2 * c.heads * c.head_dim || y->k.rows != c.kv_heads * c.head_dim)
         die("layer %d: attention projections of unexpected sizes", l);
     }
   }
   mtp = drafts && st_has(checkpoint, "mtp.fc.weight");
   if (mtp) {
-    mtp_fc = mat("mtp.fc");
-    mtp_norm_e = vec("mtp.pre_fc_norm_embedding.weight", 1), mtp_norm_h = vec("mtp.pre_fc_norm_hidden.weight", 1);
-    mtp_norm = vec("mtp.norm.weight", 1);
+    mat(&mtp_fc, "mtp.fc");
+    vec(&mtp_norm_e, "mtp.pre_fc_norm_embedding.weight", 1), vec(&mtp_norm_h, "mtp.pre_fc_norm_hidden.weight", 1);
+    vec(&mtp_norm, "mtp.norm.weight", 1);
     M = (Layer){.linear = 0, .index = c.attention};
-    M.in_norm = vec("mtp.layers.0.input_layernorm.weight", 1);
-    M.post_norm = vec("mtp.layers.0.post_attention_layernorm.weight", 1);
-    M.q = mat("mtp.layers.0.self_attn.q_proj"), M.k = mat("mtp.layers.0.self_attn.k_proj");
-    M.v = mat("mtp.layers.0.self_attn.v_proj"), M.o = mat("mtp.layers.0.self_attn.o_proj");
-    M.q_norm = vec("mtp.layers.0.self_attn.q_norm.weight", 1), M.k_norm = vec("mtp.layers.0.self_attn.k_norm.weight", 1);
-    M.gate = mat("mtp.layers.0.mlp.gate_proj"), M.up = mat("mtp.layers.0.mlp.up_proj");
-    M.down = mat("mtp.layers.0.mlp.down_proj");
+    vec(&M.in_norm, "mtp.layers.0.input_layernorm.weight", 1);
+    vec(&M.post_norm, "mtp.layers.0.post_attention_layernorm.weight", 1);
+    mat(&M.q, "mtp.layers.0.self_attn.q_proj"), mat(&M.k, "mtp.layers.0.self_attn.k_proj");
+    mat(&M.v, "mtp.layers.0.self_attn.v_proj"), mat(&M.o, "mtp.layers.0.self_attn.o_proj");
+    vec(&M.q_norm, "mtp.layers.0.self_attn.q_norm.weight", 1), vec(&M.k_norm, "mtp.layers.0.self_attn.k_norm.weight", 1);
+    mat(&M.gate, "mtp.layers.0.mlp.gate_proj"), mat(&M.up, "mtp.layers.0.mlp.up_proj");
+    mat(&M.down, "mtp.layers.0.mlp.down_proj");
     if (mtp_fc.cols != 2 * c.hidden || mtp_fc.rows != c.hidden) die("mtp.fc: %d x %d", mtp_fc.rows, mtp_fc.cols);
   }
-  size_t r = PF * 4, vd = (size_t)c.value_heads * c.value_dim;
-  TOK = zeros(PF * 4), EMB = zeros(PF * 8), EMBM = zeros(PF * 8), SEQ = zeros(PF * sizeof(Seq));
-  int widest = c.inter > 2 * c.hidden ? c.inter : 2 * c.hidden;  // 2 * hidden: the MTP head's fc
-  if (vd > (size_t)widest) widest = (int)vd;
-  XB = zeros((size_t)PF * widest * 2);
-  X = zeros(r * c.hidden), XN = zeros(r * c.hidden), R = zeros(r * c.hidden);
-  QKV = zeros(r * c.channels), CO = zeros(r * c.channels), Z = zeros(r * vd), GO = zeros(r * vd), GN = zeros(r * vd);
-  A_ = zeros(r * c.value_heads), B_ = zeros(r * c.value_heads), G = zeros(r * c.value_heads);
-  BETA = zeros(r * c.value_heads);
-  QG = zeros(r * 2 * c.heads * c.head_dim), KK = zeros(r * c.kv_heads * c.head_dim);
-  VV = zeros(r * c.kv_heads * c.head_dim), Q = zeros(r * c.heads * c.head_dim), KR = zeros(r * c.kv_heads * c.head_dim);
-  AO = zeros(r * c.heads * c.head_dim);
-  GT = zeros(r * c.inter), UP = zeros(r * c.inter), HH = zeros(r * c.inter);
-  LOGITS = zeros((size_t)ROWS * 4 * c.vocab);
-  HB = zeros(r * c.hidden), TOKM = zeros(PF * 4), SEQM = zeros(PF * sizeof(Seq)), EH = zeros(r * 2 * c.hidden);
-  QH = zeros((size_t)c.heads * PF * c.head_dim * 2);
-  grow_blocks(4096);
   json_free(root);
-  fprintf(stderr, "qwen: %d layers (%d DeltaNet, %d attention), %d hidden%s, loaded in %.1f s\n", c.layers, c.linear,
-          c.attention, c.hidden, mtp ? ", MTP head" : "", now() - t0);
+}
+
+static uint64_t workspace_bytes(void) {
+  const Buf *buffers[] = {&TOK, &EMB, &EMBM, &SEQ, &XB, &X, &XN, &R, &QKV, &CO, &Z, &GO, &GN,
+    &A_, &B_, &G, &BETA, &QG, &KK, &VV, &Q, &KR, &AO, &GT, &UP, &HH, &LOGITS,
+    &HB, &TOKM, &SEQM, &EH, &QH, &PART, &ML};
+  uint64_t bytes = 0;
+  for (size_t i = 0; i < sizeof buffers / sizeof *buffers; i++) bytes += buffers[i]->allocated;
+  return bytes;
+}
+
+static int prepare_rows(int requested, int position) {
+  MemorySlot *work = memory_current(), *core = weights_slot(dense);
+  uint64_t fixed = work->payload - workspace_bytes();
+  int rows = requested < PF ? requested : PF;
+  for (;;) {
+    uint64_t required = weights_required(dense) + fixed + workspace(rows, position, 0);
+    MemoryAdmission mode = rows > 1 ? MEMORY_WORKSPACE : MEMORY_REQUIRED;
+    if (memory_minimum_mode(core->account, required, mode)) {
+      gpu_sync();
+      workspace(rows, position, 1);
+      return rows;
+    }
+    if (rows == 1) return 0;
+    rows = (rows + 1) / 2;
+  }
+}
+
+int qwen_load(const char *dir, int drafts) {
+  double began = now();
+  if (!checkpoint) prepare(dir, drafts);
+  MemorySlot *core = weights_slot(dense), *work = memory_current();
+  memory_pin(core, 1);
+  uint64_t required = weights_required(dense) + work->payload - workspace_bytes() + workspace(128, 0, 0);
+  if (!memory_minimum(core->account, required)) { memory_pin(core, 0); return 0; }
+  gpu_sync();
+  workspace(128, 0, 1);
+  if (!weights_load(dense)) { memory_pin(core, 0); return 0; }
+  fprintf(stderr, "qwen: %d layers (%d DeltaNet, %d attention), %d hidden%s, loaded in %.1f s\n",
+          c.layers, c.linear, c.attention, c.hidden, mtp ? ", MTP head" : "", now() - began);
+  return 1;
 }
 
 int qwen_vocab(void) { return c.vocab; }
@@ -408,9 +446,9 @@ QwenState *qwen_state_new(void) {
   qwen_reside(1);
   QwenState *s = calloc(1, sizeof *s);
   for (int i = 0; i < 2; i++)
-    s->gdn[i] = zeros(gdn_bytes()), s->conv[i] = zeros(conv_bytes()), s->hid[i] = zeros(hid_bytes());
+    s->gdn[i] = kv_zeros(gdn_bytes()), s->conv[i] = kv_zeros(conv_bytes()), s->hid[i] = kv_zeros(hid_bytes());
   s->cap = 1024;
-  s->kv = own(gpu_alloc(kv_bytes(s->cap)));
+  s->kv = own(gpu_alloc_kv(kv_bytes(s->cap)));
   s->saved = -1, s->mtp_kept = -1;
   grow_blocks(s->cap);
   return s;
@@ -439,7 +477,7 @@ void qwen_state_reserve(QwenState *s, int positions) {
   int cap = s->cap;
   while (cap < positions) cap *= 2;
   gpu_sync();
-  Buf kv = own(gpu_alloc(kv_bytes(cap)));
+  Buf kv = own(gpu_alloc_kv(kv_bytes(cap)));
   kv_rows(kv.ptr, cap, s->kv.ptr, s->cap, s->pos);
   unown(&s->kv);
   s->kv = kv, s->cap = cap;
@@ -470,8 +508,8 @@ void qwen_state_back(QwenState *s) {
 QwenSnap *qwen_snap_take(const QwenState *s) {
   qwen_reside(1);
   QwenSnap *n = calloc(1, sizeof *n);
-  n->gdn = own(gpu_alloc(gdn_bytes())), n->conv = own(gpu_alloc(conv_bytes()));
-  n->hid = own(gpu_alloc(hid_bytes())), n->pos = s->pos, n->rope_delta = s->rope_delta;
+  n->gdn = own(gpu_alloc_kv(gdn_bytes())), n->conv = own(gpu_alloc_kv(conv_bytes()));
+  n->hid = own(gpu_alloc_kv(hid_bytes())), n->pos = s->pos, n->rope_delta = s->rope_delta;
   gpu_sync();
   memcpy(n->gdn.ptr, s->gdn[s->cur].ptr, gdn_bytes());
   memcpy(n->conv.ptr, s->conv[s->cur].ptr, conv_bytes());
@@ -867,7 +905,7 @@ static ModelCounters counted;     // decoding and prompt passes' rows and times
 
 static const char *q_refuse(const Options *o) {
   if (o->deepseek.experts || o->deepseek.ced || o->deepseek.substitute > 0 || o->deepseek.online_predictor || o->deepseek.predictor_state || o->deepseek.prefill_prune ||
-      o->deepseek.draft_cache || o->dump_fd >= 0 || o->routes_fd >= 0 || o->deepseek.runahead || o->deepseek.budget_gb || o->deepseek.cache_half_life ||
+      o->deepseek.draft_cache || o->dump_fd >= 0 || o->routes_fd >= 0 || o->deepseek.runahead || o->deepseek.cache_half_life ||
       o->deepseek.cache_read_cost || o->deepseek.pipeline)
     return "experts, ced, substitute, online-predictor, predictor-state, prefill-prune, draft-cache, cache, "
            "cache-half-life, cache-read-cost, dump-fd, routes-fd, runahead and pipeline apply to DeepSeek's routed experts and "
@@ -876,17 +914,21 @@ static const char *q_refuse(const Options *o) {
   return 0;
 }
 
-static void q_load(const char *dir, const Options *o) {
-  if (o->reserve_gb) cache_reserve(o->reserve_gb);
+static int q_load(const char *dir, const Options *o) {
   const char *why = q_refuse(o);
   if (why) die("qwen3_5: %s", why);
   qopt = *o;
-  qwen_load(dir, o->draft != 0);
+  if (!qwen_load(dir, o->draft != 0)) return 0;
   last_pass = now();
-  counted.dense_bytes = weight_bytes;
+  counted.dense_bytes = weights_resident_bytes(dense);
+  return 1;
 }
 
-static void q_counters(ModelCounters *out) { *out = counted; out->dense_bytes += qwen_vision_bytes(vision); }
+static void q_counters(ModelCounters *out) {
+  *out = counted;
+  out->dense_bytes = weights_resident_bytes(dense) + qwen_vision_bytes(vision);
+}
+static MemorySlot *q_weight_slot(void) { return dense ? weights_slot(dense) : NULL; }
 
 // A decoding pass's rows and times into the counters.
 static const float *decoded(const float *logits, int rows, double t0, double g0) {
@@ -925,7 +967,7 @@ static ModelSnapshot *q_snapshot_take(ModelState *s, int pos, int with_logits) {
   *t = (Taken){qwen_snap_take(q), 0};
   if (with_logits) {
     if (!last_logits) die("qwen3_5: a snapshot's logits before any pass");
-    t->logits = xmalloc((size_t)c.vocab * 4), memcpy(t->logits, last_logits, (size_t)c.vocab * 4);
+    t->logits = memory_host_required((size_t)c.vocab * 4, 1), memcpy(t->logits, last_logits, (size_t)c.vocab * 4);
   }
   return (ModelSnapshot *)t;
 }
@@ -934,7 +976,7 @@ static void q_snapshot_restore(ModelState *s, const ModelSnapshot *x) {
 }
 static void q_snapshot_free(ModelSnapshot *x) {
   if (!x) return;
-  qwen_snap_free(((Taken *)x)->snap), free(((Taken *)x)->logits), free(x);
+  qwen_snap_free(((Taken *)x)->snap), memory_host_free(((Taken *)x)->logits), free(x);
 }
 static size_t q_snapshot_bytes(int with_logits) { return qwen_snap_bytes() + (with_logits ? (size_t)c.vocab * 4 : 0); }
 static const float *q_snapshot_logits(const ModelSnapshot *x) { return ((const Taken *)x)->logits; }
@@ -974,7 +1016,10 @@ static const float *q_prefill(ModelState *st, const int *tokens, int n, int from
   int most = every ? ROWS : PF;
   const float *lg = 0;
   for (int at = from; at < n;) {
-    int end = capture > at && capture < n ? capture : n, k = end - at < most ? end - at : most;
+    int end = capture > at && capture < n ? capture : n;
+    int wanted = end - at < most ? end - at : most;
+    int k = prepare_rows(wanted, at + wanted);
+    if (!k) return NULL;
     for (int i = 0; i < k; i++) rows[i] = (QwenRow){s, tokens[at + i], 0};
     counted.prefill_rows_now = k, counted.prefill_layer = 1;
     lg = qwen_prefill(rows, k, every ? k : 1);
@@ -988,11 +1033,12 @@ static const float *q_prefill(ModelState *st, const int *tokens, int n, int from
 }
 
 static const float *q_rows(ModelState *const *states, const int *tokens, const int *pos, int m) {
-  if (m < 1 || m > ROWS) die("qwen3_5: %d rows", m);
+  int end = 0;
+  for (int r = 0; r < m; r++) if (pos[r] + 1 > end) end = pos[r] + 1;
+  if ((m > workspace_rows || end > blocks * BLK) && !prepare_rows(m, end)) return NULL;
   QwenRow rows[ROWS];
   for (int r = 0; r < m; r++) {
     QwenState *s = (QwenState *)states[r];
-    if (pos[r] != s->pos) die("qwen3_5: a row at %d of a state at %d", pos[r], s->pos);
     mtp_fill(s, tokens[r], 0);
     rows[r] = (QwenRow){s, tokens[r], 0};
   }
@@ -1002,15 +1048,12 @@ static const float *q_rows(ModelState *const *states, const int *tokens, const i
 
 static void q_draft(ModelState *st, int token, int pos, int *drafts, int n) {
   QwenState *s = (QwenState *)st;
-  if (n < 1 || !q_draft_block()) die("qwen3_5: %d drafts (the MTP head drafts one)", n);
-  if (pos != s->pos) die("qwen3_5: a draft at %d of a state at %d", pos, s->pos);
   drafts[0] = sample_argmax(mtp_fill(s, token, 1), c.vocab);
 }
 
 static const float *q_verify(ModelState *st, const int *tokens, int m, int pos) {
   QwenState *s = (QwenState *)st;
-  if (m < 1 || m > q_max_verify()) die("qwen3_5: a verify pass of %d rows", m);
-  if (pos != s->pos) die("qwen3_5: a verify pass at %d of a state at %d", pos, s->pos);
+  if ((m > workspace_rows || pos + m > blocks * BLK) && !prepare_rows(m, pos + m)) return NULL;
   mtp_fill(s, tokens[0], 0);
   QwenRow rows[2] = {{s, tokens[0], m > 1}, {s, m > 1 ? tokens[1] : 0, 0}};
   double t0 = last_pass = now(), g0 = gpu_busy;
@@ -1036,9 +1079,9 @@ static int q_idle(void) {
   return 0;
 }
 
-static void q_image(Image *image) {
+static int q_image(Image *image) {
   qwen_reside(1);
-  qwen_vision_encode(vision, image);
+  return qwen_vision_encode(vision, image);
 }
 
 static void q_images(const Image *input, int count) {
@@ -1057,7 +1100,7 @@ static void q_chat(char *text, size_t cap, const char *prompt, int images, int t
 static const char *const q_types[] = {"qwen3_5", "qwen3_5_text", 0};
 
 const ModelOps qwen_ops = {
-    .family = "Qwen3.8", .model_types = q_types, .image_token = "<|image_pad|>", .refuse = q_refuse, .load = q_load, .counters = q_counters,
+    .family = "Qwen3.8", .model_types = q_types, .image_token = "<|image_pad|>", .refuse = q_refuse, .load = q_load, .weight_slot = q_weight_slot, .counters = q_counters,
     .vocab = q_vocab, .max_rows = q_max_rows,
     .max_verify = q_max_verify, .draft_block = q_draft_block, .rewind = q_rewind, .stop = q_stop,
     .prefill_rows = q_prefill_rows,

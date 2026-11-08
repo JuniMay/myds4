@@ -29,7 +29,8 @@ static void usage(void) {
         "  --prefill-prune  skip decoder batches outside required history (default off); CED and substitution must be off\n"
         "  --ced off|N   approximate prefill: replay N decoder tokens, 128-1048576 (default off);\n"
         "                keeps the verification rewind margin; decoding uses all layers\n"
-        "  --cache GB    expert cache budget (default: from available memory)\n"
+        "  --memory GB   global model-memory ceiling, excluding KV (default: automatic)\n"
+        "  --kv-cache GB separate KV allowance for automatic memory sizing (default: 8)\n"
         "  --reserve GB  memory the expert cache leaves to other programs, 2-1024 (default 10)\n"
         "  --cache-half-life N  score half-life in forward passes, 1-1000000 (default 50)\n"
         "  --cache-read-cost   weight decode eviction priority by expert read bytes (default off)\n"
@@ -48,7 +49,7 @@ static void usage(void) {
         "                Qwen's MTP head: 1), using the requested sampler\n"
         "  --lookup off|N  verify up to N (1-15) context-copy drafts; --draft supplies fallback (default off)\n"
         "  --draft-cache N  with --draft: expert slots per stage, 15-128 (default: all 128 preloaded);\n"
-        "                smaller caches load the native selections on demand, within --cache\n"
+        "                smaller caches load the native selections on demand, within --memory\n"
         "  --online-predictor  CPU prefetch correction learned online (default off)\n"
         "  --predictor-state FILE  enable online learning, load existing state and save on clean exit\n"
         "  --substitute D  approximate: when decoding, replace selected experts that are not in memory by the\n"
@@ -92,6 +93,7 @@ int main(int argc, char **argv) {
   double temp = 0, top_p = 1;
   uint64_t seed = 0;
   int seed_set = 0;
+  double memory_gb = 0, kv_gb = 8, reserve_gb = 10;
   Options o = {.ctx = 16384, .dump_fd = -1, .routes_fd = -1};
   const char *image_path[16];
   int nimg = 0, vision_fd = -1;
@@ -167,13 +169,14 @@ int main(int argc, char **argv) {
         die("--ced takes off or 128 to 1048576 replay tokens");
       o.deepseek.ced = (int)n;
     } else if (!strcmp(a, "--ctx")) o.ctx = atoi(v);
-    else if (!strcmp(a, "--cache")) o.deepseek.budget_gb = atof(v);
+    else if (!strcmp(a, "--memory")) memory_gb = sampling_option("memory", v, 1024);
+    else if (!strcmp(a, "--kv-cache")) kv_gb = sampling_option("kv-cache", v, 1024);
     else if (!strcmp(a, "--reserve")) {
       char *end;
       double gib = strtod(v, &end);
       if (end == v || *end || !(gib >= CACHE_RESERVE_MIN && gib <= CACHE_RESERVE_MAX))
         die("--reserve takes %d to %d GiB", CACHE_RESERVE_MIN, CACHE_RESERVE_MAX);
-      o.reserve_gb = gib;
+      reserve_gb = gib;
     }
     else if (!strcmp(a, "--cache-half-life")) {
       char *end;
@@ -226,7 +229,9 @@ int main(int argc, char **argv) {
   if (o.deepseek.predictor_state) shutdown_watch();
   if (bench) {
     o.ctx = 2048;
+    if (!memory_configure(memory_gb, kv_gb, reserve_gb)) die("no space remains for the automatic model-memory budget");
     model = model_open(dir, &o);
+    if (!model) die("model weights do not fit --memory");
     if (shutdown_requested()) return complete();
     ops->bench();
     return complete();
@@ -270,7 +275,9 @@ int main(int argc, char **argv) {
     for (int i = 0; i < n; i++) printf("%d%c", tokens[i], i + 1 < n ? ',' : '\n');
     return 0;
   }
+  if (!memory_configure(memory_gb, kv_gb, reserve_gb)) die("no space remains for the automatic model-memory budget");
   model = model_open(dir, &o);
+  if (!model) die("model weights do not fit --memory");
   if (shutdown_requested()) return complete();
   const int V = ops->vocab();
   ModelState *st = ops->state_new();

@@ -14,7 +14,7 @@
 
 // Loads the checkpoint directory's config.json and weights (all resident on
 // the GPU). The MTP head is loaded only when drafts is nonzero.
-void qwen_load(const char *dir, int drafts);
+int qwen_load(const char *dir, int drafts);
 int qwen_vocab(void);
 // With on 0, the engine's buffers (weights, states, snapshots) leave the
 // GPU's residency set: they stay in memory, and other programs' GPU work can

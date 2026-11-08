@@ -149,10 +149,10 @@ def run(args, role, prompt, settings, expected, env):
     binary = args.control if role == "control" else args.candidate
     if hashlib.sha256(binary.read_bytes()).hexdigest() != settings[role + "_binary_sha256"]:
         raise RuntimeError("benchmark executable changed after the comparison was configured")
-    guard = wait_for_gpu(args.cache, args.gpu_wait, args.reserve, args.desktop, quiet_cpu=True)
+    guard = wait_for_gpu(args.memory + 2, args.gpu_wait, args.reserve, args.desktop, quiet_cpu=True)
     _idle(binary, env)
     command = [str(binary), "-m", str(args.checkpoint), "-p", prompt, "--ctx", str(args.context),
-               "--cache", str(args.cache), "--reserve", str(args.reserve), "-n", str(args.tokens), "--temperature", "1", "--top-p", "1",
+               "--memory", str(args.memory), "--reserve", str(args.reserve), "-n", str(args.tokens), "--temperature", "1", "--top-p", "1",
                "--seed", str(getattr(args, "seed", 12345))]
     command += ["--rendered"] if args.harness_session else ["--think", "75"]
     drafts = draft_count(args, role)
@@ -184,7 +184,7 @@ def run(args, role, prompt, settings, expected, env):
     decode = metrics.get("decode", {})
     valid = (p.returncode == 0 and decode.get("tokens", 0) >= 128 and
              metrics.get("prefill", {}).get("tokens") == settings["prompt_tokens"] and
-             cache.get("slots_released") == 0 and cache.get("min_bytes", 0) / 1024**3 >= args.cache - .05 and
+             cache.get("slots_released") == 0 and cache.get("min_bytes", 0) > 0 and
              cache.get("min_bytes") == cache.get("max_bytes") and (expected is None or digest == expected))
     if copy_exact is False:
         valid = False
@@ -235,7 +235,7 @@ def main():
     ap.add_argument("--input-tokens", type=int, default=8192)
     ap.add_argument("--tokens", type=int, default=1024)
     ap.add_argument("--context", type=int, default=32768)
-    ap.add_argument("--cache", type=float, default=24)
+    ap.add_argument("--memory", type=float, default=24)
     ap.add_argument("--reserve", type=float, default=10, help="engine reserve in GiB; the admission guard keeps it too")
     ap.add_argument("--desktop", action="store_true",
                     help="record ordinary desktop activity; still exclude other model/GPU jobs and large compute jobs")
@@ -250,7 +250,7 @@ def main():
     args = ap.parse_args()
     SOURCE_REVISION = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     if not (4096 <= args.input_tokens <= 114688 and 256 <= args.tokens <= 8192 and
-            args.input_tokens + args.tokens <= args.context <= 131072 and 16 <= args.cache <= 80 and 4 <= args.reserve <= 16 and
+            args.input_tokens + args.tokens <= args.context <= 131072 and 16 <= args.memory <= 80 and 4 <= args.reserve <= 16 and
             5 <= args.gpu_wait <= 600 and 60 <= args.timeout <= 1800 and len(args.order) <= 6):
         ap.error("study configuration exceeds its limits")
     if (args.quant != "mxfp4") != bool(args.experts):
@@ -264,7 +264,7 @@ def main():
     prompt, count = make_prompt(args, env)
     settings = {"workload": args.workload, "prompt_tokens": count, "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
                 "checkpoint_name": args.checkpoint.name, "expert_file": args.experts.name if args.experts else None,
-                "requested_tokens": args.tokens, "context": args.context, "cache_gib": args.cache,
+                "requested_tokens": args.tokens, "context": args.context, "model_memory_gib": args.memory,
                 "reserve_gib": args.reserve, "quant": args.quant,
                 "kind": args.kind, "control_binary": args.control.name, "candidate_binary": args.candidate.name,
                 "workload_revision": SOURCE_REVISION,

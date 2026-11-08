@@ -51,7 +51,7 @@ def main():
     env = {k: v for k, v in os.environ.items() if not k.startswith("MYDS4_")}
     env.update(MYDS4_API_KEY=key, MYDS4_LOCK=str(ROOT / "build/myds4.lock"))
     cmd = [str(args.binary.resolve()), "-m", str(args.checkpoint), "--serve", str(port),
-           "--ctx", "16384" if args.long_prefill else "4096", "--cache", "20", "--reserve", "4", "--kv-cache", "1", "--batch", str(args.batch),
+           "--ctx", "16384" if args.long_prefill else "4096", "--memory", "20", "--reserve", "4", "--kv-cache", "1", "--batch", str(args.batch),
            "--ced", args.ced, "--lookup", str(args.lookup), "--temperature", "1", "--top-p", "1", "--seed", "12345", "--think", "0"]
     if args.experts:
         cmd += ["--experts", str(args.experts)]

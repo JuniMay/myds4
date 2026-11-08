@@ -11,8 +11,11 @@ int main(int argc, char **argv) {
   int n = tok_encode_chat(tk, "<｜begin▁of▁sentence｜><｜User｜>Write a short deterministic task scheduler. "
                          "Preserve dependency order and cancel queued work when a required input fails."
                          "<｜Assistant｜></think>", tokens, 2048);
-  Options o = {.ctx = 2048, .deepseek.budget_gb = 20, .reserve_gb = 4, .draft = 1, .deepseek.draft_cache = 32,
+  double model_memory_gib = 20;
+  double model_reserve_gib = 4;
+  Options o = {.ctx = 2048, .draft = 1, .deepseek.draft_cache = 32,
                .deepseek.experts = argc == 3 ? argv[2] : NULL, .dump_fd = -1, .routes_fd = -1, .quiet = 1};
+  memory_configure(model_memory_gib, 8, model_reserve_gib);
   deepseek_load(argv[1], &o);
   const float *lg = deepseek_forward(tokens, n, 0);
   int rows[BLOCK + 1];

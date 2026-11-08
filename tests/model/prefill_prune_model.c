@@ -12,7 +12,9 @@ static size_t bytes_differ(const void *a, const void *b, size_t count) {
 
 int main(int argc, char **argv) {
   if (argc < 2) die("usage: prefill-prune-model-check CHECKPOINT [--stdin|--long] [--tokens N] [--chunk32] [--prefix N] [--wide] [--resume] [--no-draft] [--experts GGUF]");
-  Options o = {.ctx = 131072, .deepseek.budget_gb = 20, .reserve_gb = 4, .draft = 2, .deepseek.draft_cache = 32,
+  double model_memory_gib = 20;
+  double model_reserve_gib = 4;
+  Options o = {.ctx = 131072, .draft = 2, .deepseek.draft_cache = 32,
                .quiet = 1, .dump_fd = -1, .routes_fd = -1};
   int longer = 0, resume = 0, prefix = 1024, prefix_set = 0, input = 0, chunk32 = 0, count = 0;
   for (int i = 2; i < argc; i++) {
@@ -50,6 +52,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < n; i++) tokens[i] = pattern[i % pn];
   }
   if (prefix < 1 || prefix >= n || n + 8 > o.ctx) die("invalid prefix or input length");
+  memory_configure(model_memory_gib, 8, model_reserve_gib);
   deepseek_load(argv[1], &o);
   prefill_chunk = 16384;
   opt.deepseek.prefill_prune = 0;

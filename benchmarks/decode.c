@@ -11,7 +11,7 @@
 // windows that had not occurred before in its generation (1: no repeats),
 // and --show prints its text.
 //
-// usage: rows-bench CHECKPOINT ROWS [--experts GGUF] [--cache GIB] [--steps N]
+// usage: rows-bench CHECKPOINT ROWS [--experts GGUF] [--memory GIB] [--steps N]
 //                   [--warm N] [--text FILE --prompt-tokens N] [--show]
 #include "../src/model/deepseek/model.h"
 #include "../src/model/deepseek/model.c"
@@ -31,14 +31,15 @@ static double distinct_8grams(const int *gen, int n) {
 }
 
 int main(int argc, char **argv) {
-  if (argc < 3) die("usage: rows-bench CHECKPOINT ROWS [--experts GGUF] [--cache GIB] [--steps N] [--warm N] [--text FILE --prompt-tokens N] [--show]");
+  if (argc < 3) die("usage: rows-bench CHECKPOINT ROWS [--experts GGUF] [--memory GIB] [--steps N] [--warm N] [--text FILE --prompt-tokens N] [--show]");
   int rows = atoi(argv[2]), steps = 96, warm = 32, length = 0, show = 0;
   const char *file = NULL;
-  Options o = {.ctx = 4096, .deepseek.budget_gb = 40, .reserve_gb = 10, .quiet = 1, .dump_fd = -1, .routes_fd = -1};
+  double model_memory_gib = 40;
+  double model_reserve_gib = 10;
+  Options o = {.ctx = 4096, .quiet = 1, .dump_fd = -1, .routes_fd = -1};
   for (int i = 3; i < argc; i++) {
     if (!strcmp(argv[i], "--experts") && i + 1 < argc) o.deepseek.experts = argv[++i];
-    else if (!strcmp(argv[i], "--cache") && i + 1 < argc) o.deepseek.budget_gb = atof(argv[++i]);
-    else if (!strcmp(argv[i], "--steps") && i + 1 < argc) steps = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--memory") && i + 1 < argc) o"--steps") && i + 1 < argc) steps = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--warm") && i + 1 < argc) warm = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--text") && i + 1 < argc) file = argv[++i];
     else if (!strcmp(argv[i], "--prompt-tokens") && i + 1 < argc) length = atoi(argv[++i]);
@@ -50,6 +51,7 @@ int main(int argc, char **argv) {
   if (!file != !length || length < 0) die("--text and --prompt-tokens go together");
   o.ctx = length + 4096;
   tk = tok_open(argv[1], deepseek_ops.image_token);
+  memory_configure(model_memory_gib, 8, model_reserve_gib);
   deepseek_load(argv[1], &o);
   static const char *openings[] = {"A lighthouse keeper finds a bottle.", "A baker opens a shop at dawn.",
                                    "Two engineers debate a cache design.", "A sailor maps an unknown coast.",

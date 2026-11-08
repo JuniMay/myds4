@@ -46,6 +46,10 @@ fn tile(buf: &mut Buffer, area: Rect, m: &ModelMemory, selected: bool) {
             m.experts as f64 / GIB
         ))),
         Line::from(text(format!(
+            "Workspace     {:>8.2} GiB",
+            m.workspace as f64 / GIB
+        ))),
+        Line::from(text(format!(
             "KV allocated  {:>8.2} GiB",
             m.kv as f64 / GIB
         ))),
@@ -64,7 +68,11 @@ pub fn draw(buf: &mut Buffer, area: Rect, s: &Snapshot) {
     let width = area.width as usize;
     let used = s.kv_total_gib.max(s.kv_gib);
     let lines = [
-        Line::from(strong("All models · memory")),
+        Line::from(strong(format!(
+            "All models · memory: {:.2} / {:.2} GiB",
+            s.model_memory_budget.allocated as f64 / GIB,
+            s.model_memory_budget.limit as f64 / GIB
+        ))),
         Line::from(text(format!(
             "Shared KV budget: {:.2} / {:.2} GiB",
             used, s.kv_limit_gib
@@ -79,7 +87,7 @@ pub fn draw(buf: &mut Buffer, area: Rect, s: &Snapshot) {
             (s.memory.free + s.memory.file) as f64 / GIB
         ))),
         Line::from(label(
-            "Tiles: weights, experts and allocated KV. Runtime buffers are outside these totals.",
+            "Tiles include model workspaces. KV has its own budget.",
         )),
     ];
     for (i, line) in lines.into_iter().enumerate().take(area.height as usize) {

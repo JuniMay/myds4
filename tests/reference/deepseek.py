@@ -518,7 +518,7 @@ def model_check(checkpoint, cache=None):
     n, L, S, V = len(ids), 40, 4 * 5120, 129280
     r, w = os.pipe()
     proc = subprocess.Popen(["build/myds4", "-m", checkpoint, "--tokens", ",".join(map(str, ids)),
-                             "--cache", "16", "--dump-fd", str(w)], pass_fds=(w,), stderr=subprocess.DEVNULL)
+                             "--memory", "16", "--dump-fd", str(w)], pass_fds=(w,), stderr=subprocess.DEVNULL)
     os.close(w)
     f = os.fdopen(r, "rb")
     got = {"attn": np.zeros((n, L, S), np.float32), "out": np.zeros((n, L, S), np.float32),

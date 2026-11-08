@@ -7,7 +7,8 @@ NVIDIA's NVFP4 format.
 The server can serve both models in one process. It registers their
 metadata at startup and loads each model's weights on its first inference
 request. Every model has its own request queue and state; memory reserve
-and KV-cache budgets are shared.
+and KV-cache budgets are shared. The model-memory ceiling covers all
+models and excludes the separate KV budget.
 
 ## Build
 
@@ -37,12 +38,12 @@ below with your checkpoint and existing API-key paths:
   "host": "127.0.0.1",
   "api_key_file": "/path/to/api-key",
   "tui": true,
+  "memory": 80,
   "reserve": 10,
   "kv_cache": 24,
   "models": [
     {
       "model": "/path/to/DeepSeek-V4.1-Flash-1017",
-      "cache": 40,
       "ctx": 1048576,
       "batch": 4,
       "temperature": 1,

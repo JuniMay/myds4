@@ -26,6 +26,7 @@ static void fixture_free(Buf *b) {
 static void fixture_sync(void) { pending = 0; }
 
 #define gpu_alloc fixture_alloc
+#define gpu_alloc_kv fixture_alloc
 #define gpu_free fixture_free
 #define gpu_sync fixture_sync
 #include "../../src/model/deepseek/model.c"

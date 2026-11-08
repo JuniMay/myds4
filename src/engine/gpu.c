@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "myds4.h"
+#include "memory.h"
 
 typedef struct { unsigned long w, h, d; } Size3;
 extern id MTLCreateSystemDefaultDevice(void);
@@ -25,6 +26,7 @@ static id used[1024];  // resources made resident in the current encoder
 static unsigned long used_usage[1024];
 static int nused;
 static void report(void);
+static void collect(void);
 double gpu_busy, gpu_gap;
 long gpu_gaps;
 
@@ -86,6 +88,7 @@ void gpu_keep_clock(double seconds) {
 }
 
 void gpu_init(const char *source, size_t len) {
+  memory_collect_with(collect);
   pool = objc_autoreleasePoolPush();
   dev = MTLCreateSystemDefaultDevice();
   if (!dev) die("no Metal device");
@@ -141,14 +144,34 @@ int gpu_threads(int k) {
   return (int)MSG(unsigned long (*)(id, SEL), pipes[k], S("maxTotalThreadsPerThreadgroup"));
 }
 
-Buf gpu_new(size_t size) {
+size_t gpu_allocation_size(size_t size) {
+  size_t page = (size_t)getpagesize();
+  if (size > SIZE_MAX - page + 1) die("GPU allocation size overflow");
+  return (size + page - 1) / page * page;
+}
+
+static Buf allocate(size_t size, int kv, MemoryAdmission admission) {
   Buf b = {0};
+  b.allocated = gpu_allocation_size(size);
+  b.kv = kv;
+  if (kv) memory_kv_change(b.allocated, 1);
+  else {
+    b.memory = memory_current() ? memory_current() : memory_shared();
+    if (!memory_claim(b.memory, b.allocated, admission)) return (Buf){0};
+  }
   b.obj = MSG(id (*)(id, SEL, unsigned long, unsigned long), dev,
               S("newBufferWithLength:options:"), size, 0ul);
   if (!b.obj) die("cannot allocate %zu bytes on the GPU", size);
   b.ptr = MSG(void *(*)(id, SEL), (id)b.obj, S("contents"));
   b.gpu = MSG(uint64_t (*)(id, SEL), (id)b.obj, S("gpuAddress"));
   b.size = size;
+  return b;
+}
+
+Buf gpu_try_new(size_t size, int admission) { return allocate(size, 0, (MemoryAdmission)admission); }
+Buf gpu_new(size_t size) {
+  Buf b = allocate(size, 0, MEMORY_REQUIRED);
+  if (!b.obj) die("model-memory budget cannot accommodate %zu bytes", size);
   return b;
 }
 
@@ -159,10 +182,19 @@ Buf gpu_alloc(size_t size) {
   return b;
 }
 
+Buf gpu_alloc_kv(size_t size) {
+  Buf b = allocate(size, 1, MEMORY_REQUIRED);
+  gpu_resident(&b, 1);
+  gpu_residency_commit();
+  return b;
+}
+
 void gpu_free(Buf *b) {
   if (b->obj) {
     gpu_resident(b, 0);
     MSG(void (*)(id, SEL), (id)b->obj, S("release"));
+    if (b->kv) memory_kv_change(b->allocated, 0);
+    else if (b->memory) memory_release(b->memory, b->allocated);
   }
   memset(b, 0, sizeof *b);
 }
@@ -360,4 +392,15 @@ void gpu_sync(void) {
   last = 0;
   objc_autoreleasePoolPop(pool);
   pool = objc_autoreleasePoolPush();
+}
+
+// Residency updates can retain released buffers in the autorelease pool.
+// Drain it once after an eviction batch, before admitting replacement data.
+static void collect(void) {
+  gpu_residency_commit();
+  if (last) gpu_sync();
+  else {
+    objc_autoreleasePoolPop(pool);
+    pool = objc_autoreleasePoolPush();
+  }
 }

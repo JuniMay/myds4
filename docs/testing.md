@@ -35,6 +35,13 @@ build/tests/tokenizer-reference /path/to/deepseek tests/fixtures/tokenizer_deeps
 build/tests/tokenizer-reference /path/to/qwen tests/fixtures/tokenizer_qwen3_5.json
 ```
 
+`build/tests/memory` checks the shared budget, unequal entry sizes, active
+pins, expert-before-backbone eviction and separate KV storage.
+`build/tests/memory-model CHECKPOINT MEMORY_GIB` evicts a real model's
+weights, retains its KV state and compares every next-token logit after
+reloading. Its competing reservation is synthetic; it is a correctness
+check, not a throughput benchmark.
+
 The metadata check can additionally compare two checkpoint indexes and
 DeepSeek's generated Engram map. It reads headers and tokenizer data, not
 model weights:

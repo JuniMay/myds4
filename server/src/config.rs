@@ -78,7 +78,7 @@ impl ModelConfig {
                         .ok_or("ced takes off or 128 to 1048576 replay tokens")?,
                 }
             }
-            "cache" => e.deepseek_mut()?.cache_gb = num()?,
+            "cache" => return Err("cache is replaced by the server-wide memory setting".into()),
             "cache_half_life" => e.deepseek_mut()?.cache_half_life = int()?,
             "cache_read_cost" => e.deepseek_mut()?.cache_read_cost = flag()?,
             "substitute" => e.deepseek_mut()?.substitute = num()? as f32,
@@ -95,7 +95,8 @@ impl ModelConfig {
             "prefill_prune" => e.deepseek_mut()?.prefill_prune = flag()?,
             "runahead" => e.deepseek_mut()?.runahead = flag()?,
             "pipeline" => e.deepseek_mut()?.pipeline = flag()?,
-            "reserve" | "kv_cache" | "port" | "host" | "api_key_file" | "tui" | "tui_theme" => {
+            "memory" | "reserve" | "kv_cache" | "port" | "host" | "api_key_file" | "tui"
+            | "tui_theme" => {
                 return Err(format!("{name} is server-wide; move it outside models"));
             }
             "batch" => {
@@ -203,9 +204,10 @@ impl Server {
     }
 }
 
-/// One process-wide reserve and one KV budget shared by every model.
+/// Global model-memory and KV budgets, plus the process-wide reserve.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Budgets {
+    pub memory_gb: f64,
     pub reserve_gb: f64,
     pub kv_gb: f64,
 }
@@ -213,6 +215,7 @@ pub struct Budgets {
 impl Default for Budgets {
     fn default() -> Self {
         Self {
+            memory_gb: 0.0,
             reserve_gb: 10.0,
             kv_gb: 8.0,
         }
@@ -226,6 +229,12 @@ impl Budgets {
             .filter(|n| n.is_finite())
             .ok_or(format!("{name} takes a finite number"))?;
         match name {
+            "memory" if (0.0..=1024.0).contains(&n) => self.memory_gb = n,
+            "memory" => {
+                return Err(
+                    "memory takes 0 (automatic) or a positive GiB budget up to 1024".into(),
+                );
+            }
             "reserve" if (2.0..=1024.0).contains(&n) => self.reserve_gb = n,
             "kv_cache" if n > 0.0 && n <= 1024.0 => self.kv_gb = n,
             "reserve" => return Err("reserve takes 2 to 1024 GiB".into()),
@@ -265,6 +274,7 @@ pub fn parse(root: &Value) -> Result<Config, String> {
     if let Some(k) = obj.keys().find(|k| {
         ![
             "models",
+            "memory",
             "reserve",
             "kv_cache",
             "port",
@@ -278,7 +288,7 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         return Err(format!("no server setting {k}"));
     }
     let mut budgets = Budgets::default();
-    for name in ["reserve", "kv_cache"] {
+    for name in ["memory", "reserve", "kv_cache"] {
         if let Some(value) = obj.get(name) {
             budgets.set(name, value)?;
         }
@@ -322,9 +332,27 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn model_memory_is_global_and_separate_from_kv() {
+        let root = json!({"memory": 64, "reserve": 10, "kv_cache": 12, "models": [
+            {"model": "/models/deepseek"}, {"model": "/models/qwen"}
+        ]});
+        assert!(
+            parse(&root).is_ok(),
+            "one model-memory budget must serve every architecture"
+        );
+        for key in ["cache", "memory"] {
+            let nested = json!({"models": [{"model": "/models/any-model", key: 32}]});
+            assert!(
+                parse(&nested).is_err(),
+                "{key} must not create a per-model memory budget"
+            );
+        }
+    }
+
+    #[test]
     fn reserve_and_kv_cache_are_server_wide() {
-        let root = json!({"reserve": 10, "kv_cache": 12, "models": [
-            {"model": "/models/deepseek", "cache": 56}, {"model": "/models/qwen"}
+        let root = json!({"memory": 56, "reserve": 10, "kv_cache": 12, "models": [
+            {"model": "/models/deepseek"}, {"model": "/models/qwen"}
         ]});
         assert!(
             parse(&root).is_ok(),
@@ -334,7 +362,7 @@ mod tests {
 
     #[test]
     fn model_entries_cannot_create_separate_memory_budgets() {
-        for setting in ["reserve", "kv_cache"] {
+        for setting in ["memory", "reserve", "kv_cache"] {
             let mut model = json!({"model": "/models/qwen"});
             model[setting] = json!(8);
             assert!(
@@ -384,8 +412,8 @@ mod tests {
 
     #[test]
     fn a_file_gives_each_model_its_own_options() {
-        let c = parse(&json!({"kv_cache": 16, "models": [
-            {"model": "/m/deepseek", "cache": 72, "ced": 128, "batch": 4},
+        let c = parse(&json!({"memory": 72, "kv_cache": 16, "models": [
+            {"model": "/m/deepseek", "ced": 128, "batch": 4},
             {"model": "/m/qwen", "id": "qwen", "draft": 1, "ctx": 32768, "top_k": 20, "think": 0}
         ]}))
         .unwrap();
@@ -395,7 +423,7 @@ mod tests {
         assert_eq!(
             (
                 d.engine.model.as_str(),
-                d.engine.deepseek().unwrap().cache_gb,
+                c.budgets.memory_gb,
                 d.engine.deepseek().unwrap().ced,
                 c.budgets.kv_gb
             ),

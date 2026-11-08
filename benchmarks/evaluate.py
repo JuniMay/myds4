@@ -45,7 +45,7 @@ class Config:
     checkpoint: str
     experts: str | None = None
     draft: int = 0
-    cache_gb: float = 30
+    memory_gb: float = 30
     context: int = 2048
     max_new_tokens: int = 256
     timeout: float = 300
@@ -355,9 +355,9 @@ def parse_metrics(stderr):
             "gib_including_draft_at_end": float(found[2]),
             "cumulative_evictions": int(found[3]),
         }
-    found = re.search(r"expert cache: (\d+) slots \(([\d.]+) GiB\) to start", stderr)
+    found = re.search(r"expert cache: slot ceiling (\d+) \(([\d.]+) GiB\)", stderr)
     if found:
-        metrics["cache_initial"] = {"main_slots": int(found[1]), "main_gib": float(found[2])}
+        metrics["cache_ceiling"] = {"main_slots": int(found[1]), "main_gib": float(found[2])}
     found = re.search(
         r"DSpark cache: (\d+) slots per stage, ([\d.]+) GiB reserved, native experts read on demand",
         stderr,
@@ -427,7 +427,7 @@ def run_case(case, config):
         or not 512 <= config.context <= 1048576
         or not 1 <= config.max_new_tokens <= config.context
         or not 0 < config.timeout <= 1800
-        or not 0 < config.cache_gb <= 1024
+        or not 0 < config.memory_gb <= 1024
         or not isinstance(config.draft_cache, int)
         or not (config.draft_cache == 0 or 15 <= config.draft_cache <= 128)
         or (config.draft_cache and not config.draft)
@@ -493,8 +493,8 @@ def run_case(case, config):
     command += [
         "--ctx",
         str(config.context),
-        "--cache",
-        str(config.cache_gb),
+        "--memory",
+        str(config.memory_gb),
         "-n",
         str(config.max_new_tokens),
         "-t",
@@ -740,7 +740,7 @@ def summarize_results(results, baseline_labels=None):
             }
         )
     paired = []
-    scope = ("checkpoint", "experts", "cache_gb", "context", "max_new_tokens", "thinking")
+    scope = ("checkpoint", "experts", "memory_gb", "context", "max_new_tokens", "thinking")
     for case in cases:
         config = case["configuration"]
         choices = [

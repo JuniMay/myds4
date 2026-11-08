@@ -35,6 +35,7 @@ static void fixture_adapt(void) { cache_clock_advances++, cache_maintenance++; }
 static void fixture_idle(void) { cache_maintenance++; }
 
 #define gpu_alloc fixture_alloc
+#define gpu_alloc_kv fixture_alloc
 #define gpu_free fixture_free
 #define gpu_sync fixture_sync
 #define cache_adapt fixture_adapt

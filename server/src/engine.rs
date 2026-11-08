@@ -9,11 +9,13 @@ use std::ptr;
 
 use deepseek_recipe::stream::StreamTokenizer;
 
-const ABI: c_int = 12;
+const ABI: c_int = 13;
 
 #[repr(C)]
 struct RawProcess {
     abi: c_int,
+    memory_gb: f64,
+    kv_gb: f64,
     reserve_gb: f64,
     on_log: Option<extern "C" fn(*const c_char)>,
     on_die: Option<extern "C" fn()>,
@@ -23,7 +25,6 @@ struct RawProcess {
 #[derive(Clone, Copy)]
 struct RawDeepSeekConfig {
     experts: *const c_char,
-    cache_gb: f64,
     cache_half_life: c_int,
     cache_read_cost: c_int,
     substitute: f32,
@@ -170,6 +171,12 @@ pub struct Stats {
     pub pressure: c_int,
     pub layers: c_int,
     pub experts_per_row: c_int,
+    pub model_memory_limit: u64,
+    pub model_memory_used: u64,
+    pub model_memory_committed: u64,
+    pub model_memory_peak: u64,
+    pub kv_allocated: u64,
+    pub model_workspace: u64,
 }
 
 unsafe extern "C" {
@@ -180,6 +187,7 @@ unsafe extern "C" {
     fn myds4_open(c: *const RawConfig) -> *mut RawModel;
     fn myds4_load(m: *mut RawModel) -> c_int;
     fn myds4_loaded(m: *const RawModel) -> c_int;
+    fn myds4_active(m: *mut RawModel, active: c_int);
     fn myds4_finish(m: *mut RawModel);
     fn myds4_idle(m: *mut RawModel) -> c_int;
     fn myds4_max_rows(m: *const RawModel) -> c_int;
@@ -285,6 +293,7 @@ unsafe extern "C" {
     ) -> c_int;
     fn myds4_images_encode(x: *mut RawImages, from: c_int) -> c_int;
     fn myds4_images_close(x: *mut RawImages);
+    fn myds4_refresh_stats();
     fn myds4_stats_get(m: *const RawModel, s: *mut Stats);
     fn myds4_routes(m: *const RawModel, row: c_int, experts: *mut u16, sources: *mut u8) -> c_int;
     fn myds4_model_tokenizer(m: *const RawModel) -> *mut RawTokenizer;
@@ -314,12 +323,16 @@ fn c_string(s: &str) -> CString {
 /// failure hook, on this thread, which from then on is the engine's (it
 /// needs a 16 MiB stack). False when called twice.
 pub fn init(
+    memory_gb: f64,
+    kv_gb: f64,
     reserve_gb: f64,
     on_log: Option<extern "C" fn(*const c_char)>,
     on_die: Option<extern "C" fn()>,
 ) -> bool {
     let p = RawProcess {
         abi: ABI,
+        memory_gb,
+        kv_gb,
         reserve_gb,
         on_log,
         on_die,
@@ -330,6 +343,10 @@ pub fn init(
 /// Whether a stop was requested: SIGINT, SIGTERM or [`request_stop`].
 pub fn stopping() -> bool {
     unsafe { myds4_stopping() != 0 }
+}
+
+pub fn refresh_stats() {
+    unsafe { myds4_refresh_stats() };
 }
 
 /// Requests the stop as SIGINT does (the worker notices it within a second,
@@ -396,7 +413,6 @@ pub enum BackendOptions {
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct DeepSeekOptions {
     pub experts: Option<String>,
-    pub cache_gb: f64,
     pub cache_half_life: i32,
     pub cache_read_cost: bool,
     pub substitute: f32,
@@ -448,15 +464,8 @@ pub type Logits = *const f32;
 pub struct Model {
     raw: *mut RawModel,
     directory: String,
-    owner: std::thread::ThreadId,
-    published: std::sync::Mutex<Stats>,
+    validated: std::cell::Cell<bool>,
 }
-
-// Safety: execution methods check their owner before reaching C. Tokenizers
-// have their own locks; other threads read a locked copy of published stats.
-// Model handles live until process shutdown.
-unsafe impl Send for Model {}
-unsafe impl Sync for Model {}
 
 fn validate_weight_files(directory: &str) -> Result<(), String> {
     use std::io::Read;
@@ -512,14 +521,6 @@ fn validate_weight_files(directory: &str) -> Result<(), String> {
 }
 
 impl Model {
-    fn require_owner(&self) {
-        assert_eq!(
-            self.owner,
-            std::thread::current().id(),
-            "model execution belongs to its engine thread"
-        );
-    }
-
     /// Registers metadata and tokenizer without loading weights.
     pub fn open(o: &Options) -> Option<Model> {
         let architecture = Architecture::of(&o.model).ok()?;
@@ -541,7 +542,6 @@ impl Model {
             BackendOptions::DeepSeek(d) => RawModelOptions {
                 deepseek: RawDeepSeekConfig {
                     experts: experts.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
-                    cache_gb: d.cache_gb,
                     cache_half_life: d.cache_half_life,
                     cache_read_cost: d.cache_read_cost.into(),
                     substitute: d.substitute,
@@ -572,37 +572,37 @@ impl Model {
         (!m.is_null()).then_some(Model {
             raw: m,
             directory: o.model.clone(),
-            owner: std::thread::current().id(),
-            published: std::sync::Mutex::new(Stats::default()),
+            validated: std::cell::Cell::new(false),
         })
     }
 
     pub fn load(&self) -> Result<(), String> {
-        self.require_owner();
-        if self.loaded() {
-            return Ok(());
+        if !self.validated.get() {
+            validate_weight_files(&self.directory)?;
+            self.validated.set(true);
         }
-        validate_weight_files(&self.directory)?;
         if unsafe { myds4_load(self.raw) != 0 } {
             Ok(())
         } else {
             Err("the model could not be loaded".into())
         }
     }
+    pub fn active(&self, active: bool) {
+        unsafe { myds4_active(self.raw, active.into()) };
+    }
+
     pub fn loaded(&self) -> bool {
         unsafe { myds4_loaded(self.raw) != 0 }
     }
 
     /// After the last request: what the model saves or reports on exit.
     pub fn finish(&self) {
-        self.require_owner();
         unsafe { myds4_finish(self.raw) }
     }
 
     /// While the model runs no request: memory goes back to other programs if
     /// they need it; its expert cache's slots after it.
     pub fn idle(&self) -> i32 {
-        self.require_owner();
         unsafe { myds4_idle(self.raw) }
     }
 
@@ -637,21 +637,17 @@ impl Model {
     // ---- states and snapshots (the engine thread) ----
 
     pub fn state_new(&self) -> *mut RawState {
-        self.require_owner();
         unsafe { myds4_state_new(self.raw) }
     }
     pub fn state_free(&self, s: *mut RawState) {
-        self.require_owner();
         unsafe { myds4_state_free(self.raw, s) }
     }
     /// The bytes a state (null: a new one) takes holding that many positions.
     pub fn state_bytes(&self, s: *const RawState, positions: usize) -> u64 {
-        self.require_owner();
         unsafe { myds4_state_bytes(self.raw, s, positions as c_int) as u64 }
     }
     /// src's rows before `positions` that later positions do not change, into dst.
     pub fn state_copy(&self, dst: *mut RawState, src: *const RawState, positions: usize) {
-        self.require_owner();
         unsafe { myds4_state_copy(self.raw, dst, src, positions as c_int) }
     }
     pub fn snapshot_take(
@@ -660,24 +656,19 @@ impl Model {
         pos: usize,
         with_logits: bool,
     ) -> *mut RawSnapshot {
-        self.require_owner();
         unsafe { myds4_snapshot_take(self.raw, s, pos as c_int, with_logits.into()) }
     }
     pub fn snapshot_restore(&self, s: *mut RawState, x: *const RawSnapshot) {
-        self.require_owner();
         unsafe { myds4_snapshot_restore(self.raw, s, x) }
     }
     pub fn snapshot_free(&self, x: *mut RawSnapshot) {
-        self.require_owner();
         unsafe { myds4_snapshot_free(self.raw, x) }
     }
     pub fn snapshot_bytes(&self, with_logits: bool) -> u64 {
-        self.require_owner();
         unsafe { myds4_snapshot_bytes(self.raw, with_logits.into()) as u64 }
     }
     /// The logits a snapshot keeps (null without).
     pub fn snapshot_logits(&self, x: *const RawSnapshot) -> Logits {
-        self.require_owner();
         unsafe { myds4_snapshot_logits(self.raw, x) }
     }
 
@@ -697,7 +688,6 @@ impl Model {
         capture: Option<usize>,
         images: Option<&Images>,
     ) -> Option<(Logits, *mut RawSnapshot, PrefillInfo)> {
-        self.require_owner();
         let mut captured = ptr::null_mut();
         let mut info = PrefillInfo::default();
         let at = capture.map_or(-1, |p| p as c_int);
@@ -734,7 +724,6 @@ impl Model {
         tokens: &[i32],
         pos: &[i32],
     ) -> Option<Logits> {
-        self.require_owner();
         let lg = unsafe {
             myds4_rows(
                 self.raw,
@@ -747,7 +736,6 @@ impl Model {
         (!lg.is_null()).then_some(lg)
     }
     pub fn draft(&self, s: *mut RawState, token: i32, pos: usize, drafts: &mut [i32]) {
-        self.require_owner();
         unsafe {
             myds4_draft(
                 self.raw,
@@ -760,7 +748,6 @@ impl Model {
         }
     }
     pub fn verify(&self, s: *mut RawState, rows: &[i32], pos: usize) -> Option<Logits> {
-        self.require_owner();
         let lg = unsafe {
             myds4_verify(
                 self.raw,
@@ -773,7 +760,6 @@ impl Model {
         (!lg.is_null()).then_some(lg)
     }
     pub fn accept(&self, s: *mut RawState, rows: &[i32], pos: usize) {
-        self.require_owner();
         unsafe {
             myds4_accept(
                 self.raw,
@@ -785,20 +771,17 @@ impl Model {
         }
     }
     pub fn seek(&self, s: *mut RawState, tokens: &[i32], pos: usize) {
-        self.require_owner();
         unsafe { myds4_seek(self.raw, s, tokens.as_ptr(), pos as c_int) }
     }
 
     // ---- sampling, images, statistics ----
 
     pub fn sample(&self, lg: Logits, s: &mut Sampler) -> i32 {
-        self.require_owner();
         unsafe { myds4_sample(self.raw, lg, s.0) }
     }
     /// Rows of logits for a token and its drafts: the next token, and how many
     /// drafts it kept; a token that ends a reply ends the kept ones.
     pub fn sample_verify(&self, lg: Logits, drafts: &[i32], s: &mut Sampler) -> (i32, usize) {
-        self.require_owner();
         let mut accepted = 0;
         let next = unsafe {
             myds4_sample_verify(
@@ -815,7 +798,6 @@ impl Model {
 
     /// A prompt's images, decoded, for this model's vision encoder.
     pub fn images(&self, images: &[Vec<u8>]) -> Result<Images, String> {
-        self.require_owner();
         let data: Vec<*const u8> = images.iter().map(|i| i.as_ptr()).collect();
         let len: Vec<usize> = images.iter().map(|i| i.len()).collect();
         let mut message = [0 as c_char; 256];
@@ -837,21 +819,17 @@ impl Model {
         Ok(Images(x))
     }
 
-    /// The owner publishes counters between engine calls. Other threads
-    /// read that snapshot without touching mutable backend state.
+    /// Called only by the engine worker; the worker publishes copies for readers.
     pub fn stats(&self) -> Stats {
-        let mut snapshot = self.published.lock().unwrap_or_else(|e| e.into_inner());
-        if self.owner == std::thread::current().id() {
-            unsafe { myds4_stats_get(self.raw, &mut *snapshot) };
-        }
-        *snapshot
+        let mut stats = Stats::default();
+        unsafe { myds4_stats_get(self.raw, &mut stats) };
+        stats
     }
 
     /// The experts row `row` of the latest decoding pass chose, `per_row` of
     /// them, and where each one was; None for a model without routed experts
     /// or a row that did not run every layer. The engine thread.
     pub fn routes(&self, row: usize, per_row: usize) -> Option<(Vec<u16>, Vec<u8>)> {
-        self.require_owner();
         let (mut experts, mut sources) = (vec![0u16; per_row], vec![0u8; per_row]);
         // Safety: the engine writes per_row (experts_per_row) entries of each.
         (unsafe {
@@ -1085,8 +1063,16 @@ impl Images {
     }
     /// Encodes the images that positions from `from` reach, for the next
     /// prefill; how many.
-    pub fn encode(&mut self, from: usize) -> usize {
-        unsafe { myds4_images_encode(self.0, from as c_int).max(0) as usize }
+    pub fn encode(&mut self, from: usize) -> Result<usize, String> {
+        let count = unsafe { myds4_images_encode(self.0, from as c_int) };
+        if count < 0 {
+            Err(
+                "the global model-memory budget cannot fit the image encoder and its workspace"
+                    .into(),
+            )
+        } else {
+            Ok(count as usize)
+        }
     }
 }
 
@@ -1101,22 +1087,21 @@ mod ownership_tests {
     use super::*;
 
     #[test]
-    fn a_model_rejects_engine_calls_from_another_thread() {
-        assert!(init(10.0, None, None));
-        let options = Options {
-            ctx: 4096,
-            model: concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/unavailable-model"
-            )
-            .into(),
-            ..Options::default()
-        };
-        let model = Model::open(&options).expect("metadata fixture");
-        let call = std::thread::spawn(move || model.finish());
-        assert!(
-            call.join().is_err(),
-            "engine calls must stay on their owning thread"
-        );
+    fn model_handles_cannot_cross_threads() {
+        trait NotSend<Marker> {
+            fn check() {}
+        }
+        impl<T: ?Sized> NotSend<()> for T {}
+        struct SendType;
+        impl<T: ?Sized + Send> NotSend<SendType> for T {}
+        let _ = <Model as NotSend<_>>::check;
+
+        trait NotSync<Marker> {
+            fn check() {}
+        }
+        impl<T: ?Sized> NotSync<()> for T {}
+        struct SyncType;
+        impl<T: ?Sized + Sync> NotSync<SyncType> for T {}
+        let _ = <Model as NotSync<_>>::check;
     }
 }

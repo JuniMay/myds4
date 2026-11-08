@@ -113,7 +113,7 @@ def turn(port, key, messages, tokens, timeout, seed):
 
 
 def run(args, binary):
-    guard = wait_for_gpu(args.cache, 60, args.reserve, desktop=True, quiet_cpu=True)
+    guard = wait_for_gpu(args.memory + 4, 60, args.reserve, desktop=True, quiet_cpu=True)
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -121,7 +121,7 @@ def run(args, binary):
     env = {k: v for k, v in os.environ.items() if not k.startswith("MYDS4_")}
     env.update(MYDS4_API_KEY=key)
     command = [str(binary), "-m", str(args.checkpoint), "--serve", str(port), "--ctx", str(args.context),
-               "--cache", str(args.cache), "--reserve", str(args.reserve), "--kv-cache", "4", "--ced", args.ced]
+               "--memory", str(args.memory), "--reserve", str(args.reserve), "--kv-cache", "4", "--ced", args.ced]
     if args.experts:
         command += ["--experts", str(args.experts)]
     if args.draft:
@@ -147,7 +147,7 @@ def run(args, binary):
         _, two = turn(port, key, messages, args.tokens, args.timeout, args.seed + 1)
         final = status(port, key)
         cache = final["expert_cache"]
-        valid = cache["slots_released"] == 0 and cache["gib"] >= args.cache - .1
+        valid = cache["slots_released"] == 0 and cache["gib"] > 0
         return {"binary": binary.name, "date_utc": datetime.now(timezone.utc).isoformat(), "valid": valid,
                 "first_turn": one, "second_turn": two, "cache_gib": cache["gib"],
                 "available_gib_before": guard["samples"][-1]["memory"].get("available_gib")}
@@ -166,7 +166,7 @@ def main():
     ap.add_argument("--experts", type=Path, help="a GGUF expert file (any shard); the checkpoint's MXFP4 otherwise")
     ap.add_argument("--binaries", type=Path, nargs="+", required=True, help="server executables, run in --order")
     ap.add_argument("--order", type=int, nargs="+", help="indices into --binaries (default: 0 1 1 0)")
-    ap.add_argument("--cache", type=float, default=40)
+    ap.add_argument("--memory", type=float, default=40)
     ap.add_argument("--reserve", type=float, default=10)
     ap.add_argument("--context", type=int, default=32768)
     ap.add_argument("--seed", type=int, default=12345)

@@ -99,6 +99,7 @@ static void read_row(void *ctx, size_t i) {
 // lanes on the global queue, which adds threads while others wait in pread.
 #define LANES 64
 typedef struct { Row *r; int n, lane, lanes; } Lane;
+uint64_t io_rows_workspace(int rows) { return (uint64_t)rows * (sizeof(uint64_t) + sizeof(Row)); }
 
 static void read_lane(void *ctx) {
   Lane *l = ctx;
@@ -114,10 +115,10 @@ static int cmp_u64(const void *a, const void *b) {
 // many of its n-grams.
 void io_rows(int fd, uint64_t base, uint32_t rowbytes, const int64_t *rows, int n, uint8_t *dst) {
   if (n >= 1 << 20) die("io_rows: too many rows");
-  uint64_t *key = xmalloc((size_t)n * 8);  // row, then request index in the low 20 bits
+  uint64_t *key = memory_host_required((size_t)n * 8, 0);  // row, then request index in the low 20 bits
   for (int i = 0; i < n; i++) key[i] = (uint64_t)rows[i] << 20 | i;
   qsort(key, n, 8, cmp_u64);
-  Row *r = xmalloc((size_t)n * sizeof *r);
+  Row *r = memory_host_required((size_t)n * sizeof *r, 0);
   int u = 0;
   for (int i = 0; i < n; i++)
     if (!i || key[i] >> 20 != key[i - 1] >> 20) {
@@ -138,8 +139,8 @@ void io_rows(int fd, uint64_t base, uint32_t rowbytes, const int64_t *rows, int 
     if (key[i] >> 20 == key[i - 1] >> 20) memcpy(dst + (uint64_t)at * rowbytes, dst + (uint64_t)first * rowbytes, rowbytes);
     else first = at;
   }
-  free(key);
-  free(r);
+  memory_host_free(key);
+  memory_host_free(r);
 }
 
 // The kernel's page counts. Its free count includes the speculative pages
@@ -272,6 +273,7 @@ typedef struct {
   int background_load; // this load originally occupied a prefetch admission
   _Atomic int unfinished; // read or cancelled pieces that have not completed
   _Atomic char taken[16];  // piece k has been started (or dropped)
+  MemorySlot memory;
 } Slot;
 
 static uint64_t token;
@@ -280,10 +282,28 @@ FileSpan expert_span[CACHE_LAYERS][EXPERTS][3];
 int expert_spans[CACHE_LAYERS];
 CacheStats cache_stats;
 static Slot *slots;
+static int pass_layer = -1;
+static MemorySlot *cache_backbone;
+static int cache_busy = 1;
+static int minimum_slots = 2 * EXPERTS;
+static double last_pool_growth;
 static int16_t where[CACHE_LAYERS][EXPERTS];
 static int nslots, cap, max_slots, *free_list, nfree, npinned;
 static int nmapped, mcap;  // slots mapped for the GPU, and how many may be
 static uint64_t reserve, pinned_bytes;
+
+int memory_configure(double model_gib, double kv_gib, double reserve_gib) {
+  MemInfo info;
+  mem_info(&info);
+  double reserve_value = reserve_gib > 0 ? reserve_gib : CACHE_RESERVE_DEFAULT;
+  double kv_value = kv_gib > 0 ? kv_gib : 8;
+  uint64_t bytes = model_gib > 0 ? (uint64_t)(model_gib * GiB) :
+      (info.total > (reserve_value + kv_value) * GiB ? info.total - (uint64_t)((reserve_value + kv_value) * GiB) : 0);
+  if (!bytes) return 0;
+  memory_init(bytes);
+  cache_reserve(reserve_value);
+  return 1;
+}
 
 void cache_reserve(double gib) { reserve = (uint64_t)((gib > 0 ? gib : CACHE_RESERVE_DEFAULT) * GiB); }
 static int draft_capacity = DRAFT_EXPERTS;
@@ -563,11 +583,49 @@ static void release(int i) {
   cache_stats.evictions++;
 }
 
-void cache_init(TensorIndex *index, uint64_t budget, int layers) {
-  if (!retention_growth) cache_retention(0, 0);
-  const char *observe = getenv("MYDS4_PREFETCH_METRICS");
-  pf_enabled = observe && *observe && strcmp(observe, "0");
-  memset(where, 0xff, sizeof where);
+void cache_memory(MemorySlot *backbone) { cache_backbone = backbone; }
+void cache_active(int active) { cache_busy = !!active; }
+void cache_working_rows(int rows) {
+  int experts = rows * TOPK < EXPERTS ? rows * TOPK : EXPERTS;
+  minimum_slots = 2 * experts;
+}
+
+static int pool_can_evict(void *context) {
+  Slot *slot = context;
+  if (!slot->b.obj || slot->holds) return 0;
+  if (!cache_busy) return 1;
+  if (slot->pinned || slot->used == token) return 0;
+  return pass_layer < 0 || slot->layer < pass_layer - 1;
+}
+
+static void pool_evict(void *context) {
+  Slot *slot = context;
+  int index = (int)(slot - slots);
+  if (slot->pinned) {
+    cancel(index);
+    if (slot->expert >= 0) where[slot->layer][slot->expert] = -1;
+    slot->expert = -1;
+    gpu_free(&slot->b);
+  } else release(index);
+  cache_stats.given_back++;
+  gpu_residency_commit();
+}
+
+static Buf pool_buffer(int index, size_t bytes, int mapped) {
+  if (!cache_backbone) return mapped ? gpu_alloc(bytes) : gpu_new(bytes);
+  MemorySlot *previous = memory_scope(&slots[index].memory);
+  // Slot growth borrows free budget. Reuse the native victim if it cannot
+  // grow; a routing prediction never evicts another model's weight group.
+  Buf buffer = gpu_try_new(bytes, MEMORY_SPECULATIVE);
+  memory_scope(previous);
+  if (buffer.obj && mapped) gpu_resident(&buffer, 1), gpu_residency_commit();
+  return buffer;
+}
+
+static uint64_t pinned_slot_size;
+static int layout_ready;
+uint64_t cache_required(TensorIndex *index, int layers) {
+  if (!layout_ready) {
   for (int l = 0; l < CACHE_LAYERS; l++)
     for (int e = 0; !expert_spans[l] && e < (l < LAYERS ? EXPERTS : DRAFT_EXPERTS); e++) {
       Tensor w = l < LAYERS ? st_get(index, "layers.%d.ffn.experts.%d.w1.weight", l, e)
@@ -590,31 +648,51 @@ void cache_init(TensorIndex *index, uint64_t budget, int layers) {
   prepare_reload_cost(layers);
   npinned = draft_pool_count(layers);
   pinned_bytes = npinned * pin_size;
+    pinned_slot_size = pin_size;
+    layout_ready = 1;
+  }
+  return minimum_slots * gpu_allocation_size(SLOT_SIZE) + npinned * gpu_allocation_size(pinned_slot_size);
+}
+
+void cache_init(TensorIndex *index, uint64_t budget, int layers) {
+  if (!retention_growth) cache_retention(0, 0);
+  const char *observe = getenv("MYDS4_PREFETCH_METRICS");
+  pf_enabled = observe && *observe && strcmp(observe, "0");
+  cache_required(index, layers);
+  memset(where, 0xff, sizeof where);
   draft_clock = draft_touch_clock = 0;
   memset(draft_age, 0, sizeof draft_age);
-  uint64_t free = mem_free(), avail = mem_available(), limit = gpu_working_set();
+  uint64_t pin_size = pinned_slot_size;
+  uint64_t free = mem_free(), avail = mem_available(), gpu_limit = gpu_working_set(), limit = gpu_limit;
   if (!reserve) cache_reserve(0);
   int fixed = budget > 0;
   if (!budget) budget = avail > reserve ? avail - reserve : 0;
+  if (cache_backbone && memory_usage().limit < limit) limit = memory_usage().limit;
   if (budget > limit) budget = limit;
   budget = budget > pinned_bytes ? budget - pinned_bytes : 0;
   // the cache may grow up to max_slots when memory becomes free; a given budget is a fixed bound
   max_slots = (int)((fixed ? budget : limit) / SLOT_SIZE);
   if (max_slots > LAYERS * EXPERTS) max_slots = LAYERS * EXPERTS;
-  if (max_slots < 2 * EXPERTS) max_slots = 2 * EXPERTS;
-  if (budget < 2 * EXPERTS * SLOT_SIZE)
-    die("an expert cache of %.1f GiB is too small: a prompt needs %.1f GiB", budget / GiB, 2.0 * EXPERTS * SLOT_SIZE / GiB);
+  if (max_slots < minimum_slots) max_slots = minimum_slots;
+  if (budget < minimum_slots * SLOT_SIZE)
+    die("an expert cache of %.1f GiB is too small: a prompt needs %.1f GiB", budget / GiB, (double)minimum_slots * SLOT_SIZE / GiB);
   // File-cache reclamation is handled by macOS as slots are populated.
   uint64_t within = avail > reserve + pinned_bytes ? avail - reserve - pinned_bytes : 0;
   cap = (int)((budget < within ? budget : within) / SLOT_SIZE);
   if (cap > max_slots) cap = max_slots;
-  if (cap < 2 * EXPERTS) cap = 2 * EXPERTS;
+  if (cap < minimum_slots) cap = minimum_slots;
   // The mapped slots stay within the GPU's limit, beside the weights, which
   // count as resident only once the GPU uses them.
   int64_t room = mem_gpu_room() - (int64_t)pinned_bytes - (int64_t)mem_footprint() - MAP_SLACK;
-  mcap = room > 2 * EXPERTS * (int64_t)SLOT_SIZE ? (int)(room / (int64_t)SLOT_SIZE) : 2 * EXPERTS;
+  mcap = room > minimum_slots * (int64_t)SLOT_SIZE ? (int)(room / (int64_t)SLOT_SIZE) : minimum_slots;
   if (mcap > max_slots) mcap = max_slots;
   slots = xmalloc((max_slots + npinned) * sizeof *slots);
+  if (cache_backbone) for (int i = 0; i < max_slots + npinned; i++) {
+    memory_slot_init(&slots[i].memory, cache_backbone->account, cache_backbone,
+                     "routed expert", pool_evict, &slots[i]);
+    slots[i].memory.can_evict = pool_can_evict;
+    slots[i].memory.automatic = 1;
+  }
   if (pf_enabled) {
     pf_loads = xmalloc((max_slots + npinned) * sizeof *pf_loads);
     memset(pf_loads, 0, (max_slots + npinned) * sizeof *pf_loads);
@@ -626,8 +704,8 @@ void cache_init(TensorIndex *index, uint64_t budget, int layers) {
   for (int i = max_slots - 1; i >= 0; i--) free_list[nfree++] = i;
   for (int i = max_slots; i < max_slots + npinned; i++) {  // separate, MXFP4-sized draft pools
     Slot *s = &slots[i];
-    memset(s, 0, sizeof *s);
-    s->b = gpu_alloc(pin_size);
+    s->b = pool_buffer(i, pin_size, 1);
+    if (!s->b.obj) die("reserved draft expert memory is unavailable");
     s->layer = LAYERS + (i - max_slots) / draft_capacity;
     s->expert = draft_capacity == DRAFT_EXPERTS ? (i - max_slots) % draft_capacity : -1;
     s->pinned = 1;
@@ -638,12 +716,12 @@ void cache_init(TensorIndex *index, uint64_t budget, int layers) {
   }
   for (int i = max_slots; i < max_slots + npinned; i++) finish(i);
   int64_t gpu_room = mem_gpu_room();
-  fprintf(stderr, "expert cache: %d slots (%.1f GiB) to start, up to %d mapped for the GPU, %.1f GiB free and %.1f GiB "
+  fprintf(stderr, "expert cache: slot ceiling %d (%.1f GiB) within the shared model budget, up to %d mapped for the GPU, %.1f GiB free and %.1f GiB "
           "of reclaimable file cache, %.1f GiB kept for other programs, GPU resident memory %.1f GiB",
           cap, cap * (double)SLOT_SIZE / GiB, mcap, free / GiB, (avail > free ? avail - free : 0) / GiB, reserve / GiB,
           mem_gpu() / GiB);
   if (gpu_room < INT64_MAX) fprintf(stderr, " (%.1f GiB below the GPU's limit)", gpu_room / GiB);
-  fprintf(stderr, ", GPU working set %.1f GiB\n", limit / GiB);
+  fprintf(stderr, ", GPU working set %.1f GiB\n", gpu_limit / GiB);
   fprintf(stderr, "cache policy: half-life %d forward passes, read-cost weighting %s\n",
           retention_half_life, retention_read_cost ? "on" : "off");
   if (npinned) {
@@ -801,7 +879,6 @@ static void cancel(int i) {
 
 // The layer a prompt pass is at (-1: decoding). The pass still needs the
 // experts of this layer and the next; it is done with earlier layers.
-static int pass_layer = -1;
 void cache_pass(int layer) { pass_layer = layer; }
 
 // A slot for (layer, e), resident and non-volatile: a free one, or a victim.
@@ -870,8 +947,14 @@ static void map_slot(int i) {
 }
 
 static int take(int layer, int e, int optional) {
-  int i;
+  int i = -1;
   int reuse = nslots >= cap || !nfree;
+  Buf buffer = {0};
+  if (!reuse) {
+    i = free_list[nfree - 1];
+    buffer = pool_buffer(i, SLOT_SIZE, 0);
+    if (!buffer.obj) reuse = 1;
+  }
   if (reuse) {
     i = victim();
     if (i < 0) {
@@ -893,12 +976,13 @@ static int take(int layer, int e, int optional) {
     }
   } else {
     i = free_list[--nfree];
-    slots[i].b = gpu_new(SLOT_SIZE);
+    slots[i].b = buffer;
     // CPU reads fill the buffer. cache_get maps it when GPU work uses it;
     // a forecast that is never selected does not occupy GPU residency.
     slots[i].mapped = slots[i].fresh = slots[i].mapped_once = 0;
     nslots++;
   }
+  if (cache_backbone) memory_touch(&slots[i].memory);
   slots[i].prefetched = 0;
   slots[i].layer = layer, slots[i].expert = e;
   where[layer][e] = i;
@@ -991,6 +1075,10 @@ static int draft_request(int layer, const int *experts, int n) {
       finish(i);  // reap a completed handle before assigning a new expert
       Slot *s = &slots[i];
       if (s->expert >= 0) where[s->layer][s->expert] = -1, cache_stats.evictions++;
+      if (!s->b.obj) {
+        s->b = pool_buffer(i, pinned_slot_size, 1);
+        if (!s->b.obj) die("reserved draft expert memory is unavailable");
+      }
       s->layer = layer, s->expert = e;
       s->prefetched = 0;
       where[layer][e] = i;
@@ -998,6 +1086,7 @@ static int draft_request(int layer, const int *experts, int n) {
       start(i, 1);  // draft misses always use the demand-priority path
     }
     slots[i].used = stamp;
+    if (cache_backbone) memory_touch(&slots[i].memory);
     draft_age[i - max_slots] = ++draft_touch_clock;
     score[i] = escore[layer * EXPERTS + e] += weight;
     dscore[layer * EXPERTS + e] += weight;  // drafts run only while decoding
@@ -1043,6 +1132,7 @@ int cache_request(int layer, const int *experts, int n) {
     }
     slots[i].prefetched = 0;
     slots[i].used = token;
+    if (cache_backbone) memory_touch(&slots[i].memory);
     double *history = &escore[layer * EXPERTS + e];
     *history += weight;
     score[i] = *history;
@@ -1118,6 +1208,7 @@ void cache_prefetch(int layer, const int *experts, int n, int inflight) {
     if (i < 0) return;
     slots[i].prefetched = 1;
     slots[i].used = token;
+    if (cache_backbone) memory_touch(&slots[i].memory);
     start(i, 0);
     cache_stats.prefetches++;
   }
@@ -1225,7 +1316,7 @@ static void resize(int below) {
   if (!init) swapouts = s.swapouts, init = 1;
   int64_t room = mem_gpu_room();
   uint64_t swap_delta = s.swapouts > swapouts ? s.swapouts - swapouts : 0;
-  int level = mem_pressure(), swapped = swap_delta && nslots > 2 * EXPERTS;
+  int level = mem_pressure(), swapped = swap_delta && nslots > minimum_slots;
   int low = level >= 2 || swapped || avail < reserve;
   static int calm_map;
   static double unmapped;  // when the GPU's excess was last unmapped: the driver shows it about a second later
@@ -1237,7 +1328,7 @@ static void resize(int below) {
     uint64_t to = avail;
     int64_t give = level >= 4 ? nslots / 4 : nslots / 16 + 1;
     if (to < reserve && (int64_t)((reserve - to) / slot) + 1 > give) give = (reserve - to) / slot + 1;
-    cap = nslots - (int)give > 2 * EXPERTS ? nslots - (int)give : 2 * EXPERTS;
+    cap = nslots - (int)give > minimum_slots ? nslots - (int)give : minimum_slots;
     calm = 0, gave = now();
   } else if (!low && ++calm >= 32 && cap < max_slots && headroom > reserve + margin) {
     cap += (int)((headroom - reserve - margin) / slot / 4) + 1;
@@ -1245,7 +1336,7 @@ static void resize(int below) {
     calm = 0;
   }
   if (room < 0 && now() - unmapped > 1) {  // past the GPU's limit: map fewer, exactly the excess fewer
-    mcap = nmapped - (int)(-room / (int64_t)slot) - 1 > 2 * EXPERTS ? nmapped - (int)(-room / (int64_t)slot) - 1 : 2 * EXPERTS;
+    mcap = nmapped - (int)(-room / (int64_t)slot) - 1 > minimum_slots ? nmapped - (int)(-room / (int64_t)slot) - 1 : minimum_slots;
     calm_map = 0, unmapped = now();
   } else if (room >= 0 && ++calm_map >= 32 && mcap < max_slots && room > MAP_SLACK + (int64_t)GiB) {
     mcap += (int)((room - MAP_SLACK - (int64_t)GiB) / (int64_t)slot / 4) + 1;
@@ -1286,6 +1377,16 @@ void cache_adapt_pass(int pass) {
   if (held_references) die("cannot resize the cache during a runahead job");
   if (pass < 0) {
     advance_score_clock();
+  }
+  if (cache_backbone && pass < 0 && now() - last_pool_growth >= 1.0 &&
+      memory_room(cache_backbone->account) < 4 * SLOT_SIZE) {
+    MemorySlot growth;
+    memory_slot_init(&growth, cache_backbone->account, NULL, "cache growth", NULL, NULL);
+    MemorySlot *wanted[] = {&growth};
+    uint64_t bytes = 4 * SLOT_SIZE;
+    memory_admit(wanted, &bytes, 1, MEMORY_CACHE);
+    memory_slot_remove(&growth);
+    last_pool_growth = now();
   }
   resize(pass < 0 ? CACHE_LAYERS : pass - 1);
   if (pass < 0)

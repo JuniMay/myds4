@@ -1,6 +1,7 @@
 // Qwen's patch encoder and spatial merger. Images use the checkpoint's
 // resize limits; weights remain unloaded until an image is encoded.
 #include "vision.h"
+#include "../weights.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,9 +16,9 @@ struct QwenVision {
   Linear patch, merge[2];
   Buf position, norm, norm_bias;
   Block *blocks;
-  Buf *weights, work[WORK_BUFFERS];
-  int nweights;
-  uint64_t bytes;
+  WeightSet *weights;
+  MemorySlot workspace;
+  Buf work[WORK_BUFFERS];
   int pack, bias, layernorm, heads_kernel, attention, gelu, add, positions;
 };
 
@@ -80,7 +81,8 @@ int qwen_prepare_image(const char *dir, Image *im, const void *data, size_t size
   im->embedding_width = 0, im->start = 0, im->rows = NULL, im->features = (Buf){0};
   im->hash = 1469598103934665603ull;
   for (size_t i = 0; i < size; i++) im->hash = (im->hash ^ ((const uint8_t *)data)[i]) * 1099511628211ull;
-  im->patch = xmalloc((size_t)im->vh * im->vw * im->patch_stride * 2);
+  im->patch = memory_host_alloc((size_t)im->vh * im->vw * im->patch_stride * 2, 0);
+  if (!im->patch) { free(resized); *error = "model-memory budget cannot fit the image patches"; return 0; }
   for (int py = 0; py < im->vh; py++) for (int px = 0; px < im->vw; px++) {
     int row = ((py / merge) * im->tw + px / merge) * 4 + (py % merge) * 2 + px % merge;
     for (int c = 0; c < 3; c++) for (int t = 0; t < temporal; t++)
@@ -93,10 +95,20 @@ int qwen_prepare_image(const char *dir, Image *im, const void *data, size_t size
   return 1;
 }
 
+static void release_workspace(void *context) {
+  QwenVision *vision = context;
+  for (int i = 0; i < WORK_BUFFERS; i++) gpu_free(&vision->work[i]);
+  vision->capacity = 0;
+  gpu_residency_commit();
+}
+
 QwenVision *qwen_vision_open(TensorIndex *index, const Json *config) {
   if (!config) return NULL;
   QwenVision *v = xmalloc(sizeof *v);
   v->index = index;
+  MemorySlot *owner = memory_current() ? memory_current() : memory_shared();
+  v->weights = weights_new(owner->account, "Qwen vision weights");
+  memory_slot_init(&v->workspace, owner->account, weights_slot(v->weights), "vision workspace", release_workspace, v);
   v->depth = number(config, "depth", 0), v->width = number(config, "hidden_size", 0);
   v->intermediate = number(config, "intermediate_size", 0), v->output = number(config, "out_hidden_size", 0);
   v->heads = number(config, "num_heads", 0);
@@ -110,37 +122,21 @@ QwenVision *qwen_vision_open(TensorIndex *index, const Json *config) {
   return v;
 }
 
-static Buf weight(QwenVision *v, const char *name, int stride) {
+static void weight(QwenVision *v, Buf *target, const char *name, int stride) {
   Tensor tensor = st_get(v->index, "%s", name);
   if (tensor.dtype != 'b') die("%s: Qwen vision requires BF16 weights", name);
-  int rows = stride ? (int)tensor.shape[0] : 1;
-  size_t rowbytes = tensor.size / rows, bytes = stride ? (size_t)rows * stride * 2 : tensor.size;
-  Buf b = gpu_alloc(bytes);
-  memset(b.ptr, 0, b.size);
-  uint8_t *input = rowbytes == (size_t)stride * 2 || !stride ? b.ptr : xmalloc(tensor.size);
-  for (size_t got = 0; got < tensor.size;) {
-    ssize_t n = pread(tensor.fd, input + got, tensor.size - got, (off_t)(tensor.off + got));
-    if (n <= 0) die("cannot read vision tensor %s", name);
-    got += (size_t)n;
-  }
-  if (input != b.ptr) {
-    for (int r = 0; r < rows; r++) memcpy(b.ptr + (size_t)r * stride * 2, input + (size_t)r * rowbytes, rowbytes);
-    free(input);
-  }
-  v->weights = realloc(v->weights, (size_t)(v->nweights + 1) * sizeof *v->weights);
-  if (!v->weights) die("out of memory for vision weights");
-  v->weights[v->nweights++] = b; v->bytes += bytes;
-  return b;
+  if (stride) weights_padded(v->weights, target, tensor, stride);
+  else weights_tensor(v->weights, target, tensor, 0);
 }
 
-static Linear linear(QwenVision *v, const char *prefix) {
+static void linear(QwenVision *v, Linear *target, const char *prefix) {
   char name[256]; snprintf(name, sizeof name, "%s.weight", prefix);
-  Tensor t = st_get(v->index, "%s", name);
-  Linear l = {.rows = (int)t.shape[0]};
-  l.cols = (int)(t.size / 2 / l.rows), l.stride = (l.cols + 63) / 64 * 64;
-  l.w = weight(v, name, l.stride);
-  snprintf(name, sizeof name, "%s.bias", prefix); l.b = weight(v, name, 0);
-  return l;
+  Tensor tensor = st_get(v->index, "%s", name);
+  target->rows = (int)tensor.shape[0];
+  target->cols = (int)(tensor.size / 2 / target->rows);
+  target->stride = (target->cols + 63) / 64 * 64;
+  weight(v, &target->w, name, target->stride);
+  snprintf(name, sizeof name, "%s.bias", prefix); weight(v, &target->b, name, 0);
 }
 
 static void load(QwenVision *v) {
@@ -149,22 +145,22 @@ static void load(QwenVision *v) {
   v->pack = gpu_kernel("qv_pack"), v->bias = gpu_kernel("qv_bias"), v->layernorm = gpu_kernel("qv_norm");
   v->heads_kernel = gpu_kernel("qv_heads"), v->attention = gpu_kernel("qv_attention");
   v->gelu = gpu_kernel("qv_gelu"), v->add = gpu_kernel("vit_add"), v->positions = gpu_kernel("qv_positions");
-  v->patch = linear(v, "model.visual.patch_embed.proj");
-  v->position = weight(v, "model.visual.pos_embed.weight", 0);
+  linear(v, &v->patch, "model.visual.patch_embed.proj");
+  weight(v, &v->position, "model.visual.pos_embed.weight", 0);
   char name[256];
   for (int i = 0; i < v->depth; i++) {
     Block *b = &v->blocks[i];
-    snprintf(name, sizeof name, "model.visual.blocks.%d.attn.qkv", i); b->qkv = linear(v, name);
-    snprintf(name, sizeof name, "model.visual.blocks.%d.attn.proj", i); b->projection = linear(v, name);
-    snprintf(name, sizeof name, "model.visual.blocks.%d.mlp.linear_fc1", i); b->up = linear(v, name);
-    snprintf(name, sizeof name, "model.visual.blocks.%d.mlp.linear_fc2", i); b->down = linear(v, name);
+    snprintf(name, sizeof name, "model.visual.blocks.%d.attn.qkv", i); linear(v, &b->qkv, name);
+    snprintf(name, sizeof name, "model.visual.blocks.%d.attn.proj", i); linear(v, &b->projection, name);
+    snprintf(name, sizeof name, "model.visual.blocks.%d.mlp.linear_fc1", i); linear(v, &b->up, name);
+    snprintf(name, sizeof name, "model.visual.blocks.%d.mlp.linear_fc2", i); linear(v, &b->down, name);
     for (int j = 0; j < 2; j++) {
-      snprintf(name, sizeof name, "model.visual.blocks.%d.norm%d.weight", i, j + 1); b->norm[j] = weight(v, name, 0);
-      snprintf(name, sizeof name, "model.visual.blocks.%d.norm%d.bias", i, j + 1); b->bias[j] = weight(v, name, 0);
+      snprintf(name, sizeof name, "model.visual.blocks.%d.norm%d.weight", i, j + 1); weight(v, &b->norm[j], name, 0);
+      snprintf(name, sizeof name, "model.visual.blocks.%d.norm%d.bias", i, j + 1); weight(v, &b->bias[j], name, 0);
     }
   }
-  v->norm = weight(v, "model.visual.merger.norm.weight", 0), v->norm_bias = weight(v, "model.visual.merger.norm.bias", 0);
-  v->merge[0] = linear(v, "model.visual.merger.linear_fc1"), v->merge[1] = linear(v, "model.visual.merger.linear_fc2");
+  weight(v, &v->norm, "model.visual.merger.norm.weight", 0), weight(v, &v->norm_bias, "model.visual.merger.norm.bias", 0);
+  linear(v, &v->merge[0], "model.visual.merger.linear_fc1"), linear(v, &v->merge[1], "model.visual.merger.linear_fc2");
   v->loaded = 1;
 }
 
@@ -199,22 +195,36 @@ static void activate(QwenVision *v, const Buf *data, int n, int exact) {
   gpu_go((n + 255) / 256, 1, 1, 256, 1, 1);
 }
 
-void qwen_vision_encode(QwenVision *v, Image *im) {
+int qwen_vision_encode(QwenVision *v, Image *im) {
   if (!v) die("checkpoint has no Qwen vision encoder");
-  if (im->rows) return;
+  if (im->rows) return 1;
   load(v);
   int n = im->vh * im->vw, padded = (n + 255) / 256 * 256, width = v->width;
   int wide = v->intermediate > 4 * width ? v->intermediate : 4 * width;
-  if (padded > v->capacity) {
+  int capacity = padded > v->capacity ? padded : v->capacity;
+  size_t sizes[WORK_BUFFERS] = {(size_t)capacity * width * 4, (size_t)capacity * width * 4,
+    (size_t)capacity * width * 12, (size_t)capacity * width * 4, (size_t)capacity * wide * 4,
+    (size_t)capacity * (width > v->output / 4 ? width : v->output / 4) * 4, (size_t)capacity * 72 * 4,
+    (size_t)capacity * 16 * 96 * 6, (size_t)capacity * ((wide + 63) / 64 * 64) * 2};
+  MemorySlot *owner = memory_current() ? memory_current() : memory_shared(), *weights = weights_slot(v->weights);
+  uint64_t work_bytes = 0, feature_bytes = gpu_allocation_size((size_t)im->ntokens * v->output * 2);
+  for (int i = 0; i < WORK_BUFFERS; i++) work_bytes += gpu_allocation_size(sizes[i]);
+  MemorySlot *entries[] = {weights, &v->workspace, owner};
+  uint64_t required[] = {weights_required(v->weights), work_bytes, owner->payload + feature_bytes};
+  if (!memory_admit(entries, required, 3, MEMORY_REQUIRED)) return 0;
+  memory_pin(weights, 1); memory_pin(&v->workspace, 1);
+  if (!weights_load(v->weights)) die("reserved vision weights could not load");
+  if (capacity != v->capacity) {
     gpu_sync();
-    for (int i = 0; i < WORK_BUFFERS; i++) gpu_free(&v->work[i]);
-    size_t sizes[WORK_BUFFERS] = {(size_t)padded * width * 4, (size_t)padded * width * 4,
-      (size_t)padded * width * 12, (size_t)padded * width * 4, (size_t)padded * wide * 4,
-      (size_t)padded * (width > v->output / 4 ? width : v->output / 4) * 4, (size_t)padded * 72 * 4, (size_t)padded * 16 * 96 * 6,
-      (size_t)padded * ((wide + 63) / 64 * 64) * 2};
+    release_workspace(v);
+    MemorySlot *previous = memory_scope(&v->workspace);
     for (int i = 0; i < WORK_BUFFERS; i++) { v->work[i] = gpu_alloc(sizes[i]); memset(v->work[i].ptr, 0, sizes[i]); }
-    v->capacity = padded;
+    memory_scope(previous);
+    v->capacity = capacity;
+    memory_publish(&v->workspace, 1);
   }
+  im->embedding_width = v->output;
+  im->features = gpu_alloc((size_t)im->ntokens * v->output * 2);
   memcpy(v->work[VB].ptr, im->patch, (size_t)n * im->patch_stride * 2);
   float *positions = (float *)v->work[VP].ptr, *rope = (float *)v->work[VR].ptr;
   const uint16_t *grid = (const uint16_t *)v->position.ptr;
@@ -257,24 +267,25 @@ void qwen_vision_encode(QwenVision *v, Image *im) {
   norm(v, &v->work[VX], &v->norm, &v->norm_bias, &v->work[VN], n);
   matrix(v, &v->merge[0], &v->work[VN], &v->work[VF], n / 4, 0); activate(v, &v->work[VF], n * width, 1);
   matrix(v, &v->merge[1], &v->work[VF], &v->work[VP], n / 4, 0);
-  im->embedding_width = v->output;
-  im->features = gpu_alloc((size_t)im->ntokens * v->output * 2);
   uint32_t shape[3] = {(uint32_t)v->output, (uint32_t)v->output, (uint32_t)im->ntokens};
   gpu_kern(v->pack); gpu_buf(0, &v->work[VP], 0); gpu_buf(1, &im->features, 0); gpu_bytes(2, shape, sizeof shape);
   gpu_go((v->output + 255) / 256, im->ntokens, 1, 256, 1, 1);
   gpu_commit(); gpu_sync();
   im->rows = (uint16_t *)im->features.ptr;
+  memory_pin(weights, 0); memory_pin(&v->workspace, 0);
+  return 1;
 }
 
 void qwen_vision_reside(QwenVision *v, int resident) {
   if (!v) return;
-  for (int i = 0; i < v->nweights; i++) gpu_resident(&v->weights[i], resident);
+  weights_reside(v->weights, resident);
   for (int i = 0; i < WORK_BUFFERS; i++) if (v->work[i].obj) gpu_resident(&v->work[i], resident);
 }
-uint64_t qwen_vision_bytes(const QwenVision *v) { return v ? v->bytes : 0; }
+uint64_t qwen_vision_bytes(const QwenVision *v) { return v ? weights_resident_bytes(v->weights) : 0; }
 void qwen_vision_close(QwenVision *v) {
   if (!v) return;
-  for (int i = 0; i < v->nweights; i++) gpu_free(&v->weights[i]);
-  for (int i = 0; i < WORK_BUFFERS; i++) gpu_free(&v->work[i]);
-  free(v->weights); free(v->blocks); free(v);
+  release_workspace(v);
+  memory_slot_remove(&v->workspace);
+  weights_free(v->weights);
+  free(v->blocks); free(v);
 }

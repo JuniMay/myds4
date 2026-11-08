@@ -245,7 +245,7 @@ def vision_reference(directory, image_bytes, binary):
     del model, state, inputs
     gc.collect()
 
-    ready = wait_for_gpu(0, 60, reserve_gib=4)
+    ready = wait_for_gpu(24, 60, reserve_gib=10)
     result = guarded_process([str(binary), str(root), "1"], os.environ.copy(), 120,
                              ready["samples"][-1]["memory"], input_data=image_bytes, allow_cpu_helpers=True)
     if result.returncode:

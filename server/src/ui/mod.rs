@@ -104,6 +104,8 @@ pub struct Snapshot {
     reserve_gib: f64,
     #[serde(default)]
     model_memory: Vec<ModelMemory>,
+    #[serde(default)]
+    model_memory_budget: ModelBudget,
     tree: Vec<Node>,
     decode: Decode,
     prompts: Prompts,
@@ -114,10 +116,18 @@ pub struct Snapshot {
 }
 
 #[derive(Deserialize, Default)]
+struct ModelBudget {
+    limit: u64,
+    allocated: u64,
+}
+
+#[derive(Deserialize, Default)]
 struct ModelMemory {
     model: String,
     weights: u64,
     experts: u64,
+    #[serde(default)]
+    workspace: u64,
     kv: u64,
     kv_committed: u64,
     tracked: u64,
@@ -1221,6 +1231,7 @@ mod tests {
         s.memory.file = 19 * gib;
         s.model_memory = vec![
             ModelMemory {
+                workspace: 0,
                 model: "DeepSeek".into(),
                 weights: 8 * gib,
                 experts: 56 * gib,
@@ -1229,6 +1240,7 @@ mod tests {
                 tracked: 65 * gib,
             },
             ModelMemory {
+                workspace: 0,
                 model: "Qwen".into(),
                 weights: 20 * gib,
                 experts: 0,

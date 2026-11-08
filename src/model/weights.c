@@ -1,0 +1,204 @@
+#include "weights.h"
+#include <errno.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+typedef struct {
+  Buf *target;
+  const Buf *alias;
+  size_t bytes;
+  WeightFill fill;
+  void *parameters;
+} Weight;
+
+struct WeightSet {
+  MemorySlot slot;
+  Weight *items;
+  size_t count, capacity;
+  uint64_t required;
+};
+
+static void unload(void *context) {
+  WeightSet *set = context;
+  for (size_t i = 0; i < set->count; i++)
+    if (!set->items[i].alias) gpu_resident(set->items[i].target, 0);
+  gpu_residency_commit();
+  for (size_t i = 0; i < set->count; i++) {
+    Weight *weight = &set->items[i];
+    if (weight->alias) *weight->target = (Buf){0};
+    else gpu_free(weight->target);
+  }
+  gpu_residency_commit();
+}
+
+WeightSet *weights_new(MemoryAccount *account, const char *name) {
+  WeightSet *set = xmalloc(sizeof *set);
+  memory_slot_init(&set->slot, account, NULL, name, unload, set);
+  return set;
+}
+MemorySlot *weights_slot(WeightSet *set) { return &set->slot; }
+uint64_t weights_required(const WeightSet *set) { return set ? set->required : 0; }
+uint64_t weights_resident_bytes(const WeightSet *set) { return set && memory_ready(&set->slot) ? set->slot.payload : 0; }
+
+static Weight *append(WeightSet *set, Buf *target) {
+  if (set->count == set->capacity) {
+    set->capacity = set->capacity ? set->capacity * 2 : 64;
+    Weight *items = realloc(set->items, set->capacity * sizeof *items);
+    if (!items) die("out of memory for weight metadata");
+    set->items = items;
+  }
+  Weight *weight = &set->items[set->count++];
+  *weight = (Weight){.target = target};
+  return weight;
+}
+
+void weights_generated(WeightSet *set, Buf *target, size_t bytes, WeightFill fill,
+                       const void *parameters, size_t parameter_bytes) {
+  Weight *weight = append(set, target);
+  weight->bytes = bytes;
+  weight->fill = fill;
+  if (parameter_bytes) {
+    weight->parameters = xmalloc(parameter_bytes);
+    memcpy(weight->parameters, parameters, parameter_bytes);
+  }
+  set->required += gpu_allocation_size(bytes);
+  target->size = bytes;
+}
+
+void weights_alias(WeightSet *set, Buf *target, const Buf *source) {
+  Weight *weight = append(set, target);
+  weight->alias = source;
+}
+
+static void read_bytes(Tensor tensor, size_t offset, void *target, size_t bytes) {
+  size_t done = 0;
+  while (done < bytes) {
+    size_t part = bytes - done < 1u << 30 ? bytes - done : 1u << 30;
+    ssize_t n = pread(tensor.fd, (char *)target + done, part, (off_t)(tensor.off + offset + done));
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) die("cannot reload weight data at offset %llu", (unsigned long long)(tensor.off + offset + done));
+    done += (size_t)n;
+  }
+}
+
+typedef struct { Tensor tensor; int aligned; } Raw;
+static void raw_fill(Buf *buffer, const void *context) {
+  const Raw *raw = context;
+  if (raw->aligned) io_read(raw->tensor.fd, raw->tensor.off, raw->tensor.size, buffer);
+  else read_bytes(raw->tensor, 0, buffer->ptr, raw->tensor.size);
+}
+void weights_tensor(WeightSet *set, Buf *target, Tensor tensor, int aligned) {
+  Raw raw = {tensor, aligned};
+  weights_generated(set, target, tensor.size + (aligned ? 2 * 16384 : 0), raw_fill, &raw, sizeof raw);
+}
+
+typedef struct { Tensor first, second; float add; int operations, product; } Vector;
+static float value(const uint8_t *bytes, int index, int dtype) {
+  if (dtype == 'b') {
+    uint16_t short_bits;
+    memcpy(&short_bits, bytes + (size_t)index * 2, 2);
+    uint32_t bits = (uint32_t)short_bits << 16;
+    float result; memcpy(&result, &bits, 4); return result;
+  }
+  float result; memcpy(&result, bytes + (size_t)index * 4, 4); return result;
+}
+static void vector_fill(Buf *buffer, const void *context) {
+  const Vector *vector = context;
+  uint8_t first[16384], second[16384];
+  size_t count = vector->first.size / (vector->first.dtype == 'b' ? 2 : 4);
+  float *output = (float *)buffer->ptr;
+  for (size_t at = 0; at < count; at += 4096) {
+    size_t n = count - at < 4096 ? count - at : 4096;
+    size_t width = vector->first.dtype == 'b' ? 2 : 4;
+    read_bytes(vector->first, at * width, first, n * width);
+    if (vector->product) {
+      size_t other_width = vector->second.dtype == 'b' ? 2 : 4;
+      read_bytes(vector->second, at * other_width, second, n * other_width);
+    }
+    for (size_t i = 0; i < n; i++) {
+      float v = value(first, (int)i, vector->first.dtype);
+      if (vector->operations & WEIGHT_ADD) v += vector->add;
+      if (vector->product) v *= value(second, (int)i, vector->second.dtype);
+      if (vector->operations & WEIGHT_EXP) v = expf(v);
+      output[at + i] = v;
+    }
+  }
+}
+void weights_vector(WeightSet *set, Buf *target, Tensor tensor, float add, int operations) {
+  if (tensor.dtype != 'b' && tensor.dtype != 'f') die("weight vector must use BF16 or FP32");
+  Vector vector = {.first = tensor, .add = add, .operations = operations};
+  size_t bytes = tensor.size / (tensor.dtype == 'b' ? 2 : 4) * 4;
+  weights_generated(set, target, bytes, vector_fill, &vector, sizeof vector);
+}
+void weights_product(WeightSet *set, Buf *target, Tensor first, Tensor second) {
+  Vector vector = {.first = first, .second = second, .product = 1};
+  size_t n = first.size / (first.dtype == 'b' ? 2 : 4);
+  if (n != second.size / (second.dtype == 'b' ? 2 : 4)) die("weight product sizes differ");
+  weights_generated(set, target, n * 4, vector_fill, &vector, sizeof vector);
+}
+
+typedef struct { Tensor tensor; int stride; } Padded;
+static void padded_fill(Buf *buffer, const void *context) {
+  const Padded *padded = context;
+  size_t rows = padded->tensor.shape[0], row_bytes = padded->tensor.size / rows;
+  memset(buffer->ptr, 0, buffer->size);
+  for (size_t row = 0; row < rows; row++)
+    read_bytes(padded->tensor, row * row_bytes, buffer->ptr + row * padded->stride * 2, row_bytes);
+}
+void weights_padded(WeightSet *set, Buf *target, Tensor tensor, int stride) {
+  if (tensor.dtype != 'b' || stride * 2u < tensor.size / tensor.shape[0]) die("invalid padded BF16 weight");
+  Padded padded = {tensor, stride};
+  weights_generated(set, target, (size_t)tensor.shape[0] * stride * 2, padded_fill, &padded, sizeof padded);
+}
+
+int weights_load(WeightSet *set) {
+  if (memory_ready(&set->slot)) { memory_touch(&set->slot); return 1; }
+  MemorySlot *slots[] = {&set->slot};
+  if (!memory_admit(slots, &set->required, 1, MEMORY_REQUIRED)) return 0;
+  unsigned pinned = set->slot.pins;
+  memory_pin(&set->slot, 1);
+  MemorySlot *before = memory_scope(&set->slot);
+  for (size_t i = 0; i < set->count; i++) {
+    Weight *weight = &set->items[i];
+    if (weight->alias) continue;
+    *weight->target = gpu_alloc(weight->bytes);
+    weight->fill(weight->target, weight->parameters);
+  }
+  for (size_t i = 0; i < set->count; i++)
+    if (set->items[i].alias) *set->items[i].target = *set->items[i].alias;
+  memory_scope(before);
+  memory_publish(&set->slot, 1);
+  memory_pin(&set->slot, pinned);
+  return 1;
+}
+
+void weights_reside(WeightSet *set, int resident) {
+  if (!set || !memory_ready(&set->slot)) return;
+  for (size_t i = 0; i < set->count; i++)
+    if (!set->items[i].alias) gpu_resident(set->items[i].target, resident);
+}
+
+void weights_free(WeightSet *set) {
+  if (!set) return;
+  unload(set);
+  memory_trim(&set->slot);
+  memory_slot_remove(&set->slot);
+  for (size_t i = 0; i < set->count; i++) free(set->items[i].parameters);
+  free(set->items);
+  free(set);
+}
+
+void weights_remove(WeightSet *set, Buf *target) {
+  if (memory_ready(&set->slot)) die("cannot change a resident weight group");
+  for (size_t i = 0; i < set->count; i++) if (set->items[i].target == target) {
+    Weight *weight = &set->items[i];
+    if (!weight->alias) set->required -= gpu_allocation_size(weight->bytes);
+    free(weight->parameters);
+    memmove(weight, weight + 1, (set->count - i - 1) * sizeof *weight);
+    set->count--;
+    *target = (Buf){0};
+    return;
+  }
+}

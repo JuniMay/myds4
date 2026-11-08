@@ -16,6 +16,7 @@
 //! view's snapshot.
 
 use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -99,7 +100,6 @@ pub struct Request {
 pub enum SubmitError {
     /// Too many requests wait, or the server stops.
     Busy(String),
-    Invalid(String),
 }
 
 #[derive(Default)]
@@ -225,6 +225,9 @@ struct Prefilled {
 #[derive(Default)]
 struct Status {
     load_error: Option<String>,
+    engine: engine::Stats,
+    loaded: bool,
+    drafts: usize,
     phase: &'static str,
     since: Option<Instant>,
     active: usize,
@@ -262,7 +265,7 @@ struct Status {
 /// tokenizer and statistics take any thread) and its status.
 pub struct ModelShared {
     pub served: Served,
-    pub model: Arc<Model>,
+    pub tokenizer: engine::Tokenizer,
     status: Mutex<Status>,
 }
 
@@ -288,11 +291,11 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// The models the worker serves, in their order: an index of this list is a
 /// request's model.
-pub fn models() -> Vec<(String, Arc<Model>, Served)> {
+pub fn models() -> Vec<(String, engine::Tokenizer, Served)> {
     shared()
         .models
         .iter()
-        .map(|m| (m.served.id.clone(), m.model.clone(), m.served.clone()))
+        .map(|m| (m.served.id.clone(), m.tokenizer, m.served.clone()))
         .collect()
 }
 
@@ -310,11 +313,19 @@ pub fn start(
         .name("myds4-engine".into())
         .stack_size(16 << 20)
         .spawn(move || {
-            if !engine::init(budgets.reserve_gb, on_log, on_die) {
+            if !engine::init(
+                budgets.memory_gb,
+                budgets.kv_gb,
+                budgets.reserve_gb,
+                on_log,
+                on_die,
+            ) {
                 let _ = tx.send(false);
                 return;
             }
+            engine::refresh_stats();
             let mut models = Vec::new();
+            let mut engines = Vec::new();
             for s in &served {
                 let Some(m) = Model::open(&s.engine) else {
                     let _ = tx.send(false);
@@ -322,9 +333,14 @@ pub fn start(
                 };
                 models.push(ModelShared {
                     served: s.clone(),
-                    model: Arc::new(m),
-                    status: Mutex::new(Status::default()),
+                    tokenizer: m.tokenizer(),
+                    status: Mutex::new(Status {
+                        engine: m.stats(),
+                        drafts: m.draft_block(),
+                        ..Status::default()
+                    }),
                 });
+                engines.push(Rc::new(m));
             }
             let n = models.len();
             let s = Arc::new(Shared {
@@ -342,16 +358,16 @@ pub fn start(
             // A failure here ends the process, as the engine's own do: the
             // requests could not end otherwise. (The panic's message is out.)
             let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut w = Worker::new(s.clone());
+                let mut w = Worker::new(s.clone(), engines);
                 let _ = tx.send(true);
                 w.run();
+                for slot in &w.slots {
+                    slot.model.finish();
+                }
             }));
             if run.is_err() {
                 crate::ui::leave();
                 std::process::exit(1);
-            }
-            for m in &s.models {
-                m.model.finish();
             }
         })
         .expect("the engine's thread");
@@ -392,7 +408,7 @@ pub fn text_answer(model: usize) -> Option<NodeText> {
 /// The text of a model's token ids, for the live view (engine::Tokenizer::text).
 pub fn text(model: usize, ids: &[i32]) -> Vec<(String, bool)> {
     let s = SHARED.lock().unwrap().clone(); // none before the worker starts
-    s.and_then(|s| s.models.get(model).map(|m| m.model.tokenizer().text(ids)))
+    s.and_then(|s| s.models.get(model).map(|m| m.tokenizer.text(ids)))
         .unwrap_or_default()
 }
 
@@ -409,23 +425,6 @@ pub fn stop() {
 /// id), and its events.
 pub fn submit(r: Request) -> Result<(Cancel, mpsc::UnboundedReceiver<Event>), SubmitError> {
     let s = shared();
-    let bad = if r.model >= s.models.len() {
-        Some("no such model".to_string())
-    } else if r.prompt.is_empty() {
-        Some("the prompt is empty".into())
-    } else if !(r.sampling.temperature.is_finite()
-        && r.sampling.temperature >= 0.0
-        && (0.0..=1.0).contains(&r.sampling.top_p))
-    {
-        Some("temperature must be a finite nonnegative number and top_p must be in [0, 1]".into())
-    } else if r.max_tokens < 1 {
-        Some("max_tokens must be at least 1".into())
-    } else {
-        None
-    };
-    if let Some(m) = bad {
-        return Err(SubmitError::Invalid(m));
-    }
     let (tx, rx) = mpsc::unbounded_channel();
     let flags = Arc::new(Flags::default());
     let mut q = lock(&s.queue);
@@ -470,11 +469,11 @@ fn memory_models(s: &Shared) -> Vec<Value> {
     s.models
         .iter()
         .map(|m| {
-            let c = m.model.stats();
             let st = lock(&m.status);
+            let c = st.engine;
             json!({"model": m.served.id, "weights": c.dense_bytes, "experts": c.cache_bytes,
-               "kv": st.kv_allocated, "kv_committed": st.kv_bytes,
-               "tracked": c.dense_bytes + c.cache_bytes + st.kv_allocated})
+               "workspace": c.model_workspace, "kv": st.kv_allocated, "kv_committed": st.kv_bytes,
+               "tracked": c.dense_bytes + c.cache_bytes + c.model_workspace + st.kv_allocated})
         })
         .collect()
 }
@@ -487,7 +486,7 @@ pub fn status(model: usize) -> Value {
         return Value::Null;
     };
     let waiting = lock(&s.queue).jobs[model].len();
-    let c = m.model.stats();
+    let c = lock(&m.status).engine;
     let allocations = memory_models(&s);
     let st = lock(&m.status);
     let now = Instant::now();
@@ -499,7 +498,7 @@ pub fn status(model: usize) -> Value {
     let p = &st.prefill;
     let o = &m.served.engine;
     json!({
-        "loaded": m.model.loaded(), "load_error": st.load_error,
+        "loaded": st.loaded, "load_error": st.load_error,
         "phase": if st.phase.is_empty() { "idle" } else { st.phase },
         "phase_seconds": round(st.since.map_or(0.0, |t| (now - t).as_secs_f64()), 1), "decoding": st.active,
         "request": st.request, "prompt_tokens": st.prompt, "reused_tokens": st.reused, "generated_tokens": st.generated,
@@ -507,11 +506,13 @@ pub fn status(model: usize) -> Value {
         "kv_cache_gib": round(st.kv_bytes as f64 / GIB, 3), "kv_cache_limit_gib": round(s.budgets.kv_gb, 3),
         "kv_cache_scope": "server", "kv_cache_total_gib": round(s.kv_used.load(Ordering::Relaxed) as f64 / GIB, 3),
         "reserve_gib": s.budgets.reserve_gb, "model_memory": allocations,
+        "model_memory_budget": {"limit": c.model_memory_limit, "allocated": c.model_memory_used,
+                                "committed": c.model_memory_committed, "peak": c.model_memory_peak},
         "totals": {"requests": st.requests, "prompt_tokens": st.prompt_tokens, "generated_tokens": st.generated_tokens},
         "ced_depth": o.deepseek().map_or(0, |d| d.ced), "lookup_depth": o.lookup,
         "prefill_prune": o.deepseek().is_some_and(|d| d.prefill_prune),
         "runahead": o.deepseek().is_some_and(|d| d.runahead), "pipeline": o.deepseek().is_some_and(|d| d.pipeline),
-        "drafts": m.model.draft_block(),
+        "drafts": st.drafts,
         "model_decode": {"computed_rows": c.decode_rows, "seconds": c.decode_seconds,
                          "main_queue_gpu_seconds": c.decode_gpu_seconds, "requested_expert_gb": c.decode.bytes as f64 / 1e9,
                          "read_wait_seconds": c.decode.read_s},
@@ -533,7 +534,7 @@ pub fn view(model: usize) -> String {
         return "{}".into();
     };
     let waiting = lock(&s.queue).jobs[model].len();
-    let c = m.model.stats();
+    let c = lock(&m.status).engine;
     let allocations = memory_models(&s);
     let mut st = lock(&m.status);
     let now = Instant::now();
@@ -577,6 +578,8 @@ pub fn view(model: usize) -> String {
         "sessions": st.states.len(), "kv_gib": round(st.kv_bytes as f64 / GIB, 3), "kv_limit_gib": round(s.budgets.kv_gb, 3),
         "kv_total_gib": round(s.kv_used.load(Ordering::Relaxed) as f64 / GIB, 3),
         "reserve_gib": s.budgets.reserve_gb, "model_memory": allocations,
+        "model_memory_budget": {"limit": c.model_memory_limit, "allocated": c.model_memory_used,
+                                "committed": c.model_memory_committed, "peak": c.model_memory_peak},
         "tree": tree,
         "decode": {"rows": c.decode_rows, "tokens": st.decoded, "seconds": round(c.decode_seconds, 3),
                    "gpu_seconds": round(c.decode_gpu_seconds, 3),
@@ -659,7 +662,7 @@ impl Gen {
 /// shared budget; prefix matching remains scoped to this model.
 struct Slot {
     index: usize,
-    model: Arc<Model>,
+    model: Rc<Model>,
     served: Served,
     ctx: usize,
     batch: usize,
@@ -674,7 +677,7 @@ struct Slot {
 // One KV budget and one LRU clock across models. Prefix matching is
 // model-scoped; engine handles retain their owning model for eviction.
 struct StoredState {
-    owner: Arc<Model>,
+    owner: Rc<Model>,
     raw: *mut RawState,
     snapshots: HashMap<usize, *mut RawSnapshot>,
     used: Instant,
@@ -704,7 +707,7 @@ impl Memory {
         }
     }
 
-    fn add(&mut self, model: usize, owner: Arc<Model>) -> kv::Id {
+    fn add(&mut self, model: usize, owner: Rc<Model>) -> kv::Id {
         let id = self.cache.add_for(model, 0);
         let raw = owner.state_new();
         self.entries.insert(
@@ -798,16 +801,17 @@ struct Worker {
     slots: Vec<Slot>,
     memory: Memory,
     maintained: Instant,
+    published: Instant,
 }
 
 impl Worker {
-    fn new(s: Arc<Shared>) -> Worker {
+    fn new(s: Arc<Shared>, engines: Vec<Rc<Model>>) -> Worker {
         let slots = s
             .models
             .iter()
+            .zip(engines)
             .enumerate()
-            .map(|(index, m)| {
-                let model = m.model.clone();
+            .map(|(index, (m, model))| {
                 let served = m.served.clone();
                 Slot {
                     index,
@@ -829,12 +833,14 @@ impl Worker {
             slots,
             memory,
             maintained: Instant::now(),
+            published: Instant::now(),
         }
     }
 
     /// Apply one RAM reserve between engine calls, including while only a
     /// dense model is active. Release expert slots first, then idle KV.
     fn maintain(&mut self) {
+        engine::refresh_stats();
         let mut released = 0;
         for slot in &self.slots {
             if slot.per_row > 0 {
@@ -857,7 +863,17 @@ impl Worker {
                 self.memory.publish(&self.s);
             }
         }
+        self.publish_counters();
         self.maintained = Instant::now();
+    }
+
+    fn publish_counters(&self) {
+        for slot in &self.slots {
+            let mut status = lock(&self.s.models[slot.index].status);
+            status.engine = slot.model.stats();
+            status.loaded = slot.model.loaded();
+            status.drafts = slot.model.draft_block();
+        }
     }
 
     /// Every model takes one step a turn: admitting, one prefill call, one
@@ -918,6 +934,12 @@ impl Worker {
             }
             for (x, admit) in self.slots.iter_mut().zip(admitted) {
                 x.step(&s, admit, &mut self.memory);
+                x.model.active(!x.gens.is_empty());
+            }
+            if self.published.elapsed() >= Duration::from_millis(250) {
+                engine::refresh_stats();
+                self.publish_counters();
+                self.published = Instant::now();
             }
         }
         for x in &mut self.slots {
@@ -981,8 +1003,10 @@ impl Slot {
                 engine::log(&format!("req {}: client gone while waiting", job.id));
                 end_waiting(job, Finish::Cancelled);
             } else {
-                if !self.model.loaded() {
-                    self.set_status(s, "loading");
+                {
+                    if !self.model.loaded() {
+                        self.set_status(s, "loading");
+                    }
                     if let Err(error) = self.model.load() {
                         lock(&s.models[self.index].status).load_error = Some(error.clone());
                         engine::log(&format!("{}: {error}", self.served.id));
@@ -1286,7 +1310,16 @@ impl Slot {
                 from
             };
             let t = Instant::now();
-            let encoded = x.encode(first);
+            let encoded = match x.encode(first) {
+                Ok(count) => count,
+                Err(error) => {
+                    let snapshots = memory.cache.remove(id);
+                    memory.free(Vec::new(), vec![(id, snapshots)]);
+                    memory.publish(s);
+                    job.last(Event::Failed(error));
+                    return;
+                }
+            };
             if encoded > 0 {
                 engine::log(&format!(
                     "req {}: {encoded} of {} images encoded in {:.2} s",
@@ -1402,7 +1435,14 @@ impl Slot {
             self.model
                 .prefill(st, prompt, done, replay, inner, p.images.as_ref())
         else {
-            panic!("the engine refused a prefill of positions {done} to {end}");
+            let generation = self.gens.remove(i);
+            let snapshots = memory.cache.remove(generation.state);
+            memory.free(Vec::new(), vec![(generation.state, snapshots)]);
+            memory.publish(s);
+            generation.job.last(Event::Failed(
+                "the model's minimum working set cannot fit the shared memory budget".into(),
+            ));
+            return;
         };
         let origin = p.origin;
         memory
@@ -1661,6 +1701,12 @@ impl Slot {
         memory.free(snaps, states);
         memory.entries.get_mut(&g.state).expect("state").used = Instant::now();
         let st = self.model.stats();
+        {
+            let mut status = lock(&s.models[self.index].status);
+            status.engine = st;
+            status.loaded = self.model.loaded();
+            status.drafts = self.model.draft_block();
+        }
         let (c2, dt) = (st.cache, g.t1.elapsed().as_secs_f64());
         let hits = c2.hits - g.c1.hits + c2.prefetch_hits - g.c1.prefetch_hits;
         let misses = c2.misses - g.c1.misses;

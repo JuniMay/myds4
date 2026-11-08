@@ -16,7 +16,9 @@ static int compare(const float *a, const float *b) {
 
 int main(int argc, char **argv) {
   if (argc < 2) die("usage: verification-model-check CHECKPOINT [--long] [--draft] [--online] [--experts GGUF]");
-  Options o = {.ctx = 2048, .deepseek.budget_gb = 20, .reserve_gb = 4, .lookup = VERIFY_DRAFTS,
+  double model_memory_gib = 20;
+  double model_reserve_gib = 4;
+  Options o = {.ctx = 2048, .lookup = VERIFY_DRAFTS,
                .dump_fd = -1, .routes_fd = -1, .quiet = 1};
   int longer = 0;
   for (int i = 2; i < argc; i++) {
@@ -33,6 +35,7 @@ int main(int argc, char **argv) {
   int length = tok_encode(tk, " Review the queue, keep duplicate jobs, and preserve cancellation order.\n", seed, 128);
   if (!length) die("empty fixture prompt");
   for (int i = 0; i < n; i++) tokens[i] = seed[i % length];
+  memory_configure(model_memory_gib, 8, model_reserve_gib);
   deepseek_load(argv[1], &o);
   int rows[VERIFY_DRAFTS + 2];
   rows[0] = sample_argmax(deepseek_forward(tokens, n, 0), VOCAB);

@@ -26,9 +26,14 @@
 #include "../model.h"
 
 #include "engram.h"
+#include "../weights.h"
 #include "expert_tasks.h"
 static Engram ngram;
 static TensorIndex *checkpoint;
+static WeightSet *core_weights, *vision_weights, *weight_group;
+static Buf image_markers[3];
+static int model_buffers_ready;
+static uint64_t resizable_bytes(void);
 #include "prefill.h"
 
 typedef struct { Buf w, s; int n, k, group; } Lin;  // s.obj is null for BF16 weights; group: rows
@@ -130,8 +135,8 @@ static const float *stream_floats(const Buf *b, size_t first, size_t count) {
   static float *values;
   static size_t capacity;
   if (count > capacity) {
-    free(values);
-    values = xmalloc(count * sizeof *values);
+    memory_host_free(values);
+    values = memory_host_required(count * sizeof *values, 0);
     capacity = count;
   }
   const uint16_t *source = (const uint16_t *)b->ptr + first;
@@ -269,46 +274,25 @@ static void gguf_experts(const char *path) {
   Gguf h;
   if (gguf_get("output.weight", &h) && h.type == 14 && h.ne[0] == DIM && h.ne[1] == VOCAB) {  // Q6_K
     uint64_t len = (uint64_t)VOCAB * (DIM / 256) * 210;
-    head_q6 = gpu_alloc(len + 32768);
-    io_read(h.fd, h.off, len, &head_q6);
-    dense_bytes += len - head.w.size;
-    gpu_free(&head.w);
+    weights_remove(core_weights, &head.w);
+    weights_tensor(core_weights, &head_q6, (Tensor){.fd = h.fd, .off = h.off, .size = len}, 1);
     K_gg_head1 = gpu_kernel("gg_head1"), K_gg_head6 = gpu_kernel("gg_head6");
   }
 }
 
 
-static Buf load(Tensor t) {
-  Buf b = gpu_alloc(t.size + 2 * 16384);
-  io_read(t.fd, t.off, t.size, &b);
-  dense_bytes += b.size;
-  return b;
-}
-
-// A vector of BF16 or FP32 values as FP32.
-static Buf vec(Tensor t) {
-  int n = t.dtype == 'b' ? t.size / 2 : t.size / 4;
-  Buf raw = gpu_alloc(t.size + 2 * 16384), b = gpu_alloc(n * 4);
-  io_read(t.fd, t.off, t.size, &raw);
-  float *f = (float *)b.ptr;
-  for (int i = 0; i < n; i++)
-    f[i] = t.dtype == 'b' ? (union { uint32_t u; float f; }){(uint32_t)((uint16_t *)(raw.ptr + raw.off))[i] << 16}.f
-                          : ((float *)(raw.ptr + raw.off))[i];
-  gpu_free(&raw);
-  dense_bytes += b.size;
-  return b;
-}
-
-static Lin lin(const char *stem) {
+static void load(Buf *target, Tensor tensor) { weights_tensor(weight_group, target, tensor, 1); }
+static void vec(Buf *target, Tensor tensor) { weights_vector(weight_group, target, tensor, 0, 0); }
+static void lin(Lin *line, const char *stem) {
   char name[256];
   snprintf(name, sizeof name, "%s.weight", stem);
-  Tensor t = st_get(checkpoint, "%s", name);
-  Lin l = {.w = load(t), .n = (int)t.shape[0], .k = (int)t.shape[1]};
-  if (t.dtype == '8') {
+  Tensor tensor = st_get(checkpoint, "%s", name);
+  *line = (Lin){.n = (int)tensor.shape[0], .k = (int)tensor.shape[1]};
+  load(&line->w, tensor);
+  if (tensor.dtype == '8') {
     snprintf(name, sizeof name, "%s.scale", stem);
-    l.s = load(st_get(checkpoint, "%s", name));
+    load(&line->s, st_get(checkpoint, "%s", name));
   }
-  return l;
 }
 
 static Buf zeros(size_t n) {
@@ -319,6 +303,39 @@ static Buf zeros(size_t n) {
 
 // Temporary layer buffers grow for prefill and shrink for small forward
 // passes. Persistent KV, logits, request rows and draft history are separate.
+static uint64_t work_plan(int rows, int allocate) {
+  uint64_t bytes = 0;
+#define W(buffer, amount) do { size_t size = (amount); bytes += gpu_allocation_size(size); if (allocate) buffer = zeros(size); } while (0)
+  size_t m = (size_t)rows, p = m * TOPK;
+  W(H1, m * HC * DIM * STREAM_BYTES); W(MA, m * MIX * 4); W(PART, m * 400 * 4);
+  W(X, m * DIM * 4); W(XQ, m * DIM * 4); W(QA, m * QRANK * 4); W(QR, m * QRANK * 4);
+  W(QRQ, m * QRANK * 4); W(Q, m * HEADS * HEAD_DIM * 4); W(O, m * HEADS * HEAD_DIM * 4);
+  W(OA, m * OGROUPS * ORANK * 4); W(AO, m * DIM * 4); W(KV, m * HEAD_DIM * 4);
+  W(CK, (m + 2) * HEAD_DIM * 4); W(CS, (m + 2) * HEAD_DIM * 4); W(LAT, m * HEAD_DIM * 4);
+  W(IK, m * IDX_DIM * 4); W(QI, m * IDX_HEADS * IDX_DIM * 4); W(IW, m * IDX_HEADS * 4);
+  int score_rows = (int)((256u << 20) / ((size_t)opt.ctx * 4));
+  if (score_rows > rows) score_rows = rows;
+  if (score_rows < 1) score_rows = 1;
+  W(SC, (size_t)score_rows * opt.ctx * 4);
+  size_t predicted = m > 2 * FEW ? m : 2 * FEW;
+  size_t routed = m;
+  W(GL, m * EXPERTS * 4); W(GP, predicted * EXPERTS * 4); W(RT, routed * 16 * 4);
+  W(PR, (routed > predicted ? routed : predicted) * PREDICT * 4);
+  W(SHG, m * INTER * 4); W(SHU, m * INTER * 4); W(SHH, m * INTER * 4); W(SHO, m * DIM * 4);
+  W(EROW, m * DIM * 2); W(EX, m * ENGRAM_ROWS * ENGRAM_DIM * 4); W(EKV, m * (HC + 1) * DIM * 4);
+  W(MH, p * INTER * 4); W(YK, p * DIM * 4); W(TILES, (p / 32 + EXPERTS) * 32);
+  W(XH, (p + 64) * DIM * 2); W(MHH, (p + 64) * INTER * 2);
+  size_t matrix = ((m + 127) / 128) * 128 * XB_K * 2;
+  size_t queries = (m < QB_ROWS ? m : QB_ROWS) * HEADS * HEAD_DIM * 2;
+  size_t draft = opt.draft ? 128u * 3 * DIM * 2 : 0;
+  size_t xb = matrix > queries ? matrix : queries;
+  W(XB, xb > draft ? xb : draft);
+  W(PTOK, p * 4); W(PW, p * 4); W(TP, p * 4); W(WIN, (m + WINDOW) * HEAD_DIM * 2);
+  if (allocate) sc_rows = score_rows;
+#undef W
+  return bytes;
+}
+
 static void work_capacity(int rows) {
   int small = replay_margin() + 1;
   if (rows > MB) rows = MB;
@@ -327,31 +344,7 @@ static void work_capacity(int rows) {
   int resize_cache = work_rows != 0;
   gpu_sync();
   for (size_t i = 0; i < sizeof work_buffers / sizeof *work_buffers; i++) gpu_free(work_buffers[i]);
-  size_t m = (size_t)rows, p = m * TOPK;
-  H1 = zeros(m * HC * DIM * STREAM_BYTES), MA = zeros(m * MIX * 4), PART = zeros(m * 400 * 4);
-  X = zeros(m * DIM * 4), XQ = zeros(m * DIM * 4), QA = zeros(m * QRANK * 4), QR = zeros(m * QRANK * 4);
-  QRQ = zeros(m * QRANK * 4), Q = zeros(m * HEADS * HEAD_DIM * 4), O = zeros(m * HEADS * HEAD_DIM * 4);
-  OA = zeros(m * OGROUPS * ORANK * 4), AO = zeros(m * DIM * 4), KV = zeros(m * HEAD_DIM * 4);
-  CK = zeros((m + 2) * HEAD_DIM * 4), CS = zeros((m + 2) * HEAD_DIM * 4), LAT = zeros(m * HEAD_DIM * 4);
-  IK = zeros(m * IDX_DIM * 4), QI = zeros(m * IDX_HEADS * IDX_DIM * 4), IW = zeros(m * IDX_HEADS * 4);
-  sc_rows = (int)((256u << 20) / ((size_t)opt.ctx * 4));
-  if (sc_rows > rows) sc_rows = rows;
-  if (sc_rows < 1) sc_rows = 1;
-  SC = zeros((size_t)sc_rows * opt.ctx * 4);
-  size_t predicted = m > 2 * FEW ? m : 2 * FEW;
-  size_t routed = m;
-  GL = zeros(m * EXPERTS * 4), GP = zeros(predicted * EXPERTS * 4), RT = zeros(routed * 16 * 4);
-  PR = zeros((routed > predicted ? routed : predicted) * PREDICT * 4);
-  SHG = zeros(m * INTER * 4), SHU = zeros(m * INTER * 4), SHH = zeros(m * INTER * 4), SHO = zeros(m * DIM * 4);
-  EROW = zeros(m * DIM * 2), EX = zeros(m * ENGRAM_ROWS * ENGRAM_DIM * 4), EKV = zeros(m * (HC + 1) * DIM * 4);
-  MH = zeros(p * INTER * 4), YK = zeros(p * DIM * 4), TILES = zeros((p / 32 + EXPERTS) * 32);
-  XH = zeros((p + 64) * DIM * 2), MHH = zeros((p + 64) * INTER * 2);
-  size_t matrix = ((m + 127) / 128) * 128 * XB_K * 2;
-  size_t queries = (m < QB_ROWS ? m : QB_ROWS) * HEADS * HEAD_DIM * 2;
-  size_t draft = opt.draft ? 128u * 3 * DIM * 2 : 0;
-  size_t xb = matrix > queries ? matrix : queries;
-  XB = zeros(xb > draft ? xb : draft);
-  PTOK = zeros(p * 4), PW = zeros(p * 4), TP = zeros(p * 4), WIN = zeros((m + WINDOW) * HEAD_DIM * 2);
+  work_plan(rows, 1);
   work_rows = rows;
   if (resize_cache) cache_idle(); // capacity maintenance does not represent another token or pass
 }
@@ -389,6 +382,20 @@ static int is_in(int l, const int *set, int n) {
   return 0;
 }
 
+static uint64_t request_plan(int rows, int allocate) {
+  uint64_t bytes = 0;
+#define W(buffer, amount) do { size_t size = (amount); bytes += gpu_allocation_size(size); if (allocate) buffer = zeros(size); } while (0)
+  W(HS, (size_t)rows * HC * DIM * STREAM_BYTES); W(MF, (size_t)rows * MIX * 4);
+  W(SEL, (size_t)rows * (IDX_TOPK + 1) * 4);
+  W(CAND, (size_t)rows * cand_words * 4);
+  W(IMG, (size_t)rows);
+  for (int e = 0; e < 2; e++) {
+    W(EC[e], (size_t)rows * ENGRAM_ROWS * ENGRAM_DIM); W(ES[e], (size_t)rows * ENGRAM_ROWS * 8);
+  }
+#undef W
+  return bytes;
+}
+
 static void request_capacity(int rows) {
   if (Q.obj) work_capacity(rows);
   // Small forward passes overwrite these rows and do not read the prompt's
@@ -400,14 +407,9 @@ static void request_capacity(int rows) {
   if (rows <= request_rows && !(rows == small && request_rows > small)) return;
   gpu_sync();
   gpu_free(&HS), gpu_free(&MF), gpu_free(&SEL);
-  HS = zeros((size_t)rows * HC * DIM * STREAM_BYTES), MF = zeros((size_t)rows * MIX * 4);
-  SEL = zeros((size_t)rows * (IDX_TOPK + 1) * 4);
-  gpu_free(&CAND), CAND = zeros((size_t)rows * cand_words * 4);
-  gpu_free(&IMG), IMG = zeros((size_t)rows);
-  for (int e = 0; e < 2; e++) {
-    gpu_free(&EC[e]), gpu_free(&ES[e]);
-    EC[e] = zeros((size_t)rows * ENGRAM_ROWS * ENGRAM_DIM), ES[e] = zeros((size_t)rows * ENGRAM_ROWS * 8);
-  }
+  gpu_free(&CAND); gpu_free(&IMG);
+  for (int e = 0; e < 2; e++) { gpu_free(&EC[e]); gpu_free(&ES[e]); }
+  request_plan(rows, 1);
   request_rows = rows;
 }
 
@@ -415,8 +417,8 @@ static void request_capacity(int rows) {
 // shared expert, of the tensors named prefix.*.
 static void load_block(Layer *y, const char *prefix) {
   char s[128];
-#define LIN(field, name) snprintf(s, sizeof s, "%s.%s", prefix, name), y->field = lin(s)
-#define VEC(field, name) y->field = vec(st_get(checkpoint, "%s.%s", prefix, name))
+#define LIN(field, name) snprintf(s, sizeof s, "%s.%s", prefix, name), lin(&y->field, s)
+#define VEC(field, name) vec(&y->field, st_get(checkpoint, "%s.%s", prefix, name))
   LIN(wq_a, "attn.wq_a"), LIN(wq_b, "attn.wq_b"), LIN(wkv, "attn.wkv");
   LIN(wo_a, "attn.wo_a"), LIN(wo_b, "attn.wo_b"), LIN(gate, "ffn.gate");
   y->wo_a.group = ORANK;
@@ -425,10 +427,9 @@ static void load_block(Layer *y, const char *prefix) {
   VEC(q_norm, "attn.q_norm.weight"), VEC(kv_norm, "attn.kv_norm.weight");
   VEC(sink, "attn.attn_sink"), VEC(gate_bias, "ffn.gate.bias");
   if (st_has(checkpoint, "%s.ffn.gate.bias_vl", prefix)) VEC(gate_bias_vl, "ffn.gate.bias_vl");
-  else y->gate_bias_vl = y->gate_bias;
+  else weights_alias(weight_group, &y->gate_bias_vl, &y->gate_bias);
   VEC(hc_attn_fn, "hc_attn_fn"), VEC(hc_attn_base, "hc_attn_base"), VEC(hc_attn_scale, "hc_attn_scale");
   VEC(hc_ffn_fn, "hc_ffn_fn"), VEC(hc_ffn_base, "hc_ffn_base"), VEC(hc_ffn_scale, "hc_ffn_scale");
-  y->ring = zeros(RING * HEAD_DIM * 2);
 }
 
 // Bind saved learning to the actual routers and expert formats, without
@@ -484,7 +485,43 @@ void deepseek_save_predictor(void) {
   fprintf(stderr, "saved online predictor state: %s\n", opt.deepseek.predictor_state);
 }
 
-void deepseek_load(const char *dir, const Options *options) {
+static uint64_t fixed_plan(int allocate) {
+  uint64_t bytes = 2 * gpu_allocation_size((size_t)opt.ctx * 32 * 8);
+  if (allocate) {
+    cs_base = rope_table(opt.ctx, 10000, 0);
+    cs_comp = rope_table(opt.ctx, 160000, 1);
+  }
+#define W(buffer, amount) do { size_t size = (amount); bytes += gpu_allocation_size(size); if (allocate) buffer = zeros(size); } while (0)
+  size_t expert_tables = 2 * LAYERS * FEW + DRAFTS * BLOCK;
+  W(ETAB, expert_tables * 256); W(logits, (size_t)FEW * VOCAB * 4);
+  W(PARTS, FEW * DIM * 8 * 4);
+  W(XP, FEW * DIM * 4); W(PT, PREDICT * 4); W(PC, FEW * PREDICT * 4);
+  W(ASC, HEADS * ATT_ROWS * 4); W(AMAX, ATT_CHUNKS * HEADS * 4); W(APART, ATT_CHUNKS * HEADS * 514 * 4);
+  if (opt.draft) {
+    W(MAINH, WINDOW * 3 * DIM * 4); W(MXA, WINDOW * DIM * 4); W(MXN, WINDOW * DIM * 4);
+    W(MXQ, WINDOW * DIM * 4); W(DHS, BLOCK * HC * DIM * STREAM_BYTES); W(DMF, BLOCK * MIX * 4);
+    W(BLK, BLOCK * HEAD_DIM * 2); W(DSEL, (IDX_TOPK + 1) * 4); W(DLOG, (size_t)BLOCK * VOCAB * 4);
+    W(DTOK, (BLOCK + 1) * 4); W(DEROW, BLOCK * DIM * 2);
+    if (allocate) {
+    int *sel = (int *)DSEL.ptr;  // every drafted row sees every drafted row's key
+    sel[0] = BLOCK;
+    for (int r = 0; r < BLOCK; r++) sel[1 + r] = r;
+    int64_t noise[BLOCK - 1];
+    for (int r = 0; r < BLOCK - 1; r++) noise[r] = NOISE;
+    io_rows(embed_t.fd, embed_t.off, DIM * 2, noise, BLOCK - 1, DEROW.ptr + DIM * 2);
+    }
+  }
+#undef W
+  return bytes;
+}
+
+static Buf kv_zeros(size_t bytes) {
+  Buf buffer = gpu_alloc_kv(bytes);
+  memset(buffer.ptr, 0, bytes);
+  return buffer;
+}
+
+static void prepare_weights(const char *dir, const Options *options) {
   if (options->deepseek.ced && options->dump_fd >= 0) die("per-layer dumps require --ced off");
   opt = *options;
   runahead_enabled = opt.deepseek.runahead;
@@ -514,23 +551,17 @@ void deepseek_load(const char *dir, const Options *options) {
   K(cand_topk), K(x_bf16), K(q_rope);
   K(vit_bias), K(vit_norm), K(vit_rope), K(vit_heads), K(vit_attn), K(vit_swiglu), K(vit_add), K(vit_unfold);
   checkpoint = st_open(dir);
-  double t0 = now();
+  if (!memory_current()) memory_scope(memory_shared());
+  core_weights = weights_new(memory_current()->account, "DeepSeek dense backbone");
+  weight_group = core_weights;
+  cache_memory(weights_slot(core_weights));
   static const uint8_t ratios[LAYERS] = {0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
                                          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
-  int ctx = opt.ctx;
   for (int l = 0; l < LAYERS; l++) {
     Layer *y = &L[l];
     char s[128], prefix[32];
     snprintf(prefix, sizeof prefix, "layers.%d", l);
     load_block(y, prefix);
-    if (!opt.deepseek.experts) {
-      float maximum = 0;
-      for (int d = 0; d < DIM; d++) maximum = fmaxf(maximum, fabsf(((const float *)y->ffn_norm.ptr)[d]));
-      // RMSNorm bounds a channel by sqrt(DIM)*max|weight|. The factor
-      // 1.125 covers BF16 and E4M3 rounding before scaled-half staging.
-      if (!(maximum * sqrtf(DIM) * 1.125f < 511.75f))
-        die("layer %d FFN norm exceeds the MXFP4 activation-staging range", l);
-    }
     y->ratio = ratios[l];
     y->kv_source = is_in(l, kv_sources, 4);
     y->index_source = is_in(l, index_sources, 8);
@@ -542,26 +573,22 @@ void deepseek_load(const char *dir, const Options *options) {
       LIN(c_wkv, "attn.compressor.wkv");
       if (y->ratio == 2) LIN(c_wgate, "attn.compressor.wgate");
       VEC(c_norm, "attn.compressor.norm.weight");
-      y->comp = zeros(rows_bytes(l, start_cap(), 0));
-      y->keys = zeros(rows_bytes(l, start_cap(), 1));
-      y->cstate = zeros(2 * PENDING * HEAD_DIM * 4);
       LIN(i_wk, "attn.indexer.wk");
       VEC(i_knorm, "attn.indexer.k_norm.weight");
     }
     if (y->index_source) LIN(i_wq_b, "attn.indexer.wq_b"), LIN(i_wproj, "attn.indexer.weights_proj");
     if (l == 1 || l == 14) {
       LIN(e_wkv, "engram.wkv");
-      Buf qw = vec(st_get(checkpoint, "%s.engram.q_weight", prefix)), kw = vec(st_get(checkpoint, "%s.engram.k_weight", prefix));
-      y->e_qk = gpu_alloc(HC * DIM * 4);
-      for (int i = 0; i < HC * DIM; i++) ((float *)y->e_qk.ptr)[i] = ((float *)qw.ptr)[i] * ((float *)kw.ptr)[i];
-      gpu_free(&qw), gpu_free(&kw);
+      weights_product(core_weights, &y->e_qk,
+                      st_get(checkpoint, "%s.engram.q_weight", prefix),
+                      st_get(checkpoint, "%s.engram.k_weight", prefix));
       y->e_codes = st_get(checkpoint, "layers.%d.engram.embed.weight", l);
       y->e_scales = st_get(checkpoint, "layers.%d.engram.embed.scale", l);
     }
     if (!opt.quiet) fprintf(stderr, "\rloading layer %d/%d", l + 1, LAYERS);
   }
-  head = lin("head");
-  final_norm = vec(st_get(checkpoint, "norm.weight"));
+  lin(&head, "head");
+  vec(&final_norm, st_get(checkpoint, "norm.weight"));
   embed_t = st_get(checkpoint, "embed.weight");
   if (opt.draft) {
     for (int d = 0; d < DRAFTS; d++) {
@@ -569,37 +596,62 @@ void deepseek_load(const char *dir, const Options *options) {
       snprintf(prefix, sizeof prefix, "mtp.%d", d);
       load_block(&D[d], prefix);
     }
-    main_proj = lin("mtp.0.main_proj");
-    main_norm = vec(st_get(checkpoint, "mtp.0.main_norm.weight"));
-    draft_norm = vec(st_get(checkpoint, "mtp.2.norm.weight"));
-    markov_embed = load(st_get(checkpoint, "mtp.2.markov_head.embed.weight"));
-    markov_head = load(st_get(checkpoint, "mtp.2.markov_head.head.weight"));
+    lin(&main_proj, "mtp.0.main_proj");
+    vec(&main_norm, st_get(checkpoint, "mtp.0.main_norm.weight"));
+    vec(&draft_norm, st_get(checkpoint, "mtp.2.norm.weight"));
+    load(&markov_embed, st_get(checkpoint, "mtp.2.markov_head.embed.weight"));
+    load(&markov_head, st_get(checkpoint, "mtp.2.markov_head.head.weight"));
   }
-  cs_base = rope_table(ctx, 10000, 0);
-  cs_comp = rope_table(ctx, 160000, 1);
-  fprintf(stderr, "\rloaded %.1f GiB of dense weights in %.1f s\n", dense_bytes / GiB, now() - t0);
-
-  cand_words = (ctx / 8 + 31) / 32 + 1;
-  request_capacity(1);
-  work_capacity(MB);
-  size_t expert_tables = 2 * LAYERS * FEW + DRAFTS * BLOCK;
-  ETAB = zeros(expert_tables * 256), logits = zeros((size_t)FEW * VOCAB * 4);
-  PARTS = zeros(FEW * DIM * 8 * 4);
-  XP = zeros(FEW * DIM * 4), PT = zeros(PREDICT * 4), PC = zeros(FEW * PREDICT * 4);
-  ASC = zeros(HEADS * ATT_ROWS * 4), AMAX = zeros(ATT_CHUNKS * HEADS * 4), APART = zeros(ATT_CHUNKS * HEADS * 514 * 4);
-  if (opt.draft) {
-    MAINH = zeros(WINDOW * 3 * DIM * 4), MXA = zeros(WINDOW * DIM * 4), MXN = zeros(WINDOW * DIM * 4);
-    MXQ = zeros(WINDOW * DIM * 4), DHS = zeros(BLOCK * HC * DIM * STREAM_BYTES), DMF = zeros(BLOCK * MIX * 4);
-    BLK = zeros(BLOCK * HEAD_DIM * 2), DSEL = zeros((IDX_TOPK + 1) * 4), DLOG = zeros((size_t)BLOCK * VOCAB * 4);
-    DTOK = zeros((BLOCK + 1) * 4), DEROW = zeros(BLOCK * DIM * 2);
-    int *sel = (int *)DSEL.ptr;  // every drafted row sees every drafted row's key
-    sel[0] = BLOCK;
-    for (int r = 0; r < BLOCK; r++) sel[1 + r] = r;
-    int64_t noise[BLOCK - 1];
-    for (int r = 0; r < BLOCK - 1; r++) noise[r] = NOISE;
-    io_rows(embed_t.fd, embed_t.off, DIM * 2, noise, BLOCK - 1, DEROW.ptr + DIM * 2);
-  }
+  const char *markers[] = {"image_start", "image_end", "image_newline"};
+  for (int i = 0; i < 3; i++)
+    if (st_has(checkpoint, "%s", markers[i])) load(&image_markers[i], st_get(checkpoint, "%s", markers[i]));
   if (opt.deepseek.experts) gguf_experts(opt.deepseek.experts);
+  cache_retention(opt.deepseek.cache_half_life, opt.deepseek.cache_read_cost);
+  cache_draft_limit(opt.deepseek.draft_cache);
+  cand_words = (opt.ctx / 8 + 31) / 32 + 1;
+  cache_working_rows(1);
+  cache_required(checkpoint, opt.draft ? CACHE_LAYERS : LAYERS);
+}
+
+int deepseek_load(const char *dir, const Options *options) {
+  double began = now();
+  if (!checkpoint) prepare_weights(dir, options);
+  MemorySlot *core = weights_slot(core_weights), *work = memory_current();
+  memory_pin(core, 1);
+  cache_active(1);
+  int small = replay_margin() + 1 > BATCH_ROWS ? replay_margin() + 1 : BATCH_ROWS;
+  cache_working_rows(1);
+  uint64_t workspace = model_buffers_ready ? work->payload - resizable_bytes() + work_plan(small, 0) + request_plan(small, 0)
+                                          : fixed_plan(0) + work_plan(small, 0) + request_plan(small, 0);
+  uint64_t minimum = weights_required(core_weights) + workspace + cache_required(checkpoint, opt.draft ? CACHE_LAYERS : LAYERS);
+  if (!memory_minimum(core->account, minimum)) { memory_pin(core, 0); return 0; }
+  if (model_buffers_ready) request_capacity(1);
+  if (!weights_load(core_weights)) { memory_pin(core, 0); return 0; }
+  for (int l = 0; l < LAYERS; l++) {
+    Layer *y = &L[l];
+    if (!opt.deepseek.experts) {
+      float maximum = 0;
+      for (int d = 0; d < DIM; d++) maximum = fmaxf(maximum, fabsf(((const float *)y->ffn_norm.ptr)[d]));
+      // RMSNorm bounds a channel by sqrt(DIM)*max|weight|. The factor
+      // 1.125 covers BF16 and E4M3 rounding before scaled-half staging.
+      if (!(maximum * sqrtf(DIM) * 1.125f < 511.75f))
+        die("layer %d FFN norm exceeds the MXFP4 activation-staging range", l);
+    }
+  }
+  if (!model_buffers_ready) {
+    for (int l = 0; l < LAYERS; l++) {
+      Layer *y = &L[l];
+      y->ring = kv_zeros(RING * HEAD_DIM * 2);
+      if (y->kv_source) {
+        y->comp = kv_zeros(rows_bytes(l, start_cap(), 0));
+        y->keys = kv_zeros(rows_bytes(l, start_cap(), 1));
+        y->cstate = kv_zeros(2 * PENDING * HEAD_DIM * 4);
+      }
+    }
+    for (int d = 0; opt.draft && d < DRAFTS; d++) D[d].ring = kv_zeros(RING * HEAD_DIM * 2);
+    request_capacity(1);
+    work_capacity(small);
+    fixed_plan(1);
   if (opt.deepseek.online_predictor) {
     const float *biases[LAYERS];
     for (int l = 0; l < LAYERS; l++) biases[l] = (const float *)L[l].gate_bias.ptr;
@@ -614,11 +666,13 @@ void deepseek_load(const char *dir, const Options *options) {
       fprintf(stderr, "%s online predictor state: %s\n", loaded ? "loaded" : "new", opt.deepseek.predictor_state);
     }
   }
-  cache_retention(opt.deepseek.cache_half_life, opt.deepseek.cache_read_cost);
-  if (opt.reserve_gb) cache_reserve(opt.reserve_gb); // standalone CLI; the server sets the process reserve once
-  cache_draft_limit(opt.deepseek.draft_cache);
-  cache_init(checkpoint, opt.deepseek.budget_gb > 0 ? (uint64_t)(opt.deepseek.budget_gb * GiB) : 0, opt.draft ? CACHE_LAYERS : LAYERS);
-  base_state();
+    cache_init(checkpoint, 0, opt.draft ? CACHE_LAYERS : LAYERS);
+    base_state();
+    model_buffers_ready = 1;
+  }
+  dense_bytes = weights_resident_bytes(core_weights);
+  fprintf(stderr, "loaded %.1f GiB of dense weights in %.1f s\n", dense_bytes / GiB, now() - began);
+  return 1;
 }
 
 // ---- dispatch helpers ----
@@ -798,11 +852,11 @@ static void engram_hash(int token, int pos, int64_t rows[2][ENGRAM_ROWS]) {
 // Reads the m tokens' table rows of Engram layer e into EC[e] and ES[e].
 static void engram_read(int e, const int64_t (*rows)[2][ENGRAM_ROWS], int m) {
   Layer *y = &L[e ? 14 : 1];
-  int64_t *r = xmalloc((size_t)m * ENGRAM_ROWS * 8);
+  int64_t *r = memory_host_required((size_t)m * ENGRAM_ROWS * 8, 0);
   for (int i = 0; i < m; i++) memcpy(r + i * ENGRAM_ROWS, rows[i][e], ENGRAM_ROWS * 8);
   io_rows(y->e_codes.fd, y->e_codes.off, ENGRAM_DIM, r, m * ENGRAM_ROWS, EC[e].ptr);
   io_rows(y->e_scales.fd, y->e_scales.off, 8, r, m * ENGRAM_ROWS, ES[e].ptr);
-  free(r);
+  memory_host_free(r);
 }
 
 // ---- one layer for a batch of rows ----
@@ -1527,10 +1581,10 @@ static void draft_rows(State *const *st, const int *pos, int m) {
 // its row from the image (image_row).
 static const uint16_t *image_row(int pos);
 static void embed_read(const int *tokens, int m, int row, int pos) {
-  int64_t *t = xmalloc(m * 8);
+  int64_t *t = memory_host_required(m * 8, 0);
   for (int i = 0; i < m; i++) t[i] = tokens[i] < 0 ? IMAGE_TOKEN : tokens[i];
   io_rows(embed_t.fd, embed_t.off, DIM * 2, t, m, EROW.ptr);
-  free(t);
+  memory_host_free(t);
   for (int i = 0; i < m; i++) {  // layer 0 collapses the identical streams with (1, 0, 0, 0)
     if (tokens[i] < 0) memcpy(EROW.ptr + (size_t)i * DIM * 2, image_row(pos + i), DIM * 2);
     float *pre = (float *)MF.ptr + (size_t)(row + i) * MIX;
@@ -1554,7 +1608,28 @@ static void embed_rows(const int *tokens, int m, int row, int pos) {
 
 // A prompt's or a step's Engram rows, read in the background, layer 1's
 // first; each group is left when its table's rows are in.
-typedef struct { const int64_t (*rows)[2][ENGRAM_ROWS]; int n; dispatch_group_t read[2]; } Rows;
+typedef struct {
+  const int64_t (*rows)[2][ENGRAM_ROWS];
+  int n;
+  dispatch_group_t read[2];
+  MemorySlot *owner;
+  uint64_t reserved;
+} Rows;
+
+static uint64_t row_scratch(int rows) {
+  return (uint64_t)rows * ENGRAM_ROWS * 8 + io_rows_workspace(rows * ENGRAM_ROWS);
+}
+
+static void rows_begin(Rows *rows) {
+  rows->owner = memory_current();
+  rows->reserved = row_scratch(rows->n);
+  if (rows->owner && !memory_claim(rows->owner, rows->reserved, MEMORY_REQUIRED))
+    die("model-memory budget cannot fit Engram read workspace");
+}
+
+static void rows_end(Rows *rows) {
+  if (rows->owner) memory_release(rows->owner, rows->reserved);
+}
 
 static void read_rows(void *ctx) {
   Rows *r = ctx;
@@ -1602,7 +1677,8 @@ static void step_rows(const int *tokens, int m, int pos) {
   // The Engram rows are read while the first layers run: the command buffers
   // of layers 1 and 14 run after the experts' of the layer before, which are
   // committed only when the table's rows are in.
-  Rows rr = {rows, m, {dispatch_group_create(), dispatch_group_create()}};
+  Rows rr = {.rows = rows, .n = m, .read = {dispatch_group_create(), dispatch_group_create()}};
+  rows_begin(&rr);
   for (int e = 0; e < 2; e++) dispatch_group_enter(rr.read[e]);
   dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &rr, read_rows);
   embed_read(tokens, m, 0, pos);
@@ -1670,6 +1746,7 @@ static void step_rows(const int *tokens, int m, int pos) {
   gpu_sync();
   phase_s[1] += now() - ta;
   for (int e = 0; e < 2; e++) dispatch_release(rr.read[e]);
+  rows_end(&rr);
 }
 
 // ---- prefill: many tokens, layer by layer ----
@@ -1712,7 +1789,7 @@ static void step(const int *tokens, int m, int pos) {
   decode_rows += m, decode_gpu_s += gpu_busy - g0, decode_s += now() - t0;
 }
 
-uint64_t deepseek_dense_bytes(void) { return dense_bytes; }
+uint64_t deepseek_dense_bytes(void) { return weights_resident_bytes(core_weights) + weights_resident_bytes(vision_weights); }
 
 uint64_t deepseek_workspace_bytes(void) {
   uint64_t bytes = HS.size + MF.size + SEL.size + CAND.size + IMG.size;
@@ -1890,12 +1967,13 @@ static void prefill(const int *tokens, int n, int pos0) {
   reserve(pos0 + n, pos0);
   request_capacity(n);
   for (int i = 0; i < n; i++) ((uint8_t *)IMG.ptr)[i] = tokens[i] < 0;
-  int64_t (*rows)[2][ENGRAM_ROWS] = xmalloc((size_t)n * sizeof *rows);
+  int64_t (*rows)[2][ENGRAM_ROWS] = memory_host_required((size_t)n * sizeof *rows, 0);
   for (int i = 0; i < n; i++) {
     engram_hash(tokens[i], pos0 + i, rows[i]);
     if (prefix_capture.at == pos0 + i + 1) memcpy(prefix_capture.history, history, sizeof history);
   }
-  Rows rr = {rows, n, {dispatch_group_create(), dispatch_group_create()}};
+  Rows rr = {.rows = rows, .n = n, .read = {dispatch_group_create(), dispatch_group_create()}};
+  rows_begin(&rr);
   for (int e = 0; e < 2; e++) dispatch_group_enter(rr.read[e]);
   dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &rr, read_rows);
   for (int s = 0; s < n; s += MB) embed_rows(tokens + s, n - s < MB ? n - s : MB, s, pos0 + s);
@@ -1976,7 +2054,8 @@ static void prefill(const int *tokens, int n, int pos0) {
     memcpy(logits.ptr, all_logits + (size_t)(n - 1) * VOCAB, VOCAB * 4);
   }
   for (int e = 0; e < 2; e++) dispatch_release(rr.read[e]);
-  free(rows);
+  rows_end(&rr);
+  memory_host_free(rows);
   memset(IMG.ptr, 0, (size_t)n);  // decoding's rows are text
   if (opt.draft && retained) {
     int keep = retained < WINDOW ? retained : WINDOW;
@@ -1999,6 +2078,41 @@ static void prefill(const int *tokens, int n, int pos0) {
 static_assert(CHUNK >= MB && CHUNK <= 32768 && CHUNK % MB == 0, "bounded prefill chunk with unchanged matrix batches");
 static int prefill_chunk = CHUNK;
 
+static uint64_t resizable_bytes(void) {
+  uint64_t bytes = 0;
+  for (size_t i = 0; i < sizeof work_buffers / sizeof *work_buffers; i++) bytes += work_buffers[i]->allocated;
+  Buf *request[] = {&HS, &MF, &SEL, &CAND, &IMG, &EC[0], &EC[1], &ES[0], &ES[1]};
+  for (size_t i = 0; i < sizeof request / sizeof *request; i++) bytes += request[i]->allocated;
+  return bytes;
+}
+
+static int prepare_rows(int rows, int prompt) {
+  static int previous_rows;
+  static uint64_t previous_payload;
+  MemorySlot *work = memory_current();
+  if (!prompt && work && rows == previous_rows && work->payload == previous_payload) return rows;
+  if (!work || !core_weights) return rows;
+  int small = replay_margin() + 1 > BATCH_ROWS ? replay_margin() + 1 : BATCH_ROWS;
+  uint64_t fixed = work->payload - resizable_bytes();
+  int candidate = prompt && rows > prefill_chunk ? prefill_chunk : rows;
+  for (;;) {
+    int request_rows = candidate > small ? candidate : small;
+    int layer_rows = request_rows < MB ? request_rows : MB;
+    uint64_t workspace = fixed + request_plan(request_rows, 0) + work_plan(layer_rows, 0);
+    uint64_t host = row_scratch(candidate) + (uint64_t)candidate * 2 * ENGRAM_ROWS * 8 + (uint64_t)layer_rows * 64;
+    cache_working_rows(candidate);
+    uint64_t required = weights_required(core_weights) + workspace + host + cache_required(checkpoint, opt.draft ? CACHE_LAYERS : LAYERS);
+    MemoryAdmission mode = candidate > 1 && prompt ? MEMORY_WORKSPACE : MEMORY_REQUIRED;
+    if (memory_minimum_mode(work->account, required, mode)) {
+      previous_rows = prompt ? 0 : rows;
+      previous_payload = work->payload;
+      return candidate;
+    }
+    if (!prompt || candidate == 1) return 0;
+    candidate = (candidate + 1) / 2;
+  }
+}
+
 static const float *forward(const int *tokens, int n, int pos, int prefix_pos, char *prefix_dst, int prompt) {
   if (n < 1 || pos < 0 || n > opt.ctx - pos) die("invalid forward range");
   if (prefix_pos >= 0 && (prefix_pos <= pos || prefix_pos >= pos + n)) die("invalid prefix snapshot position");
@@ -2015,7 +2129,8 @@ static const float *forward(const int *tokens, int n, int pos, int prefix_pos, c
                                    .ced_applied = ced_compact && ced_first > (uint32_t)pos};
   prefix_prepare(prefix_pos, pos, prefix_dst);
   for (int done = 0, k; done < n; done += k) {
-    k = n - done < prefill_chunk ? n - done : prefill_chunk;
+    k = prepare_rows(n - done < prefill_chunk ? n - done : prefill_chunk, prompt || n > 1);
+    if (!k) return NULL;
     if ((k > 1 || prompt) && opt.dump_fd < 0) {
       float *every = all_logits;
       if (every) all_logits = every + (size_t)done * VOCAB;
@@ -2056,7 +2171,7 @@ const float *deepseek_prefill(const int *tokens, int n, int from, int replay, in
   Snapshot *x = 0;
   if (capture >= 0) {
     x = xmalloc(sizeof *x);
-    *x = (Snapshot){.pos = capture, .extent = LAYERS - 1, .rows = xmalloc(saved_bytes())};
+    *x = (Snapshot){.pos = capture, .extent = LAYERS - 1, .rows = memory_host_required(saved_bytes(), 1)};
   }
   deepseek_seek(tokens, start);
   const float *lg = forward(tokens + start, n - start, start, capture, x ? x->rows : 0, 1);
@@ -2078,42 +2193,34 @@ static struct {
   Lin patch, a1, a2;  // patch: proj with its 588 inputs zero-padded to VIT_K
   Buf patch_b, norm, a1_b, a2_b;
   VitBlock b[32];
-  uint16_t start[DIM], end[DIM], newline[DIM];  // the spans' delimiters (BF16)
 } vit;
 static const Image *imgs;  // the prompt's images (deepseek_images)
 static int nimgs;
 
 // The vision encoder's weights (0.97 GB) load at the first image.
-static void vit_load(void) {
+static void vit_prepare(void) {
   if (vit.loaded) return;
+  vision_weights = weights_new(memory_current()->account, "DeepSeek vision weights");
+  weight_group = vision_weights;
   char s[96];
   Tensor t = st_get(checkpoint, "vision.patch_embed.proj.weight");
-  Buf raw = load(t);
-  vit.patch = (Lin){.w = zeros((size_t)1024 * VIT_K * 2), .n = 1024, .k = VIT_K};
-  for (int r = 0; r < 1024; r++)
-    memcpy((uint16_t *)vit.patch.w.ptr + (size_t)r * VIT_K, (uint16_t *)(raw.ptr + raw.off) + (size_t)r * 588, 588 * 2);
-  gpu_free(&raw);
-  vit.patch_b = vec(st_get(checkpoint, "vision.patch_embed.proj.bias"));
+  vit.patch = (Lin){.n = 1024, .k = VIT_K};
+  weights_padded(vision_weights, &vit.patch.w, t, VIT_K);
+  vec(&vit.patch_b, st_get(checkpoint, "vision.patch_embed.proj.bias"));
   for (int l = 0; l < 32; l++) {
     VitBlock *b = &vit.b[l];
-    snprintf(s, sizeof s, "vision.blocks.%d.attn.wqkv", l), b->qkv = lin(s);
-    snprintf(s, sizeof s, "vision.blocks.%d.attn.wo", l), b->o = lin(s);
-    snprintf(s, sizeof s, "vision.blocks.%d.mlp.w1", l), b->w1 = lin(s);
-    snprintf(s, sizeof s, "vision.blocks.%d.mlp.w2", l), b->w2 = lin(s);
-    b->b_qkv = vec(st_get(checkpoint, "vision.blocks.%d.attn.wqkv.bias", l)), b->b_o = vec(st_get(checkpoint, "vision.blocks.%d.attn.wo.bias", l));
-    b->norm1 = vec(st_get(checkpoint, "vision.blocks.%d.norm1.weight", l)), b->norm2 = vec(st_get(checkpoint, "vision.blocks.%d.norm2.weight", l));
+    snprintf(s, sizeof s, "vision.blocks.%d.attn.wqkv", l), lin(&b->qkv, s);
+    snprintf(s, sizeof s, "vision.blocks.%d.attn.wo", l), lin(&b->o, s);
+    snprintf(s, sizeof s, "vision.blocks.%d.mlp.w1", l), lin(&b->w1, s);
+    snprintf(s, sizeof s, "vision.blocks.%d.mlp.w2", l), lin(&b->w2, s);
+    vec(&b->b_qkv, st_get(checkpoint, "vision.blocks.%d.attn.wqkv.bias", l)), vec(&b->b_o, st_get(checkpoint, "vision.blocks.%d.attn.wo.bias", l));
+    vec(&b->norm1, st_get(checkpoint, "vision.blocks.%d.norm1.weight", l)), vec(&b->norm2, st_get(checkpoint, "vision.blocks.%d.norm2.weight", l));
   }
-  vit.norm = vec(st_get(checkpoint, "vision.norm.weight"));
-  vit.a1 = lin("aligner.w1"), vit.a1_b = vec(st_get(checkpoint, "aligner.w1.bias"));
-  vit.a2 = lin("aligner.w2"), vit.a2_b = vec(st_get(checkpoint, "aligner.w2.bias"));
-  const char *name[3] = {"image_start", "image_end", "image_newline"};
-  uint16_t *row[3] = {vit.start, vit.end, vit.newline};
-  for (int i = 0; i < 3; i++) {
-    Buf r = load(st_get(checkpoint, "%s", name[i]));
-    memcpy(row[i], r.ptr + r.off, DIM * 2);
-    gpu_free(&r);
-  }
+  vec(&vit.norm, st_get(checkpoint, "vision.norm.weight"));
+  lin(&vit.a1, "aligner.w1"), vec(&vit.a1_b, st_get(checkpoint, "aligner.w1.bias"));
+  lin(&vit.a2, "aligner.w2"), vec(&vit.a2_b, st_get(checkpoint, "aligner.w2.bias"));
   vit.loaded = 1;
+  weight_group = core_weights;
 }
 
 // y = x W^T for m rows, then bf(y + bias), or rounded to BF16 without a bias.
@@ -2153,17 +2260,35 @@ static void vit_gelu_row(void *ctx, size_t r) {
   for (int i = 0; i < DIM; i++) g[i] = bf_cpu((float)(0.5 * g[i] * (1 + erf(g[i] / sqrt(2.0)))));
 }
 
-void deepseek_image(Image *im) {
-  work_capacity(MB);
+int deepseek_image(Image *im) {
+  if (im->rows) return 1;
+  vit_prepare();
   uint32_t n = (uint32_t)(im->vh * im->vw), L = (uint32_t)(im->th * im->tw);
   uint32_t np = (n + 63) / 64 * 64, dims[2] = {n, np};  // vit_attn's rows: the patches, padded to its tiles
+  MemorySlot *work = memory_current(), *weights = weights_slot(vision_weights);
+  uint64_t old_layer = 0;
+  for (size_t i = 0; i < sizeof work_buffers / sizeof *work_buffers; i++) old_layer += work_buffers[i]->allocated;
+  size_t sizes[] = {(size_t)n * VIT_K * 4, (size_t)n * 64 * 4,
+    (size_t)n * 1024 * 4, (size_t)n * 1024 * 4, (size_t)n * 1024 * 4,
+    (size_t)n * 3072 * 4, (size_t)np * 3072 * 2,
+    (size_t)n * 5632 * 4, (size_t)n * 2816 * 4,
+    (size_t)L * 9216 * 4, (size_t)L * DIM * 4, (size_t)L * DIM * 4};
+  uint64_t temporary = (size_t)L * DIM * 2;
+  for (size_t i = 0; i < sizeof sizes / sizeof *sizes; i++) temporary += gpu_allocation_size(sizes[i]);
+  MemorySlot *entries[] = {work, weights};
+  uint64_t bytes[] = {work->payload - old_layer + work_plan(MB, 0) + temporary, weights_required(vision_weights)};
+  if (!memory_admit(entries, bytes, 2, MEMORY_REQUIRED)) return 0;
+  memory_pin(weights, 1);
+  work_capacity(MB);
+  weights_load(vision_weights);
+  im->rows = memory_host_required((size_t)L * DIM * 2, 0);
   Buf px = gpu_alloc((size_t)n * VIT_K * 4), cs = gpu_alloc((size_t)n * 64 * 4);
   for (size_t i = 0; i < (size_t)n * VIT_K; i++) ((uint32_t *)px.ptr)[i] = (uint32_t)im->patch[i] << 16;
   image_rope(im, (float *)cs.ptr);
   Buf y = gpu_alloc((size_t)n * 1024 * 4), x = gpu_alloc((size_t)n * 1024 * 4), t = gpu_alloc((size_t)n * 1024 * 4);
   Buf qkv = gpu_alloc((size_t)n * 3072 * 4), hv = gpu_alloc((size_t)np * 3072 * 2);
   Buf h = gpu_alloc((size_t)n * 5632 * 4), a = gpu_alloc((size_t)n * 2816 * 4);
-  vit_load();
+  Buf u = gpu_alloc((size_t)L * 9216 * 4), g = gpu_alloc((size_t)L * DIM * 4), f = gpu_alloc((size_t)L * DIM * 4);
   gpu_begin();
   vit_linear(&vit.patch, n, &px, VIT_K, &x, &vit.patch_b);
   gpu_commit();
@@ -2192,7 +2317,6 @@ void deepseek_image(Image *im) {
     vit_add(&x, &t, n);
     gpu_commit();
   }
-  Buf u = gpu_alloc((size_t)L * 9216 * 4), g = gpu_alloc((size_t)L * DIM * 4), f = gpu_alloc((size_t)L * DIM * 4);
   uint32_t gr[3] = {(uint32_t)im->vh, (uint32_t)im->vw, (uint32_t)im->tw};
   gpu_begin();
   vit_norm(&x, &vit.norm, &y, n);
@@ -2207,11 +2331,11 @@ void deepseek_image(Image *im) {
   vit_linear(&vit.a2, L, &g, DIM, &f, &vit.a2_b);
   gpu_commit();
   gpu_sync();
-  free(im->rows);
-  im->rows = xmalloc((size_t)L * DIM * 2);
   for (size_t i = 0; i < (size_t)L * DIM; i++) im->rows[i] = (uint16_t)(((uint32_t *)f.ptr)[i] >> 16);
   Buf *all[] = {&px, &cs, &x, &y, &t, &qkv, &hv, &h, &a, &u, &g, &f};
   for (size_t i = 0; i < sizeof all / sizeof *all; i++) gpu_free(all[i]);
+  memory_pin(weights, 0);
+  return 1;
 }
 
 void deepseek_images(const Image *im, int n) { imgs = im, nimgs = n; }
@@ -2220,15 +2344,14 @@ void deepseek_images(const Image *im, int n) { imgs = im, nimgs = n; }
 // (merge_image_embeddings): the delimiters' learned rows, or the image's
 // feature rows in reading order.
 static const uint16_t *image_row(int pos) {
-  if (!vit.loaded) vit_load();
   for (int i = 0; i < nimgs; i++) {
     const Image *im = &imgs[i];
     int j = pos - im->start, n = image_span(im);
     if (j < 0 || j >= n) continue;
-    if (j == 0) return vit.start;
-    if (j == n - 1) return vit.end;
+    if (j == 0) return (const uint16_t *)(image_markers[0].ptr + image_markers[0].off);
+    if (j == n - 1) return (const uint16_t *)(image_markers[1].ptr + image_markers[1].off);
     int r = (j - 1) / (im->tw + 1), c = (j - 1) % (im->tw + 1);
-    if (c == im->tw) return vit.newline;
+    if (c == im->tw) return (const uint16_t *)(image_markers[2].ptr + image_markers[2].off);
     if (!im->rows) die("the image at position %d was not encoded", im->start);
     return im->rows + ((size_t)r * im->tw + c) * DIM;
   }
@@ -2669,7 +2792,7 @@ static void resize(State *s, int cap, int keep) {
   for (int l = 0; l < LAYERS; l++) {
     if (!L[l].kv_source) continue;
     for (int k = 0; k < 2; k++) {
-      Buf *b = k ? &s->keys[l] : &s->comp[l], nb = gpu_alloc(rows_bytes(l, cap, k));
+      Buf *b = k ? &s->keys[l] : &s->comp[l], nb = gpu_alloc_kv(rows_bytes(l, cap, k));
       size_t used = rows_bytes(l, keep, k);
       memcpy(nb.ptr, b->ptr, used < b->size ? used : b->size);
       gpu_free(b);
@@ -2704,12 +2827,12 @@ State *deepseek_state_new(void) {
   State *s = xmalloc(sizeof *s);
   s->cap = start_cap();
   for (int l = 0; l < LAYERS; l++) {
-    s->ring[l] = zeros(state_rings[l]);
+    s->ring[l] = kv_zeros(state_rings[l]);
     if (!L[l].kv_source) continue;
-    s->comp[l] = zeros(rows_bytes(l, s->cap, 0)), s->keys[l] = zeros(rows_bytes(l, s->cap, 1));
-    s->cstate[l] = zeros(state_compressors[l]);
+    s->comp[l] = kv_zeros(rows_bytes(l, s->cap, 0)), s->keys[l] = kv_zeros(rows_bytes(l, s->cap, 1));
+    s->cstate[l] = kv_zeros(state_compressors[l]);
   }
-  for (int d = 0; opt.draft && d < DRAFTS; d++) s->dring[d] = zeros(state_drafts[d]);
+  for (int d = 0; opt.draft && d < DRAFTS; d++) s->dring[d] = kv_zeros(state_drafts[d]);
   return s;
 }
 
@@ -2720,7 +2843,7 @@ void deepseek_state_free(State *s) {
     if (L[l].kv_source) gpu_free(&s->comp[l]), gpu_free(&s->keys[l]), gpu_free(&s->cstate[l]);
   }
   for (int d = 0; opt.draft && d < DRAFTS; d++) gpu_free(&s->dring[d]);
-  free(s->saved);
+  memory_host_free(s->saved);
   free(s);
 }
 
@@ -2849,7 +2972,7 @@ static const float *runahead_rows(State **states, const int *tokens, const int *
   for (int k = 0; k < RUN_BUFFERS; k++) original[k] = *live[k];
   if (!run_logits) {
     size_t bytes = (size_t)FEW * VOCAB * sizeof(float);
-    run_logits = xmalloc(bytes), scheduler_workspace_bytes += bytes;
+    run_logits = memory_host_required(bytes, 0), scheduler_workspace_bytes += bytes;
   }
   for (int r = 0; r < count; r++) {
     RunJob *job = &run_jobs[r];
@@ -3029,7 +3152,7 @@ static const float *pipeline_rows(State **states, const int *tokens, const int *
   if (K_pipe < 0) K_pipe = gpu_kernel("moe_tasks");
   if (!pipe_tasks.obj) {
     pipe_tasks = zeros((size_t)PIPE_BATCHES * BATCH_ROWS * sizeof(MoeTask));
-    pipe_logits = xmalloc((size_t)BATCH_ROWS * VOCAB * 4);
+    pipe_logits = memory_host_required((size_t)BATCH_ROWS * VOCAB * 4, 0);
     scheduler_workspace_bytes += pipe_tasks.size + (size_t)BATCH_ROWS * VOCAB * 4;
   }
   for (int r = 0; r < count; r++) {
@@ -3210,7 +3333,7 @@ static void save_rows(int restore) {
   gpu_sync();
   if (!active->saved) {
     if (restore) die("no saved attention state");
-    active->saved = xmalloc(saved_bytes());
+    active->saved = memory_host_required(saved_bytes(), 1);
   }
   char *p = active->saved;
 #define ROWS(b) (restore ? memcpy((b).ptr, p, (b).size) : memcpy(p, (b).ptr, (b).size), p += (b).size)
@@ -3246,9 +3369,9 @@ static void rolling(State *s, char *p, int restore) {
 Snapshot *deepseek_snapshot(State *s, int pos, int with_logits) {
   gpu_sync();
   Snapshot *x = xmalloc(sizeof *x);
-  *x = (Snapshot){.pos = pos, .extent = LAYERS - 1, .rows = xmalloc(saved_bytes())};
+  *x = (Snapshot){.pos = pos, .extent = LAYERS - 1, .rows = memory_host_required(saved_bytes(), 1)};
   rolling(s, x->rows, 0);
-  if (with_logits) x->logits = xmalloc(VOCAB * 4), memcpy(x->logits, logits.ptr, VOCAB * 4);
+  if (with_logits) x->logits = memory_host_required(VOCAB * 4, 1), memcpy(x->logits, logits.ptr, VOCAB * 4);
   return x;
 }
 
@@ -3259,7 +3382,7 @@ void deepseek_snapshot_restore(State *s, const Snapshot *x) {
 }
 
 void deepseek_snapshot_free(Snapshot *x) {
-  if (x) free(x->rows), free(x->logits), free(x);
+  if (x) memory_host_free(x->rows), memory_host_free(x->logits), free(x);
 }
 
 size_t deepseek_snapshot_bytes(int with_logits) { return saved_bytes() + (with_logits ? VOCAB * 4 : 0); }
@@ -3273,7 +3396,7 @@ void deepseek_state_copy(State *dst, const State *src, int positions) {
   gpu_sync();
   int cap = grown(start_cap(), positions);
   if (dst->cap != cap) resize(dst, cap, 0);
-  free(dst->saved), dst->saved = NULL;  // its rewind point belonged to its old rows
+  memory_host_free(dst->saved), dst->saved = NULL;  // its rewind point belonged to its old rows
   // Global rows never change before a state's position. The row that a
   // position before `positions` shares with a later one (a compressed pair,
   // the guard row) is computed again by the prefill that continues there.
@@ -3295,7 +3418,7 @@ void deepseek_seek(const int *tokens, int pos) {
 
 static int end_token = -1;  // config.json's eos_token_id
 
-static void ds_load(const char *dir, const Options *o) {
+static int ds_load(const char *dir, const Options *o) {
   char path[1024];
   snprintf(path, sizeof path, "%s/config.json", dir);
   char *text = read_file(path, 0);
@@ -3303,7 +3426,7 @@ static void ds_load(const char *dir, const Options *o) {
   if (!eos || eos->type != J_NUM) die("%s: no eos_token_id", path);
   end_token = (int)eos->num;
   free(text);
-  deepseek_load(dir, o);
+  return deepseek_load(dir, o);
 }
 
 // The state the layers work on: s, bound when it is not already.
@@ -3362,6 +3485,7 @@ static const float *ds_prefill(ModelState *s, const int *tokens, int n, int from
 }
 
 static const float *ds_rows(ModelState *const *states, const int *tokens, const int *pos, int m) {
+  if (m > 1 && !prepare_rows(m, 0)) return NULL;
   if (m == 1) {  // one state's token: the decoding path with its read-aheads
     use(states[0]);
     return deepseek_forward(tokens, 1, pos[0]);
@@ -3374,6 +3498,7 @@ static void ds_draft(ModelState *s, int token, int pos, int *drafts, int n) {
   deepseek_draft(token, pos, drafts, n);
 }
 static const float *ds_verify(ModelState *s, const int *tokens, int m, int pos) {
+  if (!prepare_rows(m, 0)) return NULL;
   use(s);
   return deepseek_verify(tokens, m, pos);
 }
@@ -3385,12 +3510,13 @@ static void ds_seek(ModelState *s, const int *tokens, int pos) {
   use(s);
   deepseek_seek(tokens, pos);
 }
+static MemorySlot *ds_weight_slot(void) { return core_weights ? weights_slot(core_weights) : NULL; }
 static const char *ds_refuse(const Options *o) { return 0; }
 
 static void ds_counters(ModelCounters *c) {
   *c = (ModelCounters){.decode_rows = decode_rows, .prefill_rows = prefill_rows, .decode_seconds = decode_s,
                        .decode_gpu_seconds = decode_gpu_s, .prefill_layer = prefill_layer, .prefill_rows_now = prefill_n,
-                       .layers = LAYERS, .experts_per_row = LAYERS * TOPK, .dense_bytes = dense_bytes,
+                       .layers = LAYERS, .experts_per_row = LAYERS * TOPK, .dense_bytes = weights_resident_bytes(core_weights) + weights_resident_bytes(vision_weights),
                        .decode = decode_stats, .prefill = prefill_stats};
 }
 
@@ -3463,7 +3589,7 @@ static int ds_prepare_image(const char *dir, Image *im, const void *data, size_t
 
 const ModelOps deepseek_ops = {
     .family = "DeepSeek V4.1", .model_types = ds_types, .image_token = "<｜deepseek_image｜>", .refuse = ds_refuse,
-    .load = ds_load, .counters = ds_counters, .plan = ds_plan, .routes = deepseek_routes, .vocab = ds_vocab,
+    .load = ds_load, .weight_slot = ds_weight_slot, .active = cache_active, .counters = ds_counters, .plan = ds_plan, .routes = deepseek_routes, .vocab = ds_vocab,
     .max_rows = ds_max_rows, .max_verify = ds_max_verify, .draft_block = ds_draft_block, .rewind = ds_rewind,
     .prefill_rows = ds_prefill_rows,
     .stop = ds_stop, .state_new = ds_state_new, .state_free = ds_state_free, .state_bytes = ds_state_bytes,

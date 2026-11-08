@@ -48,6 +48,7 @@ static void setup(int capacity) {
     s->layer = LAYERS + (i - max_slots) / draft_capacity;
     s->expert = draft_capacity == DRAFT_EXPERTS ? (i - max_slots) % draft_capacity : -1;
     s->pinned = 1;
+    s->b.obj = (void *)1; // preallocated fixture storage; no Metal operations use it
     s->b.size = 8192;
     s->b.gpu = 0x100000 + (uint64_t)i * 8192;
     if (s->expert >= 0) where[s->layer][s->expert] = i;

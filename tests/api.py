@@ -127,7 +127,7 @@ def arguments():
         type=Path,
         default=Path(__file__).resolve().parents[1] / "build/myds4-server",
     )
-    parser.add_argument("--cache", type=float, default=28)
+    parser.add_argument("--memory", type=float, default=28)
     parser.add_argument("--context", type=int, default=1024)
     parser.add_argument("--requests", type=int, choices=(2, 3), default=3)
     parser.add_argument("--max-new-tokens", type=int, default=32)
@@ -144,8 +144,8 @@ def arguments():
         "--predictor-state", type=Path, help="load or create state and verify its clean-stop save"
     )
     args = parser.parse_args()
-    if not (math.isfinite(args.cache) and 1 <= args.cache <= 64):
-        parser.error("--cache must be 1 to 64 GiB")
+    if not (math.isfinite(args.memory) and 1 <= args.memory <= 64):
+        parser.error("--memory must be 1 to 64 GiB")
     if not (
         math.isfinite(args.temperature)
         and args.temperature >= 0
@@ -188,8 +188,8 @@ def main():
         "127.0.0.1",
         "--ctx",
         str(args.context),
-        "--cache",
-        str(args.cache),
+        "--memory",
+        str(args.memory),
         "--kv-cache",
         "2",
         "--batch",

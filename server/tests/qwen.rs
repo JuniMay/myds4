@@ -411,7 +411,7 @@ fn deepseek_and_qwen_share_one_process() {
         return;
     };
     let _one = one_model();
-    let models = json!({"kv_cache": 8, "reserve": 10, "models": [
+    let models = json!({"memory": 64, "kv_cache": 8, "reserve": 10, "models": [
         {"model": deepseek, "experts": experts, "cache": 40},
         {"model": qwen, "ctx": 4096}
     ]});
@@ -474,10 +474,12 @@ fn models_share_one_kv_budget_and_one_reserve() {
         return;
     };
     let _one = one_model();
-    let s = Server::with_config(json!({"reserve": 13, "kv_cache": 0.75, "models": [
-        {"model": deepseek, "id": "deepseek-budget", "cache": 20, "ctx": 4096, "batch": 4},
-        {"model": qwen, "id": "qwen-budget", "batch": 8}
-    ]}));
+    let s = Server::with_config(
+        json!({"memory": 48, "reserve": 13, "kv_cache": 0.75, "models": [
+            {"model": deepseek, "id": "deepseek-budget",  "ctx": 4096, "batch": 4},
+            {"model": qwen, "id": "qwen-budget", "batch": 8}
+        ]}),
+    );
     let models = s.get("/v1/models");
     let q = models["data"]
         .as_array()
@@ -538,10 +540,12 @@ fn registered_models_have_no_loaded_weights_before_inference() {
         return;
     };
     let _one = one_model();
-    let s = Server::with_config(json!({"reserve": 10, "kv_cache": 2, "models": [
-        {"model": deepseek, "id": "deepseek-idle", "cache": 20, "ctx": 4096},
-        {"model": qwen, "id": "qwen-idle", "ctx": 4096}
-    ]}));
+    let s = Server::with_config(
+        json!({"memory": 48, "reserve": 10, "kv_cache": 2, "models": [
+            {"model": deepseek, "id": "deepseek-idle",  "ctx": 4096},
+            {"model": qwen, "id": "qwen-idle", "ctx": 4096}
+        ]}),
+    );
     let models = s.get("/v1/models");
     assert_eq!(models["data"].as_array().unwrap().len(), 2);
     for id in ["deepseek-idle", "qwen-idle"] {
@@ -584,10 +588,12 @@ fn first_inference_loads_only_the_selected_model() {
         return;
     };
     let _one = one_model();
-    let s = Server::with_config(json!({"reserve": 10, "kv_cache": 2, "models": [
-        {"model": deepseek, "id": "deepseek-lazy", "cache": 20, "ctx": 4096},
-        {"model": qwen, "id": "qwen-lazy", "ctx": 4096, "draft": 1}
-    ]}));
+    let s = Server::with_config(
+        json!({"memory": 48, "reserve": 10, "kv_cache": 2, "models": [
+            {"model": deepseek, "id": "deepseek-lazy",  "ctx": 4096},
+            {"model": qwen, "id": "qwen-lazy", "ctx": 4096, "draft": 1}
+        ]}),
+    );
     for (id, text) in [
         ("qwen-lazy", "Name one fruit."),
         ("deepseek-lazy", "Name one color."),

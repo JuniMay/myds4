@@ -408,7 +408,7 @@ static int state_parent_writable(const char *path, char *error, size_t cap) {
   else parent[0] = '.';
   struct stat st;
   int ok = !stat(parent, &st) && S_ISDIR(st.st_mode) && !access(parent, W_OK | X_OK);
-  free(parent);
+  memory_host_free(parent);
   return ok ? 1 : state_error(error, cap, "predictor state parent directory must exist and be writable");
 }
 
@@ -512,11 +512,11 @@ int online_predictor_load(const char *path, char *error, size_t cap) {
   int ok = state_read(fd, data, STATE_BYTES);
   close(fd);
   if (!ok) {
-    free(data);
+    memory_host_free(data);
     return state_error(error, cap, "cannot read complete predictor state");
   }
   if (state_validate(data, error, cap) < 0) {
-    free(data);
+    memory_host_free(data);
     return -1;
   }
   for (int index = 0; index < ONLINE_PAIRS; index++) {
@@ -537,7 +537,7 @@ int online_predictor_load(const char *path, char *error, size_t cap) {
   online.window_index = 0;
   online.dirty = 0;
   online.state_loads++;
-  free(data);
+  memory_host_free(data);
   return 1;
 }
 
@@ -563,7 +563,7 @@ int online_predictor_save(const char *path, char *error, size_t cap) {
   if (existed < 0) return -1;
   unsigned char *data = state_encode();
   if (state_validate(data, error, cap) < 0) {
-    free(data);
+    memory_host_free(data);
     return -1;
   }
   size_t n = strlen(path);
@@ -594,8 +594,8 @@ int online_predictor_save(const char *path, char *error, size_t cap) {
     state_error(error, cap, "publish predictor state: %s", strerror(errno));
   }
   if (!ok && fd >= 0) unlink(temporary);
-  free(temporary);
-  free(data);
+  memory_host_free(temporary);
+  memory_host_free(data);
   if (!ok) return -1;
   online.dirty = 0;
   online.state_saves++;

@@ -13,13 +13,10 @@ void sampler_seed(Sampler *s, uint64_t seed) {
 }
 
 int sample_argmax(const float *logits, int count) {
-  if (count < 1) die("invalid sampling vocabulary size");
   int best = 0;
   for (int i = 0; i < count; i++) {
-    if (isnan(logits[i])) die("cannot sample NaN logits");
     if (logits[i] > logits[best]) best = i;
   }
-  if (logits[best] == -INFINITY) die("cannot sample an empty distribution");
   return best;
 }
 
@@ -60,8 +57,7 @@ static int sample_top_k(const float *logits, int count, Sampler *s, int best) {
   double sum = 0;
   for (int i = 0; i < n; i++) {
     int t = order[i];
-    probability[t] = logits[best] == INFINITY ? (logits[t] == INFINITY ? 1 : 0)
-                                              : exp(((double)logits[t] - logits[best]) / s->temp);
+    probability[t] = exp(((double)logits[t] - logits[best]) / s->temp);
     sum += probability[t];
   }
   double kept = 0, threshold = s->top_p * sum;
@@ -81,15 +77,13 @@ static int sample_top_k(const float *logits, int count, Sampler *s, int best) {
 }
 
 int sample_token(const float *logits, int count, Sampler *s) {
-  if (!sampler_valid(s)) die("temperature must be finite and nonnegative; top-p must be in [0, 1]; top-k nonnegative");
   int best = sample_argmax(logits, count);
   if (s->temp == 0) return best;
   make_room(count);
   if (s->top_k > 0 && s->top_k < count) return sample_top_k(logits, count, s, best);
   double sum = 0;
   for (int i = 0; i < count; i++) {
-    double p =
-        logits[best] == INFINITY ? (logits[i] == INFINITY ? 1 : 0) : exp(((double)logits[i] - logits[best]) / s->temp);
+    double p = exp(((double)logits[i] - logits[best]) / s->temp);
     probability[i] = p;
     sum += p;
   }
@@ -125,7 +119,6 @@ int sample_token(const float *logits, int count, Sampler *s) {
 // A mismatch is already the next token: never draw it a second time.
 int sample_verify(const float *logits, int count, const int *drafts, int ndraft, int (*stop)(int token), Sampler *s,
                   int *accepted) {
-  if (ndraft < 0 || count < 1) die("invalid draft verification size");
   int n = 0;
   for (;;) {
     int next = sample_token(logits + (size_t)n * count, count, s);

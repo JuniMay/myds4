@@ -18,6 +18,7 @@ static void fixture_free(Buf *b) {
 }
 static void fixture_sync(void) {}
 #define gpu_alloc fixture_alloc
+#define gpu_alloc_kv fixture_alloc
 #define gpu_free fixture_free
 #define gpu_sync fixture_sync
 #include "../../src/model/qwen/model.c"

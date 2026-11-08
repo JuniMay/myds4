@@ -21,12 +21,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYDS4_ABI 12
+#define MYDS4_ABI 13
 
 // ---- the process ----
 
 typedef struct {
   int abi;  // MYDS4_ABI
+  double memory_gb;  // shared model allocations, excluding KV; 0: automatic
+  double kv_gb;      // separate KV budget for automatic model-memory sizing
   double reserve_gb; // process-wide available-memory target, 0: default 10 GiB
   // The log's lines, each with its time, go to on_log instead of stderr when
   // it is set. It runs on the thread that logs, one line at a time under the
@@ -58,7 +60,6 @@ typedef enum { MYDS4_DEEPSEEK = 1, MYDS4_QWEN = 2 } myds4_architecture;
 
 typedef struct {
   const char *experts;       // GGUF file or shard; null uses checkpoint experts
-  double cache_gb;
   int cache_half_life;
   int cache_read_cost;
   float substitute;
@@ -94,9 +95,10 @@ typedef struct myds4_images myds4_images;
 // Registers a checkpoint and opens its tokenizer without loading weights.
 // Null for invalid settings or a second registration of the same family.
 myds4_model *myds4_open(const myds4_config *c);
-// Loads the registered model on the engine thread, once, at first inference.
+// Makes the registered model resident on the engine thread; reloads evicted weights.
 int myds4_load(myds4_model *m);
 int myds4_loaded(const myds4_model *m);
+void myds4_active(myds4_model *m, int active); // pin the model for admitted requests
 
 // After the last request: what the model saves or reports on exit.
 void myds4_finish(myds4_model *m);
@@ -174,10 +176,10 @@ typedef struct {
 // during the prefill: a replay's branch point (from), or a position after
 // from and before n. It gets null when the model cannot take a whole state's
 // snapshot there (DeepSeek under CED compaction). info (if not null) gets the
-// prefill's plan. This and the calls below that return logits return null for
-// invalid arguments: a token outside the vocabulary (a prompt may also hold
-// the negative image keys of myds4_images_expand), positions outside the
-// context, a capture outside the prefill, more rows than the limits above.
+// prefill's plan. The server supplies validated token IDs, positions and row
+// counts within the limits above. Prompt IDs may include the negative image
+// keys from myds4_images_expand. Logit calls return null on cancellation or
+// when the required model workspace cannot fit the shared budget.
 const float *myds4_prefill(myds4_model *m, myds4_state *s, const int32_t *tokens, int n, int from, int replay,
                            int capture, myds4_snapshot **captured, myds4_prefill_info *info, const myds4_images *images);
 // What a replay at k costs beyond the prompt's new rows: the rows before k it
@@ -260,7 +262,10 @@ typedef struct {
   uint64_t total, free, file, file_kept, wired, compressor, compressed, swap_used, swapouts;
   int pressure;  // 1 normal, 2 warn, 4 critical
   int layers, experts_per_row;  // 0 without routed experts
+  uint64_t model_memory_limit, model_memory_used, model_memory_committed, model_memory_peak;
+  uint64_t kv_allocated, model_workspace;
 } myds4_stats;
+void myds4_refresh_stats(void); // sample process memory once for all models
 void myds4_stats_get(const myds4_model *m, myds4_stats *s);
 // The experts that row `row` of the model's latest decoding pass chose in
 // each layer, experts_per_row / layers per layer, and where each one was: 0

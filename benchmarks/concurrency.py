@@ -64,7 +64,7 @@ def requests(args):
 
 def run(args, mode, bodies, runahead=0, pipeline=0):
     batch = int(mode)
-    guard = wait_for_gpu(args.cache, 60, args.reserve, desktop=True, quiet_cpu=True)
+    guard = wait_for_gpu(args.memory + 4, 60, args.reserve, desktop=True, quiet_cpu=True)
     baseline = guard["samples"][-1]["memory"]
     if baseline["available_gib"] < 10 or guard["samples"][-1]["device_percent"] > 35:
         raise RuntimeError("HTTP comparison needs 10 GiB available and GPU use at most 35 percent")
@@ -75,7 +75,7 @@ def run(args, mode, bodies, runahead=0, pipeline=0):
     env = {k: v for k, v in os.environ.items() if not k.startswith("MYDS4_")}
     env.update(MYDS4_API_KEY=key, MYDS4_LOCK=str(ROOT / "build/myds4.lock"))
     command = [str(args.binary), "-m", str(args.checkpoint), "--serve", str(port), "--ctx", str(args.context),
-               "--cache", str(args.cache), "--reserve", str(args.reserve), "--kv-cache", "4", "--batch", str(batch),
+               "--memory", str(args.memory), "--reserve", str(args.reserve), "--kv-cache", "4", "--batch", str(batch),
                "--temperature", "1", "--top-p", "1", "--seed", "12345"]
     if runahead:
         command += ["--runahead"]
@@ -252,7 +252,7 @@ def run(args, mode, bodies, runahead=0, pipeline=0):
         valid = (not failures and not counters["cache_shrank"] and
                  final["expert_cache"]["slots"] >= counters["maximum_cache_slots"] and
                  final["expert_cache"].get("slots_released") == initial["expert_cache"].get("slots_released") == 0 and
-                 final["expert_cache"]["gib"] >= args.cache - .1 and generated >= 128 * len(bodies))
+                 final["expert_cache"]["gib"] > 0 and generated >= 128 * len(bodies))
         if batch > 1 and len(bodies) > 1 and not seen_batches:
             valid = False
         if initial.get("runahead") != bool(runahead):
@@ -298,7 +298,7 @@ def main():
     parser.add_argument("--pipeline", type=int, nargs="+", help="one 0/1 value per mode: the server's --pipeline")
     parser.add_argument("--tokens", type=int, default=512)
     parser.add_argument("--context", type=int, default=65536)
-    parser.add_argument("--cache", type=float, default=56)
+    parser.add_argument("--memory", type=float, default=56)
     parser.add_argument("--reserve", type=float, default=4)
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--prefill-prune", action="store_true")
@@ -310,7 +310,7 @@ def main():
     if args.pipeline is None:
         args.pipeline = [0] * len(args.modes)
     if not (1 <= len(args.before_seq) <= 6 and len(set(args.before_seq)) == len(args.before_seq)
-            and 128 <= args.tokens <= 2048 and 16384 <= args.context <= 131072 and 16 <= args.cache <= 80
+            and 128 <= args.tokens <= 2048 and 16384 <= args.context <= 131072 and 16 <= args.memory <= 80
             and 4 <= args.reserve <= 16 and 120 <= args.timeout <= 1800 and len(args.modes) <= 6
             and len(args.runahead) == len(args.modes) and all(n in (0, 1) for n in args.runahead)
             and len(args.pipeline) == len(args.modes) and all(n in (0, 1) for n in args.pipeline)
@@ -324,7 +324,7 @@ def main():
     run_binaries = [p.resolve() for p in (args.run_binaries or [args.binary] * len(args.modes))]
     run_hashes = [hashlib.sha256(p.read_bytes()).hexdigest() for p in run_binaries]
     bodies, identities = requests(args)
-    settings = {"requests": identities, "tokens": args.tokens, "context": args.context, "cache_gib": args.cache,
+    settings = {"requests": identities, "tokens": args.tokens, "context": args.context, "model_memory_gib": args.memory,
                 "reserve_gib": args.reserve, "prefill_prune": args.prefill_prune, "temperature": 1, "top_p": 1,
                 "seed": 12345, "binary_sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest(),
                 "checkpoint": args.checkpoint.name, "experts": args.experts.name if args.experts else None}

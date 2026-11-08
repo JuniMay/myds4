@@ -20,6 +20,7 @@ The root contains server settings and a nonempty `models` list:
 | `api_key_file` | File containing a 16–256 character API key. Without a file, use `MYDS4_API_KEY`. |
 | `tui` | Show the terminal interface; default false. `--tui` enables it and `--no-tui` disables it. |
 | `tui_theme` | `auto`, `light` or `dark`; default `auto`. |
+| `memory` | Shared model-memory ceiling in GiB: all loaded weights, experts, vision and model workspaces. KV is separate. Default 0 uses physical RAM minus `reserve` and `kv_cache`. |
 | `reserve` | One process-wide target for available system memory, in GiB; default 10, range 2–1024. |
 | `kv_cache` | One budget for all models' attention states and snapshots, in GiB; default 8. |
 | `models` | Each model's checkpoint and inference settings. |
@@ -57,7 +58,6 @@ DeepSeek-specific settings belong only to its entry:
 | Setting | Meaning |
 | --- | --- |
 | `experts` | GGUF file or any shard of a set. Omit for the checkpoint's native MXFP4 experts and output head. |
-| `cache` | Adaptive expert-cache ceiling in GiB, including draft pools. It is not a guaranteed allocation. |
 | `cache_half_life` | Retention score half-life in forward passes; default 50. |
 | `cache_read_cost` | Include aligned read cost in retention priority. |
 | `substitute` | Approximate expert replacement within this router-score gap; 0 disables it. |
@@ -79,8 +79,22 @@ scheduler handles multiple requests. Pipeline therefore does not replace
 ## Memory
 
 Available memory includes free and reclaimable file-backed pages. The
-shared reserve is a headroom target. The engine can shrink expert storage
-and evict idle KV state; loaded weights and active states remain protected.
+shared reserve is a headroom target. The model-memory pool holds variable-sized
+entries. A dense model's weights form one entry. MoE experts are separate
+entries that must be evicted before their dense backbone. Active requests
+pin the weights they need. Unused weight groups can be unloaded and later
+reloaded while their KV state remains in the separate pool.
+
+The `memory` ceiling counts managed model allocations, including Metal
+buffers and model-owned host buffers. Request text, tokenizer metadata,
+framework and driver overhead also contribute to the process footprint.
+`kv_cache` controls the shared KV pool independently. Inspect total process
+memory when choosing the two budgets together.
+
+Prefill uses chunks that fit available model workspace. A long prompt does
+not require its entire working buffer at once. If the smallest supported
+chunk and the required model weights cannot fit, the request reports a
+memory error. The context and KV limits still apply.
 In-memory compression is allowed. Benchmarks reject new swap-outs.
 
 The KV pool evicts spare snapshots and then idle states across all models

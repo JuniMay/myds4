@@ -34,7 +34,7 @@ static int engram_layout(const char *directory) {
   puts("Engram matches the complete checkpoint reference table");
   return 0;
 }
-static void load_stub(const char *directory, const Options *options) { loads++; }
+static int load_stub(const char *directory, const Options *options) { loads++; return 1; }
 static const char *const qwen_types[] = {"qwen3_5", 0};
 static const char *const deepseek_types[] = {"deepseek_v41", 0};
 const ModelOps qwen_ops = {.family = "Qwen", .model_types = qwen_types, .load = load_stub};
@@ -44,11 +44,11 @@ static int model_lock(const char *first, const char *second) {
   const char *path = getenv("MYDS4_LOCK");
   if (!path) return 2;
   Options options = {0};
-  Model *a = model_open(first, &options), *b = model_open(second, &options);
+  model_open(first, &options);
+  model_open(second, &options);
   int fd = open(path, O_RDWR | O_CREAT, 0600);
   int locked = fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) != 0;
   if (fd >= 0) close(fd);
-  free(a), free(b);
   if (!locked || loads != 2) {
     fputs("FAIL: every model family must share the process inference lock\n", stderr);
     return 1;
