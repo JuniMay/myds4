@@ -20,6 +20,8 @@ struct WeightSet {
   uint64_t required, scratch;
   uint64_t read_bytes;
   WeightCache *cache;
+  Buf storage;
+  int separate;
 };
 static WeightSet *reading_set;
 
@@ -30,13 +32,15 @@ static void unload(void *context) {
     set->cache->slots--;
     set->cache->stats.evictions++;
   }
-  for (size_t i = 0; i < set->count; i++)
-    if (!set->items[i].alias) gpu_resident(set->items[i].target, 0);
-  gpu_residency_commit();
-  for (size_t i = 0; i < set->count; i++) {
-    Weight *weight = &set->items[i];
-    if (weight->alias) *weight->target = (Buf){0};
-    else gpu_free(weight->target);
+  if (set->storage.obj) {
+    gpu_free(&set->storage);
+    for (size_t i = 0; i < set->count; i++) *set->items[i].target = (Buf){0};
+  } else {
+    for (size_t i = 0; i < set->count; i++) {
+      Weight *weight = &set->items[i];
+      if (weight->alias) *weight->target = (Buf){0};
+      else gpu_free(weight->target);
+    }
   }
   gpu_residency_commit();
 }
@@ -59,7 +63,18 @@ WeightSet *weights_dependent(WeightSet *backbone, const char *name) {
   return set;
 }
 MemorySlot *weights_slot(WeightSet *set) { return &set->slot; }
-uint64_t weights_required(const WeightSet *set) { return set ? set->required + set->scratch : 0; }
+static uint64_t packed_bytes(const WeightSet *set) {
+  if (!set->cache || set->separate) return 0;
+  uint64_t bytes = 0;
+  for (size_t i = 0; i < set->count; i++)
+    if (!set->items[i].alias) bytes = ((bytes + 255) & ~255ull) + set->items[i].bytes;
+  return bytes <= UINT32_MAX ? bytes : 0;
+}
+uint64_t weights_required(const WeightSet *set) {
+  if (!set) return 0;
+  uint64_t packed = packed_bytes(set);
+  return (packed ? gpu_allocation_size(packed) : set->required) + set->scratch;
+}
 uint64_t weights_resident_bytes(const WeightSet *set) { return set && memory_ready(&set->slot) ? set->slot.payload : 0; }
 
 static Weight *append(WeightSet *set, Buf *target) {
@@ -115,6 +130,7 @@ static void raw_fill(Buf *buffer, const void *context) {
 }
 void weights_tensor(WeightSet *set, Buf *target, Tensor tensor, int aligned) {
   Raw raw = {tensor, aligned};
+  if (aligned) set->separate = 1;
   weights_generated(set, target, tensor.size + (aligned ? 2 * 16384 : 0), raw_fill, &raw, sizeof raw);
 }
 
@@ -273,14 +289,28 @@ int weights_load(WeightSet *set) {
   WeightSet *previous = reading_set;
   reading_set = set;
   set->read_bytes = 0;
+  uint64_t packed = packed_bytes(set), offset = 0;
+  if (packed) {
+    set->storage = gpu_new(packed);
+    gpu_resident(&set->storage, 1);
+  }
   for (size_t i = 0; i < set->count; i++) {
     Weight *weight = &set->items[i];
     if (weight->alias) continue;
-    *weight->target = gpu_alloc(weight->bytes);
+    if (packed) {
+      offset = (offset + 255) & ~255ull;
+      *weight->target = (Buf){.obj = set->storage.obj, .ptr = set->storage.ptr + offset,
+                              .gpu = set->storage.gpu + offset, .size = weight->bytes, .off = offset};
+      offset += weight->bytes;
+    } else {
+      *weight->target = gpu_new(weight->bytes);
+      gpu_resident(weight->target, 1);
+    }
     weight->fill(weight->target, weight->parameters);
   }
   for (size_t i = 0; i < set->count; i++)
     if (set->items[i].alias) *set->items[i].target = *set->items[i].alias;
+  gpu_residency_commit();
   memory_scope(before);
   reading_set = previous;
   memory_trim(&set->slot);
@@ -296,8 +326,21 @@ int weights_load(WeightSet *set) {
   return 1;
 }
 
+void weights_use(const WeightSet *set) {
+  if (set->storage.obj) {
+    gpu_use(&set->storage);
+    return;
+  }
+  for (size_t i = 0; i < set->count; i++)
+    if (!set->items[i].alias) gpu_use(set->items[i].target);
+}
+
 void weights_reside(WeightSet *set, int resident) {
   if (!set || !memory_ready(&set->slot)) return;
+  if (set->storage.obj) {
+    gpu_resident(&set->storage, resident);
+    return;
+  }
   for (size_t i = 0; i < set->count; i++)
     if (!set->items[i].alias) gpu_resident(set->items[i].target, resident);
 }

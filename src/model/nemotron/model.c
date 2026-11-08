@@ -1,6 +1,6 @@
 // Nemotron-H language backbone for the Transcribe checkpoint.
 #include "../model.h"
-#include "../linear.h"
+#include "../experts.h"
 #include "audio.h"
 #include "dflash.h"
 #include <math.h>
@@ -9,10 +9,6 @@
 #include <unistd.h>
 
 enum { NM_ROWS = 256, NM_BATCH = 8 };
-typedef struct {
-  Linear up, down;
-  WeightSet *weights;
-} Expert;
 typedef struct {
   int kind, index;
   Buf norm, conv, conv_bias, decay, dt, skip, gate_norm, correction;
@@ -37,10 +33,6 @@ typedef struct {
   State *state;
   int token, save;
 } Row;
-typedef struct {
-  uint32_t row;
-  float weight;
-} Entry;
 static struct {
   int ready, layers, recurrent, attention, hidden, intermediate, shared, experts, chosen;
   int heads, kv_heads, head_dim, ssm_heads, ssm_dim, ssm_state, groups, channels, projected, vocab;
@@ -55,7 +47,8 @@ static struct {
   Linear head;
   Buf tokens, embeddings, sequences, x, norm, quant, packed, projected_values, convolved, scan, gated;
   Buf q, k, v, attended, part, maxima, result, shared_result, routing, selected, coefficients;
-  Buf entries, gathered, up, expert_result, logits, captured;
+  Buf gathered, up, logits, captured;
+  ExpertWork routed;
   ModelCounters counters;
   ModelPlan plan;
   const float *last_logits;
@@ -63,8 +56,8 @@ static struct {
   DFlash *draft;
   const Media *media;
   int media_count;
-  int embed_kernel, norm_kernel, round_kernel, zero_kernel, quant_kernel, conv_kernel, scan_kernel, gate_kernel;
-  int relu_kernel, add_kernel, route_kernel, gather_kernel, scatter_kernel, store_kernel, attention_kernel, sum_kernel;
+  int embed_kernel, norm_kernel, round_kernel, quant_kernel, conv_kernel, scan_kernel, gate_kernel;
+  int relu_kernel, add_kernel, route_kernel, gather_kernel, store_kernel, attention_kernel, sum_kernel;
 } nm;
 
 static int integer(const Json *j, const char *name, int fallback) {
@@ -124,11 +117,11 @@ static void prepare(const char *directory) {
     die("unsupported Nemotron-H checkpoint dimensions");
   gpu_start();
   linear_init();
+  experts_init(&nm.routed, nm.hidden, nm.intermediate, nm.experts, nm.chosen, EXPERT_RELU2, EXPERT_SUM_FP32);
 #define K(field, name) nm.field = gpu_kernel(name)
   K(embed_kernel, "embed_rows");
   K(norm_kernel, "group_rms_bf16");
   K(round_kernel, "round_bf16");
-  K(zero_kernel, "clear_f32");
   K(quant_kernel, "quantize_input");
   K(conv_kernel, "nm_conv");
   K(scan_kernel, "nm_scan");
@@ -137,7 +130,6 @@ static void prepare(const char *directory) {
   K(add_kernel, "nm_add");
   K(route_kernel, "nm_route");
   K(gather_kernel, "gather_rows");
-  K(scatter_kernel, "nm_scatter");
   K(store_kernel, "nm_kv_store");
   K(attention_kernel, "nm_attention");
   K(sum_kernel, "nm_attention_sum");
@@ -259,13 +251,12 @@ static uint64_t workspace(int rows, int blocks, int allocate) {
   B(routing, r * nm.experts);
   B(selected, rows * nm.chosen * 4);
   B(coefficients, r * nm.chosen);
-  B(entries, rows * nm.chosen * sizeof(Entry));
   B(gathered, r * nm.hidden);
   B(up, r * (nm.shared > nm.intermediate ? nm.shared : nm.intermediate));
-  B(expert_result, r * nm.hidden);
   B(logits, (size_t)(nm.draft_depth + 1 > NM_BATCH ? nm.draft_depth + 1 : NM_BATCH) * nm.vocab * 4);
   B(captured, nm.draft_depth ? r * nm.hidden * 6 : 0);
 #undef B
+  bytes += experts_workspace(&nm.routed, rows, allocate);
   if (allocate)
     nm.rows = rows, nm.blocks = blocks;
   return bytes;
@@ -293,13 +284,11 @@ static uint64_t workspace_bytes(void) {
                     &nm.routing,
                     &nm.selected,
                     &nm.coefficients,
-                    &nm.entries,
                     &nm.gathered,
                     &nm.up,
-                    &nm.expert_result,
                     &nm.logits,
                     &nm.captured};
-  uint64_t bytes = 0;
+  uint64_t bytes = experts_bytes(&nm.routed);
   for (size_t i = 0; i < sizeof buffers / sizeof *buffers; i++)
     bytes += buffers[i]->allocated;
   return bytes;
@@ -590,63 +579,30 @@ static int routed(const Layer *y, int rows) {
   gpu_go(rows, 1, 1, 128, 1, 1);
   gpu_commit();
   gpu_sync();
-  int counts[128] = {0}, offset[129] = {0}, next[128];
-  uint32_t *selected = (uint32_t *)nm.selected.ptr;
-  float *weights = (float *)nm.coefficients.ptr;
-  for (int i = 0; i < rows * nm.chosen; i++)
-    counts[selected[i]]++;
-  for (int i = 0; i < 128; i++)
-    offset[i + 1] = offset[i] + counts[i], next[i] = offset[i];
-  Entry *entries = (Entry *)nm.entries.ptr;
-  for (int row = 0; row < rows; row++)
-    for (int k = 0; k < nm.chosen; k++) {
-      int i = row * nm.chosen + k;
-      entries[next[selected[i]]++] = (Entry){(uint32_t)row, weights[i]};
-    }
-  for (int e = 0; e < 128; e++)
-    if (counts[e])
-      memory_pin(weights_slot(y->experts[e].weights), 1);
-  for (int e = 0; e < 128; e++)
-    if (counts[e]) {
-      if (memory_ready(weights_slot(y->experts[e].weights)))
-        nm.cache.stats.row_own += counts[e];
-      else
-        nm.cache.stats.row_ssd += counts[e];
-      if (!weights_load(y->experts[e].weights)) {
-        for (int k = 0; k < 128; k++)
-          if (counts[k])
-            memory_pin(weights_slot(y->experts[k].weights), 0);
-        return 0;
-      }
-      nm.cache.stats.row_unique++;
-    }
+  if (!experts_acquire(&nm.routed, y->experts, (const uint32_t *)nm.selected.ptr,
+                       (const float *)nm.coefficients.ptr, rows, &nm.cache.stats))
+    return 0;
   gpu_begin();
-  unary(nm.zero_kernel, &nm.result, (uint32_t)(rows * nm.hidden));
-  for (int e = 0; e < 128; e++)
-    if (counts[e]) {
-      uint32_t shape[2] = {(uint32_t)nm.hidden, (uint32_t)counts[e]};
-      size_t start = (size_t)offset[e] * sizeof(Entry);
-      gpu_kern(nm.gather_kernel);
-      gpu_buf(0, &nm.norm, 0);
-      gpu_buf(1, &nm.entries, start);
-      gpu_buf(2, &nm.gathered, 0);
-      gpu_bytes(3, shape, sizeof shape);
-      gpu_go((shape[0] * shape[1] + 255) / 256, 1, 1, 256, 1, 1);
-      feed_forward(y->experts + e, &nm.gathered, &nm.expert_result, counts[e]);
-      gpu_kern(nm.scatter_kernel);
-      gpu_buf(0, &nm.expert_result, 0);
-      gpu_buf(1, &nm.entries, start);
-      gpu_buf(2, &nm.result, 0);
-      gpu_bytes(3, shape, sizeof shape);
-      gpu_go((shape[0] * shape[1] + 255) / 256, 1, 1, 256, 1, 1);
-    }
-  unary(nm.round_kernel, &nm.result, (uint32_t)(rows * nm.hidden));
+  experts_encode(&nm.routed, y->experts, &nm.norm);
+  for (int i = 0; i < nm.routed.active; i++) {
+    int e = nm.routed.active_ids[i];
+    int count = experts_count(&nm.routed, e);
+    if (experts_grouped(&nm.routed, e)) continue;
+    uint32_t shape[2] = {(uint32_t)nm.hidden, (uint32_t)count};
+    gpu_kern(nm.gather_kernel);
+    gpu_buf(0, &nm.norm, 0);
+    gpu_buf(1, &nm.routed.entries, experts_entry_offset(&nm.routed, e));
+    gpu_buf(2, &nm.gathered, 0);
+    gpu_bytes(3, shape, sizeof shape);
+    gpu_go((shape[0] * shape[1] + 255) / 256, 1, 1, 256, 1, 1);
+    Buf out = experts_output(&nm.routed, e);
+    feed_forward(y->experts + e, &nm.gathered, &out, count);
+  }
+  experts_sum(&nm.routed, &nm.result);
   add(&nm.result, &nm.shared_result, rows * nm.hidden);
   gpu_commit();
   gpu_sync();
-  for (int e = 0; e < 128; e++)
-    if (counts[e])
-      memory_pin(weights_slot(y->experts[e].weights), 0);
+  experts_release(&nm.routed, y->experts);
   gpu_begin();
   return 1;
 }

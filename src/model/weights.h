@@ -32,6 +32,7 @@ void weights_generated(WeightSet *set, Buf *target, size_t bytes, WeightFill fil
                        const void *parameters, size_t parameter_bytes);
 void weights_alias(WeightSet *set, Buf *target, const Buf *source);
 int weights_load(WeightSet *set);
+void weights_use(const WeightSet *set);
 void weights_reside(WeightSet *set, int resident);
 void weights_free(WeightSet *set);
 void weights_remove(WeightSet *set, Buf *target);

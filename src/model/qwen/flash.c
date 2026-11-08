@@ -1,6 +1,7 @@
 // Qwen3.8 Flash-Next: gated residual streams, GDN, sparse attention and NVFP4 experts.
 #include "../model.h"
 #include "../linear.h"
+#include "../experts.h"
 #include "vision.h"
 #define ACCELERATE_NEW_LAPACK
 #include <Accelerate/Accelerate.h>
@@ -15,10 +16,6 @@ typedef struct {
   Linear down, up, inject;
   Buf norm;
 } Hyper;
-typedef struct {
-  Linear gate, up, down;
-  WeightSet *weights;
-} Expert;
 typedef struct {
   Linear key, value;
   Buf norm_key, norm_query, norm_conv, conv;
@@ -54,10 +51,6 @@ typedef struct {
 } FlashSeq;
 static_assert(sizeof(FlashSeq) == 72);
 typedef struct {
-  uint32_t row;
-  float weight;
-} Entry;
-typedef struct {
   FlashState *state;
   int token;
 } Row;
@@ -77,8 +70,8 @@ static struct {
   uint64_t expert_minimum;
   Buf tokens, images, sequences, ple_states, x, normalized, mixed, mix_up, mix_down, injection, result;
   Buf xb, quantized, qkv, convolved, z, a, b, decay, beta, gdn, gated, qg, k, v, q, kr, attention_out;
-  Buf index_qk, shared, shared_gate, routing, selected, coefficients, entries, gathered, gate, up, intermediate,
-      expert_out, logits;
+  Buf index_qk, shared, shared_gate, routing, selected, coefficients, gathered, gate, up, intermediate, logits;
+  ExpertWork routed;
   Buf ngram, ple_key, ple_query, ple_value, ple_gated, ple_normalized, attention_ids, part, ml;
   int workspace_rows;
   ModelCounters counters;
@@ -87,7 +80,7 @@ static struct {
   QwenVision *vision;
   const Media *image_list;
   int image_count;
-  int round, zero, embed, norm_group, hc_silu, hc_mix, hc_inject, swiglu, shared_sum, route, gather, scatter, quant;
+  int round, embed, norm_group, hc_silu, hc_mix, hc_inject, swiglu, shared_sum, route, gather, quant;
   int conv_kernel, l2, gates, delta, norm_kernel, rope, store, attend, combine, ple_gate, ple_conv;
 } f;
 
@@ -221,9 +214,9 @@ static void prepare(const char *directory) {
     die("unsupported Flash-Next checkpoint dimensions");
   gpu_start();
   linear_init();
+  experts_init(&f.routed, f.hidden, f.inter, f.experts, f.chosen, EXPERT_SWIGLU, EXPERT_SUM_BF16);
 #define K(field, name) f.field = gpu_kernel(name)
   K(round, "round_bf16");
-  K(zero, "clear_f32");
   K(embed, "flash_embed");
   K(norm_group, "group_rms_bf16");
   K(hc_silu, "flash_hc_silu");
@@ -233,7 +226,6 @@ static void prepare(const char *directory) {
   K(shared_sum, "flash_shared");
   K(route, "flash_route");
   K(gather, "gather_rows");
-  K(scatter, "flash_scatter");
   K(quant, "quantize_input");
   K(conv_kernel, "conv");
   K(l2, "l2_norm");
@@ -410,12 +402,10 @@ static uint64_t workspace(int n, int allocate) {
   B(routing, r * f.experts);
   B(selected, n * f.chosen * 4);
   B(coefficients, r * f.chosen);
-  B(entries, n * f.chosen * sizeof(Entry));
   B(gathered, r * h);
   B(gate, r * f.inter);
   B(up, r * f.inter);
   B(intermediate, r * f.inter);
-  B(expert_out, r * h);
   B(logits, (size_t)FLASH_BATCH * f.vocab * 4);
   B(ngram, r * h);
   B(ple_key, r * hc);
@@ -427,6 +417,7 @@ static uint64_t workspace(int n, int allocate) {
   B(part, (size_t)n * f.heads * blocks * f.head_dim * 4);
   B(ml, (size_t)n * f.heads * blocks * 8);
 #undef B
+  bytes += experts_workspace(&f.routed, n, allocate);
   if (allocate)
     f.workspace_rows = n;
   return bytes;
@@ -466,12 +457,10 @@ static uint64_t workspace_bytes(void) {
                     &f.routing,
                     &f.selected,
                     &f.coefficients,
-                    &f.entries,
                     &f.gathered,
                     &f.gate,
                     &f.up,
                     &f.intermediate,
-                    &f.expert_out,
                     &f.logits,
                     &f.ngram,
                     &f.ple_key,
@@ -482,7 +471,7 @@ static uint64_t workspace_bytes(void) {
                     &f.attention_ids,
                     &f.part,
                     &f.ml};
-  uint64_t n = 0;
+  uint64_t n = experts_bytes(&f.routed);
   for (size_t i = 0; i < sizeof buffers / sizeof *buffers; i++)
     n += buffers[i]->allocated;
   return n;
@@ -1048,57 +1037,26 @@ static int routed(const FlashLayer *y, int n) {
   gpu_go(n, 1, 1, 512, 1, 1);
   gpu_commit();
   gpu_sync();
-  int counts[512] = {0}, offsets[513] = {0}, next[512];
-  uint32_t *selected = (uint32_t *)f.selected.ptr;
-  float *weight = (float *)f.coefficients.ptr;
-  for (int i = 0; i < n * f.chosen; i++)
-    counts[selected[i]]++;
-  for (int e = 0; e < f.experts; e++)
-    offsets[e + 1] = offsets[e] + counts[e], next[e] = offsets[e];
-  Entry *entries = (Entry *)f.entries.ptr;
-  for (int r = 0; r < n; r++)
-    for (int k = 0; k < f.chosen; k++) {
-      int e = selected[r * f.chosen + k];
-      entries[next[e]++] = (Entry){(uint32_t)r, weight[r * f.chosen + k]};
-    }
-  for (int e = 0; e < f.experts; e++)
-    if (counts[e])
-      memory_pin(weights_slot(y->experts[e].weights), 1);
-  for (int e = 0; e < f.experts; e++)
-    if (counts[e]) {
-      int ready = memory_ready(weights_slot(y->experts[e].weights));
-      if (ready)
-        f.cache.stats.row_own += counts[e];
-      else
-        f.cache.stats.row_ssd += counts[e];
-      if (!weights_load(y->experts[e].weights)) {
-        for (int j = 0; j < f.experts; j++)
-          if (counts[j])
-            memory_pin(weights_slot(y->experts[j].weights), 0);
-        return 0;
-      }
-      f.cache.stats.row_unique++;
-    }
+  if (!experts_acquire(&f.routed, y->experts, (const uint32_t *)f.selected.ptr,
+                       (const float *)f.coefficients.ptr, n, &f.cache.stats))
+    return 0;
   gpu_begin();
-  unary(f.zero, &f.result, n * f.hidden);
-  for (int e = 0; e < f.experts; e++)
-    if (counts[e]) {
-      uint32_t dims[2] = {(uint32_t)f.hidden, (uint32_t)counts[e]};
-      size_t offset = (size_t)offsets[e] * sizeof(Entry);
-      gpu_kern(f.gather);
-      gpu_buf(0, &f.mixed, 0);
-      gpu_buf(1, &f.entries, offset);
-      gpu_buf(2, &f.gathered, 0);
-      gpu_bytes(3, dims, sizeof dims);
-      gpu_go((dims[0] * dims[1] + 255) / 256, 1, 1, 256, 1, 1);
-      feed_forward(y->experts + e, &f.gathered, &f.expert_out, counts[e], 1);
-      gpu_kern(f.scatter);
-      gpu_buf(0, &f.expert_out, 0);
-      gpu_buf(1, &f.entries, offset);
-      gpu_buf(2, &f.result, 0);
-      gpu_bytes(3, dims, sizeof dims);
-      gpu_go((dims[0] * dims[1] + 255) / 256, 1, 1, 256, 1, 1);
-    }
+  experts_encode(&f.routed, y->experts, &f.mixed);
+  for (int i = 0; i < f.routed.active; i++) {
+    int e = f.routed.active_ids[i];
+    int count = experts_count(&f.routed, e);
+    if (experts_grouped(&f.routed, e)) continue;
+    uint32_t dims[2] = {(uint32_t)f.hidden, (uint32_t)count};
+    gpu_kern(f.gather);
+    gpu_buf(0, &f.mixed, 0);
+    gpu_buf(1, &f.routed.entries, experts_entry_offset(&f.routed, e));
+    gpu_buf(2, &f.gathered, 0);
+    gpu_bytes(3, dims, sizeof dims);
+    gpu_go((dims[0] * dims[1] + 255) / 256, 1, 1, 256, 1, 1);
+    Buf out = experts_output(&f.routed, e);
+    feed_forward(y->experts + e, &f.gathered, &out, count, 1);
+  }
+  experts_sum(&f.routed, &f.result);
   uint32_t dims[2] = {(uint32_t)f.hidden, (uint32_t)n};
   gpu_kern(f.shared_sum);
   gpu_buf(0, &f.result, 0);
@@ -1108,9 +1066,7 @@ static int routed(const FlashLayer *y, int n) {
   gpu_go((dims[0] * dims[1] + 255) / 256, 1, 1, 256, 1, 1);
   gpu_commit();
   gpu_sync();
-  for (int e = 0; e < f.experts; e++)
-    if (counts[e])
-      memory_pin(weights_slot(y->experts[e].weights), 0);
+  experts_release(&f.routed, y->experts);
   gpu_begin();
   return 1;
 }

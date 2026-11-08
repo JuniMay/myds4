@@ -6,6 +6,7 @@
 | --- | --- |
 | `src/engine/` | C interface, Metal commands, file access, tokenization, sampling and media decoding. |
 | `src/model/model.*` | Model registry and common execution interface. |
+| `src/model/weights.*`, `experts.*`, `linear.*` | Reloadable weights, routed-expert batches and matrix products. |
 | `src/model/deepseek/` | DeepSeek layers, experts, Engram, prefill planning and concurrent schedules. |
 | `src/model/qwen/` | Qwen text layers, recurrent state, MTP and vision encoder. |
 | `src/model/nemotron/` | Transcribe's language backbone, speech encoder and DFlash2 drafter. |
@@ -33,6 +34,27 @@ the process. Model metadata remains registered. Weight groups can be unloaded un
 memory pressure and restored from the same checkpoint. Dense weights are
 one cache entry per model; expert entries depend on the MoE backbone, so
 experts leave before routers, attention and shared weights.
+
+Routed experts share the process memory budget and dependency rules. Flash-Next
+and Nemotron also share the expert batch planner: it groups selected rows by
+expert, pins every selection before loading misses, records cache use, and
+retains the original expert order for each row's mixture. Their NVFP4 backend
+executes small groups together. Large groups use each model's prompt matrix
+path. Workspaces remain charged to the model-memory pool.
+
+The shared weight loader packs a cached expert's matrices and scales into
+one Metal allocation with aligned views. Loading registers that allocation
+once; eviction releases and accounts for it once. Checkpoint bytes and
+scale decoding remain unchanged. Tensors that require a separate aligned
+read buffer retain their own allocations.
+
+Routing and numerical boundaries belong to the model. Flash-Next uses SwiGLU
+and rounds each expert's contribution and each addition to BF16. Nemotron uses
+squared ReLU, accumulates contributions in FP32, then rounds the mixture.
+The shared backend selects separate compiled kernels for these rules.
+DeepSeek uses its MXFP4 and GGUF expert kernels, which already combine expert
+work and overlap ready experts with pending reads. Its streaming cache uses
+the same memory pool while retaining its read scheduling and packed layouts.
 
 ## Scheduling and state
 
@@ -185,9 +207,8 @@ Snapshots retain the rolling state needed to fork a conversation.
 
 Experts are independent entries in the shared model-memory pool. Selected
 experts stay pinned through their GPU work; their backbone is retained
-until its dependent entries have been released. The initial implementation
-loads selected misses before executing each layer's routed work. It does
-not yet overlap these loads with expert computation. Prefill uses adaptive
+until its dependent entries have been released. Selected misses load before
+each layer's routed work. These loads do not yet overlap expert computation. Prefill uses adaptive
 chunks of up to 128 rows. Decoding batches up to eight request rows.
 Flash-Next MTP and context-copy verification are not implemented.
 

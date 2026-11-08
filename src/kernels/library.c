@@ -22,6 +22,8 @@ static const char source[] = {
     , '\n',
 #embed "products.metal"
     , '\n',
+#embed "experts.metal"
+    , '\n',
 #embed "deltanet.metal"
     , '\n',
 #embed "gqa.metal"
