@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <unistd.h>
 
-static int vector[4], few[4], matrix[4], convert, initialized;
+static int vector[4], few[4], three[4], matrix[4], convert, initialized;
 
 void linear_init(void) {
   if (initialized)
@@ -11,10 +11,12 @@ void linear_init(void) {
   gpu_start();
   static const char *vectors[] = {"mv1_nvfp4", "mv1_fp8", "mv1_bf16", "mv1_mxfp8"};
   static const char *several[] = {"mvr_nvfp4", "mvr_fp8", "mvr_bf16", "mvr_mxfp8"};
+  static const char *triples[] = {"mvr3_nvfp4", "mvr3_fp8", "mvr3_bf16"};
   static const char *matrices[] = {"gemm_nvfp4", "gemm_fp8", "gemm_bf16", "gemm_mxfp8"};
   for (int i = 0; i < 4; i++) {
     vector[i] = gpu_kernel(vectors[i]);
     few[i] = gpu_kernel(several[i]);
+    three[i] = i < 3 ? gpu_kernel(triples[i]) : few[i];
     matrix[i] = gpu_kernel(matrices[i]);
   }
   convert = gpu_kernel("x_bf16");
@@ -102,7 +104,7 @@ void linear_product(const Linear *m, const Buf *x, size_t xo, const Buf *y, size
       uint32_t rows, cols, n;
       float scale;
     } p = {(uint32_t)m->rows, (uint32_t)m->cols, (uint32_t)rows, m->scale};
-    gpu_kern(rows == 1 ? vector[format] : few[format]);
+    gpu_kern(rows == 1 ? vector[format] : rows == 3 ? three[format] : few[format]);
     gpu_buf(0, &m->w, 0);
     gpu_buf(1, scales, 0);
     gpu_buf(2, x, xo);

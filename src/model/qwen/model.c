@@ -67,7 +67,7 @@ static Buf QH;  // a prompt pass's queries as FP16, by head
 static Buf PART, ML;  // attention blocks' partial sums, for states of up to `blocks` * BLK positions
 static int blocks;
 static int workspace_rows;
-static int K_gate_up[3], K_add_norm, K_concat, K_q_half, K_attend_prompt, K_embed, K_rms_norm, K_l2_norm, K_conv, K_gdn_gates, K_gdn, K_qk_rope, K_kv_store, K_attend_block,
+static int K_gate_up[3], K_gate_up3, K_add_norm, K_concat, K_q_half, K_attend_prompt, K_embed, K_rms_norm, K_l2_norm, K_conv, K_gdn_gates, K_gdn, K_qk_rope, K_kv_store, K_attend_block,
     K_attend_combine, K_swiglu, K_add;
 
 struct QwenState {
@@ -251,6 +251,7 @@ static void prepare(const char *dir, int drafts) {
   gpu_start();
   linear_init();
   K_gate_up[0] = gpu_kernel("gate_up_nvfp4"), K_gate_up[1] = gpu_kernel("gate_up_fp8"), K_gate_up[2] = gpu_kernel("gate_up_bf16");
+  K_gate_up3 = gpu_kernel("gate_up3_nvfp4");
   K_add_norm = gpu_kernel("add_norm");
   K_concat = gpu_kernel("concat");
   K_q_half = gpu_kernel("gqa_q_half"), K_attend_prompt = gpu_kernel("gqa_prompt");
@@ -550,7 +551,7 @@ static void gate_up(const Layer *y, int n) {
   const Mat *g = &y->gate, *u = &y->up;
   int f = g->kind == 'n' ? 0 : g->kind == '8' ? 1 : 2;
   Mv p = {(uint32_t)g->rows, (uint32_t)g->cols, (uint32_t)n, g->scale};
-  gpu_kern(K_gate_up[f]);
+  gpu_kern(n == 3 && f == 0 ? K_gate_up3 : K_gate_up[f]);
   gpu_buf(0, &g->w, 0), gpu_buf(1, g->kind == 'n' ? &g->s : &g->w, 0);
   gpu_buf(5, &u->w, 0), gpu_buf(6, u->kind == 'n' ? &u->s : &u->w, 0);
   gpu_buf(2, &XN, 0), gpu_buf(3, &HH, 0), gpu_bytes(4, &p, sizeof p), gpu_bytes(7, &u->scale, 4);

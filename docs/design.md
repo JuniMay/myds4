@@ -122,6 +122,11 @@ Decoding handles up to eight request rows. Prefill uses the Metal matrix
 units and different operand rounding from one-row decoding. Therefore
 reusing decoded state need not equal a cold prefill of the same text.
 
+Three-row products use kernels with three accumulators per weight row.
+The NVFP4 gate/up kernel uses the same fixed row count. This covers target
+verification with two MTP proposals and avoids reserving accumulators for
+eight rows. The arithmetic and reduction order remain unchanged.
+
 With drafting enabled, the MTP head proposes up to five additional tokens.
 The first proposal uses the target hidden after final normalization. Each
 subsequent proposal uses the preceding MTP head output after its own final

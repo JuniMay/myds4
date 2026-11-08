@@ -76,27 +76,27 @@ kernel void mv1(device const uchar *W [[buffer(0)]], device const uchar *S [[buf
   if (lane == 0) y[row] = acc * p.scale;
 }
 
-template <int F>
+template <int F, int R = TM>
 kernel void mvr(device const uchar *W [[buffer(0)]], device const uchar *S [[buffer(1)]],
                 device const float *x [[buffer(2)]], device float *y [[buffer(3)]], constant Mv &p [[buffer(4)]],
                 uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
                 uint lane [[thread_index_in_simdgroup]]) {
   uint row = tg * 8 + sg, chunks = p.cols / 16;
   if (row >= p.rows) return;
-  float acc[TM];
-  for (uint t = 0; t < TM; t++) acc[t] = 0;
+  float acc[R];
+  for (uint t = 0; t < R; t++) acc[t] = 0;
   for (uint c = lane; c < chunks; c += 32) {
     float4 w[4];
     chunk<F>(W, S, row, p.cols, c, w);
-    for (uint t = 0; t < TM; t++) {
-      if (t >= p.n) break;
+    for (uint t = 0; t < R; t++) {
+      if (R == TM && t >= p.n) break;
       device const float4 *xv = (device const float4 *)(x + (size_t)t * p.cols) + c * 4;
       float4 d = w[0] * xv[0] + w[1] * xv[1] + w[2] * xv[2] + w[3] * xv[3];
       acc[t] += d.x + d.y + d.z + d.w;
     }
   }
-  for (uint t = 0; t < TM; t++) {
-    if (t >= p.n) break;
+  for (uint t = 0; t < R; t++) {
+    if (R == TM && t >= p.n) break;
     float v = simd_sum(acc[t]);
     if (lane == 0) y[(size_t)t * p.rows + row] = v * p.scale;
   }
@@ -104,7 +104,7 @@ kernel void mvr(device const uchar *W [[buffer(0)]], device const uchar *S [[buf
 
 // h[t][r] = silu(G x)[t][r] * (U x)[t][r] for the n rows of x (1 to TM): a
 // simdgroup a row of both matrices, each as mv1/mvr computes it.
-template <int F>
+template <int F, int R = TM>
 kernel void gate_up(device const uchar *Wg [[buffer(0)]], device const uchar *Sg [[buffer(1)]],
                     device const uchar *Wu [[buffer(5)]], device const uchar *Su [[buffer(6)]],
                     device const float *x [[buffer(2)]], device float *h [[buffer(3)]], constant Mv &p [[buffer(4)]],
@@ -112,14 +112,14 @@ kernel void gate_up(device const uchar *Wg [[buffer(0)]], device const uchar *Sg
                     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   uint row = tg * 8 + sg, chunks = p.cols / 16;
   if (row >= p.rows) return;
-  float ag[TM], au[TM];
-  for (uint t = 0; t < TM; t++) ag[t] = 0, au[t] = 0;
+  float ag[R], au[R];
+  for (uint t = 0; t < R; t++) ag[t] = 0, au[t] = 0;
   for (uint c = lane; c < chunks; c += 32) {
     float4 wg[4], wu[4];
     chunk<F>(Wg, Sg, row, p.cols, c, wg);
     chunk<F>(Wu, Su, row, p.cols, c, wu);
-    for (uint t = 0; t < TM; t++) {
-      if (t >= p.n) break;
+    for (uint t = 0; t < R; t++) {
+      if (R == TM && t >= p.n) break;
       device const float4 *xv = (device const float4 *)(x + (size_t)t * p.cols) + c * 4;
       float4 dg = wg[0] * xv[0] + wg[1] * xv[1] + wg[2] * xv[2] + wg[3] * xv[3];
       float4 du = wu[0] * xv[0] + wu[1] * xv[1] + wu[2] * xv[2] + wu[3] * xv[3];
@@ -127,8 +127,8 @@ kernel void gate_up(device const uchar *Wg [[buffer(0)]], device const uchar *Sg
       au[t] += du.x + du.y + du.z + du.w;
     }
   }
-  for (uint t = 0; t < TM; t++) {
-    if (t >= p.n) break;
+  for (uint t = 0; t < R; t++) {
+    if (R == TM && t >= p.n) break;
     float g = simd_sum(ag[t]) * p.scale, u = simd_sum(au[t]) * up_scale;
     if (lane == 0) h[(size_t)t * p.rows + row] = g * sigm(g) * u;
   }
@@ -149,6 +149,11 @@ template [[host_name("mv1_bf16")]] kernel mv1_t mv1<2>;
 template [[host_name("mv1_mxfp8")]] kernel mv1_t mv1<3>;
 template [[host_name("mvr_mxfp8")]] kernel mvr_t mvr<3>;
 template [[host_name("gate_up_mxfp8")]] kernel gate_up_t gate_up<3>;
+
+template [[host_name("mvr3_nvfp4")]] kernel mvr_t mvr<0, 3>;
+template [[host_name("mvr3_fp8")]] kernel mvr_t mvr<1, 3>;
+template [[host_name("mvr3_bf16")]] kernel mvr_t mvr<2, 3>;
+template [[host_name("gate_up3_nvfp4")]] kernel gate_up_t gate_up<0, 3>;
 
 // ---- matrices times a prompt's rows, on the matrix units ----
 //
