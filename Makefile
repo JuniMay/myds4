@@ -64,6 +64,10 @@ build/tests/memory-model: tests/model/memory.c build/libmyds4.a $(MODEL_HEADERS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/model/memory.c build/libmyds4.a $(LDLIBS)
 
+build/tests/qwen-mtp: tests/model/qwen_mtp.c build/libmyds4.a $(MODEL_HEADERS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -o $@ tests/model/qwen_mtp.c build/libmyds4.a $(LDLIBS)
+
 build/tests/metadata: tests/unit/checkpoint.c build/libmyds4.a $(MODEL_HEADERS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/unit/checkpoint.c build/libmyds4.a $(LDLIBS)

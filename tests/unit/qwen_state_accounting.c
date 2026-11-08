@@ -25,7 +25,7 @@ static void fixture_sync(void) {}
 
 static size_t owned_bytes(const QwenState *s) {
   size_t n = s->kv.size;
-  for (int i = 0; i < 2; i++) n += s->gdn[i].size + s->conv[i].size + s->hid[i].size;
+  for (int i = 0; i < s->copies; i++) n += s->gdn[i].size + s->conv[i].size + s->hid[i].size;
   return n;
 }
 int main(void) {
@@ -35,6 +35,10 @@ int main(void) {
   mtp = 1;
   int checks = 0, failures = 0;
 #define CHECK(x) do { checks++; if (!(x)) failures++, fprintf(stderr, "FAIL: %s\n", #x); } while (0)
+  Options chained = {.draft = 3, .dump_fd = -1, .routes_fd = -1};
+  CHECK(q_refuse(&chained) == NULL);
+  for (int copies = 2; copies <= 6; copies += 2) {
+  state_copies = copies;
   QwenState *s = qwen_state_new();
   CHECK(q_state_bytes(NULL, 1) == owned_bytes(s));
   CHECK(q_state_bytes((ModelState *)s, 0) == owned_bytes(s));
@@ -45,6 +49,7 @@ int main(void) {
     CHECK(q_state_bytes((ModelState *)s, 1) == owned_bytes(s));
   }
   qwen_state_free(s);
+  }
   unown(&PART), unown(&ML);
   free(owned);
   CHECK(allocated == 0);

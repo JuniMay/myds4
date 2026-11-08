@@ -45,7 +45,7 @@ of each architecture per process.
 | `batch` | Maximum admitted requests for this model; default 4, capped at 6 for DeepSeek and 8 for Qwen. |
 | `temperature`, `top_p`, `top_k`, `seed` | Defaults for requests that omit them or send null. Request values override them. `top_k: 0` uses the full vocabulary. |
 | `think` | Default reasoning effort, 0 for off and 1–100 for enabled reasoning. |
-| `draft` | Native speculative proposals: DeepSeek DSpark 0–5; Qwen MTP 0–1. |
+| `draft` | Native speculative proposals: DeepSeek DSpark 0–5; Qwen chained MTP 0–5. |
 | `lookup` | `off` or 1–15 context-copy proposals, limited by the model's verification capacity. |
 
 Qwen's generation configuration supplies sampling defaults when the entry

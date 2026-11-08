@@ -59,7 +59,7 @@ static Mat head;
 // The MTP head (mtp.*): pre-fc norms, fc, one full-attention layer (its keys
 // after the model's, as attention layer c.attention), its norm; the
 // embedding and head are the model's.
-static int mtp;
+static int mtp, state_copies = 2;
 static Layer M;
 static Mat mtp_fc;
 static Buf mtp_norm_e, mtp_norm_h, mtp_norm;
@@ -76,16 +76,14 @@ static int K_mv1[3], K_mvr[3], K_mm[3], K_gate_up[3], K_add_norm, K_x_bf16, K_co
     K_attend_combine, K_swiglu, K_add;
 
 struct QwenState {
-  Buf gdn[2], conv[2];  // the current recurrent state and the spare (a saved row's)
+  Buf gdn[ROWS], conv[ROWS];  // current state and verified-prefix checkpoints
   Buf kv;               // keys then values: [attention layer][cap][kv head][head dim], FP16
-  Buf hid[2];           // the last row's hidden (the MTP head's input), and the saved row's
-  int cur, pos, cap;
-  int rope_delta, saved_rope_delta;
-  int saved;  // the position after the saved row that the spare holds (-1: none)
-  // The MTP head's keys (model.h's interface fills them): the first position
-  // without its key, and the token after the saved row when that row's key is
-  // still owed (a kept draft; -1: none).
-  int mtp_next, mtp_kept;
+  Buf hid[ROWS];         // the corresponding hidden vectors for the MTP head
+  int cur, pos, cap, copies, verify_origin;
+  int rope_delta;
+  int saved_pos[ROWS], saved_rope[ROWS];
+  int mtp_next; // first position whose draft-head key is not committed
+
 };
 
 struct QwenSnap {
@@ -408,6 +406,7 @@ static int prepare_rows(int requested, int position) {
 int qwen_load(const char *dir, int drafts) {
   double began = now();
   if (!checkpoint) prepare(dir, drafts);
+  state_copies = mtp && drafts > 1 ? drafts + 1 : 2;
   MemorySlot *core = weights_slot(dense), *work = memory_current();
   memory_pin(core, 1);
   uint64_t required = weights_required(dense) + work->payload - workspace_bytes() + workspace(128, 0, 0);
@@ -437,7 +436,7 @@ static size_t kv_bytes(int cap) { return (size_t)2 * kv_layers() * cap * c.kv_he
 static size_t hid_bytes(void) { return (size_t)c.hidden * 4; }
 
 uint64_t qwen_state_bytes(int positions) {
-  return 2 * (gdn_bytes() + conv_bytes() + hid_bytes()) + kv_bytes(positions);
+  return state_copies * (gdn_bytes() + conv_bytes() + hid_bytes()) + kv_bytes(positions);
 }
 uint64_t qwen_snap_bytes(void) { return gdn_bytes() + conv_bytes() + hid_bytes(); }
 int qwen_mtp_available(void) { return mtp; }
@@ -445,11 +444,12 @@ int qwen_mtp_available(void) { return mtp; }
 QwenState *qwen_state_new(void) {
   qwen_reside(1);
   QwenState *s = calloc(1, sizeof *s);
-  for (int i = 0; i < 2; i++)
+  s->copies = state_copies;
+  for (int i = 0; i < s->copies; i++)
     s->gdn[i] = kv_zeros(gdn_bytes()), s->conv[i] = kv_zeros(conv_bytes()), s->hid[i] = kv_zeros(hid_bytes());
   s->cap = 1024;
   s->kv = own(gpu_alloc_kv(kv_bytes(s->cap)));
-  s->saved = -1, s->mtp_kept = -1;
+  for (int i = 0; i < s->copies; i++) s->saved_pos[i] = -1;
   grow_blocks(s->cap);
   return s;
 }
@@ -457,7 +457,7 @@ QwenState *qwen_state_new(void) {
 void qwen_state_free(QwenState *s) {
   if (!s) return;
   gpu_sync();
-  for (int i = 0; i < 2; i++) unown(&s->gdn[i]), unown(&s->conv[i]), unown(&s->hid[i]);
+  for (int i = 0; i < s->copies; i++) unown(&s->gdn[i]), unown(&s->conv[i]), unown(&s->hid[i]);
   unown(&s->kv);
   free(s);
 }
@@ -494,15 +494,16 @@ void qwen_state_copy(QwenState *dst, const QwenState *src, int positions) {
   memcpy(dst->conv[dst->cur].ptr, src->conv[src->cur].ptr, conv_bytes());
   memcpy(dst->hid[dst->cur].ptr, src->hid[src->cur].ptr, hid_bytes());
   kv_rows(dst->kv.ptr, dst->cap, src->kv.ptr, src->cap, positions);
-  dst->pos = positions, dst->saved = -1;
+  dst->pos = positions;
+  for (int i = 0; i < dst->copies; i++) dst->saved_pos[i] = -1;
   dst->rope_delta = src->rope_delta;
-  dst->mtp_next = positions > 0 ? positions - 1 : 0, dst->mtp_kept = -1;  // the last key waits for the next token
+  dst->mtp_next = positions > 0 ? positions - 1 : 0;  // the last key waits for the next token
 }
 
-void qwen_state_back(QwenState *s) {
-  if (s->saved < 0) die("qwen: no saved row to return to");
-  s->cur = !s->cur, s->pos = s->saved, s->saved = -1;
-  s->rope_delta = s->saved_rope_delta;
+void qwen_state_back(QwenState *s, int checkpoint) {
+  s->cur = checkpoint;
+  s->pos = s->saved_pos[checkpoint];
+  s->rope_delta = s->saved_rope[checkpoint];
 }
 
 QwenSnap *qwen_snap_take(const QwenState *s) {
@@ -524,9 +525,10 @@ void qwen_snap_restore(QwenState *s, const QwenSnap *n) {
   memcpy(s->gdn[s->cur].ptr, n->gdn.ptr, gdn_bytes());
   memcpy(s->conv[s->cur].ptr, n->conv.ptr, conv_bytes());
   memcpy(s->hid[s->cur].ptr, n->hid.ptr, hid_bytes());
-  s->pos = n->pos, s->saved = -1;
+  s->pos = n->pos;
+  for (int i = 0; i < s->copies; i++) s->saved_pos[i] = -1;
   s->rope_delta = n->rope_delta;
-  s->mtp_next = n->pos > 0 ? n->pos - 1 : 0, s->mtp_kept = -1;
+  s->mtp_next = n->pos > 0 ? n->pos - 1 : 0;
 }
 
 int qwen_snap_pos(const QwenSnap *n) { return n->pos; }
@@ -775,8 +777,8 @@ static const float *pass(const QwenRow *rows, int n, int logits, int prompt) {
     QwenState *s = rows[i].state;
     k = i > 0 && rows[i - 1].state == s ? k + 1 : 0;
     uint64_t kv = s->kv.gpu;
-    seq[i] = (Seq){.gdn = s->gdn[s->cur].gpu, .gdn_save = rows[i].save ? s->gdn[!s->cur].gpu : 0,
-                   .conv = s->conv[s->cur].gpu, .conv_save = rows[i].save ? s->conv[!s->cur].gpu : 0,
+    seq[i] = (Seq){.gdn = s->gdn[s->cur].gpu, .gdn_save = rows[i].save ? s->gdn[rows[i].save - 1].gpu : 0,
+                   .conv = s->conv[s->cur].gpu, .conv_save = rows[i].save ? s->conv[rows[i].save - 1].gpu : 0,
                    .k = kv, .v = kv + kv_bytes(s->cap) / 2, .pos = (uint32_t)(s->pos + k), .cap = (uint32_t)s->cap};
     positions(&seq[i], s, s->pos + k, prompt);
   }
@@ -843,7 +845,7 @@ static const float *pass(const QwenRow *rows, int n, int logits, int prompt) {
     for (int i = 0; i < n; i++) {
       QwenState *s = rows[i].state;
       if (i + 1 == n || rows[i + 1].state != s) cp[mm++] = (GpuCopy){&X, &s->hid[s->cur], (size_t)i * hb, 0, hb};
-      if (rows[i].save) cp[mm++] = (GpuCopy){&X, &s->hid[!s->cur], (size_t)i * hb, 0, hb};
+      if (rows[i].save) cp[mm++] = (GpuCopy){&X, &s->hid[rows[i].save - 1], (size_t)i * hb, 0, hb};
     }
     gpu_copies(cp, mm);
     if (m) mtp_rows(m, 0);
@@ -857,7 +859,11 @@ static const float *pass(const QwenRow *rows, int n, int logits, int prompt) {
     if (row->rope_w > next) next = row->rope_w;
     s->rope_delta = next - (int)row->pos;
     s->pos++;
-    if (rows[i].save) s->saved = s->pos, s->saved_rope_delta = s->rope_delta;
+    if (rows[i].save) {
+      int at = rows[i].save - 1;
+      s->saved_pos[at] = s->pos;
+      s->saved_rope[at] = s->rope_delta;
+    }
     if (mtp && prompt) s->mtp_next = s->pos - 1;  // every key of the pass's positions but its last
   }
   return logits ? (const float *)LOGITS.ptr : 0;
@@ -875,10 +881,9 @@ const float *qwen_mtp(const QwenMtpRow *rows, int n, int logits) {
   Seq *sm = (Seq *)SEQM.ptr;
   for (int i = 0; i < n; i++) {
     QwenState *s = rows[i].state;
-    int pos = rows[i].saved ? s->saved - 1 : s->pos - 1;
-    if (pos < 0) die("qwen: an MTP row without a hidden");
-    if (rows[i].token < 0 || rows[i].token >= c.vocab) die("qwen: token %d outside the vocabulary", rows[i].token);
-    cp[i] = (GpuCopy){&s->hid[rows[i].saved ? !s->cur : s->cur], &HB, 0, (size_t)i * hb, hb};
+    int hidden = rows[i].saved ? rows[i].saved - 1 : s->cur;
+    int pos = rows[i].saved ? s->saved_pos[hidden] - 1 : s->pos - 1;
+    cp[i] = (GpuCopy){&s->hid[hidden], &HB, 0, (size_t)i * hb, hb};
     tm[i] = rows[i].token, sm[i] = mtp_seq(s, pos, 0);
     ((uint64_t *)EMBM.ptr)[i] = 0;
   }
@@ -909,7 +914,7 @@ static const char *q_refuse(const Options *o) {
     return "experts, ced, substitute, online-predictor, predictor-state, prefill-prune, draft-cache, cache, "
            "cache-half-life, cache-read-cost, dump-fd, routes-fd, runahead and pipeline apply to DeepSeek's routed experts and "
            "layers, which a qwen3_5 model does not have";
-  if (o->draft > 1) return "draft: the MTP head drafts one token";
+  if (o->draft > 5) return "draft: Qwen supports up to five chained MTP proposals";
   return 0;
 }
 
@@ -917,7 +922,7 @@ static int q_load(const char *dir, const Options *o) {
   const char *why = q_refuse(o);
   if (why) die("qwen3_5: %s", why);
   qopt = *o;
-  if (!qwen_load(dir, o->draft != 0)) return 0;
+  if (!qwen_load(dir, o->draft)) return 0;
   last_pass = now();
   counted.dense_bytes = weights_resident_bytes(dense);
   return 1;
@@ -937,8 +942,8 @@ static const float *decoded(const float *logits, int rows, double t0, double g0)
 
 static int q_vocab(void) { return c.vocab; }
 static int q_max_rows(void) { return ROWS; }
-static int q_max_verify(void) { return mtp ? 2 : 1; }
-static int q_draft_block(void) { return mtp && qopt.draft > 0 ? 1 : 0; }
+static int q_max_verify(void) { return mtp ? state_copies : 1; }
+static int q_draft_block(void) { return mtp ? qopt.draft : 0; }
 static int q_rewind(void) { return 0; }
 static int q_stop(int token) { return qwen_stop(token); }
 static int q_prefill_rows(void) { return PF; }
@@ -980,21 +985,13 @@ static void q_snapshot_free(ModelSnapshot *x) {
 static size_t q_snapshot_bytes(int with_logits) { return qwen_snap_bytes() + (with_logits ? (size_t)c.vocab * 4 : 0); }
 static const float *q_snapshot_logits(const ModelSnapshot *x) { return ((const Taken *)x)->logits; }
 
-// The MTP head's keys a state owes before the token at its position runs: a
-// kept draft's (the saved row's hidden), then its last row's with `token`.
-// Only while drafts are on: without them no key is read. With logits, the
-// last row's draft logits.
+// Complete the key at the last committed target hidden, paired with its next token.
 static const float *mtp_fill(QwenState *s, int token, int logits) {
-  if (!mtp || qopt.draft <= 0) return 0;
-  QwenMtpRow rows[2];
-  int n = 0;
-  if (s->mtp_next == s->pos - 2) {
-    if (s->mtp_kept < 0 || s->saved != s->pos - 1) die("qwen3_5: an MTP key owed without its hidden");
-    rows[n++] = (QwenMtpRow){s, s->mtp_kept, 1};
-  } else if (s->mtp_next < s->pos - 2) die("qwen3_5: MTP keys %d to %d owed", s->mtp_next, s->pos - 1);
-  if (s->pos > 0 && (s->mtp_next < s->pos || logits)) rows[n++] = (QwenMtpRow){s, token, 0};
-  s->mtp_next = s->pos, s->mtp_kept = -1;
-  return n ? qwen_mtp(rows, n, logits ? 1 : 0) : 0;
+  if (!mtp || qopt.draft <= 0 || s->pos == 0) return NULL;
+  if (s->mtp_next >= s->pos && !logits) return NULL;
+  QwenMtpRow row = {s, token, 0};
+  s->mtp_next = s->pos;
+  return qwen_mtp(&row, 1, logits);
 }
 
 static const float *q_prefill(ModelState *st, const int *tokens, int n, int from, int replay, int capture,
@@ -1005,10 +1002,6 @@ static const float *q_prefill(ModelState *st, const int *tokens, int n, int from
   if (captured) *captured = 0;
   if (capture >= 0 && (capture <= from || capture >= n || !captured))
     die("qwen3_5: a capture at %d in a prefill of positions %d to %d", capture, from, n);
-  if (mtp && qopt.draft > 0 && s->mtp_next == from - 2) {  // a kept draft's key, before the prompt pass fills the next
-    QwenMtpRow r = {s, s->mtp_kept, 1};
-    qwen_mtp(&r, 1, 0);
-  }
   static QwenRow rows[PF];
   // with every position's logits, passes of ROWS rows (the head takes at most
   // ROWS): a prompt's rows give the same logits however it is split
@@ -1047,26 +1040,52 @@ static const float *q_rows(ModelState *const *states, const int *tokens, const i
 
 static void q_draft(ModelState *st, int token, int pos, int *drafts, int n) {
   QwenState *s = (QwenState *)st;
+  qwen_state_reserve(s, pos + n + 1);
   drafts[0] = sample_argmax(mtp_fill(s, token, 1), c.vocab);
+  for (int i = 1; i < n; i++) {
+    // The preceding draft head's hidden predicts the next target hidden.
+    GpuCopy copy = {&X, &HB, 0, 0, hid_bytes()};
+    ((int32_t *)TOKM.ptr)[0] = drafts[i - 1];
+    ((uint64_t *)EMBM.ptr)[0] = 0;
+    ((Seq *)SEQM.ptr)[0] = mtp_seq(s, pos + i - 1, 0);
+    prompt_pass = 0;
+    gpu_begin();
+    gpu_copies(&copy, 1);
+    mtp_rows(1, 1);
+    gpu_commit(); gpu_sync();
+    drafts[i] = sample_argmax((const float *)LOGITS.ptr, c.vocab);
+  }
 }
 
 static const float *q_verify(ModelState *st, const int *tokens, int m, int pos) {
   QwenState *s = (QwenState *)st;
   if ((m > workspace_rows || pos + m > blocks * BLK) && !prepare_rows(m, pos + m)) return NULL;
   mtp_fill(s, tokens[0], 0);
-  QwenRow rows[2] = {{s, tokens[0], m > 1}, {s, m > 1 ? tokens[1] : 0, 0}};
+  QwenRow rows[ROWS];
+  s->verify_origin = s->cur;
+  for (int i = 0; i < m; i++) {
+    int save = i + 1 < m ? (s->cur + i + 1) % s->copies + 1 : 0;
+    rows[i] = (QwenRow){s, tokens[i], save};
+  }
   double t0 = last_pass = now(), g0 = gpu_busy;
   return last_logits = decoded(qwen_forward(rows, m, m), m, t0, g0);
 }
 
 static void q_accept(ModelState *st, const int *tokens, int n, int pos) {
   QwenState *s = (QwenState *)st;
-  if (n == s->pos - pos) {  // every row kept: a kept draft owes the saved row's key
-    if (n == 2) s->mtp_kept = tokens[1];
-    return;
+  if (n < s->pos - pos) qwen_state_back(s, (s->verify_origin + n) % s->copies);
+  // Replace speculative draft keys with keys from the accepted target hiddens.
+  // This also leaves snapshots and copied prefixes with committed MTP history.
+  if (mtp && n > 1) {
+    QwenMtpRow rows[ROWS];
+    for (int i = 0; i + 1 < n; i++) {
+      int checkpoint = (s->verify_origin + i + 1) % s->copies;
+      rows[i] = (QwenMtpRow){s, tokens[i + 1], checkpoint + 1};
+    }
+    qwen_mtp(rows, n - 1, 0);
   }
-  if (n != 1 || s->pos - pos != 2) die("qwen3_5: %d of %d rows kept", n, s->pos - pos);
-  qwen_state_back(s);
+  s->mtp_next = s->pos > 0 ? s->pos - 1 : 0;
+  last_logits = (const float *)LOGITS.ptr + (size_t)(n - 1) * c.vocab;
 }
 
 static void q_seek(ModelState *s, const int *tokens, int pos) {}

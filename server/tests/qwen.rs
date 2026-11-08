@@ -364,8 +364,11 @@ fn drafts_keep_to_max_tokens_and_the_context_end() {
         return;
     };
     let _one = one_model();
-    for ctx in [160, 161] {
-        let s = Server::start(&dir, &["--ctx", &ctx.to_string(), "--draft", "1"]);
+    for (ctx, depth) in [(160, 1), (161, 3), (162, 5)] {
+        let s = Server::start(
+            &dir,
+            &["--ctx", &ctx.to_string(), "--draft", &depth.to_string()],
+        );
         for max_tokens in [20, 21, 22, 23] {
             let answer = s.chat(&body(counting(), max_tokens, false));
             let made = answer["usage"]["completion_tokens"].as_i64().unwrap();
@@ -412,7 +415,7 @@ fn deepseek_and_qwen_share_one_process() {
     };
     let _one = one_model();
     let models = json!({"memory": 64, "kv_cache": 8, "reserve": 10, "models": [
-        {"model": deepseek, "experts": experts, "cache": 40},
+        {"model": deepseek, "experts": experts},
         {"model": qwen, "ctx": 4096}
     ]});
     let s = Server::with_config(models);

@@ -121,11 +121,16 @@ Decoding handles up to eight request rows. Prefill uses the Metal matrix
 units and different operand rounding from one-row decoding. Therefore
 reusing decoded state need not equal a cold prefill of the same text.
 
-With drafting enabled, the MTP head proposes one additional token. With
-`draft: 0`, its weights, attention rows and prefill work are omitted. Target verification processes
-that proposal together with the current token. Accepted proposals keep the
-corresponding state; rejection restores the saved state. Multiple active
-requests use ordinary batched decoding instead.
+With drafting enabled, the MTP head proposes up to five additional tokens.
+Each draft head output supplies the hidden input for the next proposal.
+Target verification processes the proposals together with the current token.
+It saves the recurrent state after each possible accepted prefix. Rejection
+selects the matching checkpoint without replaying the target layers. The
+draft head then replaces speculative keys with keys from accepted target
+hiddens. Target sampling keeps the same output distribution and random stream.
+With `draft: 0`, draft weights, attention rows and prefill work are omitted.
+Multiple active requests use ordinary batched decoding instead. Larger draft
+depths allocate more recurrent checkpoints in the separate KV budget.
 
 The vision encoder has 27 blocks, width 1,152 and 16 attention heads of 72
 values. It uses 16-pixel patches, a temporal patch size of two and a 2-by-2

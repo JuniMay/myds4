@@ -46,7 +46,7 @@ static void usage(void) {
         "  --check-batch  compare a token decoded alone with the same token decoded beside another sequence\n"
         "                (and, with --draft, in a verify pass): the logits must be equal\n"
         "  --draft N     verify up to N (1-5) drafts per pass, the model's own (DeepSeek's DSpark: up to 5;\n"
-        "                Qwen's MTP head: 1), using the requested sampler\n"
+        "                Qwen's chained MTP: up to 5), using the requested sampler\n"
         "  --lookup off|N  verify up to N (1-15) context-copy drafts; --draft supplies fallback (default off)\n"
         "  --draft-cache N  with --draft: expert slots per stage, 15-128 (default: all 128 preloaded);\n"
         "                smaller caches load the native selections on demand, within --memory\n"

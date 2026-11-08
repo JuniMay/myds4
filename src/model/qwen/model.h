@@ -41,7 +41,7 @@ void qwen_state_copy(QwenState *dst, const QwenState *src, int positions);
 typedef struct {
   QwenState *state;
   int32_t token;
-  int save;  // leave a copy of the recurrent state after this row (qwen_state_back)
+  int save;  // 0, or the checkpoint buffer index plus one
 } QwenRow;
 // Runs n rows (1 to QWEN_ROWS), each at its state's next position; a state's
 // rows must be consecutive. Returns the logits of the last `logits` rows
@@ -52,9 +52,8 @@ const float *qwen_forward(const QwenRow *rows, int n, int logits);
 // the same however a prompt is split into passes, and differs from
 // qwen_forward's by rounding.
 const float *qwen_prefill(const QwenRow *rows, int n, int logits);
-// Returns the state to its position after its last saved row: the rows run
-// after it are undone (their keys stay, to be overwritten).
-void qwen_state_back(QwenState *s);
+// Selects a verified-prefix checkpoint. Later keys remain to be overwritten.
+void qwen_state_back(QwenState *s, int checkpoint);
 
 // The MTP head (when the checkpoint has one: qwen_mtp_available). Row i
 // takes `token` as the token after its state's last hidden (with `saved`,
@@ -65,7 +64,7 @@ void qwen_state_back(QwenState *s);
 typedef struct {
   QwenState *state;
   int32_t token;
-  int saved;
+  int saved; // 0 for the current hidden, otherwise checkpoint index plus one
 } QwenMtpRow;
 int qwen_mtp_available(void);
 const float *qwen_mtp(const QwenMtpRow *rows, int n, int logits);

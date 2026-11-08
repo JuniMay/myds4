@@ -73,7 +73,7 @@ typedef struct {
   int pipeline;
 } myds4_deepseek_config;
 
-typedef struct { int draft; } myds4_qwen_config; // MTP proposal, 0 or 1
+typedef struct { int draft; } myds4_qwen_config; // chained MTP proposals, 0 to 5
 
 // Common settings and one architecture's options. The tag must match the
 // checkpoint. Each family validates its own option group.

@@ -60,7 +60,7 @@ const USAGE: &str = "usage: myds4-server [--config FILE | -m MODEL [model option
   --seed N        the seed of requests that set none (default: random for each)
   --think N       thinking effort 1-100 of requests that set none; 0 turns thinking off
   --ctx N         context capacity in tokens, at most 1048576 and the model's own (default: the most)
-  --draft N       verify up to N drafts per pass, the model's own (DeepSeek's DSpark 1-5, Qwen's MTP 1)
+  --draft N       verify up to N drafts per pass, the model's own (DeepSeek's DSpark and Qwen's chained MTP: 1-5)
   --lookup off|N  verify up to N (1-15) context-copy drafts; --draft supplies fallback
   DeepSeek only:
   --ced off|N     approximate prefill: replay N decoder tokens, 128-1048576 (default off), plus the rewind margin (8)
