@@ -55,34 +55,16 @@ kernel void flash_route(device const float *logits [[buffer(0)]], device uint *i
                         device float *weights [[buffer(2)]], constant FlashRoute &p [[buffer(3)]],
                         uint row [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]],
                         uint threads [[threads_per_threadgroup]]) {
-  threadgroup float partial[32], selected[16];
-  threadgroup uint indexes[32], winner;
+  threadgroup float partial[32], selected[16], local_scores[32 * 16];
+  threadgroup uint local_ids[32 * 16];
   float key = t < p.experts ? logits[(size_t)row * p.experts + t] : -INFINITY;
   float maximum = tg_max(key, partial, t, threads);
   float base = t < p.experts ? exp(key - maximum) : 0;
   float sum = tg_sum(base, partial, t, threads);
   base /= sum;
   key = t < p.experts ? base : -INFINITY;
-  for (uint k = 0; k < p.chosen; k++) {
-    maximum = tg_max(key, partial, t, threads);
-    uint index = simd_min(key == maximum ? t : UINT_MAX);
-    if (t % 32 == 0)
-      indexes[t / 32] = index;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (t == 0) {
-      uint best = UINT_MAX;
-      for (uint s = 0; s < threads / 32; s++)
-        best = min(best, indexes[s]);
-      winner = best;
-      ids[row * p.chosen + k] = best;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (t == winner) {
-      selected[k] = base;
-      key = -INFINITY;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
+  group_topk(key, t < p.experts ? t : UINT_MAX, p.chosen, local_scores, local_ids,
+             ids + row * p.chosen, selected, t, threads);
   if (t == 0) {
     float total = 0;
     for (uint k = 0; k < p.chosen; k++)

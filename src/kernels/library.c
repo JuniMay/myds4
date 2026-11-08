@@ -37,6 +37,11 @@ static const char source[] = {
 #embed "dflash.metal"
 };
 
+const char *gpu_source(size_t *length) {
+  *length = sizeof source;
+  return source;
+}
+
 void gpu_start(void) {
   static int started;
   if (!started) gpu_init(source, sizeof source), started = 1;

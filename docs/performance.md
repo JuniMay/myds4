@@ -48,6 +48,19 @@ predictor benefit or timeliness.
 
 ## Drivers
 
+`MYDS4_PROFILE=stages` records GPU timestamps at compute-encoder boundaries.
+It keeps the command-buffer submission points and resolves samples at GPU
+synchronization points. Matrix-vector results are grouped by kernel and
+matrix dimensions. The sample buffer holds 2,048 encoders between collections.
+This mode adds encoder and counter overhead; use it to locate expensive work,
+and measure throughput with the variable unset. It has been checked against
+the expert fixtures and Flash-Next output. Command-buffer schedules that keep
+future work uncommitted need separate validation before their stage totals
+can be used.
+
+The existing `decode` and `prefill` profiling modes wait after each dispatch.
+Their throughput does not represent ordinary inference.
+
 | Driver | Scope |
 | --- | --- |
 | `benchmarks/compare.py` | Matched CLI control/candidate generations and output checks. |
@@ -55,6 +68,7 @@ predictor benefit or timeliness.
 | `benchmarks/turns.py` | A conversation followed by a longer tool-like input. |
 | `benchmarks/prefill.py` | CED prefill and continuation comparisons. |
 | `benchmarks/decode.c` | Batched model-row timing. |
+| `benchmarks/products.c` | Common matrix-product correctness and warmed vector-kernel timing; these are not model throughput or physical memory-bandwidth measurements. |
 | `benchmarks/expert_reads.py` | Expert-sized reads from checkpoint storage, with file-cache caveats. |
 | `benchmarks/evaluate.py` | Bounded public-dataset and conversation diagnostics. |
 

@@ -57,7 +57,7 @@ template <> inline void chunk<3>(device const uchar *W, device const uchar *S, u
 // then across, the lanes' sums at the end: the same arithmetic per (t, r)
 // for any n, in mv1 (one row of x) and mvr (up to TM rows, each chunk of
 // weights it decodes serving all of them). S: NVFP4's E4M3 scales per 16.
-template <int F>
+template <int F, bool Rounded = false>
 kernel void mv1(device const uchar *W [[buffer(0)]], device const uchar *S [[buffer(1)]],
                 device const float *x [[buffer(2)]], device float *y [[buffer(3)]], constant Mv &p [[buffer(4)]],
                 uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
@@ -73,10 +73,10 @@ kernel void mv1(device const uchar *W [[buffer(0)]], device const uchar *S [[buf
     acc += d.x + d.y + d.z + d.w;
   }
   acc = simd_sum(acc);
-  if (lane == 0) y[row] = acc * p.scale;
+  if (lane == 0) { float value = acc * p.scale; y[row] = Rounded ? bf(value) : value; }
 }
 
-template <int F, int R = TM>
+template <int F, int R = TM, bool Rounded = false>
 kernel void mvr(device const uchar *W [[buffer(0)]], device const uchar *S [[buffer(1)]],
                 device const float *x [[buffer(2)]], device float *y [[buffer(3)]], constant Mv &p [[buffer(4)]],
                 uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
@@ -98,7 +98,7 @@ kernel void mvr(device const uchar *W [[buffer(0)]], device const uchar *S [[buf
   for (uint t = 0; t < R; t++) {
     if (R == TM && t >= p.n) break;
     float v = simd_sum(acc[t]);
-    if (lane == 0) y[(size_t)t * p.rows + row] = v * p.scale;
+    if (lane == 0) { float value = v * p.scale; y[(size_t)t * p.rows + row] = Rounded ? bf(value) : value; }
   }
 }
 
@@ -147,6 +147,37 @@ template [[host_name("mv1_nvfp4")]] kernel mv1_t mv1<0>;
 template [[host_name("mv1_fp8")]] kernel mv1_t mv1<1>;
 template [[host_name("mv1_bf16")]] kernel mv1_t mv1<2>;
 template [[host_name("mv1_mxfp8")]] kernel mv1_t mv1<3>;
+
+// Compute chunk contributions concurrently, then retain each original lane's
+// accumulation order and the original SIMD reduction.
+template <int F, bool Rounded = false>
+kernel void mv_split(device const uchar *W [[buffer(0)]], device const uchar *S [[buffer(1)]],
+                     device const float *x [[buffer(2)]], device float *y [[buffer(3)]], constant Mv &p [[buffer(4)]],
+                     uint row [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]],
+                     uint threads [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                     uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float partial[2048];
+  uint chunks = p.cols / 16;
+  for (uint c = t; c < chunks; c += threads) {
+    float4 w[4];
+    chunk<F>(W, S, row, p.cols, c, w);
+    device const float4 *xv = (device const float4 *)x + c * 4;
+    float4 d = w[0] * xv[0] + w[1] * xv[1] + w[2] * xv[2] + w[3] * xv[3];
+    partial[c] = d.x + d.y + d.z + d.w;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (!sg) {
+    float acc = 0;
+    for (uint c = lane; c < chunks; c += 32) acc += partial[c];
+    acc = simd_sum(acc);
+    if (!lane) { float value = acc * p.scale; y[row] = Rounded ? bf(value) : value; }
+  }
+}
+typedef decltype(mv_split<0>) mv_split_t;
+template [[host_name("mv_split_nvfp4")]] kernel mv_split_t mv_split<0>;
+template [[host_name("mv_split_fp8")]] kernel mv_split_t mv_split<1>;
+template [[host_name("mv_split_bf16")]] kernel mv_split_t mv_split<2>;
+template [[host_name("mv_split_mxfp8")]] kernel mv_split_t mv_split<3>;
 template [[host_name("mvr_mxfp8")]] kernel mvr_t mvr<3>;
 template [[host_name("gate_up_mxfp8")]] kernel gate_up_t gate_up<3>;
 
@@ -213,10 +244,11 @@ inline void tile_store(threadgroup bfloat *ws, thread const uint4 *q, thread con
 
 // y[t][r] = scale * sum_c W[r][c] x[t][c] for the m rows of x (BF16, rows
 // of k), y's rows of n.
-template <int F>
+template <int F, bool Rounded = false>
 kernel void gemm(device const uchar *W [[buffer(0)]], device const uchar *S [[buffer(1)]],
                device const bfloat *x [[buffer(2)]], device float *y [[buffer(3)]], constant Gemm &p [[buffer(4)]],
                uint2 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
+  uint m0 = tg.y * 128, n0 = tg.x * 64;
   threadgroup bfloat ws[64 * 64];
   constexpr auto desc = matmul2d_descriptor(64, 64, 64, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<desc, execution_simdgroups<4>> op;
@@ -226,7 +258,6 @@ kernel void gemm(device const uchar *W [[buffer(0)]], device const uchar *S [[bu
   auto c1 = op.get_destination_cooperative_tensor<decltype(tx.slice(0, 0)), decltype(tw), float>();
   for (uint16_t i = 0; i < c0.get_capacity(); i++)
     if (c0.is_valid_element(i)) c0[i] = 0, c1[i] = 0;
-  uint m0 = tg.y * 128, n0 = tg.x * 64;
   uint4 q[4];
   float sc[2];
   tile_load<F>(W, S, n0, p.n, p.k, 0, t, q, sc);
@@ -248,7 +279,10 @@ kernel void gemm(device const uchar *W [[buffer(0)]], device const uchar *S [[bu
       uint col = n0 + at[0];
       for (uint h = 0; h < 2; h++) {
         uint row = m0 + 64 * h + at[1];
-        if (row < p.m && col < p.n) y[(size_t)row * p.n + col] = (h ? c1[i] : c0[i]) * p.scale;
+        if (row < p.m && col < p.n) {
+          float value = (h ? c1[i] : c0[i]) * p.scale;
+          y[(size_t)row * p.n + col] = Rounded ? bf(value) : value;
+        }
       }
     }
 }
@@ -260,11 +294,12 @@ template [[host_name("gemm_bf16")]] kernel gemm_t gemm<2>;
 template [[host_name("gemm_mxfp8")]] kernel gemm_t gemm<3>;
 
 // Small prompt groups use a 16-row matrix tile instead of padding work to 64 rows.
-template <int F>
+template <int F, bool Rounded = false>
 kernel void gemm16(device const uchar *W [[buffer(0)]], device const uchar *S [[buffer(1)]],
                    device const bfloat *x [[buffer(2)]], device float *y [[buffer(3)]],
                    constant Gemm &p [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
                    uint t [[thread_index_in_threadgroup]]) {
+  uint m0 = tg.y * 16, n0 = tg.x * 64;
   threadgroup bfloat ws[64 * 64];
   constexpr auto desc = matmul2d_descriptor(16, 64, 64, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<desc, execution_simdgroups<4>> op;
@@ -273,7 +308,6 @@ kernel void gemm16(device const uchar *W [[buffer(0)]], device const uchar *S [[
   tensor<threadgroup bfloat, extents<int32_t, 64, 64>, tensor_inline> tw(ws, extents<int32_t, 64, 64>());
   auto acc = op.get_destination_cooperative_tensor<decltype(tx.slice(0, 0)), decltype(tw), float>();
   for (uint16_t i = 0; i < acc.get_capacity(); i++) if (acc.is_valid_element(i)) acc[i] = 0;
-  uint m0 = tg.y * 16, n0 = tg.x * 64;
   uint4 q[4]; float sc[2];
   tile_load<F>(W, S, n0, p.n, p.k, 0, t, q, sc);
   for (uint k0 = 0; k0 < p.k; k0 += 64) {
@@ -287,7 +321,10 @@ kernel void gemm16(device const uchar *W [[buffer(0)]], device const uchar *S [[
   for (uint16_t i = 0; i < acc.get_capacity(); i++) if (acc.is_valid_element(i)) {
     auto at = acc.get_multidimensional_index(i);
     uint row = m0 + at[1], col = n0 + at[0];
-    if (row < p.m && col < p.n) y[(size_t)row * p.n + col] = acc[i] * p.scale;
+    if (row < p.m && col < p.n) {
+      float value = acc[i] * p.scale;
+      y[(size_t)row * p.n + col] = Rounded ? bf(value) : value;
+    }
   }
 }
 typedef decltype(gemm16<0>) gemm16_t;
@@ -318,3 +355,24 @@ kernel void quantize_input(device const float *x [[buffer(0)]], device float *ou
     out[i] = scale > 0 ? e2m1(clamp(value / scale, -6.0f, 6.0f)) * scale : 0;
   }
 }
+
+template [[host_name("mv1_nvfp4_rounded")]] kernel mv1_t mv1<0, true>;
+template [[host_name("mvr_nvfp4_rounded")]] kernel mvr_t mvr<0, TM, true>;
+template [[host_name("mv_split_nvfp4_rounded")]] kernel mv_split_t mv_split<0, true>;
+template [[host_name("gemm_nvfp4_rounded")]] kernel gemm_t gemm<0, true>;
+template [[host_name("mvr3_nvfp4_rounded")]] kernel mvr_t mvr<0, 3, true>;
+template [[host_name("mv1_fp8_rounded")]] kernel mv1_t mv1<1, true>;
+template [[host_name("mvr_fp8_rounded")]] kernel mvr_t mvr<1, TM, true>;
+template [[host_name("mv_split_fp8_rounded")]] kernel mv_split_t mv_split<1, true>;
+template [[host_name("gemm_fp8_rounded")]] kernel gemm_t gemm<1, true>;
+template [[host_name("mvr3_fp8_rounded")]] kernel mvr_t mvr<1, 3, true>;
+template [[host_name("mv1_bf16_rounded")]] kernel mv1_t mv1<2, true>;
+template [[host_name("mvr_bf16_rounded")]] kernel mvr_t mvr<2, TM, true>;
+template [[host_name("mv_split_bf16_rounded")]] kernel mv_split_t mv_split<2, true>;
+template [[host_name("gemm_bf16_rounded")]] kernel gemm_t gemm<2, true>;
+template [[host_name("mvr3_bf16_rounded")]] kernel mvr_t mvr<2, 3, true>;
+template [[host_name("mv1_mxfp8_rounded")]] kernel mv1_t mv1<3, true>;
+template [[host_name("mvr_mxfp8_rounded")]] kernel mvr_t mvr<3, TM, true>;
+template [[host_name("mv_split_mxfp8_rounded")]] kernel mv_split_t mv_split<3, true>;
+template [[host_name("gemm_mxfp8_rounded")]] kernel gemm_t gemm<3, true>;
+template [[host_name("gemm16_nvfp4_rounded")]] kernel gemm16_t gemm16<0, true>;

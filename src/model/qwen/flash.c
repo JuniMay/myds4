@@ -652,8 +652,7 @@ static void product(const Linear *m, const Buf *x, size_t xo, const Buf *y, int 
     offset = 0;
     if (m->kind == 'n') scaled.scale *= m->input_scale;
   }
-  linear_product(&scaled, input, offset, y, 0, n, n > 8, &f.xb, 0);
-  if (round) unary(f.round, y, (uint32_t)(n * m->rows));
+  linear_product(&scaled, input, offset, y, 0, n, n > 8, &f.xb, 0, round);
 }
 static void norm_group(const Buf *x, const Buf *w, const Buf *y, int n, int width, int groups) {
   struct {

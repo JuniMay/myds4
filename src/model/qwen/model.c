@@ -510,7 +510,7 @@ static int nrows, prompt_pass;
 // y (rows of m->rows values) = m x for the n rows of x: in a prompt pass on
 // the matrix units, else with the row kernels.
 static void product(const Mat *m, const Buf *x, size_t xo, const Buf *y, size_t yo, int n, int staged) {
-  linear_product(m, x, xo, y, yo, n, prompt_pass, &XB, staged);
+  linear_product(m, x, xo, y, yo, n, prompt_pass, &XB, staged, 0);
 }
 
 static void mv(const Mat *m, const Buf *x, size_t xo, const Buf *y, size_t yo, int n) {

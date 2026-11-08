@@ -72,6 +72,15 @@ Routing and numerical boundaries belong to the model. Flash-Next uses SwiGLU
 and rounds each expert's contribution and each addition to BF16. Nemotron uses
 squared ReLU, accumulates contributions in FP32, then rounds the mixture.
 The shared backend selects separate compiled kernels for these rules.
+The common matrix kernels can round their FP32 output to BF16 before storing
+it. Callers select this at an existing rounding boundary. Small matrix-vector
+products can compute chunks concurrently, then add them in lane-strided
+order before the SIMD reduction. Both paths use FP32 output storage.
+
+Flash-Next's router finds a top-k list within each SIMD group and merges those
+lists. Equal scores retain the lower expert index. Softmax normalization uses
+the full router vector. Selected weights are normalized in rank order and
+rounded to BF16.
 DeepSeek uses its MXFP4 and GGUF expert kernels, which already combine expert
 work and overlap ready experts with pending reads. Its streaming cache uses
 the same memory pool while retaining its read scheduling and packed layouts.

@@ -477,15 +477,13 @@ static void product(const Linear *matrix, const Buf *input, const Buf *output, i
       scaled.scale *= matrix->input_scale;
   }
   if (nm.prompt_pass || rows <= 8)
-    linear_product(&scaled, x, 0, output, 0, rows, rows > 8, &nm.packed, 0);
+    linear_product(&scaled, x, 0, output, 0, rows, rows > 8, &nm.packed, 0, round);
   else
     for (int at = 0; at < rows; at += 8) {
       int count = rows - at < 8 ? rows - at : 8;
       linear_product(&scaled, x, (size_t)at * matrix->cols * 4, output, (size_t)at * matrix->rows * 4, count, 0,
-                     &nm.packed, 0);
+                     &nm.packed, 0, round);
     }
-  if (round)
-    unary(nm.round_kernel, output, (uint32_t)(rows * matrix->rows));
 }
 static void recurrent(const Layer *y, int rows) {
   product(&y->input, &nm.norm, &nm.projected_values, rows, 1, 1);

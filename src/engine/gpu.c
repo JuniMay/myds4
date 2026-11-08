@@ -27,6 +27,16 @@ static unsigned long used_usage[1024];
 static int nused;
 static void report(void);
 static void collect(void);
+static id compute_encoder(id command);
+static void stage_collect(void);
+extern id MTLCommonCounterSetTimestamp;
+static id stage_samples;
+enum { STAGE_SAMPLES = 4096, STAGE_GROUPS = 2048 };
+static int stage_count, stage_groups;
+static struct { int kernel; uint32_t rows, cols; } stages[STAGE_SAMPLES / 2];
+static struct { int kernel; uint32_t rows, cols; long count; double seconds; } stage_group[STAGE_GROUPS];
+static uint32_t stage_rows, stage_cols;
+static struct { int kind; id object; unsigned long offset, size; unsigned char bytes[4096]; } stage_args[32];
 double gpu_busy, gpu_gap;
 long gpu_gaps;
 
@@ -120,8 +130,69 @@ void gpu_init(const char *source, size_t len) {
   s_bytes = S("setBytes:length:atIndex:");
   s_use = S("useResource:usage:");
   s_dispatch = S("dispatchThreadgroups:threadsPerThreadgroup:");
-  profile = getenv("MYDS4_PROFILE") != 0;
+  const char *setting = getenv("MYDS4_PROFILE");
+  profile = setting ? (!strcmp(setting, "stages") ? 2 : 1) : 0;
+  if (profile == 2) {
+    if (!MSG(BOOL (*)(id, SEL, unsigned long), dev, S("supportsCounterSampling:"), 0ul))
+      die("GPU stage counters are unavailable");
+    id sets = MSG(id (*)(id, SEL), dev, S("counterSets")), selected = nil;
+    unsigned long count = MSG(unsigned long (*)(id, SEL), sets, S("count"));
+    for (unsigned long i = 0; i < count; i++) {
+      id set = MSG(id (*)(id, SEL, unsigned long), sets, S("objectAtIndex:"), i);
+      id name = MSG(id (*)(id, SEL), set, S("name"));
+      if (MSG(BOOL (*)(id, SEL, id), name, S("isEqualToString:"), MTLCommonCounterSetTimestamp)) selected = set;
+    }
+    if (!selected) die("GPU timestamp counter set is unavailable");
+    id descriptor = MSG(id (*)(id, SEL), MSG(id (*)(id, SEL),
+        (id)objc_getClass("MTLCounterSampleBufferDescriptor"), S("alloc")), S("init"));
+    MSG(void (*)(id, SEL, id), descriptor, S("setCounterSet:"), selected);
+    MSG(void (*)(id, SEL, unsigned long), descriptor, S("setStorageMode:"), 0ul);
+    MSG(void (*)(id, SEL, unsigned long), descriptor, S("setSampleCount:"), (unsigned long)STAGE_SAMPLES);
+    id error = nil;
+    stage_samples = MSG(id (*)(id, SEL, id, id *), dev, S("newCounterSampleBufferWithDescriptor:error:"), descriptor, &error);
+    MSG(void (*)(id, SEL), descriptor, S("release"));
+    if (!stage_samples) die("GPU timestamp buffer: %s", describe(error));
+  }
   if (profile) atexit(report);
+}
+
+static id compute_encoder(id command) {
+  if (profile != 2) return MSG(id (*)(id, SEL), command, S("computeCommandEncoder"));
+  if (stage_count == STAGE_SAMPLES / 2) die("GPU stage sample buffer filled before synchronization");
+  id pass = MSG(id (*)(id, SEL), (id)objc_getClass("MTLComputePassDescriptor"), S("computePassDescriptor"));
+  id attachments = MSG(id (*)(id, SEL), pass, S("sampleBufferAttachments"));
+  id attachment = MSG(id (*)(id, SEL, unsigned long), attachments, S("objectAtIndexedSubscript:"), 0ul);
+  MSG(void (*)(id, SEL, id), attachment, S("setSampleBuffer:"), stage_samples);
+  MSG(void (*)(id, SEL, unsigned long), attachment, S("setStartOfEncoderSampleIndex:"), (unsigned long)stage_count * 2);
+  MSG(void (*)(id, SEL, unsigned long), attachment, S("setEndOfEncoderSampleIndex:"), (unsigned long)stage_count * 2 + 1);
+  stages[stage_count++].kernel = -1;
+  return MSG(id (*)(id, SEL, id), command, S("computeCommandEncoderWithDescriptor:"), pass);
+}
+
+static void stage_collect(void) {
+  if (!stage_count) return;
+  struct { unsigned long location, length; } range = {0, (unsigned long)stage_count * 2};
+  id data = MSG(id (*)(id, SEL, typeof(range)), stage_samples, S("resolveCounterRange:"), range);
+  const uint64_t *ticks = MSG(const void *(*)(id, SEL), data, S("bytes"));
+  for (int i = 0; i < stage_count; i++) {
+    if (stages[i].kernel < 0) continue;
+    uint64_t a = ticks[i * 2], b = ticks[i * 2 + 1];
+    if (a == UINT64_MAX || b == UINT64_MAX || b < a) die("invalid GPU stage timestamp");
+    int at;
+    for (at = 0; at < stage_groups; at++)
+      if (stage_group[at].kernel == stages[i].kernel && stage_group[at].rows == stages[i].rows &&
+          stage_group[at].cols == stages[i].cols) break;
+    if (at == stage_groups) {
+      if (at == STAGE_GROUPS) die("too many GPU profiling shapes");
+      stage_group[at].kernel = stages[i].kernel;
+      stage_group[at].rows = stages[i].rows; stage_group[at].cols = stages[i].cols;
+      stage_groups++;
+    }
+    stage_group[at].count++;
+    // Metal resolves Apple GPU stage timestamps into nanoseconds.
+    stage_group[at].seconds += (b - a) * 1e-9;
+  }
+  stage_count = 0;
 }
 
 int gpu_kernel(const char *name) {
@@ -225,8 +296,9 @@ void *gpu_open(void) {
 void gpu_encode(void *c) {
   if (enc) MSG(void (*)(id, SEL), enc, S("endEncoding"));
   cb = c;
-  enc = MSG(id (*)(id, SEL), cb, S("computeCommandEncoder"));
+  enc = compute_encoder(cb);
   nused = 0;
+  if (profile == 2) memset(stage_args, 0, sizeof stage_args);
 }
 
 void gpu_begin(void) { gpu_encode(gpu_open()); }
@@ -249,17 +321,28 @@ void gpu_submit(void *c) {
 
 void gpu_kern(int k) {
   current = k;
+  if (profile == 2) stage_rows = stage_cols = 0;
   MSG(void (*)(id, SEL, id), enc, s_pipe, pipes[k]);
 }
 
 void gpu_buf(int idx, const Buf *b, size_t off) {
   MSG(void (*)(id, SEL, id, unsigned long, unsigned long), enc, s_buf, (id)b->obj,
       b->off + off, (unsigned long)idx);
+  if (profile == 2) {
+    stage_args[idx].kind = 1; stage_args[idx].object = (id)b->obj; stage_args[idx].offset = b->off + off;
+  }
 }
 
 void gpu_bytes(int idx, const void *p, size_t n) {
   MSG(void (*)(id, SEL, const void *, unsigned long, unsigned long), enc, s_bytes, p, n,
       (unsigned long)idx);
+  if (profile == 2) {
+    stage_args[idx].kind = 2; stage_args[idx].size = n; memcpy(stage_args[idx].bytes, p, n);
+    if (idx == 4 && n == 16 && (!strncmp(names[current], "mv1_", 4) || !strncmp(names[current], "mvr", 3) ||
+                               !strncmp(names[current], "mv_split_", 9))) {
+      const uint32_t *dims = p; stage_rows = dims[0]; stage_cols = dims[1];
+    }
+  }
 }
 
 void gpu_use(const Buf *b) {
@@ -286,14 +369,29 @@ void gpu_copies(const GpuCopy *copies, int count) {
         c->from->off + c->from_offset, (id)c->to->obj, c->to->off + c->to_offset, c->bytes);
   }
   MSG(void (*)(id, SEL), blit, S("endEncoding"));
-  enc = MSG(id (*)(id, SEL), cb, S("computeCommandEncoder"));
+  enc = compute_encoder(cb);
   nused = 0;
+  if (profile == 2) memset(stage_args, 0, sizeof stage_args);
 }
 
 void gpu_go(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t tx, uint32_t ty, uint32_t tz) {
   Size3 g = {gx, gy, gz}, t = {tx, ty, tz};
   MSG(void (*)(id, SEL, Size3, Size3), enc, s_dispatch, g, t);
-  if (profile) {  // each dispatch alone in a command buffer, timed
+  if (profile == 2) {
+    stages[stage_count - 1].kernel = current;
+    stages[stage_count - 1].rows = stage_rows; stages[stage_count - 1].cols = stage_cols;
+    MSG(void (*)(id, SEL), enc, S("endEncoding"));
+    enc = compute_encoder(cb);
+    for (int i = 0; i < nused; i++) MSG(void (*)(id, SEL, id, unsigned long), enc, s_use, used[i], used_usage[i]);
+    for (unsigned long i = 0; i < 32; i++) {
+      if (stage_args[i].kind == 1)
+        MSG(void (*)(id, SEL, id, unsigned long, unsigned long), enc, s_buf, stage_args[i].object, stage_args[i].offset, i);
+      else if (stage_args[i].kind == 2)
+        MSG(void (*)(id, SEL, const void *, unsigned long, unsigned long), enc, s_bytes,
+            stage_args[i].bytes, stage_args[i].size, i);
+    }
+    MSG(void (*)(id, SEL, id), enc, s_pipe, pipes[current]);
+  } else if (profile) {  // each dispatch alone in a command buffer, timed
     MSG(void (*)(id, SEL), enc, S("endEncoding"));
     MSG(void (*)(id, SEL), cb, S("commit"));
     MSG(void (*)(id, SEL), cb, S("waitUntilCompleted"));
@@ -308,6 +406,17 @@ void gpu_go(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t tx, uint32_t ty, uin
 }
 
 static void report(void) {
+  if (profile == 2) {
+    double total = 0;
+    for (int i = 0; i < stage_groups; i++) {
+      fprintf(stderr, "STAGE %s rows=%u cols=%u calls=%ld total_ms=%.4f mean_us=%.4f\n",
+              names[stage_group[i].kernel], stage_group[i].rows, stage_group[i].cols, stage_group[i].count,
+              stage_group[i].seconds * 1e3, stage_group[i].seconds / stage_group[i].count * 1e6);
+      total += stage_group[i].seconds;
+    }
+    fprintf(stderr, "STAGE total_ms=%.4f\n", total * 1e3);
+    return;
+  }
   double total = 0;
   for (int i = 0; i < npipes; i++) total += prof_s[i];
   fprintf(stderr, "kernel           calls   total ms   mean us\n");
@@ -322,13 +431,16 @@ int gpu_profiling(void) { return profile; }
 void gpu_profile_reset(void) {
   memset(prof_s, 0, sizeof prof_s);
   memset(prof_n, 0, sizeof prof_n);
+  memset(stage_group, 0, sizeof stage_group);
+  stage_groups = 0;
 }
 
 uint64_t gpu_signal(void) {
   MSG(void (*)(id, SEL), enc, S("endEncoding"));
   MSG(void (*)(id, SEL, id, uint64_t), cb, S("encodeSignalEvent:value:"), event, ++signaled);
-  enc = MSG(id (*)(id, SEL), cb, S("computeCommandEncoder"));
+  enc = compute_encoder(cb);
   nused = 0;
+  if (profile == 2) memset(stage_args, 0, sizeof stage_args);
   return signaled;
 }
 
@@ -390,6 +502,7 @@ void gpu_sync(void) {
   }
   ndone = 0;
   last = 0;
+  if (profile == 2) stage_collect();
   objc_autoreleasePoolPop(pool);
   pool = objc_autoreleasePoolPush();
 }

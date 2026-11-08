@@ -89,6 +89,7 @@ typedef struct {
   int kv;
 } Buf;
 void gpu_init(const char *source, size_t len);
+const char *gpu_source(size_t *length);
 void gpu_start(void);  // gpu_init with every model's kernels (src/kernels/library.c), once per process
 int gpu_kernel(const char *name);
 Buf gpu_alloc(size_t size);  // resident from the start

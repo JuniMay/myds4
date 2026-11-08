@@ -3,23 +3,34 @@
 #include <stdio.h>
 #include <unistd.h>
 
-static int vector[4], few[4], three[4], matrix[4], small_matrix, convert, initialized;
+static int vector[2][4], parallel_vector[2][4], few[2][4], three[2][4], matrix[2][4], small_matrix[2], convert, initialized;
+static int product_kernel(const char *name, int rounded) {
+  if (!rounded) return gpu_kernel(name);
+  static char names[32][64];
+  static int count;
+  snprintf(names[count], sizeof names[count], "%s_rounded", name);
+  return gpu_kernel(names[count++]);
+}
 void linear_init(void) {
   if (initialized)
     return;
   gpu_start();
   static const char *vectors[] = {"mv1_nvfp4", "mv1_fp8", "mv1_bf16", "mv1_mxfp8"};
+  static const char *parallel[] = {"mv_split_nvfp4", "mv_split_fp8", "mv_split_bf16", "mv_split_mxfp8"};
   static const char *several[] = {"mvr_nvfp4", "mvr_fp8", "mvr_bf16", "mvr_mxfp8"};
   static const char *triples[] = {"mvr3_nvfp4", "mvr3_fp8", "mvr3_bf16"};
   static const char *matrices[] = {"gemm_nvfp4", "gemm_fp8", "gemm_bf16", "gemm_mxfp8"};
-  for (int i = 0; i < 4; i++) {
-    vector[i] = gpu_kernel(vectors[i]);
-    few[i] = gpu_kernel(several[i]);
-    three[i] = i < 3 ? gpu_kernel(triples[i]) : few[i];
-    matrix[i] = gpu_kernel(matrices[i]);
+  for (int r = 0; r < 2; r++) {
+    for (int i = 0; i < 4; i++) {
+      vector[r][i] = product_kernel(vectors[i], r);
+      parallel_vector[r][i] = product_kernel(parallel[i], r);
+      few[r][i] = product_kernel(several[i], r);
+      three[r][i] = i < 3 ? product_kernel(triples[i], r) : few[r][i];
+      matrix[r][i] = product_kernel(matrices[i], r);
+    }
+    small_matrix[r] = product_kernel("gemm16_nvfp4", r);
   }
   convert = gpu_kernel("x_bf16");
-  small_matrix = gpu_kernel("gemm16_nvfp4");
   initialized = 1;
 }
 
@@ -73,7 +84,7 @@ void linear_load(WeightSet *weights, Linear *m, TensorIndex *index, const char *
 }
 
 void linear_product(const Linear *m, const Buf *x, size_t xo, const Buf *y, size_t yo, int rows, int prompt,
-                    const Buf *bf16, int staged) {
+                    const Buf *bf16, int staged, int rounded) {
   int format = m->kind == 'n' ? 0 : m->kind == '8' ? 1 : m->kind == 'b' ? 2 : 3;
   const Buf *scales = m->s.obj ? &m->s : &m->w;
   if (prompt) {
@@ -93,7 +104,7 @@ void linear_product(const Linear *m, const Buf *x, size_t xo, const Buf *y, size
       uint32_t pad0, pad1, pad2;
     } p = {(uint32_t)rows, (uint32_t)m->rows, k, 0, m->scale, 0, 0, 0};
     int tile = format == 0 && rows <= 64 ? 16 : 128;
-    gpu_kern(tile == 16 ? small_matrix : matrix[format]);
+    gpu_kern(tile == 16 ? small_matrix[rounded] : matrix[rounded][format]);
     gpu_buf(0, &m->w, 0);
     gpu_buf(1, scales, 0);
     gpu_buf(2, bf16, 0);
@@ -105,12 +116,13 @@ void linear_product(const Linear *m, const Buf *x, size_t xo, const Buf *y, size
       uint32_t rows, cols, n;
       float scale;
     } p = {(uint32_t)m->rows, (uint32_t)m->cols, (uint32_t)rows, m->scale};
-    gpu_kern(rows == 1 ? vector[format] : rows == 3 ? three[format] : few[format]);
+    int split = rows == 1 && m->rows <= 320 && m->cols >= 2048 && m->cols <= 32768;
+    gpu_kern(split ? parallel_vector[rounded][format] : rows == 1 ? vector[rounded][format] : rows == 3 ? three[rounded][format] : few[rounded][format]);
     gpu_buf(0, &m->w, 0);
     gpu_buf(1, scales, 0);
     gpu_buf(2, x, xo);
     gpu_buf(3, y, yo);
     gpu_bytes(4, &p, sizeof p);
-    gpu_go((m->rows + 7) / 8, 1, 1, 256, 1, 1);
+    gpu_go(split ? m->rows : (m->rows + 7) / 8, 1, 1, 256, 1, 1);
   }
 }

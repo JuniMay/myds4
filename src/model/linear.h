@@ -11,5 +11,6 @@ typedef struct {
 void linear_init(void);
 void linear_load(WeightSet *weights, Linear *matrix, TensorIndex *index, const char *stem);
 // Float activation rows; prompt inputs stage through the supplied BF16 buffer.
+// Rounded outputs retain FP32 storage with BF16 values.
 void linear_product(const Linear *matrix, const Buf *x, size_t x_offset, const Buf *y, size_t y_offset, int rows,
-                    int prompt, const Buf *bf16, int staged);
+                    int prompt, const Buf *bf16, int staged, int rounded);

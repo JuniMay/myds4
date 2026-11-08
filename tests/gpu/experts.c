@@ -198,7 +198,7 @@ static void product(const Linear *m, const Buf *x, const Buf *y, int n) {
   gpu_go((p.count + 255) / 256, 1, 1, 256, 1, 1);
   Linear scaled = *m;
   scaled.scale *= m->input_scale;
-  linear_product(&scaled, &q, 0, y, 0, n, n > 8, &bf16, 0);
+  linear_product(&scaled, &q, 0, y, 0, n, n > 8, &bf16, 0, 0);
   rounded(y, n * m->rows);
 }
 static void baseline(int n, int relu) {

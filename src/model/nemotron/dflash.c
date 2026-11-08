@@ -55,7 +55,7 @@ struct DFlash {
   Buf buffer[BUFFERS];
   int target_layers[LAYERS], rows, blocks;
   float eps, theta;
-  int capture, norm, round, embed, conv, rope, store, attention, sum, add, swiglu;
+  int capture, norm, embed, conv, rope, store, attention, sum, add, swiglu;
 };
 static float value(uint16_t v) {
   uint32_t u = (uint32_t)v << 16;
@@ -142,7 +142,6 @@ DFlash *dflash_open(const char *directory, WeightSet *backbone, const Buf *embed
 #define K(field, name) d->field = gpu_kernel(name)
   K(capture, "df_capture");
   K(norm, "group_rms_bf16");
-  K(round, "round_bf16");
   K(embed, "embed_rows");
   K(conv, "df_conv");
   K(rope, "df_rope");
@@ -224,17 +223,8 @@ int dflash_prepare(DFlash *d, int rows, int positions) {
   d->blocks = blocks;
   return 1;
 }
-static void round_buffer(DFlash *d, const Buf *b, int count) {
-  uint32_t n = count;
-  gpu_kern(d->round);
-  gpu_buf(0, b, 0);
-  gpu_bytes(1, &n, 4);
-  gpu_go((n + 255) / 256, 1, 1, 256, 1, 1);
-}
 static void product(DFlash *d, const Linear *m, const Buf *x, size_t offset, const Buf *out, int rows, int rounding) {
-  linear_product(m, x, offset, out, 0, rows, rows > 8, &d->buffer[PACKED], 0);
-  if (rounding)
-    round_buffer(d, out, rows * m->rows);
+  linear_product(m, x, offset, out, 0, rows, rows > 8, &d->buffer[PACKED], 0, rounding);
 }
 static void normalize(DFlash *d, const Buf *x, const Buf *weight, const Buf *out, int rows) {
   struct {

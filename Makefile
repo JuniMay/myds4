@@ -80,6 +80,10 @@ build/tests/experts: tests/gpu/experts.c build/libmyds4.a src/model/experts.h
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ tests/gpu/experts.c build/libmyds4.a $(LDLIBS)
 
+build/tests/routing: tests/gpu/routing.c build/libmyds4.a $(KERNELS)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -o $@ tests/gpu/routing.c build/libmyds4.a $(LDLIBS)
+
 build/tests/speech-model: tests/model/speech.c build/libmyds4.a $(MODEL_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ tests/model/speech.c build/libmyds4.a $(LDLIBS)
@@ -323,6 +327,10 @@ build/tests/runahead-model: tests/model/runahead_model.c build/libmyds4.a $(MODE
 build/benchmarks/decode: benchmarks/decode.c build/libmyds4.a $(MODEL_HEADERS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ benchmarks/decode.c build/libmyds4.a $(LDLIBS)
+
+build/benchmarks/products: benchmarks/products.c build/libmyds4.a $(MODEL_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -o $@ benchmarks/products.c build/libmyds4.a $(LDLIBS)
 
 # ---- Diagnostics ----
 

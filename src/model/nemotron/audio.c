@@ -241,7 +241,7 @@ static void product(SpeechEncoder *s, const Projection *p, const Buf *x, const B
     values = &s->buffer[QUANT];
     matrix.scale *= matrix.input_scale;
   }
-  linear_product(&matrix, values, 0, out, 0, rows, 1, &s->buffer[PACKED], 0);
+  linear_product(&matrix, values, 0, out, 0, rows, 1, &s->buffer[PACKED], 0, 0);
   if (p->bias.size) {
     uint32_t shape[2] = {(uint32_t)matrix.rows, (uint32_t)rows};
     gpu_kern(s->bias);

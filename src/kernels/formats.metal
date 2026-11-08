@@ -20,6 +20,40 @@ inline float4 bf16x4(uint2 q) {
                 as_type<float>(q.y << 16), as_type<float>(q.y & 0xFFFF0000u));
 }
 inline float sigm(float x) { return 1.0f / (1.0f + exp(-x)); }
+
+// The global top k is contained in the union of each SIMD group's top k.
+// Equal scores keep the smaller original index. Scratch holds k entries per
+// SIMD group; k is at most 16 for the routed-expert callers.
+inline void group_topk(float key, uint index, uint k, threadgroup float *values,
+                       threadgroup uint *indexes, device uint *out, threadgroup float *selected,
+                       uint t, uint threads) {
+  uint lane = t % 32, group = t / 32;
+  for (uint rank = 0; rank < k; rank++) {
+    float score = simd_max(key);
+    uint winner = simd_min(key == score ? index : UINT_MAX);
+    if (!lane) {
+      values[group * k + rank] = score;
+      indexes[group * k + rank] = winner;
+    }
+    if (index == winner) { key = -INFINITY; index = UINT_MAX; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (!group) {
+    uint at = 0;
+    float score = lane < threads / 32 ? values[lane * k] : -INFINITY;
+    uint candidate = lane < threads / 32 ? indexes[lane * k] : UINT_MAX;
+    for (uint rank = 0; rank < k; rank++) {
+      float maximum = simd_max(score);
+      uint winner = simd_min(score == maximum ? candidate : UINT_MAX);
+      if (!lane) { out[rank] = winner; selected[rank] = maximum; }
+      if (candidate == winner) {
+        at++;
+        score = at < k ? values[lane * k + at] : -INFINITY;
+        candidate = at < k ? indexes[lane * k + at] : UINT_MAX;
+      }
+    }
+  }
+}
 // log(1 + e) without losing a small e (Metal has no log1p): Goldberg's
 // correction of log(u) by e / (u - 1), u = 1 + e rounded.
 inline float log1p_(float e) {
