@@ -81,6 +81,7 @@ static void run(int ratio, int positions, int large, int draft) {
   State *src = make_state(opt.ctx), *dst = make_state(start_cap());
   active = src;
   bind(src);
+  remember_state_layout(); // the fixture supplies the model's small rolling-buffer layout
   // What the server's KV prefix cache charges for a state (myds4_state_bytes).
   expect("a state is charged the bytes it owns", deepseek_state_bytes(src, src->cap) == owned(src));
   State *fresh = make_state(grown(start_cap(), positions));
@@ -124,11 +125,33 @@ static void run(int ratio, int positions, int large, int draft) {
   deepseek_state_free(dst), deepseek_state_free(src);
 }
 
+static void recreate_after_eviction(void) {
+  memset(L, 0, sizeof L), memset(D, 0, sizeof D);
+  opt.ctx = 128, opt.draft = 0;
+  L[2].kv_source = 1, L[2].ratio = 2;
+  State *seed = make_state(128);
+  bind(seed);
+  base_state();
+  free(seed); // base_state owns these same fixture buffers now
+  taken = 1;
+  State *first = active;
+  size_t expected = owned(first), ring = first->ring[0].size, local = first->cstate[2].size;
+  ds_state_free((ModelState *)first);
+  expect("an evicted active state leaves the model parked", active == &parked);
+  expect("new-state accounting survives an empty binding", deepseek_state_bytes(NULL, 128) == expected);
+  State *next = deepseek_state_new();
+  expect("new window buffers survive eviction of the active state", next->ring[0].size == ring && ring != 0);
+  expect("new compressor buffers survive eviction of the active state", next->cstate[2].size == local && local != 0);
+  expect("recreated state owns its complete allocation", owned(next) == expected);
+  ds_state_free((ModelState *)next);
+}
+
 int main(void) {
   alarm(15);
   run(2, 33, 1, 1);
   for (int ratio = 1; ratio <= 2; ratio++)
     for (int positions = 31; positions <= 33; positions++) run(ratio, positions, 0, positions & 1);
+  recreate_after_eviction();
   expect("all host buffers are released", allocated == 0);
   fprintf(stderr, "state fork: %d/%d CPU checks passed; peak=%zu bytes\n", checks - failures, checks, peak);
   return failures != 0;

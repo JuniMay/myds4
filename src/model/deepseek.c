@@ -2727,6 +2727,17 @@ void deepseek_bench(void) {
 
 // active: deepseek_load's state, or the one deepseek_state_use chose
 static int taken;      // deepseek_load's state went to a caller of deepseek_state_new
+static size_t state_rings[LAYERS], state_compressors[LAYERS], state_drafts[DRAFTS];
+
+// Allocation layout belongs to the loaded model, not to whichever state
+// happens to be bound. Eviction can leave the bindings empty.
+static void remember_state_layout(void) {
+  for (int l = 0; l < LAYERS; l++) {
+    state_rings[l] = L[l].ring.size;
+    state_compressors[l] = L[l].kv_source ? L[l].cstate.size : 0;
+  }
+  for (int d = 0; d < DRAFTS; d++) state_drafts[d] = opt.draft ? D[d].ring.size : 0;
+}
 
 static int start_cap(void) { return opt.ctx < CAP ? opt.ctx : CAP; }
 
@@ -2743,8 +2754,8 @@ static size_t rows_bytes(int l, int cap, int keys) {  // a KV source's compresse
 // rows and the Engram history.
 static size_t saved_bytes(void) {
   size_t n = sizeof history;
-  for (int l = 0; l < LAYERS; l++) n += L[l].ring.size + (L[l].kv_source ? L[l].cstate.size : 0);
-  for (int d = 0; opt.draft && d < DRAFTS; d++) n += D[d].ring.size;
+  for (int l = 0; l < LAYERS; l++) n += state_rings[l] + state_compressors[l];
+  for (int d = 0; opt.draft && d < DRAFTS; d++) n += state_drafts[d];
   return n;
 }
 
@@ -2787,6 +2798,7 @@ static void shrink(void) {  // the state in use back to its first capacity
 }
 
 static void base_state(void) {  // deepseek_load's buffers as the state in use
+  remember_state_layout();
   active = xmalloc(sizeof *active);
   for (int l = 0; l < LAYERS; l++) {
     active->ring[l] = L[l].ring;
@@ -2801,12 +2813,12 @@ State *deepseek_state_new(void) {
   State *s = xmalloc(sizeof *s);
   s->cap = start_cap();
   for (int l = 0; l < LAYERS; l++) {
-    s->ring[l] = zeros(L[l].ring.size);
+    s->ring[l] = zeros(state_rings[l]);
     if (!L[l].kv_source) continue;
     s->comp[l] = zeros(rows_bytes(l, s->cap, 0)), s->keys[l] = zeros(rows_bytes(l, s->cap, 1));
-    s->cstate[l] = zeros(L[l].cstate.size);
+    s->cstate[l] = zeros(state_compressors[l]);
   }
-  for (int d = 0; opt.draft && d < DRAFTS; d++) s->dring[d] = zeros(D[d].ring.size);
+  for (int d = 0; opt.draft && d < DRAFTS; d++) s->dring[d] = zeros(state_drafts[d]);
   return s;
 }
 
