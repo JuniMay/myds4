@@ -100,9 +100,9 @@ def memory_snapshot():
     def pages(name):
         return int(re.search(r"^" + re.escape(name) + r":\s+(\d+)", output, re.M)[1])
     free = pages("Pages free")
-    # macOS can reclaim file-backed pages for an explicit allocation.
-    # Speculative pages already belong to free_count; do not count them twice.
-    file_cache = max(0, pages("File-backed pages") - pages("Pages speculative"))
+    # vm_stat has already subtracted speculative pages from its printed free
+    # count. Its file-backed count includes them, so add that count unchanged.
+    file_cache = pages("File-backed pages")
     return {"free_gib": free * page_size / 1024**3,
             "file_cache_gib": file_cache * page_size / 1024**3,
             "available_gib": (free + file_cache) * page_size / 1024**3,

@@ -16,7 +16,9 @@ check establishes only that kernel's behavior.
 
 Run one model process at a time on AC power. Record competing GPU/CPU work,
 physical memory availability and cache adaptation. Count reclaimable file
-pages as available. In-memory compression is allowed; new swap-outs
+pages as available. For `vm_stat` text, add "Pages free" and "File-backed
+pages": the printed free count already excludes speculative pages.
+In-memory compression is allowed; new swap-outs
 invalidate a run. A warm file cache changes the meaning of an I/O result.
 
 Alternate control and candidate runs. A short run can reject a large
