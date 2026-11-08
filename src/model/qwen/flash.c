@@ -11,7 +11,7 @@
 #include <string.h>
 #include <unistd.h>
 
-enum { FLASH_ROWS = 128, FLASH_BATCH = 8, INDEX_DIM = 128, ATT_BLOCK = 256 };
+enum { FLASH_ROWS = 1024, FLASH_BATCH = 8, INDEX_DIM = 128, ATT_BLOCK = 256 };
 typedef struct {
   Linear down, up, inject;
   Buf norm;
@@ -25,7 +25,9 @@ typedef struct {
   float scale;
 } Ple;
 typedef struct {
-  int recurrent, index, ple_index;
+  int recurrent, index, ple_index, number, table_valid;
+  WeightPresence presence;
+  uint64_t table_generation;
   Hyper attention_hyper, mlp_hyper;
   Linear qkv, z, a, b, output, q, k, v, index_qk;
   Buf conv, decay, bias, norm, qnorm, knorm, iqnorm, iknorm;
@@ -72,6 +74,7 @@ static struct {
   Buf xb, quantized, qkv, convolved, z, a, b, decay, beta, gdn, gated, qg, k, v, q, kr, attention_out;
   Buf index_qk, shared, shared_gate, routing, selected, coefficients, gathered, gate, up, intermediate, logits;
   ExpertWork routed;
+  Buf resident_table, resident_counts;
   Buf ngram, ple_key, ple_query, ple_value, ple_gated, ple_normalized, attention_ids, part, ml;
   int workspace_rows;
   ModelCounters counters;
@@ -121,9 +124,11 @@ static void hyper(Hyper *h, const char *stem, int inject) {
     matrix(f.core, &h->inject, name);
   }
 }
-static void expert(Expert *e, const char *stem, int cached) {
+static void expert(Expert *e, const char *stem, WeightPresence *presence) {
+  int cached = presence != NULL;
   char name[384];
   e->weights = cached ? weights_cached(f.core, &f.cache, "Flash-Next expert") : f.core;
+  if (cached) weights_track(e->weights, presence);
   snprintf(name, sizeof name, "%s.gate_proj", stem);
   matrix(e->weights, &e->gate, name);
   snprintf(name, sizeof name, "%s.up_proj", stem);
@@ -251,6 +256,7 @@ static void prepare(const char *directory) {
     die("Flash-Next layer types do not match the configured layer count");
   for (int l = 0; l < f.layers; l++) {
     FlashLayer *y = f.layer + l;
+    y->number = l;
     y->ple_index = -1;
     y->recurrent = !strcmp(types->kid[l].s, "linear_attention");
     y->index = y->recurrent ? f.recurrent++ : f.attention++;
@@ -267,7 +273,7 @@ static void prepare(const char *directory) {
     y->experts = xmalloc((size_t)f.experts * sizeof *y->experts);
     for (int e = 0; e < f.experts; e++) {
       snprintf(stem, sizeof stem, "model.language_model.layers.%d.mlp.experts.%d", l, e);
-      expert(y->experts + e, stem, 1);
+      expert(y->experts + e, stem, &y->presence);
     }
     if (y->recurrent) {
 #define MAT(field, suffix)                                                                                             \
@@ -368,6 +374,8 @@ static uint64_t workspace(int n, int allocate) {
       f.name = gpu_alloc(need);                                                                                        \
     }                                                                                                                  \
   } while (0)
+  B(resident_table, (size_t)f.layers * f.experts * sizeof(ExpertGroup));
+  B(resident_counts, f.layers * 4);
   B(tokens, n * 4);
   B(images, n * 8);
   B(sequences, n * sizeof(FlashSeq));
@@ -423,7 +431,7 @@ static uint64_t workspace(int n, int allocate) {
   return bytes;
 }
 static uint64_t workspace_bytes(void) {
-  Buf *buffers[] = {&f.tokens,
+  Buf *buffers[] = {&f.resident_table, &f.resident_counts, &f.tokens,
                     &f.images,
                     &f.sequences,
                     &f.ple_states,
@@ -645,8 +653,7 @@ static void product(const Linear *m, const Buf *x, size_t xo, const Buf *y, int 
     if (m->kind == 'n') scaled.scale *= m->input_scale;
   }
   linear_product(&scaled, input, offset, y, 0, n, n > 8, &f.xb, 0);
-  if (round)
-    unary(f.round, y, (uint32_t)(n * m->rows));
+  if (round) unary(f.round, y, (uint32_t)(n * m->rows));
 }
 static void norm_group(const Buf *x, const Buf *w, const Buf *y, int n, int width, int groups) {
   struct {
@@ -1024,7 +1031,24 @@ static void ple_forward(const FlashLayer *y, const int *history, int n) {
   gpu_bytes(5, cp, sizeof cp);
   gpu_go((cp[0] + 255) / 256, 1, 1, 256, 1, 1);
 }
-static int routed(const FlashLayer *y, int n) {
+static void routed_sum(int n) {
+  experts_sum(&f.routed, &f.result);
+  uint32_t dims[2] = {(uint32_t)f.hidden, (uint32_t)n};
+  gpu_kern(f.shared_sum);
+  gpu_buf(0, &f.result, 0);
+  gpu_buf(1, &f.shared, 0);
+  gpu_buf(2, &f.shared_gate, 0);
+  gpu_bytes(3, dims, sizeof dims);
+  gpu_go((dims[0] * dims[1] + 255) / 256, 1, 1, 256, 1, 1);
+}
+static int routed(FlashLayer *y, int n) {
+  size_t offset = (size_t)y->number * f.experts * sizeof(ExpertGroup);
+  int resident = y->presence.count == (unsigned)f.experts;
+  if (resident && y->table_generation != y->presence.generation) {
+    y->table_valid = experts_table(&f.routed, y->experts, &f.resident_table, offset);
+    y->table_generation = y->presence.generation;
+  }
+  resident &= y->table_valid;
   feed_forward(&y->shared, &f.mixed, &f.shared, n, 0);
   product(&y->shared_gate, &f.mixed, 0, &f.shared_gate, n, 0, 1);
   product(&y->router, &f.mixed, 0, &f.routing, n, 0, 1);
@@ -1035,10 +1059,16 @@ static int routed(const FlashLayer *y, int n) {
   gpu_buf(2, &f.coefficients, 0);
   gpu_bytes(3, p, sizeof p);
   gpu_go(n, 1, 1, 512, 1, 1);
+  if (resident) {
+    experts_resident(&f.routed, &f.resident_table, offset, &f.selected, &f.coefficients, &f.mixed,
+                      &f.resident_counts, y->number * 4, n, 1);
+    routed_sum(n);
+    return 2;
+  }
   gpu_commit();
   gpu_sync();
   if (!experts_acquire(&f.routed, y->experts, (const uint32_t *)f.selected.ptr,
-                       (const float *)f.coefficients.ptr, n, &f.cache.stats))
+                       (const float *)f.coefficients.ptr, n, 1, &f.cache.stats))
     return 0;
   gpu_begin();
   experts_encode(&f.routed, y->experts, &f.mixed);
@@ -1056,18 +1086,7 @@ static int routed(const FlashLayer *y, int n) {
     Buf out = experts_output(&f.routed, e);
     feed_forward(y->experts + e, &f.gathered, &out, count, 1);
   }
-  experts_sum(&f.routed, &f.result);
-  uint32_t dims[2] = {(uint32_t)f.hidden, (uint32_t)n};
-  gpu_kern(f.shared_sum);
-  gpu_buf(0, &f.result, 0);
-  gpu_buf(1, &f.shared, 0);
-  gpu_buf(2, &f.shared_gate, 0);
-  gpu_bytes(3, dims, sizeof dims);
-  gpu_go((dims[0] * dims[1] + 255) / 256, 1, 1, 256, 1, 1);
-  gpu_commit();
-  gpu_sync();
-  experts_release(&f.routed, y->experts);
-  gpu_begin();
+  routed_sum(n);
   return 1;
 }
 static void add_stats(CacheStats *to, CacheStats before, CacheStats after) {
@@ -1119,6 +1138,7 @@ static const float *pass(const Row *rows, int n, int logits, int prompt) {
   }
   double began = now(), gpu = gpu_busy;
   CacheStats before = f.cache.stats;
+  int resident_layers[f.layers], resident_count = 0;
   gpu_begin();
   if (prompt)
     for (int i = 0; i < f.image_count; i++)
@@ -1143,8 +1163,9 @@ static const float *pass(const Row *rows, int n, int logits, int prompt) {
       attention(y, rows, n);
     inject(n);
     mix(&y->mlp_hyper, n);
-    if (!routed(y, n))
-      return NULL;
+    int result = routed(y, n);
+    if (!result) return NULL;
+    if (result == 2) resident_layers[resident_count++] = l;
     inject(n);
     if (f.dump_fd >= 0) {
       gpu_commit();
@@ -1159,6 +1180,13 @@ static const float *pass(const Row *rows, int n, int logits, int prompt) {
   product(&f.head, &f.mixed, (size_t)(n - logits) * f.hidden * 4, &f.logits, logits, 0, 0);
   gpu_commit();
   gpu_sync();
+  for (int i = 0; i < resident_count; i++) {
+    uint32_t unique = ((uint32_t *)f.resident_counts.ptr)[resident_layers[i]];
+    f.cache.stats.hits += unique;
+    f.cache.stats.row_unique += unique;
+    f.cache.stats.row_own += (uint64_t)n * f.chosen;
+  }
+  experts_release(&f.routed);
   if (f.dump_fd >= 0) {
     size_t bytes = (size_t)logits * f.vocab * 4;
     if (write(f.dump_fd, f.logits.ptr, bytes) != (ssize_t)bytes)

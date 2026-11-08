@@ -1,5 +1,6 @@
 #include "weights.h"
 #include <errno.h>
+#include <dispatch/dispatch.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,11 +23,20 @@ struct WeightSet {
   WeightCache *cache;
   Buf storage;
   int separate;
+  void *scratch_data;
+  int read_error;
+  uint64_t failed_offset;
+  WeightPresence *presence;
 };
-static WeightSet *reading_set;
+static _Thread_local WeightSet *reading_set;
+static _Thread_local int reading_worker;
 
 static void unload(void *context) {
   WeightSet *set = context;
+  if (set->presence && memory_ready(&set->slot)) {
+    set->presence->count--;
+    set->presence->generation++;
+  }
   if (set->cache && memory_ready(&set->slot)) {
     set->cache->bytes -= set->slot.payload;
     set->cache->slots--;
@@ -63,6 +73,7 @@ WeightSet *weights_dependent(WeightSet *backbone, const char *name) {
   return set;
 }
 MemorySlot *weights_slot(WeightSet *set) { return &set->slot; }
+void weights_track(WeightSet *set, WeightPresence *presence) { set->presence = presence; }
 static uint64_t packed_bytes(const WeightSet *set) {
   if (!set->cache || set->separate) return 0;
   uint64_t bytes = 0;
@@ -114,7 +125,12 @@ static void read_bytes(Tensor tensor, size_t offset, void *target, size_t bytes)
     size_t part = bytes - done < 1u << 30 ? bytes - done : 1u << 30;
     ssize_t n = pread(tensor.fd, (char *)target + done, part, (off_t)(tensor.off + offset + done));
     if (n < 0 && errno == EINTR) continue;
-    if (n <= 0) die("cannot reload weight data at offset %llu", (unsigned long long)(tensor.off + offset + done));
+    if (n <= 0) {
+      if (!reading_worker) die("cannot reload weight data at offset %llu", (unsigned long long)(tensor.off + offset + done));
+      reading_set->read_error = n < 0 ? errno : EIO;
+      reading_set->failed_offset = tensor.off + offset + done;
+      return;
+    }
     done += (size_t)n;
   }
 }
@@ -160,14 +176,20 @@ int weights_csf_decode(uint8_t *out, const uint8_t *fixed, size_t fixed_bytes,
 typedef struct { Tensor fixed, exceptions; int rows, cols; } CompressedScales;
 static void csf_fill(Buf *buffer, const void *context) {
   const CompressedScales *scales = context;
-  void *fixed = memory_host_required(scales->fixed.size, 0);
-  void *exceptions = memory_host_required(scales->exceptions.size, 0);
+  int borrowed = reading_set->scratch_data != NULL;
+  void *fixed = borrowed ? reading_set->scratch_data : memory_host_required(scales->fixed.size, 0);
+  void *exceptions = borrowed ? (char *)fixed + scales->fixed.size : memory_host_required(scales->exceptions.size, 0);
   read_bytes(scales->fixed, 0, fixed, scales->fixed.size);
   read_bytes(scales->exceptions, 0, exceptions, scales->exceptions.size);
+  if (reading_set->read_error) return;
   int decoded = weights_csf_decode(buffer->ptr, fixed, scales->fixed.size, exceptions,
                                    scales->exceptions.size / 4, scales->rows, scales->cols);
-  memory_host_free(fixed); memory_host_free(exceptions);
-  if (!decoded) die("invalid compressed NVFP4 scale stream");
+  if (!borrowed) { memory_host_free(fixed); memory_host_free(exceptions); }
+  if (!decoded) {
+    if (!reading_worker) die("invalid compressed NVFP4 scale stream");
+    reading_set->read_error = EBADMSG;
+    reading_set->failed_offset = scales->fixed.off;
+  }
 }
 void weights_csf(WeightSet *set, Buf *target, Tensor fixed, Tensor exceptions, int rows, int cols) {
   if (fixed.dtype != 'u' || exceptions.dtype != 'U' || exceptions.size % 4)
@@ -273,22 +295,14 @@ void weights_expanded(WeightSet *set, Buf *target, Tensor weight, Tensor scales,
   weights_generated(set, target, (size_t)weight.shape[0] * stride * 2, expanded_fill, &p, sizeof p);
 }
 
-int weights_load(WeightSet *set) {
-  if (memory_ready(&set->slot)) {
-    memory_touch(&set->slot);
-    if (set->cache) set->cache->stats.hits++;
-    return 1;
-  }
-  double began = now();
+static int allocate_set(WeightSet *set, size_t scratch) {
   MemorySlot *slots[] = {&set->slot};
   uint64_t required = weights_required(set);
   if (!memory_admit(slots, &required, 1, MEMORY_REQUIRED)) return 0;
-  unsigned pinned = set->slot.pins;
   memory_pin(&set->slot, 1);
   MemorySlot *before = memory_scope(&set->slot);
-  WeightSet *previous = reading_set;
-  reading_set = set;
   set->read_bytes = 0;
+  set->read_error = 0;
   uint64_t packed = packed_bytes(set), offset = 0;
   if (packed) {
     set->storage = gpu_new(packed);
@@ -306,23 +320,128 @@ int weights_load(WeightSet *set) {
       *weight->target = gpu_new(weight->bytes);
       gpu_resident(weight->target, 1);
     }
-    weight->fill(weight->target, weight->parameters);
   }
+  if (scratch) set->scratch_data = memory_host_required(scratch, 0);
+  memory_scope(before);
+  return 1;
+}
+static void fill_set(WeightSet *set) {
+  WeightSet *previous = reading_set;
+  reading_set = set;
+  for (size_t i = 0; i < set->count && !set->read_error; i++) {
+    Weight *weight = &set->items[i];
+    if (!weight->alias) weight->fill(weight->target, weight->parameters);
+  }
+  reading_set = previous;
+}
+static void finish_set(WeightSet *set, unsigned pinned) {
   for (size_t i = 0; i < set->count; i++)
     if (set->items[i].alias) *set->items[i].target = *set->items[i].alias;
-  gpu_residency_commit();
-  memory_scope(before);
-  reading_set = previous;
+  memory_host_free(set->scratch_data);
+  set->scratch_data = NULL;
   memory_trim(&set->slot);
   memory_publish(&set->slot, 1);
+  if (set->presence) {
+    set->presence->count++;
+    set->presence->generation++;
+  }
   memory_pin(&set->slot, pinned);
   if (set->cache) {
     set->cache->slots++;
     set->cache->bytes += set->slot.payload;
     set->cache->stats.bytes += set->read_bytes;
     set->cache->stats.misses++;
-    set->cache->stats.read_s += now() - began;
   }
+}
+int weights_load(WeightSet *set) {
+  if (memory_ready(&set->slot)) {
+    memory_touch(&set->slot);
+    if (set->cache) set->cache->stats.hits++;
+    return 1;
+  }
+  double began = now();
+  unsigned pinned = set->slot.pins;
+  if (!allocate_set(set, 0)) return 0;
+  MemorySlot *before = memory_scope(&set->slot);
+  fill_set(set);
+  memory_scope(before);
+  finish_set(set, pinned);
+  gpu_residency_commit();
+  if (set->cache) set->cache->stats.read_s += now() - began;
+  return 1;
+}
+
+typedef struct {
+  WeightSet **sets;
+  int count, workers;
+} WeightReads;
+static void read_sets(void *context, size_t worker) {
+  WeightReads *job = context;
+  reading_worker = 1;
+  for (int i = worker; i < job->count; i += job->workers) {
+    fill_set(job->sets[i]);
+  }
+  reading_worker = 0;
+}
+static int parallel_readable(const WeightSet *set) {
+  for (size_t i = 0; i < set->count; i++) {
+    const Weight *w = set->items + i;
+    if (w->alias || w->fill == csf_fill) continue;
+    if (w->fill != raw_fill || ((const Raw *)w->parameters)->aligned) return 0;
+  }
+  return 1;
+}
+
+int weights_load_many(WeightSet *const *sets, int count) {
+  WeightSet *missing[count];
+  unsigned pinned[count];
+  int n = 0;
+  WeightCache *cache = sets[0]->cache;
+  for (int i = 0; i < count; i++)
+    if (!memory_ready(&sets[i]->slot) &&
+        (!cache || sets[i]->cache != cache || !parallel_readable(sets[i]))) {
+      for (int k = 0; k < count; k++) if (!weights_load(sets[k])) return 0;
+      return 1;
+    }
+  for (int i = 0; i < count; i++) {
+    if (memory_ready(&sets[i]->slot)) {
+      memory_touch(&sets[i]->slot);
+      if (sets[i]->cache) sets[i]->cache->stats.hits++;
+    } else missing[n++] = sets[i];
+  }
+  if (!n) return 1;
+  if (n == 1) return weights_load(missing[0]);
+  double began = now();
+  for (int i = 0; i < n; i++) {
+    pinned[i] = missing[i]->slot.pins;
+    if (!allocate_set(missing[i], missing[i]->scratch)) {
+      for (int k = 0; k < i; k++) {
+        memory_host_free(missing[k]->scratch_data);
+        missing[k]->scratch_data = NULL;
+        unload(missing[k]);
+        memory_trim(&missing[k]->slot);
+        memory_pin(&missing[k]->slot, pinned[k]);
+      }
+      return 0;
+    }
+  }
+  WeightReads job = {.sets = missing, .count = n, .workers = n < 8 ? n : 8};
+  dispatch_apply_f(job.workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &job, read_sets);
+  for (int i = 0; i < n; i++) if (missing[i]->read_error) {
+    int error = missing[i]->read_error;
+    uint64_t offset = missing[i]->failed_offset;
+    for (int k = 0; k < n; k++) {
+      memory_host_free(missing[k]->scratch_data);
+      missing[k]->scratch_data = NULL;
+      unload(missing[k]);
+      memory_trim(&missing[k]->slot);
+      memory_pin(&missing[k]->slot, pinned[k]);
+    }
+    die("cannot read expert at offset %llu: %s", (unsigned long long)offset, strerror(error));
+  }
+  for (int i = 0; i < n; i++) finish_set(missing[i], pinned[i]);
+  gpu_residency_commit();
+  cache->stats.read_s += now() - began;
   return 1;
 }
 

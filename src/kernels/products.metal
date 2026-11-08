@@ -259,6 +259,40 @@ template [[host_name("gemm_bf16")]] kernel gemm_t gemm<2>;
 
 template [[host_name("gemm_mxfp8")]] kernel gemm_t gemm<3>;
 
+// Small prompt groups use a 16-row matrix tile instead of padding work to 64 rows.
+template <int F>
+kernel void gemm16(device const uchar *W [[buffer(0)]], device const uchar *S [[buffer(1)]],
+                   device const bfloat *x [[buffer(2)]], device float *y [[buffer(3)]],
+                   constant Gemm &p [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                   uint t [[thread_index_in_threadgroup]]) {
+  threadgroup bfloat ws[64 * 64];
+  constexpr auto desc = matmul2d_descriptor(16, 64, 64, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<4>> op;
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tx((device bfloat *)x,
+      dextents<int32_t, 2>(p.k, (p.m + 127) / 128 * 128));
+  tensor<threadgroup bfloat, extents<int32_t, 64, 64>, tensor_inline> tw(ws, extents<int32_t, 64, 64>());
+  auto acc = op.get_destination_cooperative_tensor<decltype(tx.slice(0, 0)), decltype(tw), float>();
+  for (uint16_t i = 0; i < acc.get_capacity(); i++) if (acc.is_valid_element(i)) acc[i] = 0;
+  uint m0 = tg.y * 16, n0 = tg.x * 64;
+  uint4 q[4]; float sc[2];
+  tile_load<F>(W, S, n0, p.n, p.k, 0, t, q, sc);
+  for (uint k0 = 0; k0 < p.k; k0 += 64) {
+    tile_store<F>(ws, q, sc, t);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (k0 + 64 < p.k) tile_load<F>(W, S, n0, p.n, p.k, k0 + 64, t, q, sc);
+    auto a = tx.slice(k0, m0);
+    op.run(a, tw, acc);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  for (uint16_t i = 0; i < acc.get_capacity(); i++) if (acc.is_valid_element(i)) {
+    auto at = acc.get_multidimensional_index(i);
+    uint row = m0 + at[1], col = n0 + at[0];
+    if (row < p.m && col < p.n) y[(size_t)row * p.n + col] = acc[i] * p.scale;
+  }
+}
+typedef decltype(gemm16<0>) gemm16_t;
+template [[host_name("gemm16_nvfp4")]] kernel gemm16_t gemm16<0>;
+
 struct InputQuant {
   uint count, bits;
   float scale;

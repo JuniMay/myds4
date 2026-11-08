@@ -10,6 +10,7 @@ typedef struct {
   ExpertMatrix gate, up, down;
   uint32_t begin, count;
 } ExpertGroup;
+typedef struct { uint32_t group, first; } ExpertTile;
 static_assert(sizeof(ExpertGroup) == 80);
 
 static inline ExpertMatrix expert_matrix(const Linear *m) {
@@ -27,25 +28,39 @@ typedef struct {
 typedef enum { EXPERT_SWIGLU, EXPERT_RELU2 } ExpertActivation;
 typedef enum { EXPERT_SUM_BF16, EXPERT_SUM_FP32 } ExpertAccumulation;
 typedef struct {
-  int hidden, intermediate, experts, chosen, rows, active, group_count, group_rows;
+  int hidden, intermediate, experts, chosen, rows, active, group_count, group_rows, matrix_tiles;
   ExpertActivation activation;
-  Buf plan, entries, order, groups, input, second, hidden_values, quantized, output;
+  Buf plan, entries, order, groups, row_groups, tiles, input, second, hidden_values, quantized, output;
   uint32_t *active_ids;
+  const Expert *held;
+  int held_count;
   int input_kernel, up_kernel, hidden_kernel, down_kernel, sum_kernel;
+  int up_single, down_single;
+  int up_matrix, down_matrix;
+  int plan_kernel;
 } ExpertWork;
 
 void experts_init(ExpertWork *work, int hidden, int intermediate, int experts, int chosen,
                   ExpertActivation activation, ExpertAccumulation accumulation);
 uint64_t experts_workspace(ExpertWork *work, int rows, int allocate);
 uint64_t experts_bytes(const ExpertWork *work);
-// Routing has completed. Pin every selected expert before loading any miss.
+// Routing and the preceding expert work have completed. Release the previous
+// selection, then pin every new selection before loading any miss.
 int experts_acquire(ExpertWork *work, const Expert *experts, const uint32_t *selected,
-                     const float *weights, int rows, CacheStats *stats);
-void experts_release(const ExpertWork *work, const Expert *experts);
-// Encode groups of up to eight rows. Larger or other-format groups use the
-// model's matrix path and write to experts_output before experts_sum.
+                     const float *weights, int rows, int prompt, CacheStats *stats);
+// Call after the queued expert work completes. Resident planning retains this
+// selection until a later acquisition or the end of the model pass.
+void experts_release(ExpertWork *work);
+// Encode NVFP4 groups together. Prompt groups use matrix tiles; decoding
+// retains scalar reductions. Other formats write to experts_output separately.
 void experts_encode(const ExpertWork *work, const Expert *experts, const Buf *input);
 void experts_sum(const ExpertWork *work, const Buf *output);
+// Build a table only when every expert is resident; unsupported formats use
+// the ordinary path. Resident encoding takes prompt rows or at most eight rows.
+int experts_table(const ExpertWork *work, const Expert *experts, const Buf *table, size_t offset);
+void experts_resident(ExpertWork *work, const Buf *table, size_t offset, const Buf *selected,
+                       const Buf *coefficients, const Buf *input, const Buf *unique, size_t unique_offset,
+                       int rows, int prompt);
 static inline int experts_count(const ExpertWork *work, int expert) {
   return ((const uint32_t *)work->plan.ptr)[expert];
 }

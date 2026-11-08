@@ -3,8 +3,7 @@
 #include <stdio.h>
 #include <unistd.h>
 
-static int vector[4], few[4], three[4], matrix[4], convert, initialized;
-
+static int vector[4], few[4], three[4], matrix[4], small_matrix, convert, initialized;
 void linear_init(void) {
   if (initialized)
     return;
@@ -20,6 +19,7 @@ void linear_init(void) {
     matrix[i] = gpu_kernel(matrices[i]);
   }
   convert = gpu_kernel("x_bf16");
+  small_matrix = gpu_kernel("gemm16_nvfp4");
   initialized = 1;
 }
 
@@ -92,13 +92,14 @@ void linear_product(const Linear *m, const Buf *x, size_t xo, const Buf *y, size
       float scale;
       uint32_t pad0, pad1, pad2;
     } p = {(uint32_t)rows, (uint32_t)m->rows, k, 0, m->scale, 0, 0, 0};
-    gpu_kern(matrix[format]);
+    int tile = format == 0 && rows <= 64 ? 16 : 128;
+    gpu_kern(tile == 16 ? small_matrix : matrix[format]);
     gpu_buf(0, &m->w, 0);
     gpu_buf(1, scales, 0);
     gpu_buf(2, bf16, 0);
     gpu_buf(3, y, yo);
     gpu_bytes(4, &p, sizeof p);
-    gpu_go((m->rows + 63) / 64, (rows + 127) / 128, 1, 128, 1, 1);
+    gpu_go((m->rows + 63) / 64, (rows + tile - 1) / tile, 1, 128, 1, 1);
   } else {
     struct {
       uint32_t rows, cols, n;

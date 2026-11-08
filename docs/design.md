@@ -39,14 +39,34 @@ Routed experts share the process memory budget and dependency rules. Flash-Next
 and Nemotron also share the expert batch planner: it groups selected rows by
 expert, pins every selection before loading misses, records cache use, and
 retains the original expert order for each row's mixture. Their NVFP4 backend
-executes small groups together. Large groups use each model's prompt matrix
-path. Workspaces remain charged to the model-memory pool.
+executes small groups together and batches larger prompt groups into 16-row
+matrix tiles. Quantized activations fit exactly in BF16; reductions retain
+FP32. Workspaces remain charged to the model-memory pool.
+
+When every expert of a layer is resident, GPU routing feeds the expert batch
+planner directly. The engine records residency changes and rebuilds that
+layer's weight-address table after a reload. Cache-use counters are collected
+after the pass completes. Layers with missing experts return their selections
+to the engine for loading.
+
+The expert batch stays in the current GPU command buffer with the following
+layer work. Selected weights remain pinned until the next CPU routing read
+or the end of the model pass. That synchronization completes the queued
+expert work before the engine releases its selection and loads another.
+Resident layers can run between these points without changing the held
+selection. Kernels and per-row summation order remain unchanged.
 
 The shared weight loader packs a cached expert's matrices and scales into
 one Metal allocation with aligned views. Loading registers that allocation
 once; eviction releases and accounts for it once. Checkpoint bytes and
 scale decoding remain unchanged. Tensors that require a separate aligned
 read buffer retain their own allocations.
+
+The engine allocates selected missing experts and their decoding scratch
+space before starting up to eight read workers. Workers read checkpoint
+bytes and decode compressed scales. The engine publishes completed weights,
+updates memory accounting and reports read failures after those workers
+finish. The selected experts stay pinned throughout this operation.
 
 Routing and numerical boundaries belong to the model. Flash-Next uses SwiGLU
 and rounds each expert's contribution and each addition to BF16. Nemotron uses
@@ -209,7 +229,7 @@ Experts are independent entries in the shared model-memory pool. Selected
 experts stay pinned through their GPU work; their backbone is retained
 until its dependent entries have been released. Selected misses load before
 each layer's routed work. These loads do not yet overlap expert computation. Prefill uses adaptive
-chunks of up to 128 rows. Decoding batches up to eight request rows.
+chunks of up to 1,024 rows. Decoding batches up to eight request rows.
 Flash-Next MTP and context-copy verification are not implemented.
 
 The shared Qwen vision encoder reconstructs its quantized matrices in BF16

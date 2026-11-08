@@ -10,7 +10,9 @@
 
 enum { NM_ROWS = 256, NM_BATCH = 8 };
 typedef struct {
-  int kind, index;
+  int kind, index, number, table_valid;
+  WeightPresence presence;
+  uint64_t table_generation;
   Buf norm, conv, conv_bias, decay, dt, skip, gate_norm, correction;
   Linear input, output, q, k, v, router;
   Expert shared, *experts;
@@ -49,6 +51,7 @@ static struct {
   Buf q, k, v, attended, part, maxima, result, shared_result, routing, selected, coefficients;
   Buf gathered, up, logits, captured;
   ExpertWork routed;
+  Buf resident_table, resident_counts;
   ModelCounters counters;
   ModelPlan plan;
   const float *last_logits;
@@ -71,9 +74,11 @@ static float number(const Json *j, const char *name, float fallback) {
 static void vector(Buf *out, const char *name, int exponential) {
   weights_vector(nm.core, out, st_get(nm.checkpoint, "%s", name), 0, exponential ? WEIGHT_EXP : 0);
 }
-static void expert(Expert *e, const char *prefix, int cache) {
+static void expert(Expert *e, const char *prefix, WeightPresence *presence) {
+  int cache = presence != NULL;
   char name[256];
   e->weights = cache ? weights_cached(nm.core, &nm.cache, "Nemotron expert") : nm.core;
+  if (cache) weights_track(e->weights, presence);
   snprintf(name, sizeof name, "%s.up_proj", prefix);
   linear_load(e->weights, &e->up, nm.checkpoint, name);
   snprintf(name, sizeof name, "%s.down_proj", prefix);
@@ -143,6 +148,7 @@ static void prepare(const char *directory) {
   nm.layer = xmalloc((size_t)nm.layers * sizeof *nm.layer);
   for (int l = 0; l < nm.layers; l++) {
     Layer *y = nm.layer + l;
+    y->number = l;
     const char *type = types->kid[l].s;
     y->kind = !strcmp(type, "mamba") || !strcmp(type, "linear_attention")     ? 0
               : !strcmp(type, "attention") || !strcmp(type, "full_attention") ? 1
@@ -180,7 +186,7 @@ static void prepare(const char *directory) {
       y->experts = xmalloc((size_t)nm.experts * sizeof *y->experts);
       for (int e = 0; e < nm.experts; e++) {
         snprintf(name, sizeof name, "backbone.layers.%d.mixer.experts.%d", l, e);
-        expert(y->experts + e, name, 1);
+        expert(y->experts + e, name, &y->presence);
       }
     } else
       die("unsupported Nemotron layer type: %s", type);
@@ -229,6 +235,8 @@ static uint64_t workspace(int rows, int blocks, int allocate) {
       nm.field = gpu_alloc(need);                                                                                      \
     }                                                                                                                  \
   } while (0)
+  B(resident_table, (size_t)nm.layers * nm.experts * sizeof(ExpertGroup));
+  B(resident_counts, nm.layers * 4);
   B(tokens, rows * 4);
   B(embeddings, rows * 8);
   B(sequences, rows * sizeof(Sequence));
@@ -262,7 +270,7 @@ static uint64_t workspace(int rows, int blocks, int allocate) {
   return bytes;
 }
 static uint64_t workspace_bytes(void) {
-  Buf *buffers[] = {&nm.tokens,
+  Buf *buffers[] = {&nm.resident_table, &nm.resident_counts, &nm.tokens,
                     &nm.embeddings,
                     &nm.sequences,
                     &nm.x,
@@ -562,7 +570,14 @@ static void feed_forward(const Expert *e, const Buf *input, const Buf *output, i
   unary(nm.relu_kernel, &nm.up, (uint32_t)(rows * e->up.rows));
   product(&e->down, &nm.up, output, rows, 1, 1);
 }
-static int routed(const Layer *y, int rows) {
+static int routed(Layer *y, int rows) {
+  size_t offset = (size_t)y->number * nm.experts * sizeof(ExpertGroup);
+  int resident = (nm.prompt_pass || rows <= 8) && y->presence.count == (unsigned)nm.experts;
+  if (resident && y->table_generation != y->presence.generation) {
+    y->table_valid = experts_table(&nm.routed, y->experts, &nm.resident_table, offset);
+    y->table_generation = y->presence.generation;
+  }
+  resident &= y->table_valid;
   feed_forward(&y->shared, &nm.norm, &nm.shared_result, rows);
   product(&y->router, &nm.norm, &nm.routing, rows, 0, 0);
   struct {
@@ -577,10 +592,17 @@ static int routed(const Layer *y, int rows) {
   gpu_buf(3, &nm.coefficients, 0);
   gpu_bytes(4, &p, sizeof p);
   gpu_go(rows, 1, 1, 128, 1, 1);
+  if (resident) {
+    experts_resident(&nm.routed, &nm.resident_table, offset, &nm.selected, &nm.coefficients, &nm.norm,
+                      &nm.resident_counts, y->number * 4, rows, nm.prompt_pass);
+    experts_sum(&nm.routed, &nm.result);
+    add(&nm.result, &nm.shared_result, rows * nm.hidden);
+    return 2;
+  }
   gpu_commit();
   gpu_sync();
   if (!experts_acquire(&nm.routed, y->experts, (const uint32_t *)nm.selected.ptr,
-                       (const float *)nm.coefficients.ptr, rows, &nm.cache.stats))
+                       (const float *)nm.coefficients.ptr, rows, nm.prompt_pass, &nm.cache.stats))
     return 0;
   gpu_begin();
   experts_encode(&nm.routed, y->experts, &nm.norm);
@@ -600,10 +622,6 @@ static int routed(const Layer *y, int rows) {
   }
   experts_sum(&nm.routed, &nm.result);
   add(&nm.result, &nm.shared_result, rows * nm.hidden);
-  gpu_commit();
-  gpu_sync();
-  experts_release(&nm.routed, y->experts);
-  gpu_begin();
   return 1;
 }
 static void add_stats(CacheStats *to, CacheStats before, CacheStats after) {
@@ -650,6 +668,7 @@ static const float *pass(const Row *rows, int count, int logits, int prompt) {
   }
   double began = now(), gpu = gpu_busy;
   CacheStats before = nm.cache.stats;
+  int resident_layers[nm.layers], resident_count = 0;
   gpu_begin();
   uint32_t hidden = (uint32_t)nm.hidden;
   if (prompt)
@@ -670,8 +689,11 @@ static const float *pass(const Row *rows, int count, int logits, int prompt) {
       recurrent(y, count);
     else if (y->kind == 1)
       attention(y, count);
-    else if (!routed(y, count))
-      return NULL;
+    else {
+      int result = routed(y, count);
+      if (!result) return NULL;
+      if (result == 2) resident_layers[resident_count++] = l;
+    }
     add(&nm.x, &nm.result, count * nm.hidden);
     dflash_capture(nm.draft, l, &nm.x, &nm.captured, count);
     if (nm.dump_fd >= 0) {
@@ -693,6 +715,13 @@ static const float *pass(const Row *rows, int count, int logits, int prompt) {
   }
   gpu_commit();
   gpu_sync();
+  for (int i = 0; i < resident_count; i++) {
+    uint32_t unique = ((uint32_t *)nm.resident_counts.ptr)[resident_layers[i]];
+    nm.cache.stats.hits += unique;
+    nm.cache.stats.row_unique += unique;
+    nm.cache.stats.row_own += (uint64_t)count * nm.chosen;
+  }
+  experts_release(&nm.routed);
   if (nm.dump_fd >= 0) {
     size_t bytes = (size_t)logits * nm.vocab * 4;
     if (write(nm.dump_fd, nm.logits.ptr, bytes) != (ssize_t)bytes)
