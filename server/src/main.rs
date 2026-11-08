@@ -35,19 +35,18 @@ use sha2::{Digest, Sha256};
 use crate::config::ModelConfig;
 use crate::format::{Family, deepseek, qwen};
 
-const USAGE: &str = "usage: myds4-server (-m MODEL [model options] | --config FILE) --serve PORT [options]
-  See docs/server.md.
+const USAGE: &str = "usage: myds4-server [--config FILE | -m MODEL [model options]] [server options]
+  Without --config or -m, read ~/.config/myds4/server.json. See docs/server.md.
   -m DIR          a checkpoint directory (DeepSeek V4.1 Flash, or a Qwen3.8 qwen3_5 model), its options below
-  --config FILE   several models in one process: a JSON file {\"models\": [{\"model\": DIR, ...}]} with each
-                  model's options under the names below (without dashes, - as _); a request's model field
-                  picks its model
-  --serve PORT    serve OpenAI Chat Completions at http://HOST:PORT/v1 (needs MYDS4_API_KEY or --api-key-file)
+  --config FILE   server settings and models in JSON; a request's model field picks its model
+  --serve PORT    override the JSON port; serve OpenAI Chat Completions at http://HOST:PORT/v1
   --host ADDR     the IPv4 address to serve on (default 127.0.0.1)
   --api-key-file FILE  the API key clients must send (16 to 256 characters)
   --reserve GB    one process-wide available-memory target, 2-1024 GiB (default 10)
   --kv-cache GB   total KV states and snapshots across all models, GiB (default 8)
   --tui           a live view in the terminal (requests, speed, experts, memory, the KV cache) instead of the
                   log on stderr; q stops the server, n shows the next model, and the last log lines print on exit
+  --no-tui        use the log even when the configuration enables the live view
   --tui-theme T   the live view's colors: auto (default: by the terminal's background, light without an
                   answer), light or dark
   --render FILE   print the prompt of a JSON test case of DeepSeek's encoding/tests, and exit
@@ -93,35 +92,28 @@ struct Args {
     /// -m and its options, or --config's models.
     models: Vec<ModelConfig>,
     budgets: config::Budgets,
-    port: Option<u16>,
-    host: String,
-    key_file: Option<String>,
+    server: config::Server,
     render: Option<String>,
-    tui: bool,
-    tui_colors: view::Colors,
 }
 
 fn parse(args: &[String]) -> Args {
     let mut a = Args {
         models: Vec::new(),
         budgets: config::Budgets::default(),
-        port: None,
-        host: "127.0.0.1".into(),
-        key_file: None,
+        server: config::Server::default(),
         render: None,
-        tui: false,
-        tui_colors: view::Colors::Auto,
     };
     let mut one: Option<ModelConfig> = None;
     let mut options: Vec<(String, Value)> = Vec::new(); // -m's options, in order
     let mut budgets: Vec<(String, Value)> = Vec::new();
-    let mut file = None;
+    let mut server: Vec<(String, Value)> = Vec::new();
+    let mut file: Option<std::path::PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
         let switch = |name: &str| (name.to_string(), Value::Bool(true));
         match flag {
-            "--tui" => a.tui = true,
+            "--tui" | "--no-tui" => server.push(("tui".into(), Value::Bool(flag == "--tui"))),
             "--cache-read-cost" | "--runahead" | "--pipeline" | "--prefill-prune" | "--online-predictor" => {
                 options.push(switch(&flag[2..].replace('-', "_")))
             }
@@ -135,24 +127,19 @@ fn parse(args: &[String]) -> Args {
                         }
                         one = Some(ModelConfig::new(v));
                     }
-                    "--config" => file = Some(v.clone()),
+                    "--config" => file = Some(v.into()),
                     "--reserve" | "--kv-cache" => {
                         let name = flag[2..].replace('-', "_");
                         let value = serde_json::from_str::<Value>(v).unwrap_or(Value::Null);
                         budgets.push((name, value));
                     }
-                    "--serve" => a.port = Some(v.parse().unwrap_or_else(|_| die(&format!("--serve: not a port: {v}")))),
-                    "--host" => a.host = v.clone(),
-                    "--api-key-file" => a.key_file = Some(v.clone()),
-                    "--render" => a.render = Some(v.clone()),
-                    "--tui-theme" => {
-                        a.tui_colors = match v.as_str() {
-                            "auto" => view::Colors::Auto,
-                            "light" => view::Colors::Light,
-                            "dark" => view::Colors::Dark,
-                            _ => die("--tui-theme takes auto, light or dark"),
-                        }
+                    "--serve" => {
+                        let port: u16 = v.parse().unwrap_or_else(|_| die(&format!("--serve: not a port: {v}")));
+                        server.push(("port".into(), Value::from(port)));
                     }
+                    "--host" | "--api-key-file" | "--tui-theme" =>
+                        server.push((flag[2..].replace('-', "_"), Value::String(v.clone()))),
+                    "--render" => a.render = Some(v.clone()),
                     _ => {
                         let name = match flag {
                             "-t" => "temperature".to_string(),
@@ -167,6 +154,9 @@ fn parse(args: &[String]) -> Args {
             }
         }
         i += 1;
+    }
+    if one.is_none() && file.is_none() && a.render.is_none() {
+        file = Some(config::default_path().unwrap_or_else(|e| die(&e)));
     }
     match (one, file) {
         (Some(_), Some(_)) => die("-m and --config: give one model with -m, or several in the file"),
@@ -183,11 +173,15 @@ fn parse(args: &[String]) -> Args {
             let c = config::read(&f).unwrap_or_else(|e| die(&e));
             a.models = c.models;
             a.budgets = c.budgets;
+            a.server = c.server;
         }
         (None, None) => {}
     }
     for (name, value) in budgets {
         a.budgets.set(&name, &value).unwrap_or_else(|e| die(&e));
+    }
+    for (name, value) in server {
+        a.server.set(&name, &value).unwrap_or_else(|e| die(&e));
     }
     a
 }
@@ -202,10 +196,28 @@ fn one_model_takes_its_options_from_the_command_line() {
     assert!(m.engine.prefill_prune);
     assert_eq!((m.engine.lookup, m.engine.draft, m.engine.ced), (15, 2, 0));
     assert_eq!((m.temperature, m.top_p, a.budgets.kv_gb, m.batch), (None, None, 8.0, 4));
-    assert_eq!((a.port, a.tui), (Some(8008), true));
+    assert_eq!((a.server.port, a.server.tui), (Some(8008), true));
     let a = parse(&["-m", "/m/q", "-t", "0.6", "--top-k", "20", "--id", "qwen", "--kv-cache", "4"].map(String::from));
     let m = &a.models[0];
     assert_eq!((m.temperature, m.top_k, m.id.as_deref(), a.budgets.kv_gb), (Some(0.6), Some(20), Some("qwen"), 4.0));
+}
+
+#[test]
+fn command_line_server_settings_override_the_file_in_either_order() {
+    let file = format!("{}/tests/fixtures/default-home/.config/myds4/server.json", env!("CARGO_MANIFEST_DIR"));
+    let a = parse(&["--config".into(), file.clone()]);
+    assert_eq!((a.server.port, a.server.tui, a.server.tui_theme), (Some(8008), true, view::Colors::Dark));
+    assert_eq!(a.server.api_key_file.as_deref(), Some("/dev/null"));
+    for before in [false, true] {
+        let flags: Vec<String> = ["--serve", "9008", "--host", "127.0.0.2", "--api-key-file", "override-key",
+                                 "--no-tui", "--tui-theme", "light", "--reserve", "12", "--kv-cache", "16"].map(String::from).into();
+        let config = vec!["--config".into(), file.clone()];
+        let a = parse(&if before { [flags, config].concat() } else { [config, flags].concat() });
+        assert_eq!((a.server.port, a.server.host.as_str(), a.server.api_key_file.as_deref()),
+                   (Some(9008), "127.0.0.2", Some("override-key")));
+        assert_eq!((a.server.tui, a.server.tui_theme), (false, view::Colors::Light));
+        assert_eq!((a.budgets.reserve_gb, a.budgets.kv_gb), (12.0, 16.0));
+    }
 }
 
 /// A served model: its name, its family's chat format and its settings.
@@ -410,8 +422,8 @@ fn main() {
     if let Some(file) = &a.render {
         exit(deepseek::render_file(file));
     }
-    let (Some(port), false) = (a.port, a.models.is_empty()) else { usage() };
-    let key = match &a.key_file {
+    let (Some(port), false) = (a.server.port, a.models.is_empty()) else { usage() };
+    let key = match &a.server.api_key_file {
         Some(f) => std::fs::read_to_string(f).unwrap_or_else(|_| die(&format!("cannot open {f}"))),
         None => std::env::var("MYDS4_API_KEY").unwrap_or_default(),
     };
@@ -419,10 +431,10 @@ fn main() {
     if !(16..=256).contains(&key.len()) {
         die("the API key (MYDS4_API_KEY or --api-key-file) must have 16 to 256 characters");
     }
-    let host: Ipv4Addr = if a.host == "localhost" {
+    let host: Ipv4Addr = if a.server.host == "localhost" {
         Ipv4Addr::LOCALHOST
     } else {
-        a.host.parse().unwrap_or_else(|_| die(&format!("--host takes an IPv4 address: {}", a.host)))
+        a.server.host.parse().unwrap_or_else(|_| die(&format!("host takes an IPv4 address: {}", a.server.host)))
     };
     // The port is taken before the models load, so that a busy port fails at once.
     let listener = std::net::TcpListener::bind((host, port))
@@ -451,7 +463,7 @@ fn main() {
     }
     // The live view takes the log from the start; until it is on the screen,
     // the lines go to stderr as well.
-    let tui = a.tui && std::io::stderr().is_terminal();
+    let tui = a.server.tui && std::io::stderr().is_terminal();
     let (on_log, on_die): (Option<extern "C" fn(*const std::ffi::c_char)>, Option<extern "C" fn()>) =
         if tui { (Some(view::on_log), Some(view::on_die)) } else { (None, None) };
     if !worker::start(served.clone(), a.budgets.clone(), on_log, on_die) {
@@ -489,8 +501,8 @@ fn main() {
         served_models.push(Served { id, name, ctx, tokenizer: loaded[served_models.len()].1.tokenizer(), format });
     }
     let title = format!("myds4 · {host}:{port} · {}", served_models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>().join(" · "));
-    let live = if tui { view::start(title, a.tui_colors) } else { None };
-    if a.tui && live.is_none() {
+    let live = if tui { view::start(title, a.server.tui_theme) } else { None };
+    if a.server.tui && live.is_none() {
         engine::log("--tui: stderr is not a terminal; the log stays on stderr");
     }
     if !host.is_loopback() {

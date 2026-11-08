@@ -101,8 +101,10 @@ response for 60 s, ends its request (see
 
 The [README](../README.md#run) shows how to create a key file and start the server.
 
-`-m DIR` serves one model with the options after it on the command line;
-`--config FILE` serves several in one process, from a JSON file that lists
+Running `build/myds4-server` reads `~/.config/myds4/server.json`. The file
+sets the port, host, API-key-file path, live view and memory budgets as well
+as the models. `-m DIR` serves one model from command-line options without
+reading that default file; `--config FILE` selects another JSON file that lists
 them, each with its own options under the names below without the dashes
 (`-` as `_`), and each request goes to the model its `model` field names (as
 `GET /v1/models` lists them). A model is DeepSeek V4.1 Flash or a Qwen3.8
@@ -113,15 +115,21 @@ goes up to 8, `draft` is 0 or 1 (the MTP head), and DeepSeek's options
 example, DeepSeek with its experts and the 27B beside it:
 
 ```json
-{"models": [
+{"port": 8008, "host": "127.0.0.1", "api_key_file": "/path/to/api-key",
+ "tui": true, "reserve": 10, "kv_cache": 24, "models": [
   {"model": "/path/to/DeepSeek-V4.1-Flash-1017", "experts": "/path/to/UD-IQ1_M-00001-of-00004.gguf", "cache": 56},
   {"model": "/path/to/Qwen3.8-27B-NVFP4", "draft": 1}
 ]}
 ```
 
 ```sh
-build/myds4-server --config models.json --serve 8008 --api-key-file ~/.config/myds4/api-key
+build/myds4-server
 ```
+
+Save the JSON at the default path before running this command. Use full
+paths for the key and checkpoints; JSON paths do not expand `~`. Relative
+paths use the working directory. CLI server settings override the file
+regardless of argument order. Changes take effect after a restart.
 
 See [Models](server.md#models) for routing, scheduling and memory, and
 [Chat formats](server.md#chat-formats) for a Qwen model's requests.
@@ -129,10 +137,10 @@ See [Models](server.md#models) for routing, scheduling and memory, and
 | Option | Effect |
 | --- | --- |
 | `-m DIR` | The model to serve, its options after it; or `--config FILE` for several. |
-| `--config FILE` | Serve the models the JSON file lists (`{"models": [{"model": DIR, ...}]}`), each with its own options. |
-| `--serve PORT` | Serve on this port. |
+| `--config FILE` | Use this file instead of `~/.config/myds4/server.json`. Root settings: `port`, `host`, `api_key_file`, `tui`, `tui_theme`, `reserve`, `kv_cache`, and `models`. |
+| `--serve PORT` | Override the configured `port`. A port must be set in either place. |
 | `--host ADDR` | The IPv4 address to listen on (default `127.0.0.1`, this machine only). The server speaks plain HTTP: on another address, keys and conversations cross the network unencrypted. |
-| `--api-key-file FILE` | The key clients must send. |
+| `--api-key-file FILE` | Override `api_key_file`, the path containing the key clients must send. Without a configured file, use `MYDS4_API_KEY`. |
 | `--id NAME` | The name requests give in `model` (default `deepseek-v4.1-flash`, or a Qwen model's directory's name in lower case). |
 | `--kv-cache GB` | One shared budget for every model's KV states and snapshots (default 8 GiB, apart from `--cache`). Root JSON key: `kv_cache`. Spare snapshots and then idle states are evicted across all models in LRU order. Requests that cannot fit are refused before eviction. State growth and pending snapshots are charged before allocation. If only busy states remain, a generation can grow past the limit and the server logs it. |
 | `--reserve GB` | One process-wide target for memory left available to the system, including reclaimable file pages; default 10 GiB. Root JSON key: `reserve`. The controller adapts expert memory and then idle KV against this target, regardless of which model is active. |
@@ -145,6 +153,7 @@ See [Models](server.md#models) for routing, scheduling and memory, and
 | `--runahead` | Let ready concurrent requests advance while other requests' expert reads run. Groups ready requests at the same layer; each loads its own experts. Applies with two or more decoding requests; off by default. Requires no `--draft`, `--online-predictor` or `--substitute`. Context lookup remains available for a request running alone. |
 | `--pipeline` | Experimental native MXFP4 pipeline for two or more requests. Keeps request stages in flight and combines ready expert stages across layers; a lone request keeps ordinary decoding. Off by default. Requires no GGUF experts, runahead, DSpark, online predictor, substitution or dispatch profiling. JSON configuration: `"pipeline": true` on the DeepSeek model. |
 | `--tui` | A live view on the terminal in place of the log, in six tabs (see below). `n` changes the model shown; the Memory tab shows all models together. `q` stops the server as Ctrl-C does. |
+| `--no-tui` | Use the log when the configuration enables the live view. |
 | `--tui-theme auto\|light\|dark` | The live view's colors: by the terminal's background color, which the view asks the terminal for (`auto`, the default; light colors when it does not answer), or the light or dark ones. |
 | `--render FILE` | Print the prompt of a JSON test case of DeepSeek's `encoding/tests` (or a request's messages, tools, thinking mode and effort) as the server renders it, and exit; for `tools/reference/check.py encoding`. |
 

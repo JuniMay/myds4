@@ -1,0 +1,10 @@
+{
+  "port": 8008,
+  "host": "127.0.0.1",
+  "api_key_file": "/dev/null",
+  "tui": true,
+  "tui_theme": "dark",
+  "reserve": 10,
+  "kv_cache": 8,
+  "models": [{"model": "unused-model"}]
+}

@@ -98,8 +98,12 @@ Chat Completions protocol and the key file's contents (see
 [Usage](docs/usage.md#deepseek-harness)). Each run takes most of the memory,
 so one runs at a time: a second waits for the first's lock.
 
-To serve DeepSeek and Qwen together, list both in `--config FILE` as shown
-in [Models](docs/server.md#models). Put `reserve` and `kv_cache` at the JSON
+To serve DeepSeek and Qwen together, list both in
+`~/.config/myds4/server.json` as shown in [Models](docs/server.md#models).
+Put `port`, `api_key_file` and `tui` at the root along with the memory
+settings, then run `build/myds4-server` without arguments. `--config FILE`
+selects another file; command-line server settings override its values.
+Put `reserve` and `kv_cache` at the JSON
 root: they set one system headroom target and one KV budget for the whole
 server. Each model keeps its own context, batch limit and sampling options.
 Configuration changes require a restart. In the live view, `n` switches

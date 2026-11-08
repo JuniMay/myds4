@@ -68,18 +68,37 @@ since its requests could not end otherwise.
 
 ## Models
 
-`-m DIR` serves one model, its options on the command line; `--config FILE`
-serves the models a JSON file lists, each with its own options under the same
-names without the dashes (`-` as `_`):
+Running `build/myds4-server` reads `~/.config/myds4/server.json` (from
+`HOME`). The file holds the listener, API-key-file path, live view, memory
+budgets and models. `--config FILE` selects another file. `-m DIR` serves
+one model from command-line settings without reading the default file.
+`--render` also runs without the default file.
+
+The root holds server settings; each model has its own options under the
+same names without the dashes (`-` as `_`):
 
 ```json
-{"reserve": 10, "kv_cache": 24, "models": [
+{"port": 8008, "host": "127.0.0.1", "api_key_file": "/path/to/api-key",
+ "tui": true, "tui_theme": "auto", "reserve": 10, "kv_cache": 24, "models": [
   {"model": "/path/to/DeepSeek-V4.1-Flash-1017", "cache": 40, "ctx": 1048576,
    "batch": 4, "pipeline": true, "temperature": 1, "top_p": 1, "top_k": 0},
   {"model": "/path/to/Qwen3.8-27B-NVFP4", "draft": 1, "ctx": 262144,
    "batch": 4, "temperature": 1, "top_p": 1, "top_k": 0}
 ]}
 ```
+
+With this saved at the default path, start it with `build/myds4-server`.
+`port` replaces the required command-line `--serve`; `api_key_file` names
+the existing key file. When no key file is configured, `MYDS4_API_KEY`
+supplies the key. Paths in JSON are literal; relative paths use the current
+working directory, and `~` is not expanded. Use full paths to start the same
+configuration from any directory. The host defaults to `127.0.0.1`, the
+live view to off, and its theme to `auto`.
+
+Explicit command-line server settings override the file regardless of their
+position: `--serve`, `--host`, `--api-key-file`, `--tui` or `--no-tui`,
+`--tui-theme`, `--reserve` and `--kv-cache`. With `--config`, model settings
+stay in the file. Configuration changes require a restart.
 
 A checkpoint's `config.json` tells its family (`model_type` `deepseek_v41`,
 or `qwen3_5`); a family refuses options it has no use for at startup (the
@@ -90,8 +109,7 @@ in lower case), context, concurrency limit (`batch`), drafts and request
 defaults. `reserve` and `kv_cache` belong to the server: one available-memory
 target and one total KV budget, in GiB. Model entries containing either are
 rejected. Command-line `--reserve` and `--kv-cache` apply with either `-m`
-or `--config`; explicit command-line values override the file's globals.
-Changes require a server restart.
+or configuration-file startup.
 
 The KV pool can spend its budget on either model. One LRU clock orders
 eviction across models: spare snapshots first, then idle states. Prefixes

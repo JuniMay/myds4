@@ -2,11 +2,12 @@
 //! one model from `-m DIR` and its options on the command line, or several
 //! from `--config FILE`, a JSON file that lists them, each with its own
 //! options under the same names (without the dashes, `-` as `_`). The root
-//! holds the process-wide reserve and shared KV budget.
+//! holds the listener, authentication, live view and memory settings.
 
+use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
-use crate::engine;
+use crate::{engine, view};
 
 /// One model's settings: the engine's, the worker's and its requests'
 /// defaults.
@@ -77,7 +78,8 @@ impl ModelConfig {
             "prefill_prune" => e.prefill_prune = flag()?,
             "runahead" => e.runahead = flag()?,
             "pipeline" => e.pipeline = flag()?,
-            "reserve" | "kv_cache" => return Err(format!("{name} is server-wide; move it outside models")),
+            "reserve" | "kv_cache" | "port" | "host" | "api_key_file" | "tui" | "tui_theme" =>
+                return Err(format!("{name} is server-wide; move it outside models")),
             "batch" => self.batch = int().ok().filter(|n| *n >= 1).ok_or("batch takes a positive integer")? as usize,
             "temperature" => {
                 self.temperature = Some(num().ok().filter(|t| t.is_finite() && *t >= 0.0).ok_or("temperature must be finite and nonnegative")?)
@@ -87,6 +89,49 @@ impl ModelConfig {
             "seed" => self.seed = Some(v.as_u64().ok_or("seed takes a nonnegative integer")?),
             "think" => self.think = Some(v.as_u64().filter(|n| *n <= 100).ok_or("think takes 0 (off) or 1 to 100")? as u32),
             _ => return Err(format!("no option {name}")),
+        }
+        Ok(())
+    }
+}
+
+/// Listener, authentication and terminal settings for the whole server.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Server {
+    pub port: Option<u16>,
+    pub host: String,
+    pub api_key_file: Option<String>,
+    pub tui: bool,
+    pub tui_theme: view::Colors,
+}
+
+impl Default for Server {
+    fn default() -> Self {
+        Self { port: None, host: "127.0.0.1".into(), api_key_file: None,
+               tui: false, tui_theme: view::Colors::Auto }
+    }
+}
+
+impl Server {
+    pub fn set(&mut self, name: &str, value: &Value) -> Result<(), String> {
+        let text = || value.as_str().filter(|s| !s.is_empty()).ok_or(format!("{name} takes nonempty text"));
+        match name {
+            "port" => self.port = Some(value.as_u64().and_then(|n| u16::try_from(n).ok()).ok_or("port takes an integer from 0 to 65535")?),
+            "host" => {
+                let host = text()?;
+                if host != "localhost" && host.parse::<std::net::Ipv4Addr>().is_err() {
+                    return Err("host takes an IPv4 address or localhost".into());
+                }
+                self.host = host.into();
+            }
+            "api_key_file" => self.api_key_file = Some(text()?.into()),
+            "tui" => self.tui = value.as_bool().ok_or("tui takes true or false")?,
+            "tui_theme" => self.tui_theme = match text()? {
+                "auto" => view::Colors::Auto,
+                "light" => view::Colors::Light,
+                "dark" => view::Colors::Dark,
+                _ => return Err("tui_theme takes auto, light or dark".into()),
+            },
+            _ => return Err(format!("no server setting {name}")),
         }
         Ok(())
     }
@@ -119,25 +164,37 @@ impl Budgets {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
+    pub server: Server,
     pub budgets: Budgets,
     pub models: Vec<ModelConfig>,
 }
 
-/// Reads process-wide budgets and the models they serve.
-pub fn read(path: &str) -> Result<Config, String> {
-    let text = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    let root: Value = serde_json::from_slice(&text).map_err(|e| format!("{path}: {e}"))?;
-    parse(&root).map_err(|e| format!("{path}: {e}"))
+pub fn default_path() -> Result<PathBuf, String> {
+    std::env::var_os("HOME").filter(|s| !s.is_empty())
+        .map(|home| PathBuf::from(home).join(".config/myds4/server.json"))
+        .ok_or("HOME is unset; specify --config FILE or -m DIR".into())
+}
+
+/// Reads the server settings and the models they serve.
+pub fn read(path: &Path) -> Result<Config, String> {
+    let name = path.display();
+    let text = std::fs::read(path).map_err(|e| format!("cannot read {name}: {e}"))?;
+    let root: Value = serde_json::from_slice(&text).map_err(|e| format!("{name}: {e}"))?;
+    parse(&root).map_err(|e| format!("{name}: {e}"))
 }
 
 pub fn parse(root: &Value) -> Result<Config, String> {
     let Some(obj) = root.as_object() else { return Err("not a JSON object".into()) };
-    if let Some(k) = obj.keys().find(|k| !["models", "reserve", "kv_cache"].contains(&k.as_str())) {
+    if let Some(k) = obj.keys().find(|k| !["models", "reserve", "kv_cache", "port", "host", "api_key_file", "tui", "tui_theme"].contains(&k.as_str())) {
         return Err(format!("no server setting {k}"));
     }
     let mut budgets = Budgets::default();
     for name in ["reserve", "kv_cache"] {
         if let Some(value) = obj.get(name) { budgets.set(name, value)?; }
+    }
+    let mut server = Server::default();
+    for name in ["port", "host", "api_key_file", "tui", "tui_theme"] {
+        if let Some(value) = obj.get(name) { server.set(name, value)?; }
     }
     let list = obj.get("models").and_then(Value::as_array).filter(|l| !l.is_empty()).ok_or("models must be a nonempty list")?;
     let mut out = Vec::new();
@@ -150,7 +207,7 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         }
         out.push(c);
     }
-    Ok(Config { budgets, models: out })
+    Ok(Config { server, budgets, models: out })
 }
 
 #[cfg(test)]
@@ -172,6 +229,23 @@ mod tests {
             let mut model = json!({"model": "/models/qwen"});
             model[setting] = json!(8);
             assert!(parse(&json!({"models": [model]})).is_err(), "{setting} belongs at the server level");
+        }
+    }
+
+    #[test]
+    fn server_settings_are_global_and_cli_values_can_override_them() {
+        let mut c = parse(&json!({"port": 8008, "host": "localhost", "api_key_file": "key-file", "tui": true,
+                                "tui_theme": "dark", "models": [{"model": "/models/deepseek"}]})).unwrap();
+        assert_eq!((c.server.port, c.server.host.as_str(), c.server.api_key_file.as_deref()), (Some(8008), "localhost", Some("key-file")));
+        assert!(c.server.tui);
+        assert_eq!(c.server.tui_theme, view::Colors::Dark);
+        c.server.set("port", &json!(9008)).unwrap();
+        c.server.set("tui", &json!(false)).unwrap();
+        c.server.set("tui_theme", &json!("light")).unwrap();
+        assert_eq!((c.server.port, c.server.tui, c.server.tui_theme), (Some(9008), false, view::Colors::Light));
+        for (name, value) in [("port", json!(-1)), ("port", json!(65536)), ("port", json!(1.5)), ("port", json!("8008")),
+                             ("host", json!("not-an-address")), ("api_key_file", json!("")), ("tui", json!(1)), ("tui_theme", json!("blue"))] {
+            assert!(c.server.set(name, &value).is_err(), "{name} {value}");
         }
     }
 
@@ -209,7 +283,7 @@ mod tests {
         assert!(parse(&json!({"models": [{"model": "/m", "cahce": 1}]})).unwrap_err().contains("cahce"));
         assert!(parse(&json!({"models": [{"model": "/m", "ced": 64}]})).is_err());
         assert!(parse(&json!({"models": [{"model": "/m", "top_p": 2}]})).is_err());
-        assert!(parse(&json!({"port": 8008, "models": [{"model": "/m"}]})).is_err());
+        assert!(parse(&json!({"prt": 8008, "models": [{"model": "/m"}]})).is_err());
         assert_eq!(parse(&json!({"models": [{"model": "/m", "ced": "off", "lookup": "off"}]})).unwrap().models[0].engine.ced, 0);
     }
 }
