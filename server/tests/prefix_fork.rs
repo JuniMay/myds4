@@ -1,4 +1,4 @@
-//! The KV prefix cache through HTTP (docs/server.md): the fork test's server
+//! The KV prefix cache through HTTP: the fork test's server
 //! part, and the cache's budget (--kv-cache). Forks of
 //! a conversation reuse its history up to where they part from it, also while
 //! the conversation is still decoding. The cache resumes each fork the
@@ -29,7 +29,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("the repository").to_path_buf()
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the repository")
+        .to_path_buf()
 }
 
 /// Held while a test runs servers: one model process at a time.
@@ -45,7 +48,10 @@ fn one_model() -> std::sync::MutexGuard<'static, ()> {
 /// default --lookup) before k, and each layer below at most 128 positions
 /// earlier (127, plus a ratio-2 compressor's pair).
 fn replay_rows(k: usize) -> usize {
-    (0..40).map(|j| k.min(137 + 128 * j)).sum::<usize>().div_ceil(40)
+    (0..40)
+        .map(|j| k.min(137 + 128 * j))
+        .sum::<usize>()
+        .div_ceil(40)
 }
 
 /// What a bounded replay at k computes again (--ced): a ring's positions.
@@ -63,8 +69,17 @@ struct Setup {
 fn setup() -> Option<Setup> {
     let checkpoint = std::env::var("MYDS4_CHECKPOINT").ok()?;
     let experts = std::env::var("MYDS4_EXPERTS").ok()?;
-    let pick = |var: &str, default: &str| std::env::var(var).map(PathBuf::from).unwrap_or_else(|_| root().join(default));
-    Some(Setup { checkpoint, experts, server: pick("MYDS4_SERVER", "build/myds4-server"), cli: pick("MYDS4_CLI", "build/myds4") })
+    let pick = |var: &str, default: &str| {
+        std::env::var(var)
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| root().join(default))
+    };
+    Some(Setup {
+        checkpoint,
+        experts,
+        server: pick("MYDS4_SERVER", "build/myds4-server"),
+        cli: pick("MYDS4_CLI", "build/myds4"),
+    })
 }
 
 // ---- HTTP/1.1, enough for the server's JSON answers ----
@@ -78,17 +93,28 @@ fn http(port: u16, key: &str, method: &str, path: &str, body: Option<&Value>) ->
          Content-Length: {}\r\nConnection: close\r\n\r\n",
         payload.len()
     );
-    s.write_all(head.as_bytes()).and_then(|_| s.write_all(payload.as_bytes())).expect("send");
+    s.write_all(head.as_bytes())
+        .and_then(|_| s.write_all(payload.as_bytes()))
+        .expect("send");
     let mut raw = Vec::new();
     s.read_to_end(&mut raw).expect("read");
-    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("an HTTP answer");
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("an HTTP answer");
     let headers = String::from_utf8_lossy(&raw[..split]).to_lowercase();
-    let status = headers.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let status = headers
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
     let mut rest = raw[split + 4..].to_vec();
     if headers.contains("transfer-encoding: chunked") {
         let (mut out, mut at) = (Vec::new(), 0);
         while let Some(end) = rest[at..].windows(2).position(|w| w == b"\r\n") {
-            let size = usize::from_str_radix(String::from_utf8_lossy(&rest[at..at + end]).trim(), 16).unwrap_or(0);
+            let size =
+                usize::from_str_radix(String::from_utf8_lossy(&rest[at..at + end]).trim(), 16)
+                    .unwrap_or(0);
             if size == 0 {
                 break;
             }
@@ -109,14 +135,42 @@ struct Server {
 
 impl Server {
     fn start(s: &Setup, extra: &[&str]) -> Server {
-        let port = TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).expect("a free port").port();
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-        let key = format!("fork-test-{}-{:x}", std::process::id(), nanos ^ (port as u128) << 64);
-        let mut args: Vec<String> = ["-m", &s.checkpoint, "--experts", &s.experts, "--cache", "40", "--kv-cache", "8"]
-            .iter()
-            .map(|a| a.to_string())
-            .collect();
-        args.extend(["--ctx", "32768", "--serve", &port.to_string(), "--batch", "2"].map(String::from));
+        let port = TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("a free port")
+            .port();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let key = format!(
+            "fork-test-{}-{:x}",
+            std::process::id(),
+            nanos ^ (port as u128) << 64
+        );
+        let mut args: Vec<String> = [
+            "-m",
+            &s.checkpoint,
+            "--experts",
+            &s.experts,
+            "--cache",
+            "40",
+            "--kv-cache",
+            "8",
+        ]
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+        args.extend(
+            [
+                "--ctx",
+                "32768",
+                "--serve",
+                &port.to_string(),
+                "--batch",
+                "2",
+            ]
+            .map(String::from),
+        );
         args.extend(extra.iter().map(|a| a.to_string()));
         let child = Command::new(&s.server)
             .args(&args)
@@ -142,23 +196,42 @@ impl Server {
 
     /// The served model's status: GET /v1/models/{id}'s "status".
     fn status(&self) -> (u16, Value) {
-        let models: Value = serde_json::from_slice(&self.get("/v1/models").1).unwrap_or(Value::Null);
+        let models: Value =
+            serde_json::from_slice(&self.get("/v1/models").1).unwrap_or(Value::Null);
         let id = models["data"][0]["id"].as_str().unwrap_or("").to_string();
         let (code, body) = self.get(&format!("/v1/models/{id}"));
-        (code, serde_json::from_slice::<Value>(&body).map(|v| v["status"].clone()).unwrap_or(Value::Null))
+        (
+            code,
+            serde_json::from_slice::<Value>(&body)
+                .map(|v| v["status"].clone())
+                .unwrap_or(Value::Null),
+        )
     }
 
     fn chat(&self, body: &Value) -> Value {
-        let (status, answer) = http(self.port, &self.key, "POST", "/v1/chat/completions", Some(body));
+        let (status, answer) = http(
+            self.port,
+            &self.key,
+            "POST",
+            "/v1/chat/completions",
+            Some(body),
+        );
         let v: Value = serde_json::from_slice(&answer).unwrap_or(Value::Null);
-        assert_eq!(status, 200, "chat completion: {}", String::from_utf8_lossy(&answer));
+        assert_eq!(
+            status,
+            200,
+            "chat completion: {}",
+            String::from_utf8_lossy(&answer)
+        );
         v
     }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = Command::new("kill").args(["-TERM", &self.child.id().to_string()]).status();
+        let _ = Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status();
         let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
             if let Ok(Some(_)) = self.child.try_wait() {
@@ -181,18 +254,46 @@ fn tokens(s: &Setup, messages: &Value) -> Vec<i64> {
 fn rendered_tokens(s: &Setup, messages: &Value, thinking: bool) -> Vec<i64> {
     let case = std::env::temp_dir().join(format!("myds4-fork-{}.json", std::process::id()));
     let mode = if thinking { "thinking" } else { "chat" };
-    std::fs::write(&case, json!({"messages": messages, "thinking_mode": mode}).to_string()).expect("a render case");
-    let rendered = Command::new(&s.server).arg("--render").arg(&case).output().expect("render");
+    std::fs::write(
+        &case,
+        json!({"messages": messages, "thinking_mode": mode}).to_string(),
+    )
+    .expect("a render case");
+    let rendered = Command::new(&s.server)
+        .arg("--render")
+        .arg(&case)
+        .output()
+        .expect("render");
     let _ = std::fs::remove_file(&case);
-    assert!(rendered.status.success(), "render: {}", String::from_utf8_lossy(&rendered.stderr));
+    assert!(
+        rendered.status.success(),
+        "render: {}",
+        String::from_utf8_lossy(&rendered.stderr)
+    );
     let prompt = String::from_utf8(rendered.stdout).expect("UTF-8");
     let ids = Command::new(&s.cli)
-        .args(["-m", &s.checkpoint, "--rendered", "--ctx", "32768", "--tokenize", "-p"])
+        .args([
+            "-m",
+            &s.checkpoint,
+            "--rendered",
+            "--ctx",
+            "32768",
+            "--tokenize",
+            "-p",
+        ])
         .arg(prompt.trim_end_matches('\n'))
         .output()
         .expect("tokenize");
-    assert!(ids.status.success(), "tokenize: {}", String::from_utf8_lossy(&ids.stderr));
-    String::from_utf8_lossy(&ids.stdout).trim().split(',').filter_map(|t| t.parse().ok()).collect()
+    assert!(
+        ids.status.success(),
+        "tokenize: {}",
+        String::from_utf8_lossy(&ids.stderr)
+    );
+    String::from_utf8_lossy(&ids.stdout)
+        .trim()
+        .split(',')
+        .filter_map(|t| t.parse().ok())
+        .collect()
 }
 
 fn common(a: &[i64], b: &[i64]) -> usize {
@@ -209,17 +310,26 @@ fn body(messages: &Value, max_tokens: u32, thinking: bool) -> Value {
 }
 
 fn hit(answer: &Value) -> i64 {
-    answer["usage"]["prompt_cache_hit_tokens"].as_i64().unwrap_or(-1)
+    answer["usage"]["prompt_cache_hit_tokens"]
+        .as_i64()
+        .unwrap_or(-1)
 }
 
 fn content(answer: &Value) -> String {
-    answer["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string()
+    answer["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
 }
 
 /// The reply's reasoning and its content.
 fn reply(answer: &Value) -> String {
     let m = &answer["choices"][0]["message"];
-    format!("{}|{}", m["reasoning_content"].as_str().unwrap_or(""), m["content"].as_str().unwrap_or(""))
+    format!(
+        "{}|{}",
+        m["reasoning_content"].as_str().unwrap_or(""),
+        m["content"].as_str().unwrap_or("")
+    )
 }
 
 /// The rows the server's last prefill computed (the model's status): the
@@ -237,7 +347,13 @@ fn texts() -> (String, String) {
     let design = std::fs::read_to_string(root().join("docs/design.md")).expect("docs/design.md");
     let usage = std::fs::read_to_string(root().join("docs/usage.md")).expect("docs/usage.md");
     let cut = |t: &str, n: usize| t.chars().take(n).collect::<String>();
-    (format!("You review this project's design. Reference:\n\n{}", cut(&design, 15000)), cut(&usage, 4000))
+    (
+        format!(
+            "You review this project's design. Reference:\n\n{}",
+            cut(&design, 15000)
+        ),
+        cut(&usage, 4000),
+    )
 }
 
 /// Character offsets: fixed ones near the ends and seeded random ones.
@@ -260,18 +376,24 @@ fn offsets(len: usize, random: usize, seed: u64) -> Vec<usize> {
 /// differently.
 fn conversation_and_forks() -> (Value, Vec<(String, Value)>) {
     let (system, user) = texts();
-    let tail = " Leave the rest aside and answer in one short sentence: what does this part describe?";
-    let conversation = json!([{"role": "system", "content": system}, {"role": "user", "content": user}]);
+    let tail =
+        " Leave the rest aside and answer in one short sentence: what does this part describe?";
+    let conversation =
+        json!([{"role": "system", "content": system}, {"role": "user", "content": user}]);
     let mut forks: Vec<(String, Value)> = Vec::new();
     for c in offsets(user.chars().count(), 8, 0x9E37_79B9) {
         let cut: String = user.chars().take(c).collect();
-        forks.push((format!("user turn at character {c}"),
-                    json!([{"role": "system", "content": system}, {"role": "user", "content": cut + tail}])));
+        forks.push((
+            format!("user turn at character {c}"),
+            json!([{"role": "system", "content": system}, {"role": "user", "content": cut + tail}]),
+        ));
     }
     for c in offsets(system.chars().count(), 4, 0x85EB_CA6B) {
         let cut: String = system.chars().take(c).collect();
-        forks.push((format!("system prompt at character {c}"),
-                    json!([{"role": "system", "content": cut + tail}, {"role": "user", "content": user}])));
+        forks.push((
+            format!("system prompt at character {c}"),
+            json!([{"role": "system", "content": cut + tail}, {"role": "user", "content": user}]),
+        ));
     }
     (conversation, forks)
 }
@@ -288,7 +410,12 @@ struct Forked {
 /// The forks, one after another on one server (with the extra options) while
 /// the conversation decodes there. A fork whose reuse lies outside
 /// [shared - rows(shared), shared] is added to `wrong`.
-fn run_forks(s: &Setup, extra: &[&str], rows: fn(usize) -> usize, wrong: &mut Vec<String>) -> Vec<Forked> {
+fn run_forks(
+    s: &Setup,
+    extra: &[&str],
+    rows: fn(usize) -> usize,
+    wrong: &mut Vec<String>,
+) -> Vec<Forked> {
     let (conversation, forks) = conversation_and_forks();
     let source = tokens(s, &conversation);
     let mut results = Vec::new();
@@ -296,7 +423,8 @@ fn run_forks(s: &Setup, extra: &[&str], rows: fn(usize) -> usize, wrong: &mut Ve
     let port = server.port;
     let key = server.key.clone();
     let long = request(&conversation, 6000);
-    let busy = std::thread::spawn(move || http(port, &key, "POST", "/v1/chat/completions", Some(&long)));
+    let busy =
+        std::thread::spawn(move || http(port, &key, "POST", "/v1/chat/completions", Some(&long)));
     std::thread::sleep(Duration::from_secs(5)); // past the conversation's prefill: it decodes
     for (what, messages) in forks {
         let shared = common(&tokens(s, &messages), &source);
@@ -304,9 +432,17 @@ fn run_forks(s: &Setup, extra: &[&str], rows: fn(usize) -> usize, wrong: &mut Ve
         let (reused, least) = (hit(&answer), shared - rows(shared));
         println!("{what}: shares {shared} tokens, reused {reused} (at least {least})");
         if reused < least as i64 || reused > shared as i64 {
-            wrong.push(format!("{what}: shares {shared} tokens, reused {reused}; at least {least} expected"));
+            wrong.push(format!(
+                "{what}: shares {shared} tokens, reused {reused}; at least {least} expected"
+            ));
         }
-        results.push(Forked { what, messages, shared, reused, text: content(&answer) });
+        results.push(Forked {
+            what,
+            messages,
+            shared,
+            reused,
+            text: content(&answer),
+        });
     }
     drop(server); // ends the decoding request too
     let _ = busy.join();
@@ -328,13 +464,29 @@ fn forks_reuse_the_shared_prefix_and_give_the_cold_tokens() {
         let reference = content(&cold.chat(&request(&f.messages, 16)));
         drop(cold);
         let same = reference == f.text;
-        println!("{} (shares {}, reused {}): tokens {}", f.what, f.shared, f.reused,
-                 if same { "equal to the cold server's" } else { "DIFFERENT from the cold server's" });
+        println!(
+            "{} (shares {}, reused {}): tokens {}",
+            f.what,
+            f.shared,
+            f.reused,
+            if same {
+                "equal to the cold server's"
+            } else {
+                "DIFFERENT from the cold server's"
+            }
+        );
         if !same {
-            wrong.push(format!("{}: {:?} against the cold server's {reference:?}", f.what, f.text));
+            wrong.push(format!(
+                "{}: {:?} against the cold server's {reference:?}",
+                f.what, f.text
+            ));
         }
     }
-    assert!(wrong.is_empty(), "forks that reused too little or changed the output:\n{}", wrong.join("\n"));
+    assert!(
+        wrong.is_empty(),
+        "forks that reused too little or changed the output:\n{}",
+        wrong.join("\n")
+    );
 }
 
 /// With --ced 128 a fork resumes by a bounded replay (a ring's positions
@@ -351,7 +503,11 @@ fn ced_forks_reuse_the_shared_prefix_less_a_ring() {
     for f in run_forks(&s, &["--ced", "128"], bounded_rows, &mut wrong) {
         println!("{}: {:?}", f.what, f.text);
     }
-    assert!(wrong.is_empty(), "forks that reused too little:\n{}", wrong.join("\n"));
+    assert!(
+        wrong.is_empty(),
+        "forks that reused too little:\n{}",
+        wrong.join("\n")
+    );
 }
 
 /// A thinking prompt ends with <think>. The next turn renders that reply
@@ -371,36 +527,69 @@ fn a_thinking_turn_s_next_turn_resumes_one_position_before_its_prompt_end() {
     let second = json!([{"role": "system", "content": system}, {"role": "user", "content": user},
                         {"role": "assistant", "content": "It describes how the server is started and checked."},
                         {"role": "user", "content": "Which of those options change the output?"}]);
-    let (a, b) = (rendered_tokens(&s, &first, true), rendered_tokens(&s, &second, true));
+    let (a, b) = (
+        rendered_tokens(&s, &first, true),
+        rendered_tokens(&s, &second, true),
+    );
     let shared = common(&a, &b);
-    assert_eq!(shared, a.len() - 1, "the next turn parts at the first turn's last token");
+    assert_eq!(
+        shared,
+        a.len() - 1,
+        "the next turn parts at the first turn's last token"
+    );
     let mut wrong = Vec::new();
     for extra in [&[][..], &["--ced", "128"][..]] {
-        let what = if extra.is_empty() { "without --ced" } else { "with --ced 128" };
+        let what = if extra.is_empty() {
+            "without --ced"
+        } else {
+            "with --ced 128"
+        };
         let server = Server::start(&s, extra);
         server.chat(&body(&first, 16, true));
         let answer = server.chat(&body(&second, 16, true));
         let (reused, computed) = (hit(&answer), last_prefill(&server));
-        println!("{what}: the next turn shares {shared} of its {} tokens, reused {reused}, computed {computed} rows",
-                 b.len());
+        println!(
+            "{what}: the next turn shares {shared} of its {} tokens, reused {reused}, computed {computed} rows",
+            b.len()
+        );
         if answer["usage"]["prompt_tokens"].as_i64() != Some(b.len() as i64) {
-            wrong.push(format!("{what}: the server's prompt has {} tokens, the test's {}", answer["usage"]["prompt_tokens"], b.len()));
+            wrong.push(format!(
+                "{what}: the server's prompt has {} tokens, the test's {}",
+                answer["usage"]["prompt_tokens"],
+                b.len()
+            ));
         }
         if reused != shared as i64 || computed != (b.len() - shared) as i64 {
-            wrong.push(format!("{what}: reused {reused} and computed {computed} rows; {shared} and {} expected", b.len() - shared));
+            wrong.push(format!(
+                "{what}: reused {reused} and computed {computed} rows; {shared} and {} expected",
+                b.len() - shared
+            ));
         }
         if extra.is_empty() {
             let text = reply(&answer);
             drop(server);
             let cold = Server::start(&s, &[]);
             let reference = reply(&cold.chat(&body(&second, 16, true)));
-            println!("{what}: tokens {}", if text == reference { "equal to the cold server's" } else { "DIFFERENT from the cold server's" });
+            println!(
+                "{what}: tokens {}",
+                if text == reference {
+                    "equal to the cold server's"
+                } else {
+                    "DIFFERENT from the cold server's"
+                }
+            );
             if text != reference {
-                wrong.push(format!("{what}: {text:?} against the cold server's {reference:?}"));
+                wrong.push(format!(
+                    "{what}: {text:?} against the cold server's {reference:?}"
+                ));
             }
         }
     }
-    assert!(wrong.is_empty(), "the next thinking turn:\n{}", wrong.join("\n"));
+    assert!(
+        wrong.is_empty(),
+        "the next thinking turn:\n{}",
+        wrong.join("\n")
+    );
 }
 
 // ---- an image in the shared prefix ----
@@ -409,9 +598,15 @@ fn base64(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for c in data.chunks(3) {
-        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
         for i in 0..4 {
-            out.push(if i <= c.len() { ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+            out.push(if i <= c.len() {
+                ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char
+            } else {
+                '='
+            });
         }
     }
     out
@@ -422,7 +617,11 @@ fn crc32(data: &[u8]) -> u32 {
     for &b in data {
         c ^= b as u32;
         for _ in 0..8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
         }
     }
     !c
@@ -500,9 +699,19 @@ fn image_forks_give_the_cold_tokens() {
         let cold = Server::start(&s, &[]);
         content(&cold.chat(&request(&fork, 16)))
     };
-    println!("image fork: reused {reused}; tokens {}", if text == reference { "equal to the cold server's" } else { "DIFFERENT" });
+    println!(
+        "image fork: reused {reused}; tokens {}",
+        if text == reference {
+            "equal to the cold server's"
+        } else {
+            "DIFFERENT"
+        }
+    );
     assert!(reused > 0, "the fork after the image reused nothing");
-    assert_eq!(text, reference, "the fork after the image gives other tokens than a cold server");
+    assert_eq!(
+        text, reference,
+        "the fork after the image gives other tokens than a cold server"
+    );
 }
 
 // ---- the cache's budget (--kv-cache) ----
@@ -524,7 +733,10 @@ fn status(server: &Server) -> Status {
         limit: v["kv_cache_limit_gib"].as_f64().unwrap_or(f64::NAN),
         phase: v["phase"].as_str().unwrap_or("").to_string(),
         requests: v["totals"]["requests"].as_i64().unwrap_or(0),
-        sessions: v["sessions"].as_array().map(|a| a.iter().filter_map(|s| s["tokens"].as_i64()).collect()).unwrap_or_default(),
+        sessions: v["sessions"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|s| s["tokens"].as_i64()).collect())
+            .unwrap_or_default(),
     }
 }
 
@@ -568,15 +780,27 @@ fn a_saved_prompt_again_fits_a_full_kv_cache() {
     server.chat(&request(&prompt, 1));
     let again = server.chat(&request(&prompt, 1));
     let st = settled(&server, 2);
-    println!("saved prompt again: the first try took {first:.3} GiB, --kv-cache {limit}; the retry reused {} of {n}; the cache takes {:.3} GiB", hit(&again), st.kv);
+    println!(
+        "saved prompt again: the first try took {first:.3} GiB, --kv-cache {limit}; the retry reused {} of {n}; the cache takes {:.3} GiB",
+        hit(&again),
+        st.kv
+    );
     assert_eq!(hit(&again), n, "the retry did not resume at its prompt end");
-    assert!(st.kv <= st.limit, "the cache takes {:.3} GiB of {:.3}", st.kv, st.limit);
+    assert!(
+        st.kv <= st.limit,
+        "the cache takes {:.3} GiB of {:.3}",
+        st.kv,
+        st.limit
+    );
 }
 
 /// A conversation with `lo` to `hi` prompt tokens: a cut of docs/design.md as
 /// the system prompt, and a question whose answer is long.
 fn sized_prompt(s: &Setup, lo: usize, hi: usize) -> (Value, usize) {
-    let design: Vec<char> = std::fs::read_to_string(root().join("docs/design.md")).expect("docs/design.md").chars().collect();
+    let design: Vec<char> = std::fs::read_to_string(root().join("docs/design.md"))
+        .expect("docs/design.md")
+        .chars()
+        .collect();
     let make = |c: usize| {
         let cut: String = design[..c].iter().collect();
         json!([{"role": "system", "content": format!("You review this project's design. Reference:\n\n{cut}")},
@@ -625,18 +849,27 @@ fn a_growing_generation_frees_room_before_it_grows() {
     server.chat(&request(&short, 1));
     let body = request(&long, (16_384 - n + 150) as u32);
     let (port, key) = (server.port, server.key.clone());
-    let job = std::thread::spawn(move || http(port, &key, "POST", "/v1/chat/completions", Some(&body)));
+    let job =
+        std::thread::spawn(move || http(port, &key, "POST", "/v1/chat/completions", Some(&body)));
     let mut samples = Vec::new();
     while !job.is_finished() {
         samples.push(status(&server));
         std::thread::sleep(Duration::from_millis(250));
     }
     let (code, answer) = job.join().expect("the long request");
-    assert_eq!(code, 200, "the long request: {}", String::from_utf8_lossy(&answer));
+    assert_eq!(
+        code,
+        200,
+        "the long request: {}",
+        String::from_utf8_lossy(&answer)
+    );
     let answer: Value = serde_json::from_slice(&answer).unwrap_or(Value::Null);
     let generated = answer["usage"]["completion_tokens"].as_i64().unwrap_or(0) as usize;
     // Samples published after the long state grew: it holds more than 16,384 positions.
-    let grown: Vec<&Status> = samples.iter().filter(|st| st.phase == "decode" && st.sessions.iter().any(|&t| t > 16_384)).collect();
+    let grown: Vec<&Status> = samples
+        .iter()
+        .filter(|st| st.phase == "decode" && st.sessions.iter().any(|&t| t > 16_384))
+        .collect();
     let over = samples.iter().filter(|st| st.kv > st.limit).count();
     println!(
         "growing generation: {n} prompt tokens, {generated} generated, --kv-cache {limit} (the short one took {f:.3} GiB); \
@@ -645,8 +878,18 @@ fn a_growing_generation_frees_room_before_it_grows() {
         grown.len(),
         grown.iter().filter(|st| st.sessions.len() > 1).count()
     );
-    assert!(n + generated > 16_390, "the reply ended at {} positions, before the state grew", n + generated);
-    assert!(!grown.is_empty(), "no status sample while it decoded past 16,384 positions");
-    assert!(grown.iter().all(|st| st.sessions.len() == 1), "the idle state stayed while the generation grew past its room");
+    assert!(
+        n + generated > 16_390,
+        "the reply ended at {} positions, before the state grew",
+        n + generated
+    );
+    assert!(
+        !grown.is_empty(),
+        "no status sample while it decoded past 16,384 positions"
+    );
+    assert!(
+        grown.iter().all(|st| st.sessions.len() == 1),
+        "the idle state stayed while the generation grew past its room"
+    );
     assert_eq!(over, 0, "the cache took more than --kv-cache");
 }

@@ -3,6 +3,7 @@
 // snapshots, sampling, context-copy drafts, images, statistics and its
 // tokenizer. Requests, their scheduling and the KV prefix cache are the
 // server's (server/src/worker.rs, server/src/kv.rs).
+#include "../model/deepseek/model.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -16,7 +17,7 @@
 #include "engine.h"
 #include "myds4.h"
 #include "../model/model.h"
-#include "../experimental/context_lookup.h"
+#include "../model/draft.h"
 
 struct myds4_model {
   Model *m;
@@ -25,6 +26,12 @@ struct myds4_model {
   Options opt;
   char *dir;
   atomic_int loaded;
+};
+
+struct myds4_images {
+  myds4_model *m;
+  Image *ims;
+  int n;
 };
 
 static myds4_process proc;
@@ -86,50 +93,42 @@ void myds4_request_stop(void) { shutdown_request(); }
 static char *copy(const char *s) { return s ? strdup(s) : 0; }
 
 myds4_model *myds4_open(const myds4_config *c) {
-  const char *bad = !initialized                    ? "the engine is not initialized (myds4_init)"
-                  : !c || c->abi != MYDS4_ABI       ? "the engine's interface version differs from the caller's"
-                  : !c->model                       ? "no checkpoint directory"
-                  : c->ctx < 1 || c->ctx > 1 << 20  ? "ctx takes 1 to 1048576 tokens (the longest context)"
-                  : c->draft < 0 || c->draft > BLOCK ? "draft takes 0 to 5 drafts"
-                  : c->lookup < 0 || c->lookup > VERIFY_DRAFTS ? "lookup takes off or 1 to 15 drafts"
-                  : c->draft_cache && !c->draft     ? "draft-cache needs draft"
-                  : c->draft_cache && (c->draft_cache < DRAFT_CACHE_MIN || c->draft_cache > DRAFT_EXPERTS)
-                      ? "draft-cache takes 15 to 128 slots per stage (0 keeps the default)"
-                  : c->ced && (c->ced < WINDOW || c->ced > 1 << 20) ? "ced takes off or 128 to 1048576 replay tokens"
-                  : c->cache_half_life < 0 || c->cache_half_life > CACHE_HALF_LIFE_MAX
-                      ? "cache-half-life takes 1 to 1000000 forward passes"
-                  : c->runahead && (c->draft || c->online_predictor || c->substitute > 0)
-                      ? "runahead requires draft off, no online predictor and no substitution"
-                  : c->pipeline && (c->experts || c->runahead || c->draft || c->online_predictor || c->predictor_state || c->substitute > 0)
-                      ? "pipeline requires native MXFP4, no runahead, draft, online predictor or substitution"
-                                                    : 0;
-  if (bad) {
-    fprintf(stderr, "myds4: %s\n", bad);
-    return 0;
-  }
+  if (!initialized || !c || c->abi != MYDS4_ABI || !c->model) return NULL;
   const ModelOps *ops = model_find(c->model);
-  for (int i = 0; i < nfamilies; i++)
-    if (families[i] == ops) {
-      fprintf(stderr, "myds4: %s: a %s model is loaded already (one model of a family per process)\n", c->model,
-              ops->family);
-      return 0;
-    }
+  myds4_architecture architecture = ops == &deepseek_ops ? MYDS4_DEEPSEEK : MYDS4_QWEN;
+  if (c->architecture != architecture) {
+    say("%s: option group does not match checkpoint architecture", c->model);
+    return NULL;
+  }
+  const myds4_deepseek_config empty = {0};
+  const myds4_deepseek_config *d = architecture == MYDS4_DEEPSEEK ? &c->options.deepseek : &empty;
+  Options options = {.family = c->architecture, .ctx = c->ctx, .lookup = c->lookup, .dump_fd = -1, .routes_fd = -1, .quiet = 1,
+    .deepseek.budget_gb = d->cache_gb, .deepseek.cache_half_life = d->cache_half_life, .deepseek.cache_read_cost = d->cache_read_cost,
+    .draft = architecture == MYDS4_DEEPSEEK ? d->draft : c->options.qwen.draft,
+    .deepseek.draft_cache = d->draft_cache, .deepseek.predictor_state = d->predictor_state, .deepseek.substitute = d->substitute,
+    .deepseek.experts = d->experts, .deepseek.online_predictor = d->online_predictor || d->predictor_state ? 64 : 0,
+    .deepseek.ced = d->ced, .deepseek.prefill_prune = d->prefill_prune, .deepseek.runahead = d->runahead, .deepseek.pipeline = d->pipeline};
+  const char *bad = options.ctx < 1 || options.ctx > 1 << 20 ? "ctx takes 1 to 1048576 tokens"
+    : options.draft < 0 || options.draft > BLOCK ? "draft takes 0 to 5 proposals"
+    : options.lookup < 0 || options.lookup > VERIFY_DRAFTS ? "lookup takes off or 1 to 15 proposals"
+    : d->draft_cache && !d->draft ? "draft-cache needs draft"
+    : d->draft_cache && (d->draft_cache < DRAFT_CACHE_MIN || d->draft_cache > DRAFT_EXPERTS) ? "draft-cache takes 15 to 128 slots"
+    : d->ced && (d->ced < WINDOW || d->ced > 1 << 20) ? "ced takes off or 128 to 1048576 replay tokens"
+    : d->cache_half_life < 0 || d->cache_half_life > CACHE_HALF_LIFE_MAX ? "cache-half-life takes 1 to 1000000 passes"
+    : d->runahead && (d->draft || d->online_predictor || d->substitute > 0) ? "runahead requires draft off, no online predictor and no substitution"
+    : d->pipeline && (d->experts || d->runahead || d->draft || d->online_predictor || d->predictor_state || d->substitute > 0)
+      ? "pipeline requires native MXFP4, no runahead, draft, online predictor or substitution" : ops->refuse(&options);
+  if (bad) { say("%s: %s", c->model, bad); return NULL; }
+  for (int i = 0; i < nfamilies; i++) if (families[i] == ops) {
+    say("%s: a %s model is registered already", c->model, ops->family);
+    return NULL;
+  }
   myds4_model *x = xmalloc(sizeof *x);
   atomic_init(&x->loaded, 0);
   x->ops = ops;
-  x->opt = (Options){.ctx = c->ctx, .budget_gb = c->cache_gb,
-                     .cache_half_life = c->cache_half_life, .cache_read_cost = c->cache_read_cost, .dump_fd = -1,
-                     .routes_fd = -1, .draft = c->draft, .draft_cache = c->draft_cache,
-                     .predictor_state = copy(c->predictor_state), .substitute = c->substitute,
-                     .experts = copy(c->experts), .quiet = 1,
-                     .online_predictor = c->online_predictor || c->predictor_state ? 64 : 0, .ced = c->ced,
-                     .lookup = c->lookup, .prefill_prune = c->prefill_prune, .runahead = c->runahead, .pipeline = c->pipeline};
-  const char *why = ops->refuse(&x->opt);
-  if (why) {
-    fprintf(stderr, "myds4: %s: %s\n", c->model, why);
-    free(x);
-    return 0;
-  }
+  x->opt = options;
+  x->opt.deepseek.predictor_state = copy(options.deepseek.predictor_state);
+  x->opt.deepseek.experts = copy(options.deepseek.experts);
   families[nfamilies++] = ops;
   x->tk = tok_open(c->model, ops->image_token);
   x->dir = copy(c->model);
@@ -145,8 +144,8 @@ int myds4_load(myds4_model *m) {
   atomic_store_explicit(&m->loaded, 1, memory_order_release);
   say("%s: %s, context %d, drafts %d, rewind margin %d, context lookup %d; prefill: ced_depth=%d (%s), dependency "
       "pruning=%s",
-      m->dir, m->ops->family, m->opt.ctx, m->ops->draft_block(), m->ops->rewind(), m->opt.lookup, m->opt.ced,
-      m->opt.ced ? "approximate" : "off", m->opt.prefill_prune ? "on" : "off");
+      m->dir, m->ops->family, m->opt.ctx, m->ops->draft_block(), m->ops->rewind(), m->opt.lookup, m->opt.deepseek.ced,
+      m->opt.deepseek.ced ? "approximate" : "off", m->opt.deepseek.prefill_prune ? "on" : "off");
   return 1;
 }
 
@@ -206,12 +205,14 @@ static int in_vocabulary(const myds4_model *m, const int32_t *tokens, int n, int
 }
 
 const float *myds4_prefill(myds4_model *m, myds4_state *s, const int32_t *tokens, int n, int from, int replay,
-                           int capture, myds4_snapshot **captured, myds4_prefill_info *info) {
+                           int capture, myds4_snapshot **captured, myds4_prefill_info *info, const myds4_images *images) {
   if (captured) *captured = 0;
   if (n < 1 || from < 0 || from >= n || n > m->opt.ctx || !in_vocabulary(m, tokens, n, m->ops->image != 0)) return 0;
   if (replay && from > 0 && m->ops->replay_rows(from) < 0) return 0;
   int start = replay && from > 0 ? m->ops->replay_start(from) : from;
   if (capture >= 0 && (!captured || capture <= start || capture >= n)) return 0;
+  if (images && images->m != m) return NULL;
+  if (m->ops->images) m->ops->images(images ? images->ims : NULL, images ? images->n : 0);
   const float *lg = m->ops->prefill(s, tokens, n, from, replay, capture, captured, 0);
   if (info) {  // the family's plan, or every row through every layer
     ModelPlan p = {.chunks = 1, .tokens = n - start, .decoder_tokens = n - start};
@@ -293,15 +294,9 @@ void myds4_lookup_feedback(myds4_lookup *x, int offered, int accepted) { context
 
 // ---- images ----
 
-struct myds4_images {
-  myds4_model *m;
-  Image *ims;
-  int n;
-};
-
 myds4_images *myds4_images_open(myds4_model *m, const uint8_t *const *data, const size_t *len, int n, char *message,
                                 size_t cap) {
-  if (!m->ops->image) {
+  if (!m->ops->image || !m->ops->prepare_image) {
     snprintf(message, cap, "this model has no vision encoder");
     return 0;
   }
@@ -311,7 +306,7 @@ myds4_images *myds4_images_open(myds4_model *m, const uint8_t *const *data, cons
   if (!x->ims) die("out of memory");
   for (int i = 0; i < n; i++) {
     const char *why;
-    if (!image_open(&x->ims[i], data[i], len[i], &why)) {
+    if (!m->ops->prepare_image(m->dir, &x->ims[i], data[i], len[i], &why)) {
       snprintf(message, cap, "image %d: %s", i + 1, why);
       myds4_images_close(x);
       return 0;
@@ -322,14 +317,14 @@ myds4_images *myds4_images_open(myds4_model *m, const uint8_t *const *data, cons
 }
 
 int myds4_images_expand(myds4_images *x, const int32_t *in, int n, int32_t *out, int max) {
-  return image_expand(in, n, x->ims, x->n, out, max);
+  int token = tok_find(x->m->tk, x->m->ops->image_token);
+  return image_expand(in, n, x->ims, x->n, out, max, token);
 }
 
 int myds4_images_encode(myds4_images *x, int from) {
   int encoded = 0;  // the encoder runs for the images the prefill reaches; the others are in the state's rows
   for (int i = 0; i < x->n; i++)
     if (x->ims[i].start + image_span(&x->ims[i]) > from) x->m->ops->image(&x->ims[i]), encoded++;
-  x->m->ops->images(x->ims, x->n);
   return encoded;
 }
 

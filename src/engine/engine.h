@@ -14,15 +14,14 @@
 // snapshots, prefill, decoding, drafts, samplers, context lookups and images
 // run on one thread, the server's engine thread: the GPU code keeps state per
 // thread, and one command queue carries every model's passes. The tokenizer's
-// functions, myds4_log, myds4_stopping, myds4_request_stop and
-// myds4_stats_get may be called from any thread; myds4_stats_get reads the
-// counters as they are, without a lock, so a prefill's progress shows while
-// it runs.
+// functions, myds4_log, myds4_stopping and myds4_request_stop may be called
+// from any thread. myds4_stats_get runs on the engine thread between passes;
+// the caller publishes a copy for its HTTP handlers and terminal.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYDS4_ABI 11
+#define MYDS4_ABI 12
 
 // ---- the process ----
 
@@ -55,29 +54,42 @@ void myds4_log(const char *line);
 
 // ---- models ----
 
-// A model's settings: the server's per-model options. Options a model's
-// family has no use for must stay 0: myds4_open refuses them.
+typedef enum { MYDS4_DEEPSEEK = 1, MYDS4_QWEN = 2 } myds4_architecture;
+
 typedef struct {
-  int abi;                     // MYDS4_ABI
-  const char *model;           // the checkpoint directory
-  const char *experts;         // DeepSeek: a GGUF file or any shard of a set; null: the checkpoint's
-  int ctx;                     // context capacity in tokens, 1 to 1,048,576
-  double cache_gb;             // DeepSeek: expert cache budget in GB; 0: from available memory
-  int cache_half_life;         // DeepSeek: in forward passes; 0: the default, 50
-  int cache_read_cost;         // DeepSeek
-  float substitute;            // DeepSeek: 0, exact
-  int draft;                   // drafts per pass, the model's own: DeepSeek's DSpark 0 to 5, Qwen's MTP 0 or 1
-  int draft_cache;             // DeepSeek: draft expert slots per stage; 0: all preloaded
-  int online_predictor;        // DeepSeek
-  const char *predictor_state; // DeepSeek: a file, or null
-  int ced;                     // DeepSeek: 0 or 128 to 1048576 decoder replay tokens; approximate
-  int lookup;                  // 0 or 1 to 15 context-copy drafts
-  int prefill_prune;           // DeepSeek: skip unused decoder batches, dependencies kept
-  int runahead;                // DeepSeek: concurrent requests' scheduler
-  int pipeline;                // DeepSeek: experimental native MXFP4 stage pipeline
+  const char *experts;       // GGUF file or shard; null uses checkpoint experts
+  double cache_gb;
+  int cache_half_life;
+  int cache_read_cost;
+  float substitute;
+  int draft;                // DSpark proposals, 0 to 5
+  int draft_cache;
+  int online_predictor;
+  const char *predictor_state;
+  int ced;
+  int prefill_prune;
+  int runahead;
+  int pipeline;
+} myds4_deepseek_config;
+
+typedef struct { int draft; } myds4_qwen_config; // MTP proposal, 0 or 1
+
+// Common settings and one architecture's options. The tag must match the
+// checkpoint. Each family validates its own option group.
+typedef struct {
+  int abi;
+  const char *model;
+  myds4_architecture architecture;
+  int ctx;
+  int lookup;
+  union {
+    myds4_deepseek_config deepseek;
+    myds4_qwen_config qwen;
+  } options;
 } myds4_config;
 
 typedef struct myds4_model myds4_model;
+typedef struct myds4_images myds4_images;
 
 // Registers a checkpoint and opens its tokenizer without loading weights.
 // Null for invalid settings or a second registration of the same family.
@@ -95,7 +107,7 @@ void myds4_finish(myds4_model *m);
 int myds4_idle(myds4_model *m);
 
 // The model's limits: rows of different states that myds4_rows takes at
-// once, the drafts per pass it makes itself (myds4_config.draft, at most its
+// once, the drafts per pass it makes itself (the selected model options' draft field, at most its
 // draft head's), the most rows one verify pass takes, the positions a state
 // can continue before its end (the rewind margin), and the vocabulary. And
 // whether a token ends a reply.
@@ -167,7 +179,7 @@ typedef struct {
 // the negative image keys of myds4_images_expand), positions outside the
 // context, a capture outside the prefill, more rows than the limits above.
 const float *myds4_prefill(myds4_model *m, myds4_state *s, const int32_t *tokens, int n, int from, int replay,
-                           int capture, myds4_snapshot **captured, myds4_prefill_info *info);
+                           int capture, myds4_snapshot **captured, myds4_prefill_info *info, const myds4_images *images);
 // What a replay at k costs beyond the prompt's new rows: the rows before k it
 // computes again, per layer on average (-1: the model cannot replay); and the
 // first position it computes again, from which the prompt's images must be
@@ -216,7 +228,6 @@ void myds4_lookup_feedback(myds4_lookup *x, int offered, int accepted);
 // A prompt's images: each image place (the model's image token) becomes its
 // image's span of tokens. Null with a message for an image that cannot be
 // read, or for a model without a vision encoder.
-typedef struct myds4_images myds4_images;
 myds4_images *myds4_images_open(myds4_model *m, const uint8_t *const *data, const size_t *len, int n, char *message,
                                 size_t cap);
 // The prompt with the spans in place into out (at most max tokens): its

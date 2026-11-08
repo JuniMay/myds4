@@ -2,6 +2,7 @@
 // them: decoding, the grid an image gets, Pillow's bicubic resize and gray
 // padding (ImageOps.pad), the ViT's patches and 2D RoPE angles, and the
 // tokens of the image's span in a prompt.
+#include "../model/deepseek/model.h"
 #include <CoreGraphics/CoreGraphics.h>
 #include <ImageIO/ImageIO.h>
 #include <jpeglib.h>
@@ -322,6 +323,16 @@ static Rgb pad(Rgb s, int bw, int bh) {
 
 // ---- the image's patches, positions and tokens ----
 
+uint8_t *image_decode_rgb(const void *data, size_t len, int *width, int *height, const char **err) {
+  Rgb image = decode(data, len, err);
+  *width = image.w, *height = image.h;
+  return image.p;
+}
+
+uint8_t *image_resize_rgb(const uint8_t *pixels, int width, int height, int out_width, int out_height) {
+  return resize((Rgb){width, height, (uint8_t *)pixels}, out_width, out_height).p;
+}
+
 uint8_t *image_rgb(const void *data, size_t len, int *bw, int *bh, int *th, int *tw, const char **err) {
   Rgb s = decode(data, len, err);
   if (!s.p) return 0;
@@ -348,6 +359,8 @@ int image_open(Image *im, const void *data, size_t len, const char **err) {
   uint8_t *rgb = image_rgb(data, len, &bw, &bh, &im->th, &im->tw, err);
   if (!rgb) return 0;
   im->vh = bh / PATCH, im->vw = bw / PATCH, im->rows = 0, im->start = 0;
+  im->ntokens = tokens_of(im->th, im->tw), im->patch_stride = VIT_K, im->embedding_width = DIM;
+  im->features = (Buf){0};
   im->hash = 1469598103934665603ull;  // FNV-1a of the file's bytes
   for (size_t i = 0; i < len; i++) im->hash = (im->hash ^ ((const uint8_t *)data)[i]) * 1099511628211ull;
   // the pixels as float32 in [-1, 1], rounded to BF16; a patch's channel c
@@ -366,12 +379,12 @@ int image_open(Image *im, const void *data, size_t len, const char **err) {
   return 1;
 }
 
-int image_span(const Image *im) { return tokens_of(im->th, im->tw); }
+int image_span(const Image *im) { return im->ntokens; }
 
-int image_expand(const int *in, int n, Image *im, int nim, int *out, int max) {
+int image_expand(const int *in, int n, Image *im, int nim, int *out, int max, int image_token) {
   int k = 0, m = 0;
   for (int i = 0; i < n; i++) {
-    if (in[i] != IMAGE_TOKEN) {
+    if (in[i] != image_token) {
       if (m < max) out[m] = in[i];
       m++;
       continue;
@@ -406,6 +419,8 @@ void image_rope(const Image *im, float *cs) {
 }
 
 void image_free(Image *im) {
-  free(im->patch), free(im->rows);
+  free(im->patch);
+  if (im->features.obj) gpu_free(&im->features);
+  else free(im->rows);
   im->patch = 0, im->rows = 0;
 }

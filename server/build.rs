@@ -5,7 +5,9 @@ use std::process::Command;
 
 fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
-    let root = Path::new(&manifest).parent().expect("server/ is inside the repository");
+    let root = Path::new(&manifest)
+        .parent()
+        .expect("server/ is inside the repository");
     let status = Command::new("make")
         .arg("-C")
         .arg(root)
@@ -14,9 +16,19 @@ fn main() {
         .expect("make runs");
     assert!(status.success(), "make build/libmyds4.a failed");
 
-    println!("cargo:rustc-link-search=native={}", root.join("build").display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        root.join("build").display()
+    );
     println!("cargo:rustc-link-lib=static=myds4");
-    for framework in ["Metal", "Foundation", "IOKit", "ImageIO", "CoreGraphics", "Accelerate"] {
+    for framework in [
+        "Metal",
+        "Foundation",
+        "IOKit",
+        "ImageIO",
+        "CoreGraphics",
+        "Accelerate",
+    ] {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
     println!("cargo:rustc-link-lib=objc");
@@ -26,7 +38,10 @@ fn main() {
         .args(["--libs", "yyjson", "libjpeg"])
         .output()
         .expect("pkg-config runs");
-    assert!(libs.status.success(), "pkg-config requires yyjson and libjpeg");
+    assert!(
+        libs.status.success(),
+        "pkg-config requires yyjson and libjpeg"
+    );
     for flag in String::from_utf8_lossy(&libs.stdout).split_whitespace() {
         if let Some(dir) = flag.strip_prefix("-L") {
             println!("cargo:rustc-link-search=native={dir}");
@@ -36,7 +51,7 @@ fn main() {
     }
 
     // Cargo scans a directory's whole tree for changes.
-    for path in ["Makefile", "src", "data/engram.bin"] {
+    for path in ["Makefile", "src"] {
         println!("cargo:rerun-if-changed={}", root.join(path).display());
     }
 }

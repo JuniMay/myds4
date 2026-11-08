@@ -19,16 +19,32 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("the repository").to_path_buf()
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the repository")
+        .to_path_buf()
 }
 
 /// A pseudo-terminal of cols x rows cells: its controlling side and the side
 /// the server gets as its terminal.
 fn pty(cols: u16, rows: u16) -> (File, OwnedFd) {
     let (mut m, mut s) = (0, 0);
-    let mut size = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    let mut size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
     // Safety: openpty fills two descriptors; no name or settings are asked for.
-    let r = unsafe { libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut(), &mut size) };
+    let r = unsafe {
+        libc::openpty(
+            &mut m,
+            &mut s,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
     assert_eq!(r, 0, "openpty");
     // Safety: both descriptors are new and owned here.
     unsafe { (File::from(OwnedFd::from_raw_fd(m)), OwnedFd::from_raw_fd(s)) }
@@ -51,17 +67,38 @@ fn http(port: u16, key: &str, method: &str, path: &str, body: &str) -> Option<St
 
 #[test]
 fn the_live_view_draws_every_tab_with_a_model() {
-    let (Ok(checkpoint), Ok(experts)) = (std::env::var("MYDS4_CHECKPOINT"), std::env::var("MYDS4_EXPERTS")) else {
+    let (Ok(checkpoint), Ok(experts)) = (
+        std::env::var("MYDS4_CHECKPOINT"),
+        std::env::var("MYDS4_EXPERTS"),
+    ) else {
         eprintln!("skipped: set MYDS4_CHECKPOINT and MYDS4_EXPERTS");
         return;
     };
-    let server = std::env::var("MYDS4_SERVER").map(PathBuf::from).unwrap_or_else(|_| root().join("build/myds4-server"));
-    let port = TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).expect("a free port").port();
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let server = std::env::var("MYDS4_SERVER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| root().join("build/myds4-server"));
+    let port = TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("a free port")
+        .port();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
     let key = format!("live-view-{}-{:x}", std::process::id(), nanos);
     let (mut master, slave) = pty(160, 46);
     let mut child = Command::new(&server)
-        .args(["-m", &checkpoint, "--experts", &experts, "--cache", "40", "--kv-cache", "8", "--ctx", "32768"])
+        .args([
+            "-m",
+            &checkpoint,
+            "--experts",
+            &experts,
+            "--cache",
+            "40",
+            "--kv-cache",
+            "8",
+            "--ctx",
+            "32768",
+        ])
         .args(["--serve", &port.to_string(), "--tui"])
         .env("MYDS4_API_KEY", &key)
         .env("TERM", "xterm-256color")
@@ -97,7 +134,10 @@ fn the_live_view_draws_every_tab_with_a_model() {
 
     let ready = Instant::now();
     while http(port, &key, "GET", "/health", "").is_none() {
-        assert!(ready.elapsed() < Duration::from_secs(600), "the server did not start");
+        assert!(
+            ready.elapsed() < Duration::from_secs(600),
+            "the server did not start"
+        );
         std::thread::sleep(Duration::from_millis(500));
     }
     // a reply long enough to decode through the keys below
@@ -135,26 +175,71 @@ fn the_live_view_draws_every_tab_with_a_model() {
         if let Some(s) = child.try_wait().expect("the server") {
             break s;
         }
-        assert!(stop.elapsed() < Duration::from_secs(60), "the server did not stop after q");
+        assert!(
+            stop.elapsed() < Duration::from_secs(60),
+            "the server did not stop after q"
+        );
         std::thread::sleep(Duration::from_millis(200));
     };
     drop(master);
     let _ = pump.join();
     let all = since(0);
-    println!("answer: {}", answer.lines().last().unwrap_or("").chars().take(120).collect::<String>());
+    println!(
+        "answer: {}",
+        answer
+            .lines()
+            .last()
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect::<String>()
+    );
     let checks = [
-        ("the view asked for the background", all.contains("\x1b]11;?")),
-        ("the dark colors (the dark accent)", all.contains("125;122;255")),
-        ("the mouse reported, then given back", all.contains("\x1b[?1000h") && all.contains("\x1b[?1000l")),
-        ("the tabs", tabs["overview"].contains("1 Overview") && tabs["overview"].contains("6 Memory")),
-        ("the expert map's request", tabs["experts"].contains("Request") && tabs["experts"].contains("#1 · s1")),
-        ("four experts a cell at 160 columns", tabs["experts"].contains("four experts")),
-        ("the KV tree's axis and session", tabs["kv"].contains("tokens") && tabs["kv"].contains("s1")),
-        ("a node's text", tabs["text"].contains("Count from 1 to 300")),
-        ("the wheel scrolled the text", tabs["wheel"].contains("lines 4–")),
-        ("a click chose the last minute", tabs["minute"].contains("phase") && tabs["minute"].contains("tokens/s")),
+        (
+            "the view asked for the background",
+            all.contains("\x1b]11;?"),
+        ),
+        (
+            "the dark colors (the dark accent)",
+            all.contains("125;122;255"),
+        ),
+        (
+            "the mouse reported, then given back",
+            all.contains("\x1b[?1000h") && all.contains("\x1b[?1000l"),
+        ),
+        (
+            "the tabs",
+            tabs["overview"].contains("1 Overview") && tabs["overview"].contains("6 Memory"),
+        ),
+        (
+            "the expert map's request",
+            tabs["experts"].contains("Request") && tabs["experts"].contains("#1 · s1"),
+        ),
+        (
+            "four experts a cell at 160 columns",
+            tabs["experts"].contains("four experts"),
+        ),
+        (
+            "the KV tree's axis and session",
+            tabs["kv"].contains("tokens") && tabs["kv"].contains("s1"),
+        ),
+        (
+            "a node's text",
+            tabs["text"].contains("Count from 1 to 300"),
+        ),
+        (
+            "the wheel scrolled the text",
+            tabs["wheel"].contains("lines 4–"),
+        ),
+        (
+            "a click chose the last minute",
+            tabs["minute"].contains("phase") && tabs["minute"].contains("tokens/s"),
+        ),
         ("the log", tabs["log"].contains("req 1:")),
-        ("the shared memory budget and tile", tabs["memory"].contains("Shared KV budget") && tabs["memory"].contains("GiB tracked")),
+        (
+            "the shared memory budget and tile",
+            tabs["memory"].contains("Shared KV budget") && tabs["memory"].contains("GiB tracked"),
+        ),
         ("the server's exit status 0", status.success()),
     ];
     let failed: Vec<&str> = checks.iter().filter(|c| !c.1).map(|c| c.0).collect();
@@ -224,5 +309,7 @@ fn screen(out: &str, cols: usize, rows: usize) -> Vec<String> {
             _ => {}
         }
     }
-    grid.into_iter().map(|row| row.into_iter().filter(|&ch| ch != '\0').collect()).collect()
+    grid.into_iter()
+        .map(|row| row.into_iter().filter(|&ch| ch != '\0').collect())
+        .collect()
 }

@@ -1,5 +1,5 @@
-// Every model behind one interface. A model family (src/model/deepseek.c,
-// src/model/qwen.c) fills a ModelOps table; model_open reads a checkpoint's
+// Every model behind one interface. A model family (src/model/deepseek/model.c,
+// src/model/qwen/model.c) fills a ModelOps table; model_open reads a checkpoint's
 // config.json, picks the family that runs its model_type, and loads it. The
 // engine (src/engine/engine.c), the CLI (src/cli/main.c) and the checks run
 // any checkpoint through these calls.
@@ -9,6 +9,35 @@
 // and a family's buffers are its own.
 #pragma once
 #include "myds4.h"
+
+// Common execution settings and family-specific options. The family is
+// resolved from the checkpoint before loading.
+typedef struct {
+  double budget_gb;   // expert cache budget, 0 = automatic
+  int cache_half_life;  // score half-life in forward passes; 0 = default 50
+  int cache_read_cost;  // weight decode eviction priorities by aligned read bytes / slot size
+  int draft_cache;    // draft expert slots per stage; 0 = all 128 preloaded
+  const char *predictor_state; // load or create online state; save on clean completion
+  float substitute;            // > 0: replace a missing expert by a resident one up to this far below in key
+  const char *experts;         // a GGUF file (set) whose routed experts replace the checkpoint's, or null
+  int online_predictor;        // rank64 online prefetch corrector; 0 disables it
+  int ced;                    // 0: no approximate replay; otherwise decoder replay tokens (at least WINDOW)
+  int prefill_prune;          // skip decoder batches outside the final and saved-prefix dependencies
+  int runahead;               // exact concurrent requests: group ready jobs while other expert reads run
+  int pipeline;               // experimental native MXFP4 stages across concurrent requests
+} DeepSeekOptions;
+typedef struct { int reserved; } QwenOptions;
+typedef struct {
+  enum { MODEL_UNSPECIFIED, MODEL_DEEPSEEK, MODEL_QWEN } family;
+  int ctx;            // capacity in tokens
+  double reserve_gb;  // standalone CLI process reserve; server leaves 0 after setting its global reserve
+  int dump_fd;        // -1, or a pipe receiving per-layer streams
+  int routes_fd;      // -1, or a pipe receiving every decoded token's routes, predictions and router logits
+  int draft;          // enable the model's native draft head(s)
+  int lookup;         // context-copy candidates; bounded by the model's verification capacity
+  int quiet;                   // no progress lines on stderr
+  union { DeepSeekOptions deepseek; QwenOptions qwen; };
+} Options;
 
 typedef struct ModelState ModelState;        // one sequence: a family's own state
 typedef struct ModelSnapshot ModelSnapshot;  // a state's rolling part at one position
@@ -105,6 +134,7 @@ typedef struct {
   void (*report)(FILE *out, int at, int tokens);
   // The vision encoder, when the model has one (null otherwise): an image's
   // feature rows, and the images that the next prefill's image positions take.
+  int (*prepare_image)(const char *dir, Image *im, const void *data, size_t len, const char **error);
   void (*image)(Image *im);
   void (*images)(const Image *im, int n);
   // The experts row `row` of the latest decoding pass chose and where each

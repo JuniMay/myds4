@@ -40,6 +40,7 @@ typedef struct { int rank, pos; } Pair;
 enum { SPLITS = 8 };
 
 struct Tokenizer {
+  Json *document;
   Key *vocab;
   uint64_t vcap;
   Merge *merges;
@@ -161,11 +162,14 @@ Tokenizer *tok_open(const char *dir, const char *image) {
   pthread_once(&once, alphabet);
   char path[4096];
   snprintf(path, sizeof path, "%s/tokenizer.json", dir);
-  Json *root = json_parse(read_file(path, 0)), *model = json_get(root, "model");
+  char *text = read_file(path, 0);
+  Json *root = json_parse(text), *model = json_get(root, "model");
+  free(text);
   Json *v = json_get(model, "vocab"), *m = json_get(model, "merges"), *add = json_get(root, "added_tokens");
   if (!v || v->type != J_OBJ || !m || m->type != J_ARR || !add || add->type != J_ARR)
     die("%s: no vocabulary, merges or added tokens", path);
   Tokenizer *t = xmalloc(sizeof *t);
+  t->document = root;
   pthread_mutex_init(&t->lock, 0);
   pipeline(t, root, path);
   for (int i = 0; i < v->n; i++) t->nvocab = (int)v->kid[i].num >= t->nvocab ? (int)v->kid[i].num + 1 : t->nvocab;
@@ -241,6 +245,17 @@ void alphabet(void) {
 }
 
 int tok_vocab(const Tokenizer *t) { return t->nvocab; }
+
+void tok_close(Tokenizer *t) {
+  if (!t) return;
+  for (int i = 0; i < t->nsplit; i++) uregex_close(t->split[i]);
+  for (uint64_t i = 0; i < t->vcap; i++) free((char *)t->vocab[i].s);
+  free(t->vocab); free(t->merges); free(t->pieces); free(t->piece_len);
+  free(t->added); free(t->special); free(t->sym); free(t->prv); free(t->nxt); free(t->heap);
+  json_free(t->document);
+  pthread_mutex_destroy(&t->lock);
+  free(t);
+}
 
 // ---- encoding ----
 

@@ -32,7 +32,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::Sleep;
 
-use crate::{engine, format};
+use crate::{chat, engine};
 
 /// The limits on connections and requests.
 #[derive(Clone, Copy)]
@@ -50,21 +50,36 @@ pub struct Limits {
     pub body: usize,
 }
 
-pub const LIMITS: Limits = Limits { connections: 64, timeout: Duration::from_secs(60), head: 64 << 10, body: 32 << 20 };
+pub const LIMITS: Limits = Limits {
+    connections: 64,
+    timeout: Duration::from_secs(60),
+    head: 64 << 10,
+    body: 32 << 20,
+};
 
 /// Serves app on listener until `stopped` completes; then it accepts no more
 /// and waits for the open connections to end.
-pub async fn serve(listener: TcpListener, app: Router, stopped: impl Future<Output = ()>, limits: Limits) {
+pub async fn serve(
+    listener: TcpListener,
+    app: Router,
+    stopped: impl Future<Output = ()>,
+    limits: Limits,
+) {
     let slots = Arc::new(Semaphore::new(limits.connections));
     let graceful = GracefulShutdown::new();
     let mut builder = http1::Builder::new();
-    builder.timer(TokioTimer::new()).header_read_timeout(limits.timeout).max_buf_size(limits.head);
-    let app = app.layer(middleware::from_fn(move |r: Request, next: Next| async move {
-        if head_size(&r) > limits.head {
-            return large_head(&r, limits.head);
-        }
-        next.run(r).await
-    }));
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(limits.timeout)
+        .max_buf_size(limits.head);
+    let app = app.layer(middleware::from_fn(
+        move |r: Request, next: Next| async move {
+            if head_size(&r) > limits.head {
+                return large_head(&r, limits.head);
+            }
+            next.run(r).await
+        },
+    ));
     tokio::pin!(stopped);
     loop {
         let (stream, peer) = tokio::select! {
@@ -85,7 +100,9 @@ pub async fn serve(listener: TcpListener, app: Router, stopped: impl Future<Outp
             continue;
         };
         let service = TowerToHyperService::new(app.clone().layer(Extension(ConnectInfo(peer))));
-        let connection = graceful.watch(builder.serve_connection(TokioIo::new(Stalls::new(stream, limits.timeout)), service));
+        let connection = graceful.watch(
+            builder.serve_connection(TokioIo::new(Stalls::new(stream, limits.timeout)), service),
+        );
         tokio::spawn(async move {
             let _ = connection.await;
             drop(slot);
@@ -99,15 +116,33 @@ pub async fn serve(listener: TcpListener, app: Router, stopped: impl Future<Outp
 /// a few large reads.
 fn head_size(r: &Request) -> usize {
     let target = r.uri().path_and_query().map_or(1, |p| p.as_str().len());
-    let headers: usize = r.headers().iter().map(|(name, value)| name.as_str().len() + 2 + value.len() + 2).sum();
+    let headers: usize = r
+        .headers()
+        .iter()
+        .map(|(name, value)| name.as_str().len() + 2 + value.len() + 2)
+        .sum();
     r.method().as_str().len() + 1 + target + 1 + "HTTP/1.1\r\n".len() + headers + 2
 }
 
 fn large_head(r: &Request, limit: usize) -> Response {
-    let peer = r.extensions().get::<ConnectInfo<std::net::SocketAddr>>().map(|c| c.0.ip().to_string());
-    engine::log(&format!("{}: 431: a request's line and headers above {} KB", peer.unwrap_or_default(), limit >> 10));
-    let message = format!("the request's line and headers are larger than {} KB", limit >> 10);
-    format::error(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, "invalid_request_error", &message)
+    let peer = r
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip().to_string());
+    engine::log(&format!(
+        "{}: 431: a request's line and headers above {} KB",
+        peer.unwrap_or_default(),
+        limit >> 10
+    ));
+    let message = format!(
+        "the request's line and headers are larger than {} KB",
+        limit >> 10
+    );
+    chat::error(
+        StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+        "invalid_request_error",
+        &message,
+    )
 }
 
 /// The answer to a connection beyond the limit, before its request is read.
@@ -115,7 +150,7 @@ fn large_head(r: &Request, limit: usize) -> Response {
 /// head's worth, for at most 2 s): closing with it unread would reset the
 /// connection, which can discard the answer before the client reads it.
 async fn refuse(mut stream: TcpStream, limits: Limits) {
-    let body = format::error_json("server_error", "too many connections");
+    let body = chat::error_json("server_error", "too many connections");
     let head = format!(
         "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -143,8 +178,8 @@ async fn refuse(mut stream: TcpStream, limits: Limits) {
 
 /// A request's body: at most limits.body bytes, each part arriving within
 /// limits.timeout of the one before.
-pub async fn read_body(mut body: Body, limits: Limits) -> Result<Bytes, format::Error> {
-    let large = || format::Error {
+pub async fn read_body(mut body: Body, limits: Limits) -> Result<Bytes, chat::Error> {
+    let large = || chat::Error {
         status: StatusCode::PAYLOAD_TOO_LARGE,
         message: format!("the request's body is larger than {} MB", limits.body >> 20),
     };
@@ -155,12 +190,21 @@ pub async fn read_body(mut body: Body, limits: Limits) -> Result<Bytes, format::
     loop {
         match tokio::time::timeout(limits.timeout, body.frame()).await {
             Err(_) => {
-                let message = format!("the request's body stopped arriving for {} s", limits.timeout.as_secs());
-                return Err(format::Error { status: StatusCode::REQUEST_TIMEOUT, message });
+                let message = format!(
+                    "the request's body stopped arriving for {} s",
+                    limits.timeout.as_secs()
+                );
+                return Err(chat::Error {
+                    status: StatusCode::REQUEST_TIMEOUT,
+                    message,
+                });
             }
             Ok(None) => return Ok(out.into()),
             Ok(Some(Err(_))) => {
-                return Err(format::Error { status: StatusCode::BAD_REQUEST, message: "the request's body ended early".into() });
+                return Err(chat::Error {
+                    status: StatusCode::BAD_REQUEST,
+                    message: "the request's body ended early".into(),
+                });
             }
             Ok(Some(Ok(frame))) => {
                 if let Ok(data) = frame.into_data() {
@@ -184,39 +228,64 @@ struct Stalls {
 
 impl Stalls {
     fn new(stream: TcpStream, limit: Duration) -> Stalls {
-        Stalls { stream, limit, stalled: None }
+        Stalls {
+            stream,
+            limit,
+            stalled: None,
+        }
     }
 
     /// A write's outcome: one that waits starts the deadline, and one that
     /// goes on clears it.
-    fn deadline<T>(&mut self, cx: &mut Context<'_>, outcome: Poll<io::Result<T>>) -> Poll<io::Result<T>> {
+    fn deadline<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        outcome: Poll<io::Result<T>>,
+    ) -> Poll<io::Result<T>> {
         if outcome.is_ready() {
             self.stalled = None;
             return outcome;
         }
         let limit = self.limit;
-        let stalled = self.stalled.get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
+        let stalled = self
+            .stalled
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
         match stalled.as_mut().poll(cx) {
-            Poll::Ready(()) => Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, "the client stopped reading"))),
+            Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the client stopped reading",
+            ))),
             Poll::Pending => Poll::Pending,
         }
     }
 }
 
 impl AsyncRead for Stalls {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for Stalls {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let s = self.get_mut();
         let outcome = Pin::new(&mut s.stream).poll_write(cx, buf);
         s.deadline(cx, outcome)
     }
 
-    fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[io::IoSlice<'_>]) -> Poll<io::Result<usize>> {
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
         let s = self.get_mut();
         let outcome = Pin::new(&mut s.stream).poll_write_vectored(cx, bufs);
         s.deadline(cx, outcome)
@@ -248,7 +317,12 @@ mod tests {
     use std::time::Instant;
     use tokio::sync::oneshot;
 
-    const QUICK: Limits = Limits { connections: 2, timeout: Duration::from_millis(300), head: 16 << 10, body: 1000 };
+    const QUICK: Limits = Limits {
+        connections: 2,
+        timeout: Duration::from_millis(300),
+        head: 16 << 10,
+        body: 1000,
+    };
 
     /// Sets its flag when dropped: the handler or the response it belongs to ended.
     struct Ended(Arc<AtomicBool>);
@@ -263,7 +337,14 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (stop, stopped) = oneshot::channel::<()>();
-        tokio::spawn(serve(listener, app, async move { let _ = stopped.await; }, limits));
+        tokio::spawn(serve(
+            listener,
+            app,
+            async move {
+                let _ = stopped.await;
+            },
+            limits,
+        ));
         (addr, stop)
     }
 
@@ -327,25 +408,42 @@ mod tests {
 
     #[tokio::test]
     async fn connections_beyond_the_limit_get_503() {
-        let (addr, _stop) = start(app(Arc::default()), Limits { timeout: Duration::from_secs(5), ..QUICK }).await;
+        let (addr, _stop) = start(
+            app(Arc::default()),
+            Limits {
+                timeout: Duration::from_secs(5),
+                ..QUICK
+            },
+        )
+        .await;
         let first = TcpStream::connect(addr).await.unwrap();
         let _second = TcpStream::connect(addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut third = TcpStream::connect(addr).await.unwrap();
         // A client sends its request before it reads: closing a connection
         // with that request unread would reset it before the answer is read.
-        third.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        third
+            .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await; // the answer arrives before the client reads it
         let mut refused = Vec::new();
-        let read = tokio::time::timeout(Duration::from_secs(5), third.read_to_end(&mut refused)).await;
-        assert!(matches!(read, Ok(Ok(_))), "the connection was reset or kept open: {read:?}");
+        let read =
+            tokio::time::timeout(Duration::from_secs(5), third.read_to_end(&mut refused)).await;
+        assert!(
+            matches!(read, Ok(Ok(_))),
+            "the connection was reset or kept open: {read:?}"
+        );
         let refused = String::from_utf8_lossy(&refused);
         assert!(refused.starts_with("HTTP/1.1 503"), "{refused}");
         assert!(refused.contains("too many connections"), "{refused}");
         drop(first); // its slot comes back once the server sees it closed
         tokio::time::sleep(Duration::from_millis(200)).await;
         let mut fourth = TcpStream::connect(addr).await.unwrap();
-        fourth.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await.unwrap();
+        fourth
+            .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
         let served = answer(&mut fourth).await;
         assert!(served.starts_with("HTTP/1.1 200"), "{served}");
     }
@@ -353,9 +451,16 @@ mod tests {
     #[tokio::test]
     async fn a_head_above_the_limit_gets_431() {
         let (addr, _stop) = start(app(Arc::default()), QUICK).await;
-        for (pad, status) in [(15 << 10, "HTTP/1.1 200"), (17 << 10, "HTTP/1.1 431"), (40 << 10, "HTTP/1.1 431")] {
+        for (pad, status) in [
+            (15 << 10, "HTTP/1.1 200"),
+            (17 << 10, "HTTP/1.1 431"),
+            (40 << 10, "HTTP/1.1 431"),
+        ] {
             let mut c = TcpStream::connect(addr).await.unwrap();
-            let head = format!("GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\nX-Pad: {}\r\n\r\n", "a".repeat(pad));
+            let head = format!(
+                "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\nX-Pad: {}\r\n\r\n",
+                "a".repeat(pad)
+            );
             let _ = c.write_all(head.as_bytes()).await;
             let got = answer(&mut c).await;
             assert!(got.starts_with(status), "{pad} bytes of padding: {got}");
@@ -366,38 +471,69 @@ mod tests {
     async fn a_late_head_closes_the_connection() {
         let (addr, _stop) = start(app(Arc::default()), QUICK).await;
         let mut c = TcpStream::connect(addr).await.unwrap();
-        c.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n").await.unwrap();
+        c.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
         let t = Instant::now();
         let left = answer(&mut c).await;
         assert!(left.is_empty(), "{left}");
-        assert!(t.elapsed() < Duration::from_secs(2), "closed after {:?}", t.elapsed());
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "closed after {:?}",
+            t.elapsed()
+        );
     }
 
     #[tokio::test]
     async fn a_stalled_body_gets_408_and_a_large_one_413() {
         let (addr, _stop) = start(app(Arc::default()), QUICK).await;
         let mut c = TcpStream::connect(addr).await.unwrap();
-        c.write_all(b"POST /body HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc").await.unwrap();
+        c.write_all(b"POST /body HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc")
+            .await
+            .unwrap();
         let late = answer(&mut c).await;
         assert!(late.starts_with("HTTP/1.1 408"), "{late}");
         let mut c = TcpStream::connect(addr).await.unwrap();
-        c.write_all(b"POST /body HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\nConnection: close\r\n\r\n").await.unwrap();
+        c.write_all(
+            b"POST /body HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
         let large = answer(&mut c).await;
         assert!(large.starts_with("HTTP/1.1 413"), "{large}");
         let mut c = TcpStream::connect(addr).await.unwrap();
-        c.write_all(b"POST /body HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc").await.unwrap();
+        c.write_all(
+            b"POST /body HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc",
+        )
+        .await
+        .unwrap();
         let read = answer(&mut c).await;
-        assert!(read.starts_with("HTTP/1.1 200") && read.ends_with("3 bytes"), "{read}");
+        assert!(
+            read.starts_with("HTTP/1.1 200") && read.ends_with("3 bytes"),
+            "{read}"
+        );
     }
 
     #[tokio::test]
     async fn a_client_that_leaves_ends_its_request() {
         let flag = Arc::new(AtomicBool::new(false));
-        let (addr, _stop) = start(app(flag.clone()), Limits { timeout: Duration::from_secs(30), ..QUICK }).await;
+        let (addr, _stop) = start(
+            app(flag.clone()),
+            Limits {
+                timeout: Duration::from_secs(30),
+                ..QUICK
+            },
+        )
+        .await;
         let mut c = TcpStream::connect(addr).await.unwrap();
-        c.write_all(b"POST /wait HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+        c.write_all(b"POST /wait HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(!flag.load(Ordering::SeqCst), "the request waits while its client stays");
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "the request waits while its client stays"
+        );
         drop(c);
         let took = ended_within(&flag, Duration::from_secs(3)).await;
         assert!(took.is_some(), "the handler ran on after its client left");
@@ -408,11 +544,16 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let (addr, _stop) = start(app(flag.clone()), QUICK).await;
         let mut c = TcpStream::connect(addr).await.unwrap();
-        c.write_all(b"GET /stream HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        c.write_all(b"GET /stream HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
         // The client reads nothing: once the socket's buffers are full, the
         // server's writes wait, and after the limit the response ends.
         let took = ended_within(&flag, Duration::from_secs(10)).await;
-        assert!(took.is_some(), "the response kept waiting for a client that does not read");
+        assert!(
+            took.is_some(),
+            "the response kept waiting for a client that does not read"
+        );
         drop(c);
     }
 }

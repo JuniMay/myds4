@@ -56,7 +56,7 @@ kernel void vit_heads(device const float4 *qkv [[buffer(0)]], device bfloat4 *hv
 // probabilities pass from the scores' layout to the second product's through
 // get_left_input_cooperative_tensor, which needs a source of its element type
 // (a float source passed this way gave wrong rows): a change of the products'
-// shapes or types needs tools/reference/check.py vision again.
+// shapes or types needs tests/reference/deepseek.py vision again.
 kernel void vit_attn(device const bfloat *hv [[buffer(0)]], device float *o [[buffer(1)]],
                      constant uint2 &dims [[buffer(2)]], uint2 tg [[threadgroup_position_in_grid]],
                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {

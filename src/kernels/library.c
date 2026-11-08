@@ -8,13 +8,15 @@ static const char source[] = {
     , '\n',
 #embed "kernels.metal"
     , '\n',
-#embed "../experimental/moe_tasks.metal"
+#embed "expert_tasks.metal"
     , '\n',
 #embed "gguf_grids.metal"
     , '\n',
 #embed "gguf.metal"
     , '\n',
 #embed "vision.metal"
+    , '\n',
+#embed "qwen_vision.metal"
     , '\n',
 #embed "rows.metal"
     , '\n',

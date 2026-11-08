@@ -8,7 +8,10 @@ use std::process::{Command, Stdio};
 use serde_json::{Value, json};
 
 fn root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_owned()
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_owned()
 }
 
 fn run(args: &[String], config: Option<Value>) -> String {
@@ -18,15 +21,26 @@ fn run(args: &[String], config: Option<Value>) -> String {
         .env("HOME", root().join("server/tests/fixtures/default-home"))
         .env_remove("XDG_CONFIG_HOME")
         .env("MYDS4_API_KEY", "startup-check-key-not-a-secret")
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().expect("server starts");
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("server starts");
     if let Some(c) = config {
-        child.stdin.take().unwrap().write_all(c.to_string().as_bytes()).unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(c.to_string().as_bytes())
+            .unwrap();
     } else {
         drop(child.stdin.take());
     }
     let output = child.wait_with_output().unwrap();
-    assert!(!output.status.success(), "fixture must stop before model loading");
+    assert!(
+        !output.status.success(),
+        "fixture must stop before model loading"
+    );
     String::from_utf8(output.stderr).unwrap()
 }
 
@@ -46,8 +60,14 @@ fn no_arguments_loads_the_default_home_config() {
 
 #[test]
 fn command_line_key_file_overrides_the_default_config() {
-    let error = run(&["--api-key-file".into(), "missing-override-key".into()], None);
-    assert!(error.contains("cannot open missing-override-key"), "{error}");
+    let error = run(
+        &["--api-key-file".into(), "missing-override-key".into()],
+        None,
+    );
+    assert!(
+        error.contains("cannot open missing-override-key"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -56,28 +76,66 @@ fn explicit_config_and_cli_listener_override_stop_before_model_loading() {
     let port = guard.local_addr().unwrap().port();
     let base = json!({"port": port, "host": "127.0.0.1", "tui": false, "tui_theme": "light",
                       "models": [{"model": "unused-model"}]});
-    let error = run(&["--config".into(), "/dev/stdin".into()], Some(base.clone()));
-    assert!(error.contains(&format!("cannot listen on 127.0.0.1:{port}")), "{error}");
+    let error = run(
+        &["--config".into(), "/dev/stdin".into()],
+        Some(base.clone()),
+    );
+    assert!(
+        error.contains(&format!("cannot listen on 127.0.0.1:{port}")),
+        "{error}"
+    );
     for before in [false, true] {
         let mut c = base.clone();
         c["port"] = json!(0);
         c["api_key_file"] = json!("missing-config-key");
-        let cli = vec!["--serve".into(), port.to_string(), "--api-key-file".into(), "/dev/null".into(), "--no-tui".into()];
+        let cli = vec![
+            "--serve".into(),
+            port.to_string(),
+            "--api-key-file".into(),
+            "/dev/null".into(),
+            "--no-tui".into(),
+        ];
         let file = vec!["--config".into(), "/dev/stdin".into()];
-        let args = if before { [cli, file].concat() } else { [file, cli].concat() };
+        let args = if before {
+            [cli, file].concat()
+        } else {
+            [file, cli].concat()
+        };
         let error = run(&args, Some(c));
         assert!(error.contains("must have 16 to 256 characters"), "{error}");
     }
     let mut c = base;
     c["port"] = json!(0);
-    let error = run(&["--config".into(), "/dev/stdin".into(), "--serve".into(), port.to_string()], Some(c));
-    assert!(error.contains(&format!("cannot listen on 127.0.0.1:{port}")), "{error}");
+    let error = run(
+        &[
+            "--config".into(),
+            "/dev/stdin".into(),
+            "--serve".into(),
+            port.to_string(),
+        ],
+        Some(c),
+    );
+    assert!(
+        error.contains(&format!("cannot listen on 127.0.0.1:{port}")),
+        "{error}"
+    );
 }
 
 #[test]
 fn an_explicit_model_uses_cli_settings_without_the_default_file() {
     let guard = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = guard.local_addr().unwrap().port();
-    let error = run(&["-m".into(), "unused-model".into(), "--serve".into(), port.to_string()], None);
-    assert!(error.contains(&format!("cannot listen on 127.0.0.1:{port}")), "{error}");
+    let error = run(
+        &[
+            "-m".into(),
+            "unused-model".into(),
+            "--serve".into(),
+            port.to_string(),
+        ],
+        None,
+    );
+    assert!(
+        error.contains(&format!("cannot listen on 127.0.0.1:{port}")),
+        "{error}"
+    );
 }

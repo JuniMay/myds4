@@ -6,7 +6,7 @@
 
 #define BLK 256  // positions per attention block
 
-struct Rope { uint heads, dim, rot, stride; float theta, eps; uint pad0, pad1; };
+struct Rope { uint heads, dim, rot, stride; float theta, eps; uint section_h, section_w; };
 
 // Full attention's query or key head g.x of row g.y (dim values at
 // x + (g.y * heads + g.x) * stride): RMSNorm (weights w), then the rotary
@@ -37,11 +37,12 @@ kernel void qk_rope(device const float *x [[buffer(0)]], device const float *w [
   threadgroup_barrier(mem_flags::mem_threadgroup);
   device float *yr = y + ((size_t)g.y * p.heads + g.x) * p.dim;
   uint half_rot = p.rot / 2;
-  float pos = float(rows[g.y].pos);
   for (uint i = t; i < p.dim; i += tn) {
     float v = row[i];
     if (i < p.rot) {
       uint j = i < half_rot ? i : i - half_rot;
+      float pos = float(j % 3 == 1 && j < p.section_h * 3 ? rows[g.y].rope_h :
+                        j % 3 == 2 && j < p.section_w * 3 ? rows[g.y].rope_w : rows[g.y].rope_t);
       float f = pos * pow(p.theta, -2.0f * float(j) / float(p.rot));
       float c = cos(f), sn = sin(f);
       v = i < half_rot ? row[i] * c - row[i + half_rot] * sn : row[i - half_rot] * sn + row[i] * c;

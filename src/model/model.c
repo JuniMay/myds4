@@ -28,6 +28,8 @@ Model *model_open(const char *dir, const Options *o) {
   Model *m = xmalloc(sizeof *m);
   *m = (Model){.ops = model_find(dir), .dir = dir};
   lock_model();
-  m->ops->load(dir, o);
+  Options options = *o;
+  options.family = m->ops == &deepseek_ops ? MODEL_DEEPSEEK : MODEL_QWEN;
+  m->ops->load(dir, &options);
   return m;
 }

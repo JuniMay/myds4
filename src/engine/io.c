@@ -23,6 +23,7 @@
 // second between steps for the memory given back to show; it grows again
 // only after a calm period. It checks after every token, after every layer
 // of a prompt and every second while the server idles.
+#include "../model/deepseek/model.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>

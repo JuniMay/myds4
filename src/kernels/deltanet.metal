@@ -11,6 +11,7 @@ struct Seq {
   device float *conv, *conv_save;  // convolution inputs [linear layer][3][channels], oldest first
   device half *k, *v;              // [attention layer][cap][kv head][head dim]
   uint pos, cap;                   // the row's position; the keys' capacity
+  int rope_t, rope_h, rope_w, pad;
 };
 
 struct Conv { uint channels, n, layer, pad; };

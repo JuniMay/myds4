@@ -1,5 +1,6 @@
 // myds4 command line: generate text with any checkpoint the engine runs
 // (src/model/model.h), or replay token ids for checks.
+#include "../model/deepseek/model.h"
 #include <math.h>
 #include <errno.h>
 #include <pthread.h>
@@ -9,7 +10,7 @@
 
 #include "myds4.h"
 #include "../model/model.h"
-#include "../experimental/context_lookup.h"
+#include "../model/draft.h"
 
 static void usage(void) {
   fputs("usage: myds4 -m MODEL [-p PROMPT | -f FILE | --tokens IDS] [options]\n"
@@ -127,15 +128,15 @@ int main(int argc, char **argv) {
       continue;
     }
     if (!strcmp(a, "--cache-read-cost")) {
-      o.cache_read_cost = 1;
+      o.deepseek.cache_read_cost = 1;
       continue;
     }
     if (!strcmp(a, "--prefill-prune")) {
-      o.prefill_prune = 1;
+      o.deepseek.prefill_prune = 1;
       continue;
     }
     if (!strcmp(a, "--online-predictor")) {
-      o.online_predictor = 64;
+      o.deepseek.online_predictor = 64;
       continue;
     }
     if (!v) usage();
@@ -164,9 +165,9 @@ int main(int argc, char **argv) {
       long n = !strcmp(v, "off") ? 0 : strtol(v, &end, 10);
       if (strcmp(v, "off") && (end == v || *end || errno || n < WINDOW || n > 1 << 20))
         die("--ced takes off or 128 to 1048576 replay tokens");
-      o.ced = (int)n;
+      o.deepseek.ced = (int)n;
     } else if (!strcmp(a, "--ctx")) o.ctx = atoi(v);
-    else if (!strcmp(a, "--cache")) o.budget_gb = atof(v);
+    else if (!strcmp(a, "--cache")) o.deepseek.budget_gb = atof(v);
     else if (!strcmp(a, "--reserve")) {
       char *end;
       double gib = strtod(v, &end);
@@ -179,7 +180,7 @@ int main(int argc, char **argv) {
       long half_life = strtol(v, &end, 10);
       if (end == v || *end || half_life < 1 || half_life > CACHE_HALF_LIFE_MAX)
         die("--cache-half-life takes 1 to %d forward passes", CACHE_HALF_LIFE_MAX);
-      o.cache_half_life = (int)half_life;
+      o.deepseek.cache_half_life = (int)half_life;
     } else if (!strcmp(a, "--tokens")) ids = v;
     else if (!strcmp(a, "--dump-fd")) o.dump_fd = atoi(v);
     else if (!strcmp(a, "--routes-fd")) o.routes_fd = atoi(v);
@@ -197,12 +198,12 @@ int main(int argc, char **argv) {
       long slots = strtol(v, &end, 10);
       if (end == v || *end || slots < 0 || slots > DRAFT_EXPERTS || (slots && slots < DRAFT_CACHE_MIN))
         die("--draft-cache takes 15 to 128 slots per stage (0 keeps the default)");
-      o.draft_cache = (int)slots;
+      o.deepseek.draft_cache = (int)slots;
     } else if (!strcmp(a, "--predictor-state")) {
       if (!*v) die("--predictor-state needs a nonempty path");
-      o.predictor_state = v, o.online_predictor = 64;
-    } else if (!strcmp(a, "--substitute")) o.substitute = atof(v);
-    else if (!strcmp(a, "--experts")) o.experts = v;
+      o.deepseek.predictor_state = v, o.deepseek.online_predictor = 64;
+    } else if (!strcmp(a, "--substitute")) o.deepseek.substitute = atof(v);
+    else if (!strcmp(a, "--experts")) o.deepseek.experts = v;
     else if (!strcmp(a, "--prefill")) prefill = atoi(v);
     else if (!strcmp(a, "--logits-fd")) logits_fd = atoi(v);
     else if (!strcmp(a, "--image")) {
@@ -217,12 +218,12 @@ int main(int argc, char **argv) {
     die("--image works with a prompt's generation and with --vision-fd");
   if (o.ctx < 1 || o.ctx > 1 << 20) die("--ctx takes 1 to %d tokens (the model's longest context)", 1 << 20);
   if (o.draft < 0 || o.draft > BLOCK) die("--draft takes 1 to %d drafts", BLOCK);
-  if (o.draft_cache && !o.draft) die("--draft-cache needs --draft");
-  if (o.ced && (o.dump_fd >= 0 || check)) die("--dump-fd and --check-prefill require --ced off; they inspect every prompt row");
+  if (o.deepseek.draft_cache && !o.draft) die("--draft-cache needs --draft");
+  if (o.deepseek.ced && (o.dump_fd >= 0 || check)) die("--dump-fd and --check-prefill require --ced off; they inspect every prompt row");
   const ModelOps *ops = model_find(dir);
   if (nimg && !ops->image) die("--image: this model has no vision encoder");
   if (bench && !ops->bench) die("--bench: this model has no kernel timings");
-  if (o.predictor_state) shutdown_watch();
+  if (o.deepseek.predictor_state) shutdown_watch();
   if (bench) {
     o.ctx = 2048;
     model = model_open(dir, &o);
@@ -241,7 +242,7 @@ int main(int argc, char **argv) {
       s = end;
     }
   } else {
-    size_t len = strlen(prompt) + 512 + 32 * (size_t)nimg;
+    size_t len = strlen(prompt) + 512 + 128 * (size_t)nimg;
     char *text = xmalloc(len);
     if (raw) snprintf(text, len, "%s", prompt);
     else if (ops->chat) ops->chat(text, len, prompt, nimg, think);
@@ -256,11 +257,11 @@ int main(int argc, char **argv) {
       size_t len;
       const char *err;
       char *d = read_file(image_path[i], &len);
-      if (!image_open(&ims[i], d, len, &err)) die("%s: %s", image_path[i], err);
+      if (!ops->prepare_image || !ops->prepare_image(dir, &ims[i], d, len, &err)) die("%s: %s", image_path[i], ops->prepare_image ? err : "this model has no image processor");
       free(d);
       total += image_span(&ims[i]) - 1;
     }
-    int *p = xmalloc((size_t)(total + 1) * sizeof *p), m = image_expand(tokens, n, ims, nimg, p, total);
+    int *p = xmalloc((size_t)(total + 1) * sizeof *p), m = image_expand(tokens, n, ims, nimg, p, total, tok_find(tk, ops->image_token));
     if (m < 0) die("the prompt holds another number of <｜deepseek_image｜> than --image images");
     if (m > o.ctx) die("the prompt has %d tokens with its images; --ctx holds %d", m, o.ctx);
     free(tokens), tokens = p, n = m;
