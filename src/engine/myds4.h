@@ -7,6 +7,10 @@
 // ---- util.c ----
 _Noreturn void die(const char *fmt, ...);
 extern void (*die_hook)(void);  // runs before die's message (the server's live view restores the terminal)
+// The log: say() writes one line with its time, to log_hook when it is set
+// (the server's live view), else to stderr. Any thread may call it.
+extern void (*log_hook)(const char *line);
+void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 double now(void);
 void *xmalloc(size_t n);
 char *read_file(const char *path, size_t *len);

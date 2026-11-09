@@ -183,6 +183,76 @@ static int slots_not_yet_written_are_not_room(void) {
   return held <= 96 * GB;
 }
 
+// The expert cache grows into the room above the reserve, slot by slot, as
+// far as the memory allows (a speculative claim).
+static Entry *grown_slot(MemoryAccount *account, uint64_t bytes) {
+  Entry *e = calloc(1, sizeof *e);
+  memory_slot_init(&e->slot, account, NULL, "routed expert", evict_entry, e);
+  if (!memory_claim(&e->slot, bytes, MEMORY_SPECULATIVE)) {
+    memory_slot_remove(&e->slot);
+    free(e);
+    return NULL;
+  }
+  memory_publish(&e->slot, 1);
+  return e;
+}
+
+// A pass takes small host buffers in the model's workspace and frees them
+// (a token's embedding and Engram rows), and the cache grows by a slot when
+// an expert misses. Once the cache has filled the room above the reserve,
+// the small buffers must not take an expert back on every pass: of 20
+// passes, at most one may.
+static int small_buffers_do_not_take_experts_back_each_pass(void) {
+  memory_configure(110, 4);
+  MemoryAccount *deepseek = calloc(1, sizeof *deepseek);
+  memory_account_init(deepseek, "DeepSeek");
+  MemorySlot *work = calloc(1, sizeof *work);
+  memory_slot_init(work, deepseek, NULL, "model workspace", NULL, NULL);
+  work->automatic = 1;
+  enum { MOST = 2048 };
+  Entry **slots = calloc(MOST, sizeof *slots);
+  int n = 0, taken = 0;
+  while (n < MOST && (slots[n] = grown_slot(deepseek, 64ull << 20))) n++;
+  for (int pass = 0; pass < 20; pass++) {
+    MemorySlot *before = memory_scope(work);
+    memory_host_free(memory_host_alloc(64, 0));
+    memory_scope(before);
+    if (n < MOST && (slots[n] = grown_slot(deepseek, 64ull << 20))) n++;
+  }
+  for (int i = 0; i < n; i++) taken += slots[i]->evicted;
+  fprintf(stderr, "  20 passes with small buffers at the reserve: %d expert slots taken back (at most 1)\n", taken);
+  return taken <= 1;
+}
+
+// Memory messages go to the engine's log (the server's live view shows it),
+// and only take-backs of 1 GiB or more: a small buffer that takes back one
+// 64 MiB slot logs nothing, and a 4 GiB load that takes back 4 GiB logs one
+// line.
+static int lines_logged;
+static char last_line[512];
+static void capture(const char *line) {
+  lines_logged++;
+  snprintf(last_line, sizeof last_line, "%s", line);
+}
+static int memory_messages_go_to_the_log(void) {
+  memory_configure(110, 4);
+  log_hook = capture;
+  MemoryAccount *deepseek = calloc(1, sizeof *deepseek), *qwen = calloc(1, sizeof *qwen);
+  memory_account_init(deepseek, "DeepSeek"), memory_account_init(qwen, "Qwen");
+  MemorySlot *work = calloc(1, sizeof *work);
+  memory_slot_init(work, deepseek, NULL, "model workspace", NULL, NULL);
+  work->automatic = 1;
+  for (int i = 0; i < 1536; i++) entry(deepseek, NULL, 64ull << 20);  // 96 GiB: the room above the reserve
+  MemorySlot *before = memory_scope(work);
+  memory_host_free(memory_host_alloc(64, 0));
+  memory_scope(before);
+  int small = lines_logged;
+  entry(qwen, NULL, 4 * GB);
+  fprintf(stderr, "  memory messages in the log: %d for a 64 MiB take-back (none), %d for a 4 GiB one (one): %s\n",
+          small, lines_logged - small, lines_logged ? last_line : "-");
+  return small == 0 && lines_logged == 1 && strstr(last_line, "took back");
+}
+
 static int checks, failures;
 static void run_case(const char *name, int (*check)(void)) {
   fflush(stderr);
@@ -203,6 +273,8 @@ int main(void) {
   run_case("KV growth takes its space back from idle experts", kv_growth_takes_its_space_from_the_experts);
   run_case("the file cache the kernel keeps is not room for model memory", the_kept_file_cache_is_not_room);
   run_case("charged slots that their reads have not written yet are not room", slots_not_yet_written_are_not_room);
+  run_case("a pass's small buffers do not take an expert back on every pass", small_buffers_do_not_take_experts_back_each_pass);
+  run_case("memory messages go to the engine's log, and only large take-backs", memory_messages_go_to_the_log);
   fprintf(stderr, "memory budget: %d/%d CPU checks passed\n", checks - failures, checks);
   return failures != 0;
 }

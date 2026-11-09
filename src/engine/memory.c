@@ -30,6 +30,10 @@ static double read_at = -1e9, released_at = -1e9;
 
 static uint64_t in_use(void) { return usage.allocated + usage.kv; }
 #define GIB_F 1073741824.0
+// The log names take-backs of this much or more (a model's load, a long
+// prompt's workspace); smaller ones happen in passes and only count
+// (usage.evictions).
+#define LOGGED_TAKE_BACK (1ull << 30)
 
 static uint64_t available(uint64_t adding) {
   double t = now();
@@ -239,14 +243,18 @@ int memory_admit(MemorySlot *const *wanted, const uint64_t *sizes, size_t n, Mem
   int evicted = 0;
   uint64_t extra = growth(wanted, sizes, n);
   // What the addition needs past the reserve comes back from idle model
-  // memory in the same order as what it needs past the limit.
-  uint64_t short_by = extra == UINT64_MAX ? 0 : shortage(extra), over = over_limit(extra);
+  // memory in the same order as what it needs past the limit. Speculative
+  // growth (the expert cache's) stops one more of itself short of the
+  // reserve: a pass's small buffers then fit without taking an expert back,
+  // which the next miss would read again.
+  uint64_t probe = mode == MEMORY_SPECULATIVE && extra <= UINT64_MAX / 2 ? 2 * extra : extra;
+  uint64_t short_by = extra == UINT64_MAX ? 0 : shortage(probe), over = over_limit(extra);
   uint64_t need = over > short_by ? over : short_by, freed = 0;
   if (mode == MEMORY_SPECULATIVE && need) { usage.refusals++; return 0; }
   if (need && (need == UINT64_MAX || need > reclaimable(wanted, sizes, n, mode))) {
     if (short_by)
-      fprintf(stderr, "memory: %s: %.2f GiB to add, %.2f GiB short of the %.1f GiB reserve, too little idle: refused\n",
-              wanted[0]->name, extra / GIB_F, short_by / GIB_F, reserve / GIB_F);
+      say("memory: %s: %.2f GiB to add, %.2f GiB short of the %.1f GiB reserve, too little idle: refused",
+          wanted[0]->name, extra / GIB_F, short_by / GIB_F, reserve / GIB_F);
     usage.refusals++;
     return 0;
   }
@@ -259,10 +267,10 @@ int memory_admit(MemorySlot *const *wanted, const uint64_t *sizes, size_t n, Mem
     evicted = 1, taken++;
     extra = growth(wanted, sizes, n);
   }
-  if (short_by)
-    fprintf(stderr, "memory: %s: %.2f GiB to add, %.2f GiB short of the %.1f GiB reserve (reading %.1f s old): "
-            "took back %.2f GiB from %d idle entries\n", wanted[0]->name, extra / GIB_F, short_by / GIB_F,
-            reserve / GIB_F, now() - read_at, freed / GIB_F, taken);
+  if (short_by && freed >= LOGGED_TAKE_BACK)
+    say("memory: %s: %.2f GiB to add, %.2f GiB short of the %.1f GiB reserve (reading %.1f s old): "
+        "took back %.2f GiB from %d idle entries", wanted[0]->name, extra / GIB_F, short_by / GIB_F,
+        reserve / GIB_F, now() - read_at, freed / GIB_F, taken);
   for (size_t i = 0; i < n; i++) change(wanted[i], sizes[i] > wanted[i]->payload ? sizes[i] : wanted[i]->payload);
   if (evicted && collect_released) collect_released();
   return 1;
@@ -323,9 +331,9 @@ void memory_kv_change(uint64_t bytes, int allocated) {
     released++;
   }
   if (released && collect_released) collect_released();
-  if (short_by)
-    fprintf(stderr, "memory: KV grows %.2f GiB, %.2f GiB short of the %.1f GiB reserve: took back %.2f GiB from %d idle "
-            "entries\n", bytes / GIB_F, short_by / GIB_F, reserve / GIB_F, freed / GIB_F, released);
+  if (short_by && freed >= LOGGED_TAKE_BACK)
+    say("memory: KV grows %.2f GiB, %.2f GiB short of the %.1f GiB reserve: took back %.2f GiB from %d idle entries",
+        bytes / GIB_F, short_by / GIB_F, reserve / GIB_F, freed / GIB_F, released);
   usage.kv += bytes;
 }
 MemoryUsage memory_usage(void) { return usage; }

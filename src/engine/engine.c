@@ -43,35 +43,8 @@ static int initialized;
 static const ModelOps *families[8];  // the families loaded: one model each
 static int nfamilies;
 
-// ---- the log: one line per event, on stderr (or to the caller's on_log) ----
-
-static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static void say(const char *fmt, ...) {
-  struct timeval tv;
-  struct tm tm;
-  char t[16];
-  gettimeofday(&tv, 0);
-  localtime_r(&tv.tv_sec, &tm);
-  strftime(t, sizeof t, "%H:%M:%S", &tm);
-  va_list ap;
-  va_start(ap, fmt);
-  pthread_mutex_lock(&log_lock);
-  if (proc.on_log) {
-    char line[1024];
-    int k = snprintf(line, sizeof line, "%s.%03d ", t, (int)(tv.tv_usec / 1000));
-    vsnprintf(line + k, sizeof line - k, fmt, ap);
-    proc.on_log(line);
-  } else {
-    fprintf(stderr, "%s.%03d ", t, (int)(tv.tv_usec / 1000));
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
-  }
-  pthread_mutex_unlock(&log_lock);
-  va_end(ap);
-}
-
+// The log is say() in util.c: one line per event, to the caller's on_log
+// (log_hook) or stderr.
 void myds4_log(const char *line) { say("%s", line); }
 
 // ---- the process ----
@@ -82,6 +55,7 @@ int myds4_init(const myds4_process *p) {
   memory_configure(p->memory_gb, p->reserve_gb);
   proc = *p;
   die_hook = p->on_die;
+  log_hook = p->on_log;
   pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);  // the models' GPU work goes before background work
   shutdown_watch();  // an interrupt while loading still saves a predictor's state
   initialized = 1;

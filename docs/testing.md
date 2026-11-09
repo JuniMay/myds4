@@ -46,8 +46,11 @@ within the installed memory less the reserve less other programs, never
 takes the space that KV occupies, stays under a lower `memory` setting, a
 load after other programs grew first takes back idle experts, KV growth
 takes its space back from idle experts, and expert slots charged before
-their reads write them are not room. Its simulated kernel counts memory as
-used once it is written, as macOS does.
+their reads write them are not room. It also checks that 20 passes of small
+workspace buffers at the reserve take back no expert, and that memory
+messages reach the engine's log hook only for take-backs of 1 GiB or more.
+Its simulated kernel counts memory as used once it is written, as macOS
+does.
 `build/tests/cache-memory` checks the cache's resizing under controlled
 memory counters, including that a shortfall without memory pressure gives
 back only the slots that restore the reserve. It also checks which slot

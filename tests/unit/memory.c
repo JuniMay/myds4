@@ -12,6 +12,10 @@ _Noreturn void die(const char *format, ...) {
   va_list args; va_start(args, format); vfprintf(stderr, format, args); va_end(args);
   fputc('\n', stderr); exit(2);
 }
+void say(const char *format, ...) {
+  va_list args; va_start(args, format); vfprintf(stderr, format, args); va_end(args);
+  fputc('\n', stderr);
+}
 #define CHECK(test) do { if (!(test)) die("%s:%d: %s", __func__, __LINE__, #test); } while (0)
 
 typedef struct { MemorySlot slot; int id, evicted; } Entry;

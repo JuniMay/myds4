@@ -36,8 +36,14 @@ written, while the engine charges the buffer when it allocates it. A reading
 of the counters therefore counts the expert-cache bytes that no completed
 read has written as in use (`memory_unwritten`; `cache_unwritten` in
 src/engine/io.c): slots whose reads are under way, and the part of a slot
-beyond a smaller expert. Each loaded model owns its tensor index; deferred media
-encoding uses that model's index.
+beyond a smaller expert. The expert cache's speculative growth stops while
+one more slot would still fit above the reserve. That margin holds a pass's
+small workspace buffers, which the workspace slot charges and releases on
+every pass, so they do not take back an expert that the next miss would read
+again. Memory messages go through the engine's log
+(`say` in src/engine/util.c, which the server's live view receives) and
+name only take-backs of 1 GiB or more, and refusals. Each loaded model owns
+its tensor index; deferred media encoding uses that model's index.
 
 Weights are read in 16 KiB-aligned spans into a page-aligned buffer and
 copied out (`read_bytes`, src/model/weights.c): checkpoint files are opened

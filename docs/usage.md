@@ -107,7 +107,11 @@ The rules below keep the server from causing that pressure (see
 
 - **Additions keep the reserve.** Before model memory or KV is added, the
   engine checks the available memory: an addition may not take it below
-  `reserve`. When it would, idle model memory goes back first.
+  `reserve`. When it would, idle model memory goes back first. The expert
+  cache grows only while one more expert slot would still fit above
+  `reserve`, so the small buffers a pass takes and frees fit without taking
+  an expert back. The log names take-backs of 1 GiB or more, and refusals;
+  smaller take-backs are counted, not logged.
 - **What goes back, and in what order.**
   - The model memory holds variable-sized entries. A dense model's weights
     form one entry, and MoE experts are separate entries that go back before
