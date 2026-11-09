@@ -98,6 +98,13 @@ logits after state restoration, and state forks beyond the sparse indexer's
 --layer N` compares a requested text block with Transformers using the same
 input and only that block's selected experts.
 
+`build/tests/gguf-decode [GGUF]` compares GPU dequantization with llama.cpp's
+scalar formulas. It covers Q2_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S,
+IQ3_XXS and the Q6_K output head, including both IQ2_S kernel layouts.
+It checks random blocks and samples each supported expert tensor in the
+supplied shard set. The tensor metadata chooses the format; a GGUF variant
+can mix several formats. This checks stored-value decoding, not model quality.
+
 The image reference mode in `tests/reference/qwen.py` also accepts Flash-Next.
 It keeps per-block traces in memory, limits those fixtures to 1,024 patches,
 and requires at least 45 dB SNR for each block on identical inputs. Its
@@ -111,6 +118,14 @@ should use GGUF experts. Run the selected Rust integration target with
 `--test-threads 1`; some cases deliberately load both architectures inside
 one server process. The lifecycle checks verify metadata-only startup,
 loading the requested model, and service errors for unavailable weights.
+
+Set `MYDS4_FLASH` for Flash-Next's image and conversation-reuse check.
+Set `MYDS4_NEMOTRON` and `MYDS4_DFLASH` for Transcribe's shared-memory
+lifecycle check. The audio reuse test also reads a JSON chat request from
+`MYDS4_AUDIO_REQUEST`; it must contain inline `input_audio` data. The path
+can be `/dev/stdin` to keep the fixture in memory. That test compares a
+repeated transcription and a continued conversation with fresh execution,
+both without drafts and with DFlash when its checkpoint is supplied.
 
 Model checks cover prefix forks, draft rollback, batched rows, compressed
 history, dependency pruning and concurrent execution. Build the relevant

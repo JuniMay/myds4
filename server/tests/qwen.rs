@@ -11,6 +11,8 @@
 //! The test of both models in one process also needs MYDS4_CHECKPOINT (the
 //! DeepSeek checkpoint directory) and MYDS4_EXPERTS (its GGUF experts).
 //! MYDS4_SERVER picks the server binary (default build/myds4-server).
+//! MYDS4_AUDIO_REQUEST supplies a JSON chat request containing input_audio
+//! for the Transcribe reuse test; /dev/stdin accepts an in-memory fixture.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -799,6 +801,92 @@ fn nemotron_and_qwen_reload_under_one_memory_limit() {
     let budget = &status["status"]["model_memory_budget"];
     assert_eq!(budget["limit"].as_u64(), Some(22 << 30));
     assert!(budget["allocated"].as_u64().unwrap() <= 22 << 30);
+}
+
+#[test]
+fn transcribe_audio_reuses_its_prefix_and_continues_after_a_fork() {
+    let (Ok(directory), Ok(fixture)) = (
+        std::env::var("MYDS4_NEMOTRON"),
+        std::env::var("MYDS4_AUDIO_REQUEST"),
+    ) else {
+        return;
+    };
+    let _one = one_model();
+    let mut request: Value = serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
+    assert!(
+        request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["content"]
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|part| part["type"] == "input_audio"))
+            })
+    );
+    request["temperature"] = json!(0);
+    request["top_p"] = json!(1);
+    request["top_k"] = json!(0);
+    request["max_tokens"] = json!(256);
+    request["reasoning_effort"] = json!("none");
+    request["stream"] = json!(false);
+    let draft = std::env::var("MYDS4_DFLASH").ok();
+    let mut transcript = None;
+    for depth in if draft.is_some() { vec![0, 7] } else { vec![0] } {
+        let mut options = vec![
+            "--memory",
+            "28",
+            "--kv-cache",
+            "6",
+            "--ctx",
+            "4096",
+            "--draft",
+        ];
+        options.push(if depth == 0 { "0" } else { "7" });
+        if depth != 0 {
+            options.extend(["--draft-model", draft.as_deref().unwrap()]);
+        }
+        let (continued, warm) = {
+            let server = Server::start(&directory, &options);
+            request["model"] = server.get("/v1/models")["data"][0]["id"].clone();
+            let first = server.chat(&request);
+            let answer = content(&first);
+            assert!(!answer.trim().is_empty(), "empty transcript: {first}");
+            if let Some(reference) = &transcript {
+                assert_eq!(&answer, reference, "DFlash changed the greedy transcript");
+            } else {
+                eprintln!("audio transcript: {answer}");
+                transcript = Some(answer.clone());
+            }
+            let repeated = server.chat(&request);
+            assert_eq!(content(&repeated), answer);
+            assert!(
+                repeated["usage"]["prompt_cache_hit_tokens"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+            let mut continued = request.clone();
+            continued["messages"].as_array_mut().unwrap().extend([
+                json!({"role":"assistant","content":answer}),
+                json!({"role":"user","content":"Repeat the transcript exactly."}),
+            ]);
+            let warm = server.chat(&continued);
+            assert!(warm["usage"]["prompt_cache_hit_tokens"].as_u64().unwrap() > 0);
+            eprintln!(
+                "audio draft={depth}: repeated {} reused; continuation {} reused",
+                repeated["usage"]["prompt_cache_hit_tokens"],
+                warm["usage"]["prompt_cache_hit_tokens"]
+            );
+            (continued, warm)
+        };
+        let cold = Server::start(&directory, &options).chat(&continued);
+        assert_eq!(
+            content(&warm),
+            content(&cold),
+            "audio continuation changed with cached history"
+        );
+    }
 }
 
 #[test]

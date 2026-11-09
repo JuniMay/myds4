@@ -9,9 +9,9 @@
 //! server that starts without a cache. With --ced, forks are approximate by
 //! design: the replay is bounded to a ring, and their tokens are printed.
 //!
-//! It runs only when MYDS4_CHECKPOINT (the checkpoint directory) and
-//! MYDS4_EXPERTS (a GGUF file) are set. The tests run one model process at a
-//! time (they share a lock):
+//! Set MYDS4_CHECKPOINT to the checkpoint directory. MYDS4_EXPERTS optionally
+//! selects GGUF experts; otherwise the tests use native MXFP4. The tests run
+//! one model process at a time (they share a lock):
 //!
 //!     MYDS4_CHECKPOINT=DIR MYDS4_EXPERTS=GGUF cargo test --release \
 //!       --manifest-path server/Cargo.toml --test prefix_fork -- --nocapture
@@ -61,14 +61,14 @@ fn bounded_rows(k: usize) -> usize {
 
 struct Setup {
     checkpoint: String,
-    experts: String,
+    experts: Option<String>,
     server: PathBuf,
     cli: PathBuf,
 }
 
 fn setup() -> Option<Setup> {
     let checkpoint = std::env::var("MYDS4_CHECKPOINT").ok()?;
-    let experts = std::env::var("MYDS4_EXPERTS").ok()?;
+    let experts = std::env::var("MYDS4_EXPERTS").ok();
     let pick = |var: &str, default: &str| {
         std::env::var(var)
             .map(PathBuf::from)
@@ -147,19 +147,13 @@ impl Server {
             std::process::id(),
             nanos ^ (port as u128) << 64
         );
-        let mut args: Vec<String> = [
-            "-m",
-            &s.checkpoint,
-            "--experts",
-            &s.experts,
-            "--memory",
-            "56",
-            "--kv-cache",
-            "8",
-        ]
-        .iter()
-        .map(|a| a.to_string())
-        .collect();
+        let mut args: Vec<String> = ["-m", &s.checkpoint, "--memory", "56", "--kv-cache", "8"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        if let Some(experts) = &s.experts {
+            args.extend(["--experts".to_string(), experts.clone()]);
+        }
         args.extend(
             [
                 "--ctx",
