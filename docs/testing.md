@@ -104,6 +104,12 @@ the GPU. The Python measurement drivers enforce process, memory and GPU
 checks. Standalone C checks require the operator to provide that window.
 Do not interpret a correctness check's elapsed time as a throughput result.
 
+`make pass-eviction-check` needs no model. It opens two command buffers as
+a decode step opens a layer's expert buffers, commits a third behind them,
+then allocates past a 64 MiB limit so that an idle expert goes back. The
+eviction must not wait for the GPU; a wait that never ends fails the check
+by its 20-second alarm.
+
 ```sh
 make build/tests/vision
 build/tests/vision

@@ -381,10 +381,16 @@ uint64_t gpu_working_set(void) {
 }
 
 // Command buffers run in the order they are opened (enqueued), whatever the
-// order in which they are encoded and committed.
+// order in which they are encoded and committed. `reserved` counts those
+// opened and not committed yet: while there are any, a buffer committed after
+// them runs only once they are committed, so the thread that will commit
+// them must not wait for it.
+static int reserved;
+
 void *gpu_open(void) {
   id c = MSG(id (*)(id, SEL), queue, S("commandBufferWithUnretainedReferences"));
   MSG(void (*)(id, SEL), c, S("enqueue"));
+  reserved++;
   return c;
 }
 
@@ -412,6 +418,7 @@ void gpu_submit(void *c) {
   MSG(void (*)(id, SEL), (id)c, S("commit"));
   if (ndone < 4096) done[ndone++] = c;
   last = c;
+  reserved--;
 }
 
 void gpu_kern(int k) {
@@ -489,6 +496,7 @@ void gpu_go(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t tx, uint32_t ty, uin
   } else if (profile) {  // each dispatch alone in a command buffer, timed
     MSG(void (*)(id, SEL), enc, S("endEncoding"));
     MSG(void (*)(id, SEL), cb, S("commit"));
+    reserved--;
     MSG(void (*)(id, SEL), cb, S("waitUntilCompleted"));
     prof_s[current] += MSG(double (*)(id, SEL), cb, S("GPUEndTime")) - MSG(double (*)(id, SEL), cb, S("GPUStartTime"));
     prof_n[current]++;
@@ -545,6 +553,7 @@ void gpu_commit(void) {
   if (ndone < 4096) done[ndone++] = cb;
   last = cb;
   enc = 0;
+  reserved--;
 }
 
 // The GPU signals the shared event's values in order, each after the command
@@ -617,8 +626,12 @@ void gpu_drain(void) {
 
 // Residency updates can retain released buffers in the autorelease pool.
 // Drain it once after an eviction batch, before admitting replacement data.
+// In the middle of a pass, with command buffers reserved and not committed
+// (see gpu_open), waiting for the GPU would never end: the pass's own
+// gpu_sync drains the pool then.
 static void collect(void) {
   gpu_residency_commit();
+  if (reserved) return;
   if (last) gpu_sync();
   else {
     objc_autoreleasePoolPop(pool);

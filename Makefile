@@ -304,6 +304,13 @@ build/tests/gpu-clock: tests/gpu/gpu_clock.c src/engine/gpu.c src/kernels/kernel
 gpu-clock-check: build/tests/gpu-clock
 	./build/tests/gpu-clock
 
+build/tests/pass-eviction: tests/gpu/pass_eviction.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(MODEL_HEADERS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -o $@ tests/gpu/pass_eviction.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)
+
+pass-eviction-check: build/tests/pass-eviction
+	./build/tests/pass-eviction
+
 # IQ1_M expert decoding on the GPU against llama.cpp's, on random blocks and,
 # with GGUF=FILE, on that file's IQ1_M expert tensors; no model is loaded.
 build/tests/gguf-decode: tests/gpu/quantization.c src/engine/gpu.c src/engine/util.c src/engine/myds4.h src/kernels/formats.metal src/kernels/kernels.metal src/kernels/gguf_grids.metal src/kernels/gguf.metal
@@ -368,4 +375,4 @@ build/tests/moe-tasks: tests/gpu/expert_tasks.c src/model/deepseek/expert_tasks.
 clean:
 	rm -rf build
 
-.PHONY: clean server server-check test activation-format-check context-lookup-check workspace-check state-fork-check verification-schedule-check sampling-check shutdown-check cache-ready-check draft-cache-check prefetch-metrics-check prefetch-queue-check prefetch-admission-check prefetch-demote-check prefetch-refine-race-check cache-policy-check memory-available-check cache-memory-check memory-budget-check weights-stop-check weights-read-check gpu-clock-check gguf-decode-check
+.PHONY: clean server server-check test activation-format-check context-lookup-check workspace-check state-fork-check verification-schedule-check sampling-check shutdown-check cache-ready-check draft-cache-check prefetch-metrics-check prefetch-queue-check prefetch-admission-check prefetch-demote-check prefetch-refine-race-check cache-policy-check memory-available-check cache-memory-check memory-budget-check weights-stop-check weights-read-check gpu-clock-check pass-eviction-check gguf-decode-check

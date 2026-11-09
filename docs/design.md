@@ -103,6 +103,15 @@ allocation's membership. Only changed sets are committed. This bounds the
 amount of memory in each set while preserving buffer addresses and execution
 order.
 
+Command buffers run in the order they are opened, and a decode step opens a
+layer's expert buffers before it commits the next layer's front behind
+them. Until those opened buffers are committed, no thread may wait for a
+command buffer committed after them: the GPU would run it only after buffers
+that the waiting thread commits later. So an eviction in the middle of a
+pass (an allocation that takes back an idle expert) commits the residency
+change but does not wait for the GPU; the pass's own `gpu_sync` drains the
+released buffers (`collect` and `reserved` in src/engine/gpu.c).
+
 DeepSeek uses Metal's working-set recommendation to decide how many expert
 buffers to map. Allocation follows the available memory and the reserve,
 within the `memory` and KV settings. The engine does not change system
