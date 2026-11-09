@@ -11,7 +11,7 @@
 #include <unistd.h>
 static vm_statistics64_data_t vm_fixture;
 static int pressure_fixture = 1;
-static uint64_t compressed_fixture, wakeups_fixture;
+static uint64_t compressed_fixture, wakeups_fixture, working_set_fixture = 128ull << 30;
 static kern_return_t fixture_host(host_t host, host_flavor_t flavor, host_info64_t out, mach_msg_type_number_t *n) {
   memcpy(out, &vm_fixture, sizeof vm_fixture);
   return KERN_SUCCESS;
@@ -30,7 +30,7 @@ static int fixture_sysctl(const char *name, void *out, size_t *n, void *in, size
   memcpy(out, &value, size), *n = size;
   return 0;
 }
-static uint64_t fixture_working_set(void) { return 128ull << 30; }
+static uint64_t fixture_working_set(void) { return working_set_fixture; }
 static void fixture_residency(void) {}
 static int fixture_thread(pthread_t *thread, const pthread_attr_t *a, void *(*f)(void *), void *arg) { return 0; }
 #define host_statistics64 fixture_host
@@ -94,6 +94,12 @@ static void child_case(int kind) {
 }
 int main(void) {
   alarm(10);
+  working_set_fixture = 0;
+  expect("an unopened Metal device supplies no residency target", mem_gpu_limit() == INT64_MAX);
+  working_set_fixture = 100ull << 30;
+  expect("residency follows Metal's working-set recommendation", mem_gpu_limit() == (int64_t)working_set_fixture);
+  working_set_fixture = 128ull << 30;
+  expect("an early query does not freeze the residency target", mem_gpu_limit() == (int64_t)working_set_fixture);
   vm_fixture.free_count = (48ull << 30) / vm_page_size;
   vm_fixture.external_page_count = (30ull << 30) / vm_page_size;
   vm_fixture.speculative_count = (2ull << 30) / vm_page_size;

@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 #include "myds4.h"
 #include "memory.h"
@@ -17,8 +18,14 @@ extern void objc_autoreleasePoolPop(void *);
 #define S(name) sel_registerName(name)
 #define MSG(type, ...) ((type)objc_msgSend)(__VA_ARGS__)
 
-static id dev, queue, event, cb, enc, last, resident, pipes[512], done[4096];
-static int resident_dirty;
+static id dev, queue, event, cb, enc, last, pipes[512], done[4096];
+enum { RESIDENT_SETS = 32 };
+static struct { id object; uint64_t bytes; } resident[RESIDENT_SETS];
+static uint32_t resident_count, resident_dirty;
+static uint64_t resident_target;
+typedef struct { id object; uint64_t bytes; uint32_t set; } ResidentAllocation;
+static ResidentAllocation *resident_allocations;
+static size_t resident_capacity, resident_used, resident_occupied;
 static int ndone, current, profile;
 static double prof_s[512];
 static long prof_n[512];
@@ -102,15 +109,16 @@ void gpu_init(const char *source, size_t len) {
   pool = objc_autoreleasePoolPush();
   dev = MTLCreateSystemDefaultDevice();
   if (!dev) die("no Metal device");
+  resident_target = gpu_working_set() / 20;
+  if (resident_target < (64ull << 20)) resident_target = 64ull << 20;
+  const char *set_bytes = getenv("MYDS4_RESIDENCY_SET_BYTES");
+  if (set_bytes) {
+    char *end; errno = 0;
+    resident_target = strtoull(set_bytes, &end, 10);
+    if (!*set_bytes || *set_bytes == '-' || *end || errno)
+      die("MYDS4_RESIDENCY_SET_BYTES must be an unsigned byte count");
+  }
   queue = MSG(id (*)(id, SEL), dev, S("newCommandQueue"));
-  // Every buffer stays resident through one set attached to the queue
-  // (gpu_resident takes buffers out), so command buffers carry no residency.
-  id rd = MSG(id (*)(id, SEL), MSG(id (*)(id, SEL), (id)objc_getClass("MTLResidencySetDescriptor"), S("alloc")), S("init"));
-  MSG(void (*)(id, SEL, unsigned long), rd, S("setInitialCapacity:"), 32768ul);
-  id err0 = 0;
-  resident = MSG(id (*)(id, SEL, id, id *), dev, S("newResidencySetWithDescriptor:error:"), rd, &err0);
-  if (!resident) die("residency set: %s", describe(err0));
-  MSG(void (*)(id, SEL, id), queue, S("addResidencySet:"), resident);
   clock_queue = MSG(id (*)(id, SEL), dev, S("newCommandQueue"));
   event = MSG(id (*)(id, SEL), dev, S("newSharedEvent"));
   id opts = MSG(id (*)(id, SEL), MSG(id (*)(id, SEL), (id)objc_getClass("MTLCompileOptions"),
@@ -270,15 +278,102 @@ void gpu_free(Buf *b) {
   memset(b, 0, sizeof *b);
 }
 
+// The engine thread owns this table. Buffer views share an allocation, so
+// membership follows the Metal object rather than a view's address or size.
+static size_t resident_find(id object) {
+  size_t at = (((uintptr_t)object >> 4) * 11400714819323198485ull) & (resident_capacity - 1);
+  size_t empty = SIZE_MAX;
+  while (resident_allocations[at].object) {
+    if (resident_allocations[at].object == object) return at;
+    if (resident_allocations[at].object == (id)1 && empty == SIZE_MAX) empty = at;
+    at = (at + 1) & (resident_capacity - 1);
+  }
+  return empty != SIZE_MAX ? empty : at;
+}
+
+static void resident_rehash(size_t capacity) {
+  ResidentAllocation *old = resident_allocations;
+  size_t old_capacity = resident_capacity;
+  resident_capacity = capacity;
+  resident_allocations = xmalloc(capacity * sizeof *resident_allocations);
+  for (size_t i = 0; i < old_capacity; i++)
+    if ((uintptr_t)old[i].object > 1) resident_allocations[resident_find(old[i].object)] = old[i];
+  free(old);
+  resident_occupied = resident_used;
+}
+
+static uint32_t resident_set(uint64_t bytes) {
+  uint32_t smallest = 0;
+  for (uint32_t i = 0; i < resident_count; i++) {
+    uint64_t used = resident[i].bytes;
+    if (!resident_target || !used || (used <= resident_target && bytes <= resident_target - used)) return i;
+    if (used < resident[smallest].bytes) smallest = i;
+  }
+  // Metal permits at most 32 sets per queue. The byte target is soft: an
+  // oversized allocation or a full queue uses the least occupied set.
+  if (resident_count == RESIDENT_SETS) return smallest;
+  id descriptor = MSG(id (*)(id, SEL), MSG(id (*)(id, SEL),
+      (id)objc_getClass("MTLResidencySetDescriptor"), S("alloc")), S("init"));
+  MSG(void (*)(id, SEL, unsigned long), descriptor, S("setInitialCapacity:"), 1024ul);
+  id error = nil;
+  id object = MSG(id (*)(id, SEL, id, id *), dev, S("newResidencySetWithDescriptor:error:"), descriptor, &error);
+  MSG(void (*)(id, SEL), descriptor, S("release"));
+  if (!object) die("residency set: %s", describe(error));
+  MSG(void (*)(id, SEL, id), queue, S("addResidencySet:"), object);
+  resident[resident_count].object = object;
+  return resident_count++;
+}
+
 void gpu_resident(const Buf *b, int on) {
-  MSG(void (*)(id, SEL, id), resident, on ? S("addAllocation:") : S("removeAllocation:"), (id)b->obj);
-  resident_dirty = 1;
+  if (!resident_capacity) resident_rehash(64);
+  id object = (id)b->obj;
+  size_t at = resident_find(object);
+  if (on) {
+    if (resident_allocations[at].object == object) return;
+    if ((resident_occupied + 1) * 4 >= resident_capacity * 3) {
+      resident_rehash(resident_used * 2 >= resident_capacity ? resident_capacity * 2 : resident_capacity);
+      at = resident_find(object);
+    }
+    uint64_t bytes = MSG(unsigned long (*)(id, SEL), object, S("allocatedSize"));
+    uint32_t set = resident_set(bytes);
+    MSG(void (*)(id, SEL, id), resident[set].object, S("addAllocation:"), object);
+    if (!resident_allocations[at].object) resident_occupied++;
+    resident_allocations[at] = (ResidentAllocation){object, bytes, set};
+    resident_used++;
+    resident[set].bytes += bytes;
+    resident_dirty |= 1u << set;
+  } else if (resident_allocations[at].object == object) {
+    ResidentAllocation *allocation = &resident_allocations[at];
+    uint32_t set = allocation->set;
+    MSG(void (*)(id, SEL, id), resident[set].object, S("removeAllocation:"), object);
+    resident[set].bytes -= allocation->bytes;
+    allocation->object = (id)1;
+    resident_used--;
+    resident_dirty |= 1u << set;
+  }
 }
 
 void gpu_residency_commit(void) {
   if (!resident_dirty) return;
-  MSG(void (*)(id, SEL), resident, S("commit"));
+  for (uint32_t i = 0; i < resident_count; i++)
+    if (resident_dirty & (1u << i)) MSG(void (*)(id, SEL), resident[i].object, S("commit"));
   resident_dirty = 0;
+}
+
+void gpu_residency_info(GpuResidencyInfo *info) {
+  *info = (GpuResidencyInfo){.sets = resident_count, .target_set = resident_target};
+  for (uint32_t s = 0; s < resident_count; s++) {
+    id allocations = MSG(id (*)(id, SEL), resident[s].object, S("allAllocations"));
+    unsigned long count = MSG(unsigned long (*)(id, SEL), allocations, S("count"));
+    info->allocations += count;
+    uint64_t bytes = 0;
+    for (unsigned long i = 0; i < count; i++) {
+      id allocation = MSG(id (*)(id, SEL, unsigned long), allocations, S("objectAtIndex:"), i);
+      bytes += MSG(unsigned long (*)(id, SEL), allocation, S("allocatedSize"));
+    }
+    info->bytes += bytes;
+    if (bytes > info->largest_set) info->largest_set = bytes;
+  }
 }
 
 uint64_t gpu_working_set(void) {

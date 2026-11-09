@@ -62,6 +62,16 @@ once; eviction releases and accounts for it once. Checkpoint bytes and
 scale decoding remain unchanged. Tensors that require a separate aligned
 read buffer retain their own allocations.
 
+The Metal backend distributes mapped allocations across residency sets.
+Each set targets 5% of the device's recommended working-set size, with a
+64 MiB minimum. The queue holds at most 32 sets; oversized allocations and
+the set-count limit can exceed that per-set target. Views share the original
+allocation's membership. Only changed sets are committed. This bounds the
+amount of memory in each set while preserving buffer addresses and execution
+order. DeepSeek uses Metal's working-set recommendation to decide how many
+expert buffers to map. The global model-memory and KV budgets still control
+allocation. The engine does not change system wired-memory settings.
+
 The engine allocates selected missing experts and their decoding scratch
 space before starting up to eight read workers. Workers read checkpoint
 bytes and decode compressed scales. The engine publishes completed weights,

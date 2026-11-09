@@ -48,6 +48,14 @@ predictor benefit or timeliness.
 
 ## Drivers
 
+`MYDS4_RESIDENCY_SET_BYTES` overrides the Metal residency-set byte target for
+diagnosis. Zero puts all mapped allocations in one set. The default uses
+5% of Metal's recommended working-set size, with a 64 MiB minimum. This
+setting changes allocation grouping, not the model or KV memory budgets.
+Compare matched runs with the same mapping allowance when isolating its
+effect. `build/tests/residency` checks grouping, aliases, removal, remapping
+and GPU data visibility with small allocations.
+
 `MYDS4_PROFILE=stages` records GPU timestamps at compute-encoder boundaries.
 It keeps the command-buffer submission points and resolves samples at GPU
 synchronization points. Matrix-vector results are grouped by kernel and

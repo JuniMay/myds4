@@ -209,30 +209,11 @@ uint64_t mem_gpu(void) {
   return v > 0 ? (uint64_t)v : 0;
 }
 
-// How far the GPU driver's resident memory is below the point past which
-// the GPU stalls (INT64_MAX: no such point). Measured on an M5 Max with 128
-// GiB (macOS 27): with 54.4 GiB resident decoding ran at its usual speed,
-// from 55.2 GiB on it took 8 to 15 times its GPU time per token, the GPU
-// only 17 to 46% busy meanwhile, whatever the slot count or the free memory;
-// allocated but not resident memory (68.9 GiB in all) did not matter.
-// Presumably the IOGPU driver's wired-memory collector: unless it is off
-// (iogpu.disable_wired_collector) or a low-water mark is set
-// (iogpu.wired_lwm_mb, then the limit), the limit is 41% of the physical
-// memory, about 2 GiB below the measured point.
+// Metal's working-set recommendation guides residency, not RAM allocation.
+// Registration can query memory before Metal starts; do not cache that zero.
 int64_t mem_gpu_limit(void) {
-  static int64_t limit = -1;
-  if (limit < 0) {
-    int off = 0, lwm = 0;
-    uint64_t ram = 0;
-    size_t n = sizeof off;
-    sysctlbyname("iogpu.disable_wired_collector", &off, &n, 0, 0);
-    n = sizeof lwm;
-    sysctlbyname("iogpu.wired_lwm_mb", &lwm, &n, 0, 0);
-    n = sizeof ram;
-    sysctlbyname("hw.memsize", &ram, &n, 0, 0);
-    limit = off ? INT64_MAX : lwm > 0 ? (int64_t)lwm << 20 : (int64_t)(ram / 100 * 41);
-  }
-  return limit;
+  uint64_t target = gpu_working_set();
+  return target ? (int64_t)target : INT64_MAX;
 }
 
 int64_t mem_gpu_room(void) {
@@ -681,7 +662,7 @@ void cache_init(TensorIndex *index, uint64_t budget, int layers) {
   cap = (int)((budget < within ? budget : within) / SLOT_SIZE);
   if (cap > max_slots) cap = max_slots;
   if (cap < minimum_slots) cap = minimum_slots;
-  // The mapped slots stay within the GPU's limit, beside the weights, which
+  // The mapped slots stay within Metal's recommendation, beside weights that
   // count as resident only once the GPU uses them.
   int64_t room = mem_gpu_room() - (int64_t)pinned_bytes - (int64_t)mem_footprint() - MAP_SLACK;
   mcap = room > minimum_slots * (int64_t)SLOT_SIZE ? (int)(room / (int64_t)SLOT_SIZE) : minimum_slots;
@@ -720,7 +701,7 @@ void cache_init(TensorIndex *index, uint64_t budget, int layers) {
           "of reclaimable file cache, %.1f GiB kept for other programs, GPU resident memory %.1f GiB",
           cap, cap * (double)SLOT_SIZE / GiB, mcap, free / GiB, (avail > free ? avail - free : 0) / GiB, reserve / GiB,
           mem_gpu() / GiB);
-  if (gpu_room < INT64_MAX) fprintf(stderr, " (%.1f GiB below the GPU's limit)", gpu_room / GiB);
+  if (gpu_room < INT64_MAX) fprintf(stderr, " (%.1f GiB below the residency target)", gpu_room / GiB);
   fprintf(stderr, ", GPU working set %.1f GiB\n", gpu_limit / GiB);
   fprintf(stderr, "cache policy: half-life %d forward passes, read-cost weighting %s\n",
           retention_half_life, retention_read_cost ? "on" : "off");

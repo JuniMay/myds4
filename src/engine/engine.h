@@ -261,7 +261,7 @@ typedef struct {
   int slots, mapped, cap, max_slots, experts, uncached;  // the expert cache's slots, and experts on the SSD only
   uint64_t slot_bytes, uncached_bytes, cache_bytes, dense_bytes;
   uint64_t footprint, gpu_in_use, available;
-  int64_t gpu_limit;  // INT64_MAX: none
+  int64_t gpu_limit;  // Metal's working-set recommendation; INT64_MAX before GPU initialization
   uint64_t total, free, file, file_kept, wired, compressor, compressed, swap_used, swapouts;
   int pressure;  // 1 normal, 2 warn, 4 critical
   int layers, experts_per_row;  // 0 without routed experts

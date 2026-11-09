@@ -264,6 +264,10 @@ cache-memory-check: build/tests/cache-memory
 
 # ---- GPU checks without a model ----
 
+build/tests/residency: tests/gpu/residency.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(MODEL_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -o $@ tests/gpu/residency.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)
+
 build/tests/mxfp4-activation: tests/gpu/mxfp4_activation.c tests/reference/activations.h src/engine/gpu.c src/engine/util.c src/engine/myds4.h $(KERNELS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/gpu/mxfp4_activation.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)

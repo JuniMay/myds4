@@ -98,11 +98,15 @@ Buf gpu_try_new(size_t size, int admission); // empty when the model-memory pool
 Buf gpu_alloc_kv(size_t size); // charged only to the separate KV pool
 size_t gpu_allocation_size(size_t size);
 void gpu_free(Buf *b);
-// Membership of a buffer in the residency set of every command buffer; the
-// changes apply at gpu_residency_commit (gpu_alloc commits its own), which
-// takes about 0.1 ms with thousands of buffers in the set.
+// Allocation membership in the main queue's bounded residency sets. Changes
+// apply at gpu_residency_commit; gpu_alloc commits its own allocation.
 void gpu_resident(const Buf *b, int on);
 void gpu_residency_commit(void);
+typedef struct {
+  uint64_t bytes, largest_set, target_set;
+  uint32_t sets, allocations;
+} GpuResidencyInfo;
+void gpu_residency_info(GpuResidencyInfo *info);
 uint64_t gpu_working_set(void);
 void *gpu_open(void);        // a command buffer that runs after those opened before
 void gpu_encode(void *cmd);  // encode into it until gpu_commit or the next gpu_encode
@@ -146,9 +150,9 @@ typedef struct {
 } MemInfo;
 void mem_info(MemInfo *m);
 int memory_configure(double model_gib, double kv_gib, double reserve_gib);
-int64_t mem_gpu_limit(void);  // the GPU's resident-memory limit (INT64_MAX: none)
+int64_t mem_gpu_limit(void);  // Metal's residency target (INT64_MAX before GPU initialization)
 uint64_t mem_gpu(void);       // the GPU driver's resident memory for all processes
-int64_t mem_gpu_room(void);   // how far it is below the point where the GPU stalls (INT64_MAX: none)
+int64_t mem_gpu_room(void);   // target minus total driver residency (INT64_MAX before initialization)
 uint64_t mem_footprint(void);  // of this process
 uint64_t mem_swapouts(void);   // pages the system swapped out since boot
 uint64_t mem_compressions(void);  // pages the system compressed since boot
