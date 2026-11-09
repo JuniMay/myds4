@@ -111,6 +111,13 @@ void myds4_finish(myds4_model *m);
 // without one).
 int myds4_idle(myds4_model *m);
 uint64_t myds4_reclaim(uint64_t bytes);
+// Process controls run on the engine thread, between completed model calls.
+typedef struct {
+  uint64_t limit, model_bytes, kv_bytes;
+} myds4_memory_info;
+myds4_memory_info myds4_memory(void);
+void myds4_memory_limit(uint64_t bytes);
+void myds4_drain(void); // engine-thread boundary: GPU queues and expert reads
 
 // The model's limits: rows of different states that myds4_rows takes at
 // once, the drafts per pass it makes itself (the selected model options' draft field, at most its

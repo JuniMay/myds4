@@ -129,6 +129,9 @@ requests does not reserve or guarantee memory for eight such states.
 | `GET /v1/models` | Registered model IDs and context limits. Does not load model weights. |
 | `GET /v1/models/{id}` | Model metadata and status, including `loaded`, memory and queue information. |
 | `POST /v1/chat/completions` | Generate with the model named in the request. Its first request loads its weights. |
+| `GET /v1/control` | Process-wide execution state, effective budgets and retained model/KV bytes. |
+| `POST /v1/control/yield` | Pause inference and reclaim to temporary budgets. |
+| `POST /v1/control/resume` | Restore configured budgets and scheduling for the matching operation. |
 
 Send the key as `Authorization: Bearer KEY` or `x-api-key: KEY`.
 With several models, requests must name one. With one model, omitted or
@@ -154,6 +157,99 @@ alignment and timestamp metadata are not implemented. Remote audio URLs
 and client-supplied file paths are not fetched by the server.
 The HTTP request body, including base64 data, is limited to 32 MiB. Use a
 compressed audio container or the CLI for recordings that exceed that limit.
+
+### Yield and resume
+
+A tool wrapper can yield the serving process before running resource-heavy
+commands. These endpoints use the same API key as inference. They apply to
+every model hosted by this process. Other programs run independently.
+
+Send a new, caller-generated `operation_id` for each interval:
+
+```json
+{"operation_id":"build-001","memory_gib":16,"kv_cache_gib":2}
+```
+
+`POST /v1/control/yield` accepts these fields only:
+
+| Field | Meaning |
+| --- | --- |
+| `operation_id` | Required nonblank string, 1–128 UTF-8 bytes, without control characters. |
+| `memory_gib` | Optional model-memory allowance the server may retain. |
+| `kv_cache_gib` | Optional separate KV allowance the server may retain. |
+
+An omitted allowance keeps its configured limit. A positive allowance is a
+strict cap, at most the configured limit. Zero requests the minimum
+retainable memory: the server evicts every reclaimable entry, preserves
+active-request state and required work buffers, and sets the temporary
+limit to that remaining requirement. Zero therefore need not produce zero
+retained bytes. KV reservations for active requests can make the effective
+KV limit larger than its currently allocated bytes.
+
+The server first reports `yielding`. At the next engine boundary it drains
+both GPU queues and pending expert reads, releases weight pins, and
+reclaims memory. Only then does it report `yielded`. A long prefill may
+delay that boundary. New inference requests remain queued within the
+normal queue limits. The health and control endpoints remain available.
+
+A successful status has this form; sizes are integer bytes:
+
+```json
+{
+  "state":"yielded",
+  "operation_id":"build-001",
+  "configured_limits":{"model_bytes":68719476736,"kv_bytes":8589934592},
+  "effective_limits":{"model_bytes":17179869184,"kv_bytes":2147483648},
+  "retained":{"model_bytes":1073741824,"kv_bytes":536870912},
+  "error":null
+}
+```
+
+`retained` is the worker's latest measurement of managed model and KV
+allocations. It excludes HTTP, tokenizer, framework and driver overhead.
+Transitional states can show the last completed measurement; `yielded`
+confirms that drain and reclamation have finished. The temporary limits
+stay in force until an explicit resume. Disconnects and elapsed time do
+not resume inference.
+
+`POST /v1/control/resume` takes only:
+
+```json
+{"operation_id":"build-001"}
+```
+
+It reports `resuming` while restoring the configured limits and reloading
+backbones needed by paused requests. Idle weights and expert caches load
+later on demand. `running` means normal scheduling has resumed. KV state
+and per-request sampling state remain attached to paused requests.
+
+Both POST endpoints return 202 when a transition is pending. Poll
+`GET /v1/control`, or repeat the same POST with the same fields. Repeating
+YIELD returns 200 once that operation is yielded. Repeating RESUME returns
+200 once the operation has ended, with `resumed_operation_id` identifying
+it. That acknowledgement leaves any newer owner's state unchanged.
+
+Retries never create another interval. An active operation rejects another
+owner, changed limits for its ID, or an unknown resume ID with HTTP 409.
+A completed ID cannot start another yield; that retry returns
+`operation_completed`. Operation history lasts for this server process.
+A restart discards it, so a wrapper must reconfirm yielding after a restart.
+
+Invalid JSON or limits return 400; missing or invalid authentication returns
+401. A positive cap that cannot fit protected buffers fails asynchronously:
+the server returns to `running` with configured limits and an `error` object
+containing the operation ID, code `limits_unreachable`, and required bytes
+in its message. Retrying that YIELD returns 409 with `yield_failed`.
+Reclamation may already have evicted idle entries before this failure.
+
+Wrappers must wait for their own `yielded` state before starting commands.
+They own command timeouts and cancellation, including parallel children
+and background jobs. Wait for every child to stop before resuming. Use a
+separate cleanup deadline for resume; an aborted command's cancellation
+signal must not cancel cleanup. Supply the whole work plan before yielding,
+because inference on this server remains paused during the interval.
+Development wrappers may serialize their outer intervals with their own
+lock. The server does not acquire or inspect that lock.
 
 ## Terminal interface
 

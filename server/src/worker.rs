@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+use crate::control::{self, Action, Control, Phase, Target};
 use crate::engine::{
     self, CacheCounts, Logits, Lookup, Media, Model, PrefillInfo, RawSnapshot, RawState, Sampler,
 };
@@ -170,6 +171,7 @@ struct Queue {
     /// The live view's question for a node's text: a model, a state's number
     /// and positions start..end ([`ask_text`]).
     text: Option<(usize, u64, usize, usize)>,
+    control: Control,
 }
 
 /// The tokens of a state's positions start..end, for the live view's text of
@@ -289,6 +291,46 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+pub fn control_status() -> Value {
+    let s = shared();
+    lock(&s.queue).control.snapshot()
+}
+
+pub fn yield_request(request: control::YieldRequest) -> Result<(u16, Value), control::Error> {
+    let s = shared();
+    let mut q = lock(&s.queue);
+    if q.closed || engine::stopping() {
+        return Err(control::Error {
+            status: 503,
+            code: "server_stopping",
+            message: "the server is stopping".into(),
+        });
+    }
+    let status = q.control.yield_request(request)?;
+    let value = q.control.snapshot();
+    s.wake.notify_all();
+    Ok((status, value))
+}
+
+pub fn resume_request(request: control::ResumeRequest) -> Result<(u16, Value), control::Error> {
+    let s = shared();
+    let mut q = lock(&s.queue);
+    if q.closed || engine::stopping() {
+        return Err(control::Error {
+            status: 503,
+            code: "server_stopping",
+            message: "the server is stopping".into(),
+        });
+    }
+    let ended = q.control.resume_request(&request.operation_id)?;
+    let mut value = q.control.snapshot();
+    if ended {
+        value["resumed_operation_id"] = json!(request.operation_id);
+    }
+    s.wake.notify_all();
+    Ok((if ended { 200 } else { 202 }, value))
+}
+
 /// The models the worker serves, in their order: an index of this list is a
 /// request's model.
 pub fn models() -> Vec<(String, engine::Tokenizer, Served)> {
@@ -346,6 +388,10 @@ pub fn start(
             let s = Arc::new(Shared {
                 queue: Mutex::new(Queue {
                     jobs: (0..n).map(|_| VecDeque::new()).collect(),
+                    control: Control::new(control::Limits {
+                        model_bytes: engine::memory().limit,
+                        kv_bytes: (budgets.kv_gb * GIB) as u64,
+                    }),
                     ..Queue::default()
                 }),
                 wake: Condvar::new(),
@@ -485,7 +531,14 @@ pub fn status(model: usize) -> Value {
     let Some(m) = s.models.get(model) else {
         return Value::Null;
     };
-    let waiting = lock(&s.queue).jobs[model].len();
+    let (waiting, control_phase, kv_limit) = {
+        let q = lock(&s.queue);
+        (
+            q.jobs[model].len(),
+            q.control.phase,
+            q.control.effective.kv_bytes,
+        )
+    };
     let c = lock(&m.status).engine;
     let allocations = memory_models(&s);
     let st = lock(&m.status);
@@ -499,11 +552,11 @@ pub fn status(model: usize) -> Value {
     let o = &m.served.engine;
     json!({
         "loaded": st.loaded, "load_error": st.load_error,
-        "phase": if st.phase.is_empty() { "idle" } else { st.phase },
+        "phase": if control_phase != Phase::Running { control_phase.label() } else if st.phase.is_empty() { "idle" } else { st.phase },
         "phase_seconds": round(st.since.map_or(0.0, |t| (now - t).as_secs_f64()), 1), "decoding": st.active,
         "request": st.request, "prompt_tokens": st.prompt, "reused_tokens": st.reused, "generated_tokens": st.generated,
         "waiting": waiting, "sessions": sessions,
-        "kv_cache_gib": round(st.kv_bytes as f64 / GIB, 3), "kv_cache_limit_gib": round(s.budgets.kv_gb, 3),
+        "kv_cache_gib": round(st.kv_bytes as f64 / GIB, 3), "kv_cache_limit_gib": round(kv_limit as f64 / GIB, 3),
         "kv_cache_scope": "server", "kv_cache_total_gib": round(s.kv_used.load(Ordering::Relaxed) as f64 / GIB, 3),
         "reserve_gib": s.budgets.reserve_gb, "model_memory": allocations,
         "model_memory_budget": {"limit": c.model_memory_limit, "allocated": c.model_memory_used,
@@ -533,7 +586,14 @@ pub fn view(model: usize) -> String {
     let Some(m) = s.models.get(model) else {
         return "{}".into();
     };
-    let waiting = lock(&s.queue).jobs[model].len();
+    let (waiting, control_phase, kv_limit) = {
+        let q = lock(&s.queue);
+        (
+            q.jobs[model].len(),
+            q.control.phase,
+            q.control.effective.kv_bytes,
+        )
+    };
     let c = lock(&m.status).engine;
     let allocations = memory_models(&s);
     let mut st = lock(&m.status);
@@ -568,14 +628,14 @@ pub fn view(model: usize) -> String {
     let v = json!({
         "model": m.served.id, "models": s.models.len(),
         "uptime_seconds": round(s.started.elapsed().as_secs_f64(), 0),
-        "phase": if st.phase.is_empty() { "idle" } else { st.phase },
+        "phase": if control_phase != Phase::Running { control_phase.label() } else if st.phase.is_empty() { "idle" } else { st.phase },
         "phase_seconds": round(st.since.map_or(0.0, |t| (now - t).as_secs_f64()), 1), "waiting": waiting, "requests": requests,
         "layers": c.layers, "experts_per_row": c.experts_per_row,
         "prefill": {"layer": c.prefill_layer, "rows": c.prefill_rows_now},
         "totals": {"requests": st.requests, "prompt_tokens": st.prompt_tokens, "reused_tokens": st.reused_tokens,
                    "generated_tokens": st.generated_tokens},
         "kinds": {"new": st.kinds[0], "continued": st.kinds[1], "saved": st.kinds[2], "forked": st.kinds[3]},
-        "sessions": st.states.len(), "kv_gib": round(st.kv_bytes as f64 / GIB, 3), "kv_limit_gib": round(s.budgets.kv_gb, 3),
+        "sessions": st.states.len(), "kv_gib": round(st.kv_bytes as f64 / GIB, 3), "kv_limit_gib": round(kv_limit as f64 / GIB, 3),
         "kv_total_gib": round(s.kv_used.load(Ordering::Relaxed) as f64 / GIB, 3),
         "reserve_gib": s.budgets.reserve_gb, "model_memory": allocations,
         "model_memory_budget": {"limit": c.model_memory_limit, "allocated": c.model_memory_used,
@@ -875,6 +935,101 @@ impl Worker {
             status.loaded = slot.model.loaded();
             status.drafts = slot.model.draft_block();
         }
+        let used = engine::memory();
+        lock(&self.s.queue).control.retained = control::Limits {
+            model_bytes: used.model_bytes,
+            kv_bytes: used.kv_bytes,
+        };
+    }
+
+    fn resume_models(&mut self) {
+        for slot in &mut self.slots {
+            if slot.gens.is_empty() {
+                continue;
+            }
+            if !slot.model.loaded() {
+                if let Err(error) = slot.model.load() {
+                    lock(&self.s.models[slot.index].status).load_error = Some(error.clone());
+                    for generation in std::mem::take(&mut slot.gens) {
+                        let snapshots = self.memory.cache.remove(generation.state);
+                        self.memory
+                            .free(Vec::new(), vec![(generation.state, snapshots)]);
+                        generation.job.last(Event::Failed(error.clone()));
+                    }
+                    continue;
+                }
+            }
+            slot.model.active(true);
+        }
+    }
+
+    fn control_action(&mut self, action: Action) {
+        let configured = lock(&self.s.queue).control.configured;
+        engine::drain();
+        match action {
+            Action::Yield(targets) => {
+                for slot in &self.slots {
+                    slot.model.active(false);
+                }
+                let before = engine::memory();
+                engine::reclaim(match targets.model {
+                    Target::Minimum => u64::MAX,
+                    Target::Bytes(cap) => before.model_bytes.saturating_sub(cap),
+                });
+                let (snaps, states) = self.memory.cache.reclaim(match targets.kv {
+                    Target::Minimum => u64::MAX,
+                    Target::Bytes(cap) => self.memory.cache.bytes().saturating_sub(cap),
+                });
+                self.memory.free(snaps, states);
+                engine::drain();
+                let used = engine::memory();
+                let retained = control::Limits {
+                    model_bytes: used.model_bytes,
+                    kv_bytes: used.kv_bytes,
+                };
+                let protected_kv = used.kv_bytes.max(self.memory.cache.bytes());
+                let limits = control::Limits {
+                    model_bytes: match targets.model {
+                        Target::Minimum => used.model_bytes,
+                        Target::Bytes(cap) => cap,
+                    },
+                    kv_bytes: match targets.kv {
+                        Target::Minimum => protected_kv,
+                        Target::Bytes(cap) => cap,
+                    },
+                };
+                if used.model_bytes > limits.model_bytes || protected_kv > limits.kv_bytes {
+                    self.resume_models();
+                    let used = engine::memory();
+                    lock(&self.s.queue).control.failed(format!(
+                        "limits cannot retain protected buffers: {} model bytes and {} KV bytes are required",
+                        retained.model_bytes, protected_kv), control::Limits { model_bytes: used.model_bytes, kv_bytes: used.kv_bytes });
+                } else {
+                    engine::memory_limit(limits.model_bytes);
+                    self.memory.cache.limit = limits.kv_bytes;
+                    lock(&self.s.queue).control.yielded(limits, retained);
+                    engine::log(&format!(
+                        "yielded: {} model bytes and {} KV bytes retained",
+                        retained.model_bytes, retained.kv_bytes
+                    ));
+                }
+            }
+            Action::Resume => {
+                engine::memory_limit(configured.model_bytes);
+                self.memory.cache.limit = configured.kv_bytes;
+                lock(&self.s.queue).control.effective = configured;
+                self.resume_models();
+                let used = engine::memory();
+                lock(&self.s.queue).control.resumed(control::Limits {
+                    model_bytes: used.model_bytes,
+                    kv_bytes: used.kv_bytes,
+                });
+                engine::log("resumed: configured model and KV limits restored");
+            }
+        }
+        engine::refresh_stats();
+        self.memory.publish(&self.s);
+        self.publish_counters();
     }
 
     /// Every model takes one step a turn: admitting, one prefill call, one
@@ -888,9 +1043,23 @@ impl Worker {
                 self.maintain();
             }
             let mut q = lock(&s.queue);
+            if let Some(action) = q.control.next_action() {
+                drop(q);
+                self.control_action(action);
+                continue;
+            }
+            if q.control.phase != Phase::Running {
+                let (guard, _) = s
+                    .wake
+                    .wait_timeout(q, Duration::from_secs(1))
+                    .unwrap_or_else(|e| e.into_inner());
+                drop(guard);
+                continue;
+            }
             let idle = |q: &Queue, slots: &[Slot]| {
                 q.jobs.iter().all(|j| j.is_empty())
                     && q.text.is_none()
+                    && q.control.phase == Phase::Running
                     && slots.iter().all(|x| x.gens.is_empty())
             };
             while idle(&q, &self.slots) && !engine::stopping() {
@@ -904,6 +1073,9 @@ impl Worker {
                     self.maintain();
                     q = lock(&s.queue);
                 }
+            }
+            if q.control.phase != Phase::Running {
+                continue;
             }
             let question = q.text.take();
             let mut admitted: Vec<Vec<Job>> = Vec::new();

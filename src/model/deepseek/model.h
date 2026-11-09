@@ -111,6 +111,7 @@ void cache_pass(int layer);  // a prompt pass is at this layer (-1: none): keep 
 void cache_adapt(void);             // between tokens
 void cache_adapt_pass(int layer);   // within a prompt pass at this layer
 void cache_idle(void);              // while no request runs: resizes as between tokens
+void cache_drain(void);             // complete queued and active expert reads
 uint64_t cache_bytes(void);
 int cache_slots(void);
 int cache_mapped(void);     // slots mapped for the GPU

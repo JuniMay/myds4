@@ -9,6 +9,7 @@
 
 mod chat;
 mod config;
+mod control;
 mod engine;
 mod http;
 mod kv;
@@ -435,6 +436,56 @@ async fn health() -> Response {
     json(r#"{"status": "ok"}"#.into())
 }
 
+fn control_response(result: Result<(u16, Value), control::Error>) -> Response {
+    let (status, body) = match result {
+        Ok((status, body)) => (status, body),
+        Err(error) => (
+            error.status,
+            json!({"error": {
+                "type":"control_error", "code":error.code, "message":error.message,
+            }}),
+        ),
+    };
+    (
+        StatusCode::from_u16(status).unwrap(),
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+async fn control_status() -> Response {
+    json(worker::control_status().to_string())
+}
+
+async fn control_yield(body: axum::body::Bytes) -> Response {
+    let request = match serde_json::from_slice::<control::YieldRequest>(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return chat::error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &error.to_string(),
+            );
+        }
+    };
+    control_response(worker::yield_request(request))
+}
+
+async fn control_resume(body: axum::body::Bytes) -> Response {
+    let request = match serde_json::from_slice::<control::ResumeRequest>(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return chat::error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &error.to_string(),
+            );
+        }
+    };
+    control_response(worker::resume_request(request))
+}
+
 /// A model's object as GET /v1/models lists it: OpenAI's fields, and the
 /// context's length as servers commonly add it.
 fn model_object(s: &Shared, m: &Served) -> Value {
@@ -764,6 +815,12 @@ fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/health", get(health))
+        .route("/v1/control", get(control_status).fallback(use_get))
+        .route("/v1/control/yield", post(control_yield).fallback(use_post))
+        .route(
+            "/v1/control/resume",
+            post(control_resume).fallback(use_post),
+        )
         .route("/v1/models", get(models).fallback(use_get))
         .route("/models", get(models).fallback(use_get))
         .route("/v1/models/{id}", get(model).fallback(use_get))

@@ -127,6 +127,15 @@ can be `/dev/stdin` to keep the fixture in memory. That test compares a
 repeated transcription and a continued conversation with fresh execution,
 both without drafts and with DFlash when its checkpoint is supplied.
 
+The `yield_` cases in the `qwen` HTTP integration target check ownership,
+authentication, retries, disconnects and queued requests. With Qwen and
+DeepSeek checkpoints configured, they pause two active requests, reclaim
+weights, preserve their sampling and KV state, and compare complete replies
+after resume. Omitting `MYDS4_EXPERTS` selects native MXFP4 for that check.
+Positive-cap checks cross a maintenance cycle and verify lazy reload for
+idle models. The development-lock case confirms that a normal server can
+load a model while a development wrapper holds its own lock.
+
 Model checks cover prefix forks, draft rollback, batched rows, compressed
 history, dependency pruning and concurrent execution. Build the relevant
 `build/tests/` target listed in the Makefile. Compare all relevant state and

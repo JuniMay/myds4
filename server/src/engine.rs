@@ -187,6 +187,14 @@ pub struct Stats {
     pub model_workspace: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MemoryInfo {
+    pub limit: u64,
+    pub model_bytes: u64,
+    pub kv_bytes: u64,
+}
+
 unsafe extern "C" {
     fn myds4_init(p: *const RawProcess) -> c_int;
     fn myds4_stopping() -> c_int;
@@ -199,6 +207,9 @@ unsafe extern "C" {
     fn myds4_finish(m: *mut RawModel);
     fn myds4_idle(m: *mut RawModel) -> c_int;
     fn myds4_reclaim(bytes: u64) -> u64;
+    fn myds4_memory() -> MemoryInfo;
+    fn myds4_memory_limit(bytes: u64);
+    fn myds4_drain();
     fn myds4_max_rows(m: *const RawModel) -> c_int;
     fn myds4_draft_block(m: *const RawModel) -> c_int;
     fn myds4_max_verify(m: *const RawModel) -> c_int;
@@ -362,6 +373,16 @@ pub fn refresh_stats() {
 
 pub fn reclaim(bytes: u64) -> u64 {
     unsafe { myds4_reclaim(bytes) }
+}
+
+pub fn memory() -> MemoryInfo {
+    unsafe { myds4_memory() }
+}
+pub fn memory_limit(bytes: u64) {
+    unsafe { myds4_memory_limit(bytes) };
+}
+pub fn drain() {
+    unsafe { myds4_drain() };
 }
 
 /// Requests the stop as SIGINT does (the worker notices it within a second,

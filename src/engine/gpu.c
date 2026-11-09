@@ -602,6 +602,19 @@ void gpu_sync(void) {
   pool = objc_autoreleasePoolPush();
 }
 
+void gpu_drain(void) {
+  if (!dev) return;
+  gpu_sync();
+  gpu_residency_commit();
+  void *scope = objc_autoreleasePoolPush();
+  id fence = MSG(id (*)(id, SEL), clock_queue, S("commandBuffer"));
+  MSG(void (*)(id, SEL), fence, S("commit"));
+  MSG(void (*)(id, SEL), fence, S("waitUntilCompleted"));
+  if (MSG(long (*)(id, SEL), fence, S("status")) == 5)
+    die("GPU clock queue: %s", describe(MSG(id (*)(id, SEL), fence, S("error"))));
+  objc_autoreleasePoolPop(scope);
+}
+
 // Residency updates can retain released buffers in the autorelease pool.
 // Drain it once after an eviction batch, before admitting replacement data.
 static void collect(void) {

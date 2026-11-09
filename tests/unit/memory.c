@@ -157,12 +157,28 @@ static void ram_reserve_reclaims_idle_entries(void) {
   CHECK(memory_reclaim(1) == 0);
 }
 
+static void temporary_limits_survive_new_accounts(void) {
+  memory_init(100);
+  MemoryAccount first, second;
+  memory_account_init(&first, "first");
+  Entry cached;
+  entry(&cached, &first, NULL, 40, 1);
+  CHECK(memory_reclaim(40) == 40);
+  memory_set_limit(0);
+  memory_account_init(&second, "second");
+  CHECK(memory_usage().limit == 0 && memory_usage().allocated == 0);
+  CHECK(!claim(&cached, 1, MEMORY_CACHE));
+  memory_set_limit(100);
+  CHECK(claim(&cached, 40, MEMORY_REQUIRED));
+  CHECK(memory_usage().limit == 100 && memory_usage().allocated == 40);
+}
+
 int main(void) {
   void (*cases[])(void) = {different_sizes_and_dependency_order, dense_weights_are_one_entry,
     pinned_entries_and_kv_are_separate, active_minimum_cannot_overcommit,
     speculative_reads_do_not_evict_weights, combined_admission_refuses_without_partial_eviction,
     cached_bytes_can_fund_a_promised_workspace, host_and_gpu_payloads_share_the_budget,
-    ram_reserve_reclaims_idle_entries};
+    ram_reserve_reclaims_idle_entries, temporary_limits_survive_new_accounts};
   int failed = 0;
   for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
     pid_t child = fork();

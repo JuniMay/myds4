@@ -8,6 +8,7 @@
 static MemoryAccount *accounts;
 static MemorySlot *entries;
 static MemoryUsage usage;
+static int pool_initialized;
 static void (*collect_released)(void);
 static _Thread_local MemorySlot *current;
 
@@ -26,10 +27,13 @@ static void change(MemorySlot *slot, uint64_t bytes) {
 
 void memory_init(uint64_t limit) {
   usage = (MemoryUsage){.limit = limit ? limit : UINT64_MAX};
+  pool_initialized = 1;
 }
 
+void memory_set_limit(uint64_t bytes) { usage.limit = bytes; pool_initialized = 1; }
+
 void memory_account_init(MemoryAccount *account, const char *name) {
-  if (!usage.limit) usage.limit = UINT64_MAX;
+  if (!pool_initialized) memory_init(0);
   *account = (MemoryAccount){.next = accounts, .name = name};
   accounts = account;
 }

@@ -36,6 +36,7 @@ typedef struct {
 } MemoryUsage;
 
 void memory_init(uint64_t limit);
+void memory_set_limit(uint64_t bytes); // absolute temporary limit, including zero
 void memory_account_init(MemoryAccount *account, const char *name);
 void memory_slot_init(MemorySlot *slot, MemoryAccount *account, MemorySlot *dependency,
                       const char *name, void (*evict)(void *), void *context);

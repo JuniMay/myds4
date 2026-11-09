@@ -15,6 +15,7 @@
 | `server/src/chat/` | API request conversion, model prompt formatting and response decoding. |
 | `server/src/ui/` | Terminal rendering and interaction. |
 | `server/src/worker.rs`, `kv.rs` | Scheduling, model state ownership and the shared prefix-cache budget. |
+| `server/src/control.rs` | Yield ownership, retry handling and temporary process-wide limits. |
 | `tests/`, `server/tests/` | Maintained correctness checks and their inputs. |
 | `benchmarks/` | Measurement drivers and evaluation datasets. |
 
@@ -96,6 +97,15 @@ work and overlap ready experts with pending reads. Its streaming cache uses
 the same memory pool while retaining its read scheduling and packed layouts.
 
 ## Scheduling and state
+
+The control API queues yield and resume transitions for the engine thread.
+Yield runs between worker turns. It drains both Metal queues and expert
+reads, unpins weights, then reclaims model and KV allocations separately.
+The worker pauses inference and holds the resulting limits until the owner
+requests resume. Active request state and samplers stay alive. Resume
+restores configured limits and loads any missing backbone needed by an
+active request. Idle models load on demand. Control requests and status
+queries continue on the HTTP threads throughout the transition.
 
 The worker gives each model a turn. It admits requests up to that model's
 batch limit, advances prefill, then advances decoding. Qwen prefill uses

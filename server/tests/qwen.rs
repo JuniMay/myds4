@@ -117,7 +117,7 @@ impl Server {
                 }
             }
         });
-        let s = Server {
+        let mut s = Server {
             child,
             port,
             key,
@@ -125,6 +125,12 @@ impl Server {
         };
         let deadline = Instant::now() + Duration::from_secs(300);
         while Instant::now() < deadline {
+            if let Some(exit) = s.child.try_wait().expect("server process") {
+                panic!(
+                    "server exited before readiness: {exit}; {:?}",
+                    s.log.lock().unwrap()
+                );
+            }
             if s.healthy() {
                 return s;
             }
@@ -137,6 +143,7 @@ impl Server {
         let Ok(mut s) = TcpStream::connect(("127.0.0.1", self.port)) else {
             return false;
         };
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut raw = Vec::new();
         s.write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
             .is_ok()
@@ -147,13 +154,17 @@ impl Server {
     /// A request and its whole answer; with `leave`, the client closes its
     /// connection that long after sending the request.
     fn post(&self, body: &Value, leave: Option<Duration>) -> (u16, Vec<u8>) {
+        self.post_to("/v1/chat/completions", body, leave)
+    }
+
+    fn post_to(&self, path: &str, body: &Value, leave: Option<Duration>) -> (u16, Vec<u8>) {
         let Ok(mut s) = TcpStream::connect(("127.0.0.1", self.port)) else {
             return (0, Vec::new());
         };
         s.set_read_timeout(Some(Duration::from_secs(900))).ok();
         let payload = body.to_string();
         let head = format!(
-            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\n\
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\n\
              Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             self.key,
             payload.len()
@@ -564,6 +575,370 @@ fn registered_models_have_no_loaded_weights_before_inference() {
             );
         }
     }
+}
+
+#[test]
+fn yield_control_recovers_retries_and_waits_for_explicit_resume() {
+    let _one = one_model();
+    let path = root().join("server/tests/fixtures/unavailable-model");
+    let server = Server::start(
+        path.to_str().unwrap(),
+        &["--memory", "4", "--kv-cache", "1"],
+    );
+    let original = server.get("/v1/control");
+    assert_eq!(original["state"], "running");
+    for (method, endpoint, payload) in [
+        ("GET", "/v1/control", ""),
+        (
+            "POST",
+            "/v1/control/yield",
+            "{\"operation_id\":\"unauthorized\"}",
+        ),
+    ] {
+        let mut socket = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write!(socket,"{method} {endpoint} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",payload.len()).unwrap();
+        let mut reply = String::new();
+        socket.read_to_string(&mut reply).unwrap();
+        assert!(reply.starts_with("HTTP/1.1 401"), "{reply}");
+    }
+    assert_eq!(server.get("/v1/control")["state"], "running");
+    let request = json!({"operation_id":"a","memory_gib":0,"kv_cache_gib":0});
+    assert_eq!(server.post_to("/v1/control/yield", &request, None).0, 202);
+    let yielded = wait_control(&server, "yielded");
+    assert_eq!(yielded["operation_id"], "a");
+    assert_eq!(yielded["effective_limits"]["model_bytes"], 0);
+    assert_eq!(yielded["retained"]["kv_bytes"], 0);
+    assert_eq!(server.post_to("/v1/control/yield", &request, None).0, 200);
+    assert_eq!(
+        server
+            .post_to("/v1/control/yield", &json!({"operation_id":"b"}), None)
+            .0,
+        409
+    );
+    assert_eq!(
+        server
+            .post_to("/v1/control/resume", &json!({"operation_id":"b"}), None)
+            .0,
+        409
+    );
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::channel();
+        let server = &server;
+        scope.spawn(move || {
+            let _ = send.send(server.post(
+                &body(json!([{"role":"user","content":"hello"}]), 1, false),
+                None,
+            ));
+        });
+        let early = receive.recv_timeout(Duration::from_millis(200));
+        let ran_while_yielded = early.is_ok();
+        assert_eq!(
+            server
+                .post_to("/v1/control/resume", &json!({"operation_id":"a"}), None)
+                .0,
+            202
+        );
+        wait_control(server, "running");
+        let answer =
+            early.unwrap_or_else(|_| receive.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert!(!ran_while_yielded, "a queued request ran before resume");
+        assert_eq!(answer.0, 503); // the fixture has metadata but no weights
+    });
+    let restored = server.get("/v1/control");
+    assert_eq!(restored["effective_limits"], original["effective_limits"]);
+    assert_eq!(server.post_to("/v1/control/yield", &request, None).0, 409);
+    server.post_to(
+        "/v1/control/yield",
+        &json!({"operation_id":"b"}),
+        Some(Duration::from_millis(20)),
+    );
+    wait_control(&server, "yielded");
+    std::thread::sleep(Duration::from_millis(200));
+    let (status, reply) = server.post_to("/v1/control/resume", &json!({"operation_id":"a"}), None);
+    assert_eq!(status, 200);
+    let reply: Value = serde_json::from_slice(&reply).unwrap();
+    assert_eq!(reply["resumed_operation_id"], "a");
+    assert_eq!(reply["operation_id"], "b");
+    assert_eq!(server.get("/v1/control")["state"], "yielded");
+    assert_eq!(server.get("/health")["status"], "ok");
+    server.post_to("/v1/control/resume", &json!({"operation_id":"b"}), None);
+    wait_control(&server, "running");
+}
+
+fn wait_control(server: &Server, phase: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = server.get("/v1/control");
+        if status["state"] == phase {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "control did not reach {phase}: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+struct ResumeOnDrop<'a> {
+    server: &'a Server,
+    id: &'a str,
+}
+impl Drop for ResumeOnDrop<'_> {
+    fn drop(&mut self) {
+        self.server
+            .post_to("/v1/control/resume", &json!({"operation_id":self.id}), None);
+    }
+}
+
+#[test]
+fn yield_preserves_active_dense_and_moe_requests() {
+    let (Some(qwen), Ok(deepseek)) = (checkpoint(), std::env::var("MYDS4_CHECKPOINT")) else {
+        return;
+    };
+    let experts = std::env::var("MYDS4_EXPERTS").ok();
+    let _one = one_model();
+    let mut moe = json!({"id":"moe","model":deepseek,"ctx":4096,"draft":0});
+    if let Some(experts) = experts {
+        moe["experts"] = json!(experts);
+    }
+    let server = Server::with_config(json!({"memory":64,"kv_cache":8,"reserve":10,"models":[
+        {"id":"dense","model":qwen,"ctx":4096,"draft":3},
+        moe
+    ]}));
+    let ids = ["dense", "moe"];
+    let requests: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            let mut request = body(counting(), 192, false);
+            request["model"] = json!(id);
+            request["temperature"] = json!(1);
+            request["top_p"] = json!(1);
+            request["top_k"] = json!(0);
+            request["seed"] = json!(20261109);
+            request
+        })
+        .collect();
+    let expected: Vec<String> = requests
+        .iter()
+        .map(|request| content(&server.chat(request)))
+        .collect();
+    let initial = server.get("/v1/control");
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::channel();
+        for (i, request) in requests.iter().enumerate() {
+            let send = send.clone();
+            let server = &server;
+            scope.spawn(move || {
+                let _ = send.send((i, server.chat(request)));
+            });
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let active = ids.iter().all(|id| {
+                server.get(&format!("/v1/models/{id}"))["status"]["decoding"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    > 0
+            });
+            if active {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "both models did not begin decoding"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _resume = ResumeOnDrop {
+            server: &server,
+            id: "active",
+        };
+        assert_eq!(
+            server
+                .post_to(
+                    "/v1/control/yield",
+                    &json!({"operation_id":"active","memory_gib":0,"kv_cache_gib":0}),
+                    None
+                )
+                .0,
+            202
+        );
+        let yielded = wait_control(&server, "yielded");
+        assert!(
+            yielded["retained"]["model_bytes"].as_u64().unwrap() < 1 << 30,
+            "{yielded}"
+        );
+        assert!(
+            yielded["retained"]["kv_bytes"].as_u64().unwrap() > 0,
+            "active states were discarded"
+        );
+        let before: Vec<Value> = ids
+            .iter()
+            .map(|id| server.get(&format!("/v1/models/{id}"))["status"].clone())
+            .collect();
+        std::thread::sleep(Duration::from_millis(1400));
+        for (id, previous) in ids.iter().zip(&before) {
+            let current = server.get(&format!("/v1/models/{id}"));
+            assert_eq!(
+                current["status"]["generated_tokens"],
+                previous["generated_tokens"]
+            );
+            assert_eq!(current["status"]["phase"], "yielded");
+            assert_eq!(current["status"]["loaded"], false);
+        }
+        assert_eq!(
+            server.get("/v1/control")["effective_limits"],
+            yielded["effective_limits"]
+        );
+        eprintln!("active yield: {}", yielded);
+        assert_eq!(
+            server
+                .post_to(
+                    "/v1/control/resume",
+                    &json!({"operation_id":"active"}),
+                    None
+                )
+                .0,
+            202
+        );
+        wait_control(&server, "running");
+        for _ in 0..2 {
+            let (i, answer) = receive.recv_timeout(Duration::from_secs(60)).unwrap();
+            assert_eq!(
+                content(&answer),
+                expected[i],
+                "{} changed after yield/resume",
+                ids[i]
+            );
+        }
+    });
+    assert_eq!(
+        server.get("/v1/control")["effective_limits"],
+        initial["effective_limits"]
+    );
+    assert_eq!(
+        server
+            .post_to(
+                "/v1/control/yield",
+                &json!({
+                    "operation_id":"idle-positive", "memory_gib":1, "kv_cache_gib":1
+                }),
+                None
+            )
+            .0,
+        202
+    );
+    let idle = wait_control(&server, "yielded");
+    assert_eq!(idle["effective_limits"]["model_bytes"], 1u64 << 30);
+    assert_eq!(idle["effective_limits"]["kv_bytes"], 1u64 << 30);
+    assert!(idle["retained"]["model_bytes"].as_u64().unwrap() <= 1 << 30);
+    assert!(idle["retained"]["kv_bytes"].as_u64().unwrap() <= 1 << 30);
+    std::thread::sleep(Duration::from_millis(1400));
+    assert_eq!(
+        server.get("/v1/control")["effective_limits"],
+        idle["effective_limits"]
+    );
+    server.post_to(
+        "/v1/control/resume",
+        &json!({"operation_id":"idle-positive"}),
+        None,
+    );
+    wait_control(&server, "running");
+    for id in ids {
+        assert_eq!(
+            server.get(&format!("/v1/models/{id}"))["status"]["loaded"],
+            false,
+            "resume eagerly loaded an idle model"
+        );
+    }
+    server.post_to(
+        "/v1/control/yield",
+        &json!({"operation_id":"too-small","memory_gib":1.0/1073741824.0}),
+        None,
+    );
+    let failed = wait_control(&server, "running");
+    assert_eq!(failed["error"]["code"], "limits_unreachable");
+    assert_eq!(failed["effective_limits"], initial["effective_limits"]);
+}
+
+#[test]
+fn yield_keeps_idle_kv_across_all_model_families() {
+    let (Some(qwen), Ok(deepseek), Ok(flash), Ok(nemotron), Ok(draft)) = (
+        checkpoint(),
+        std::env::var("MYDS4_CHECKPOINT"),
+        std::env::var("MYDS4_FLASH"),
+        std::env::var("MYDS4_NEMOTRON"),
+        std::env::var("MYDS4_DFLASH"),
+    ) else {
+        return;
+    };
+    let _one = one_model();
+    let mut moe = json!({"id":"moe","model":deepseek,"ctx":4096,"draft":0});
+    if let Ok(experts) = std::env::var("MYDS4_EXPERTS") {
+        moe["experts"] = json!(experts);
+    }
+    let server = Server::with_config(json!({"memory":64,"kv_cache":8,"reserve":10,"models":[
+        {"id":"dense","model":qwen,"ctx":4096,"draft":3},
+        {"id":"flash","model":flash,"ctx":4096,"draft":0},
+        {"id":"speech","model":nemotron,"draft_model":draft,"ctx":4096,"draft":7},
+        moe
+    ]}));
+    let ids = ["dense", "flash", "speech", "moe"];
+    let requests: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            let mut request = body(
+                json!([{"role":"user","content":"Name two colors."}]),
+                24,
+                false,
+            );
+            request["model"] = json!(id);
+            request
+        })
+        .collect();
+    let before: Vec<String> = requests
+        .iter()
+        .map(|request| content(&server.chat(request)))
+        .collect();
+    assert!(before.iter().all(|text| !text.is_empty()));
+    server.post_to(
+        "/v1/control/yield",
+        &json!({"operation_id":"all-families","memory_gib":0}),
+        None,
+    );
+    let yielded = wait_control(&server, "yielded");
+    assert!(yielded["retained"]["kv_bytes"].as_u64().unwrap() > 0);
+    for id in ids {
+        assert_eq!(
+            server.get(&format!("/v1/models/{id}"))["status"]["loaded"],
+            false
+        );
+    }
+    server.post_to(
+        "/v1/control/resume",
+        &json!({"operation_id":"all-families"}),
+        None,
+    );
+    wait_control(&server, "running");
+    for (i, request) in requests.iter().enumerate() {
+        let answer = server.chat(request);
+        assert_eq!(
+            content(&answer),
+            before[i],
+            "{} changed after reload",
+            ids[i]
+        );
+        assert!(
+            answer["usage"]["prompt_cache_hit_tokens"].as_u64().unwrap() > 0,
+            "{} did not reuse retained KV",
+            ids[i]
+        );
+    }
+    eprintln!("all four model families reloaded with matching replies and retained KV");
 }
 
 #[test]

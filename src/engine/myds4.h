@@ -126,6 +126,7 @@ void gpu_commit(void);
 void gpu_wait_signal(uint64_t v);
 uint64_t gpu_signal_value(void);  // latest completed signal, without waiting
 void gpu_sync(void);
+void gpu_drain(void); // complete both the compute and clock-keeping queues
 int gpu_threads(int k);  // max threads per threadgroup of a kernel
 int gpu_profiling(void);       // MYDS4_PROFILE set: dispatches run one at a time, timed
 void gpu_profile_reset(void);

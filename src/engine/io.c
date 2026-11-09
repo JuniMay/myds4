@@ -850,6 +850,11 @@ static void finish(int i) {
   slots[i].loading = 0;
 }
 
+void cache_drain(void) {
+  if (!slots) return;
+  for (int i = 0; i < max_slots + npinned; i++) finish(i);
+}
+
 // Slot i is reused: its pieces no reader has started are not read.
 static void cancel(int i) {
   if (!slots[i].loading) return;

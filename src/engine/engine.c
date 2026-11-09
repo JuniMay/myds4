@@ -371,6 +371,12 @@ void myds4_refresh_stats(void) {
 }
 
 uint64_t myds4_reclaim(uint64_t bytes) { return memory_reclaim(bytes); }
+myds4_memory_info myds4_memory(void) {
+  MemoryUsage usage = memory_usage();
+  return (myds4_memory_info){usage.limit, usage.allocated, usage.kv};
+}
+void myds4_memory_limit(uint64_t bytes) { memory_set_limit(bytes); }
+void myds4_drain(void) { gpu_drain(); cache_drain(); }
 
 void myds4_stats_get(const myds4_model *m, myds4_stats *s) {
   ModelCounters c = {0};
