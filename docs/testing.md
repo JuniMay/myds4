@@ -155,6 +155,11 @@ Positive-cap checks cross a maintenance cycle and verify lazy reload for
 idle models. The development-lock case confirms that a normal server can
 load a model while a development wrapper holds its own lock.
 
+The `prefix_fork` target needs `MYDS4_CHECKPOINT`; `MYDS4_EXPERTS` is
+optional there. Besides prefix reuse and the KV budget, it sends SIGTERM
+5 s into a DeepSeek prefill of about 15,000 tokens and requires the server
+to exit within 5 s and to answer that request with 503.
+
 Model checks cover prefix forks, draft rollback, batched rows, compressed
 history, dependency pruning and concurrent execution. Build the relevant
 `build/tests/` target listed in the Makefile. Compare all relevant state and

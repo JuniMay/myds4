@@ -48,7 +48,12 @@ what it took and fails, and the server ends the requests waiting for it as
 a shutdown. Weights that a pass loads
 complete with the pass. A pass that fails because its experts could not
 load ends its requests: as a shutdown while quitting, otherwise with an
-error, discarding their states.
+error, discarding their states. DeepSeek prefills a prompt in one engine
+call, so its prefill (`prefill` in src/model/deepseek/model.c) checks for
+quitting before each batch of rows. A stopped prefill waits for its GPU
+work and its Engram row reads, returns no logits and no snapshot, and
+leaves the state's new rows incomplete; the server then ends the request
+as a shutdown and exits.
 
 File validation errors during loading return a service error while the
 server remains available. Fatal backend or device errors still terminate

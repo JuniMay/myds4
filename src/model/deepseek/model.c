@@ -1950,7 +1950,10 @@ static PrefillPrune decoder_plan(int pos, int count, int layer) {
                            remaining, WINDOW, replay_margin(), MB);
 }
 
-static void prefill(const int *tokens, int n, int pos0) {
+// Runs the prompt's rows through every layer. Quitting stops it before its
+// next batch of rows: it returns 0, and the state's rows from pos0 on are
+// then incomplete.
+static int prefill(const int *tokens, int n, int pos0) {
   if (pos0 + n > opt.ctx) die("context full (%d tokens)", opt.ctx);
   ced_active = ced_first != 0;
   prompt_pass = 1;
@@ -1982,7 +1985,8 @@ static void prefill(const int *tokens, int n, int pos0) {
     for (int e = 0; e < EXPERTS; e++) all[e] = e;
     cache_prefetch_from(0, all, EXPERTS, 2 * EXPERTS, PF_BULK);
   }
-  for (int l = 0; l < LAYERS; l++) {
+  int stopped = 0;
+  for (int l = 0; l < LAYERS && !stopped; l++) {
     if (prefill_prune_active && l > 20) plan = decoder_plan(pos0, n, l);
     cache_pass(l);
     if (l == 1 || l == 14) dispatch_group_wait(rr.read[l == 14], DISPATCH_TIME_FOREVER);
@@ -1999,6 +2003,10 @@ static void prefill(const int *tokens, int n, int pos0) {
     if (replaying && replay_first[l] - pos0 > begin) begin = replay_first[l] - pos0 < n ? replay_first[l] - pos0 : n;
     int first_batch = 1;
     for (int s = begin; s < n; s += MB) {
+      if (shutdown_requested()) {
+        stopped = 1;
+        break;
+      }
       if (prefill_prune_active && l > 20) {
         if (s < plan.prefix_begin) s = plan.prefix_begin;
         if (s >= plan.prefix_end && s < plan.tail_begin) s = plan.tail_begin;
@@ -2029,20 +2037,21 @@ static void prefill(const int *tokens, int n, int pos0) {
       routed_batch(&b, l, ahead, 2 * EXPERTS, opt.deepseek.substitute > 0);
       gpu_commit();
     }
+    if (stopped) break;
     if (!opt.quiet) fprintf(stderr, "\rprefill: layer %d/%d", l + 1, LAYERS);
     prefill_layer = l + 1;
   }
   cache_pass(-1);
   prompt_pass = 0;  // the head: one row, as decoding runs it
   if (!opt.quiet) fprintf(stderr, "\r                         \r");
-  if (retained) {
+  if (retained && !stopped) {
     gpu_begin();
     hc_pre_norm(1, &HS, (size_t)(n - 1) * HC * DIM * STREAM_BYTES, &MF, (size_t)(n - 1) * MIX * 4, &final_norm);
     head_out(1, &logits);
     gpu_commit();
   }
   gpu_sync();
-  if (all_logits) {  // every row's logits, for checks
+  if (all_logits && !stopped) {  // every row's logits, for checks
     for (int r = 0; r < n; r++) {
       gpu_begin();
       hc_pre_norm(1, &HS, (size_t)r * HC * DIM * STREAM_BYTES, &MF, (size_t)r * MIX * 4, &final_norm);
@@ -2053,11 +2062,13 @@ static void prefill(const int *tokens, int n, int pos0) {
     }
     memcpy(logits.ptr, all_logits + (size_t)(n - 1) * VOCAB, VOCAB * 4);
   }
-  for (int e = 0; e < 2; e++) dispatch_release(rr.read[e]);
+  // A stopped prefill may end before layers 1 and 14 waited for the rows:
+  // the reader uses rr and rows until it leaves both groups.
+  for (int e = 0; e < 2; e++) dispatch_group_wait(rr.read[e], DISPATCH_TIME_FOREVER), dispatch_release(rr.read[e]);
   rows_end(&rr);
   memory_host_free(rows);
   memset(IMG.ptr, 0, (size_t)n);  // decoding's rows are text
-  if (opt.draft && retained) {
+  if (opt.draft && retained && !stopped) {
     int keep = retained < WINDOW ? retained : WINDOW;
     prompt_pass = 1;
     draft_keys(keep, pos0 + n - keep);
@@ -2068,6 +2079,7 @@ static void prefill(const int *tokens, int n, int pos0) {
   prefill_rows += n, prefill_layer = prefill_n = 0;
   cache_metrics_end();
   ced_active = 0;
+  return !stopped;
 }
 
 
@@ -2134,8 +2146,12 @@ static const float *forward(const int *tokens, int n, int pos, int prefix_pos, c
     if ((k > 1 || prompt) && opt.dump_fd < 0) {
       float *every = all_logits;
       if (every) all_logits = every + (size_t)done * VOCAB;
-      prefill(tokens + done, k, pos + done);
+      int completed = prefill(tokens + done, k, pos + done);
       all_logits = every;
+      if (!completed) {  // quitting stopped it: no logits, and no snapshot of its rows
+        prefix_capture.at = -1, prefill_prune_active = 0;
+        return NULL;
+      }
     } else {
       for (int i = done; i < done + k; i++) {
         step(tokens + i, 1, pos + i);
@@ -2176,6 +2192,7 @@ const float *deepseek_prefill(const int *tokens, int n, int from, int replay, in
   deepseek_seek(tokens, start);
   const float *lg = forward(tokens + start, n - start, start, capture, x ? x->rows : 0, 1);
   replaying = 0, bounded = 0;
+  if (x && !lg) deepseek_snapshot_free(x), x = 0;  // a prefill that did not finish has no capture
   if (x) {
     if (forward_info.prefix_encoder_only) x->extent = 20;
     *captured = x;

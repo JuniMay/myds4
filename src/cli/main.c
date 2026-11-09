@@ -71,6 +71,14 @@ static int complete(void) {
   return 0;
 }
 
+// A prefill's logits. Null means quitting stopped the prefill, and the run
+// ends, or its working memory did not fit.
+static const float *prefilled(const float *logits) {
+  if (logits) return logits;
+  if (shutdown_requested()) exit(complete());
+  die("the prompt's working memory does not fit the free memory less --reserve, or --memory");
+}
+
 static double sampling_option(const char *name, const char *value, double upper) {
   char *end;
   errno = 0;
@@ -313,13 +321,13 @@ int main(int argc, char **argv) {
   if (ops->media) ops->media(ims, nmedia);
   if (check) { // every position's logits: the batched prefill against token-by-token decoding
     float *a = xmalloc((size_t)n * V * 4);
-    ops->prefill(st, tokens, n, 0, 0, -1, 0, a);
+    prefilled(ops->prefill(st, tokens, n, 0, 0, -1, 0, a));
     if (shutdown_requested()) return complete();
     if (n >= 4) { // two prompt batches, the first of odd length, against one
       ModelState *s2 = ops->state_new();
       int n1 = (n / 2) | 1, diff = 0;
-      ops->prefill(s2, tokens, n1, 0, 0, -1, 0, 0);
-      const float *c = ops->prefill(s2, tokens, n, n1, 0, -1, 0, 0), *an = a + (size_t)(n - 1) * V;
+      prefilled(ops->prefill(s2, tokens, n1, 0, 0, -1, 0, 0));
+      const float *c = prefilled(ops->prefill(s2, tokens, n, n1, 0, -1, 0, 0)), *an = a + (size_t)(n - 1) * V;
       for (int k = 0; k < V; k++) diff += c[k] != an[k];
       printf("two batches (%d + %d) against one: %d of %d final logits differ\n", n1, n - n1, diff, V);
     }
@@ -348,7 +356,7 @@ int main(int argc, char **argv) {
     float *alone = xmalloc((size_t)2 * V * 4);
     for (int s = 0; s < 2; s++) {
       if (shutdown_requested()) return complete();
-      next[s] = sample_argmax(ops->prefill(both_st[s], tokens, len[s], 0, 0, -1, 0, 0), V);
+      next[s] = sample_argmax(prefilled(ops->prefill(both_st[s], tokens, len[s], 0, 0, -1, 0, 0)), V);
       at[s] = ops->snapshot_take(both_st[s], len[s], 0);
       memcpy(alone + (size_t)s * V, ops->rows(&both_st[s], &next[s], &len[s], 1), (size_t)V * 4);
       ops->snapshot_restore(both_st[s], at[s]);
@@ -379,7 +387,7 @@ int main(int argc, char **argv) {
   }
   if (perplexity) { // tokens prefill.. scored, each on the logits after the token before it, decoded one at a time
     if (prefill < 1 || prefill >= n) die("--prefill takes 1 to %d tokens", n - 1);
-    const float *lg = prefill > 1 ? ops->prefill(st, tokens, prefill, 0, 0, -1, 0, 0) : 0; // after token prefill - 1
+    const float *lg = prefill > 1 ? prefilled(ops->prefill(st, tokens, prefill, 0, 0, -1, 0, 0)) : 0; // after token prefill - 1
     double nll = 0, t0 = now();
     int top = 0, steps = 0, scored = 0;
     CacheStats c0 = counters().cache;
@@ -409,7 +417,7 @@ int main(int argc, char **argv) {
   CacheStats c0 = counters().cache;
   uint64_t swap0 = mem_swapouts(), comp0 = mem_compressions();
   double g0 = gpu_busy, t0 = now();
-  const float *logits = ops->prefill(st, tokens, n, 0, 0, -1, 0, 0);
+  const float *logits = prefilled(ops->prefill(st, tokens, n, 0, 0, -1, 0, 0));
   if (ops->report) ops->report(stderr, 0, n);
   double t1 = now();
   CacheStats c1 = counters().cache;

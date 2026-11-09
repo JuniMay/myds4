@@ -225,6 +225,7 @@ impl Drop for Server {
     fn drop(&mut self) {
         let _ = Command::new("kill")
             .args(["-TERM", &self.child.id().to_string()])
+            .stderr(Stdio::null())
             .status();
         let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
@@ -886,4 +887,50 @@ fn a_growing_generation_frees_room_before_it_grows() {
         "the idle state stayed while the generation grew past its room"
     );
     assert_eq!(over, 0, "the cache took more than --kv-cache");
+}
+
+/// Quitting stops a long prompt's prefill: SIGTERM 5 s into the prefill of
+/// about 15,000 tokens ends the server within 5 s, not when the prefill
+/// ends, and the request's answer is the server's stop (503). A short
+/// request loads the model first, so the long prompt's prefill starts as
+/// soon as it arrives.
+#[test]
+fn quitting_stops_a_long_prefill() {
+    let Some(s) = setup() else {
+        eprintln!("skipped: set MYDS4_CHECKPOINT and MYDS4_EXPERTS");
+        return;
+    };
+    let _one = one_model();
+    let (long, n) = sized_prompt(&s, 15_000, 16_000);
+    let mut server = Server::start(&s, &[]);
+    server.chat(&request(&short_prompt(), 1));
+    let body = request(&long, 8);
+    let (port, key) = (server.port, server.key.clone());
+    let job =
+        std::thread::spawn(move || http(port, &key, "POST", "/v1/chat/completions", Some(&body)));
+    std::thread::sleep(Duration::from_secs(5));
+    let stop = Instant::now();
+    let _ = Command::new("kill")
+        .args(["-TERM", &server.child.id().to_string()])
+        .status();
+    let mut exit = None;
+    while exit.is_none() && stop.elapsed() < Duration::from_secs(300) {
+        exit = server.child.try_wait().ok().flatten();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let took = stop.elapsed().as_secs_f64();
+    let (code, answer) = job.join().expect("the long request");
+    println!(
+        "quitting a {n}-token prefill: the server exited {took:.1} s after SIGTERM ({exit:?}); the request: {code} {}",
+        String::from_utf8_lossy(&answer)
+    );
+    assert!(
+        exit.is_some_and(|e| e.success()),
+        "the server did not exit cleanly"
+    );
+    assert!(
+        took < 5.0,
+        "the server exited {took:.1} s after SIGTERM, during a {n}-token prefill"
+    );
+    assert_eq!(code, 503, "the stopped request's answer");
 }
