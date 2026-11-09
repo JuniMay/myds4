@@ -90,7 +90,7 @@ def run(args, mode, bodies, runahead=0, pipeline=0):
         port = sock.getsockname()[1]
     key = secrets.token_hex(24)
     env = {k: v for k, v in os.environ.items() if not k.startswith("MYDS4_")}
-    env.update(MYDS4_API_KEY=key, MYDS4_LOCK=str(ROOT / "build/myds4.lock"))
+    env.update(MYDS4_API_KEY=key)
     command = [str(args.binary), "-m", str(args.checkpoint), "--serve", str(port), "--ctx", str(args.context),
                "--memory", str(args.memory), "--reserve", str(args.reserve), "--kv-cache", str(kv), "--batch", str(batch),
                "--temperature", "1", "--top-p", "1", "--top-k", "0", "--seed", "12345",

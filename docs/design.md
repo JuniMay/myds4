@@ -25,7 +25,7 @@ option union. The Rust configuration uses the corresponding backend enum.
 
 Registration reads metadata and tokenizers without loading weights.
 An inference request triggers loading only for its selected model. The
-engine's process lock covers every model. Each loaded model owns its tensor
+process manages its own memory budgets. Each loaded model owns its tensor
 index; deferred media encoding uses that model's index.
 
 File validation errors during loading return a service error while the

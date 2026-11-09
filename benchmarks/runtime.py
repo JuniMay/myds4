@@ -153,7 +153,7 @@ def gpu_snapshot(memory_gib, reserve_gib=10, desktop=False, quiet_cpu=False):
         reasons.append("another compute process is present")
     if quiet_cpu and sum(p["cpu_percent"] for p in background) > 100:
         reasons.append("background CPU builds exceed one CPU core")
-    # Check device load as well as process ownership and the shared model lock.
+    # Check device load as well as process ownership.
     if device > 35:
         reasons.append("GPU device activity exceeds 35 percent")
     if resident > 8:

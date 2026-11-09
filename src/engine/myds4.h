@@ -11,7 +11,6 @@ double now(void);
 void *xmalloc(size_t n);
 char *read_file(const char *path, size_t *len);
 long b64_decode(const char *s, size_t n, uint8_t *out); // bytes written (at most 3 per 4 characters), -1 if not base64
-void lock_model(void);     // waits until no other process holds myds4.lock beside the executable ($MYDS4_LOCK)
 void shutdown_watch(void); // SIGINT/SIGTERM request a stop; handlers do no I/O
 int shutdown_requested(void);
 void shutdown_request(void); // a stop, as SIGINT and SIGTERM request one

@@ -15,7 +15,7 @@ import shlex
 import subprocess
 import time
 
-from evaluate import _idle, parse_metrics
+from evaluate import parse_metrics
 from runtime import GPUUnavailable, guarded_process, wait_for_gpu
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -150,7 +150,6 @@ def run(args, role, prompt, settings, expected, env):
     if hashlib.sha256(binary.read_bytes()).hexdigest() != settings[role + "_binary_sha256"]:
         raise RuntimeError("benchmark executable changed after the comparison was configured")
     guard = wait_for_gpu(args.memory + 2, args.gpu_wait, args.reserve, args.desktop, quiet_cpu=True)
-    _idle(binary, env)
     command = [str(binary), "-m", str(args.checkpoint), "-p", prompt, "--ctx", str(args.context),
                "--memory", str(args.memory), "--reserve", str(args.reserve), "-n", str(args.tokens), "--temperature", "1", "--top-p", "1",
                "--seed", str(getattr(args, "seed", 12345))]
@@ -259,8 +258,7 @@ def main():
         ap.error("--workload harness needs --harness-session and --before-seq")
     args.control = args.control.resolve()
     args.candidate = args.candidate.resolve()
-    env = {k: v for k, v in os.environ.items() if not k.startswith("MYDS4_") or k == "MYDS4_LOCK"}
-    _idle(ROOT / "build/myds4", env)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MYDS4_")}
     prompt, count = make_prompt(args, env)
     settings = {"workload": args.workload, "prompt_tokens": count, "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
                 "checkpoint_name": args.checkpoint.name, "expert_file": args.experts.name if args.experts else None,

@@ -49,7 +49,7 @@ def main():
         port = s.getsockname()[1]
     key = secrets.token_hex(24)
     env = {k: v for k, v in os.environ.items() if not k.startswith("MYDS4_")}
-    env.update(MYDS4_API_KEY=key, MYDS4_LOCK=str(ROOT / "build/myds4.lock"))
+    env.update(MYDS4_API_KEY=key)
     cmd = [str(args.binary.resolve()), "-m", str(args.checkpoint), "--serve", str(port),
            "--ctx", "16384" if args.long_prefill else "4096", "--memory", "20", "--reserve", "4", "--kv-cache", "1", "--batch", str(args.batch),
            "--ced", args.ced, "--lookup", str(args.lookup), "--temperature", "1", "--top-p", "1", "--seed", "12345", "--think", "0"]

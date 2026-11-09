@@ -13,7 +13,6 @@ typedef struct { uint64_t p[3]; uint32_t start, count; } Tile;
 
 int main(void) {
   alarm(90);
-  lock_model();
   static const char source[] = {
 #embed "../../src/kernels/formats.metal"
       , '\n',

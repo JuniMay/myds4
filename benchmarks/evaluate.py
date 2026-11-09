@@ -12,7 +12,6 @@ import ast
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
-import fcntl
 import gzip
 import json
 import os
@@ -405,17 +404,6 @@ def parse_metrics(stderr):
     return metrics
 
 
-def _idle(binary, env):
-    lock = Path(env.get("MYDS4_LOCK", str(Path(binary).resolve().parent / "myds4.lock")))
-    if lock.exists():
-        with lock.open("rb") as stream:
-            try:
-                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise RuntimeError("another inference process owns the model lock") from None
-            fcntl.flock(stream, fcntl.LOCK_UN)
-
-
 def run_case(case, config):
     """Run one exact-routing, greedy generation; caller owns the GPU slot.
 
@@ -483,7 +471,6 @@ def run_case(case, config):
         "MYDS4_GGUF_FROM",
     ):
         env.pop(key, None)
-    _idle(config.binary, env)
     command = [str(config.binary), "-m", str(config.checkpoint)]
     command += (
         ["-p", case.prompt, "--think", str(config.thinking)]

@@ -82,6 +82,7 @@ impl Server {
         let mut child = Command::new(server)
             .args(&args)
             .env("MYDS4_API_KEY", &key)
+            .env("MYDS4_LOCK", root().join("build/myds4.lock"))
             .stdin(if input.is_some() {
                 Stdio::piped()
             } else {
@@ -563,6 +564,48 @@ fn registered_models_have_no_loaded_weights_before_inference() {
             );
         }
     }
+}
+
+#[test]
+fn a_development_lock_does_not_block_normal_server_requests() {
+    use std::os::fd::AsRawFd;
+    let Some(directory) = checkpoint() else {
+        return;
+    };
+    let _one = one_model();
+    let development = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root().join("build/myds4.lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(development.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let server = Server::start(&directory, &["--memory", "32", "--draft", "0"]);
+    let response = std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::channel();
+        let server = &server;
+        scope.spawn(move || {
+            let answer = server.post(
+                &body(json!([{"role":"user","content":"hello"}]), 1, false),
+                None,
+            );
+            let _ = send.send(answer);
+        });
+        let answer = receive.recv_timeout(Duration::from_secs(8));
+        drop(development);
+        answer
+    });
+    assert!(
+        response.is_ok(),
+        "the server waited for the development lock: {:?}",
+        server.log.lock().unwrap()
+    );
+    assert_eq!(response.unwrap().0, 200);
+    assert_eq!(server.get("/health")["status"], "ok");
 }
 
 #[test]

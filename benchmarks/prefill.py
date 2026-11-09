@@ -14,7 +14,6 @@ from pathlib import Path
 import subprocess
 import time
 
-from evaluate import _idle
 from runtime import guarded_process, wait_for_gpu
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -139,7 +138,7 @@ def main():
                  ("dspark-2", ["--bench", str(args.tokens), "--dspark", "2"]),
                  ("dspark-control-b", ["--bench", str(args.tokens)])]
     env = {k: v for k, v in os.environ.items() if not k.startswith("MYDS4_")}
-    env.update(MYDS4_LOCK=str(ROOT / "build/myds4.lock"), MYDS4_PREFETCH_METRICS="1")
+    env.update(MYDS4_PREFETCH_METRICS="1")
     for quant in (("mxfp4", "q2") if args.quant == "both" else (args.quant,)):
         def matching():
             return [r for r in report["runs"] if r["settings"] == identity and r["quant"] == quant and r["valid"]]
@@ -156,7 +155,6 @@ def main():
                 if not any(r["name"] == required for r in matching()):
                     raise ValueError("Run compact correctness validation before the generation comparison")
             guard = wait_for_gpu(args.memory + 2, 15, reserve_gib=args.reserve, desktop=True)
-            _idle(ROOT / "build/myds4", env)
             cmd = command + options + (["--experts", str(args.q2)] if quant == "q2" else [])
             print("STUDY_START " + json.dumps({"quant": quant, "name": name}), flush=True)
             started = time.monotonic()

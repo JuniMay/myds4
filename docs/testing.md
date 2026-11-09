@@ -68,7 +68,7 @@ model weights:
 
 ```sh
 make build/tests/metadata
-MYDS4_LOCK=build/tests/runtime.lock build/tests/metadata /path/to/deepseek /path/to/qwen
+build/tests/metadata /path/to/deepseek /path/to/qwen
 ```
 
 `tests/reference/engram.py CHECKPOINT` computes the same layout through the

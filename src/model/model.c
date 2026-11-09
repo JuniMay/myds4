@@ -34,7 +34,6 @@ Model *model_create(const char *dir) {
 }
 
 int model_load(Model *m, const Options *o) {
-  lock_model();
   memory_scope(&m->work);
   Options options = *o;
   options.family = m->ops == &deepseek_ops ? MODEL_DEEPSEEK : m->ops == &nemotron_ops ? MODEL_NEMOTRON : MODEL_QWEN;

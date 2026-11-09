@@ -1,13 +1,10 @@
 // Errors, time, a small JSON parser, the safetensors index and GGUF headers.
 #include <fcntl.h>
-#include <libgen.h>
 #include <limits.h>
-#include <mach-o/dyld.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/file.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -81,26 +78,6 @@ void str_printf(Str *s, const char *fmt, ...) {
   va_end(ap);
   s->n += n;
 }
-
-// One process that loads the model at a time, since each takes most of the
-// memory: an exclusive lock (flock, as lockf(1) takes it) on myds4.lock
-// beside the executable, or on $MYDS4_LOCK, held until the process ends.
-void lock_model(void) {
-  static int owner = -1;
-  if (owner >= 0) return;
-  char exe[PATH_MAX], real[PATH_MAX], path[PATH_MAX + 16];
-  uint32_t n = sizeof exe;
-  if (getenv("MYDS4_LOCK")) snprintf(path, sizeof path, "%s", getenv("MYDS4_LOCK"));
-  else if (_NSGetExecutablePath(exe, &n) || !realpath(exe, real)) die("cannot find the executable's directory");
-  else snprintf(path, sizeof path, "%s/myds4.lock", dirname(real));
-  int fd = open(path, O_RDWR | O_CREAT, 0644);
-  if (fd < 0) die("cannot open the lock %s", path);
-  if (flock(fd, LOCK_EX | LOCK_NB)) {
-    fprintf(stderr, "myds4: another process holds %s; waiting for it to end\n", path);
-    if (flock(fd, LOCK_EX)) die("cannot lock %s", path);
-  }
-  owner = fd;
-}  // the descriptor stays open: the lock lasts as long as the process
 
 // Base64 (RFC 4648, also its URL alphabet), up to padding, skipping
 // whitespace: the bytes written to out, or -1 for another character.
