@@ -43,8 +43,9 @@ const USAGE: &str = "usage: myds4-server [--config FILE | -m MODEL [model option
   --serve PORT    override the JSON port; serve OpenAI Chat Completions at http://HOST:PORT/v1
   --host ADDR     the IPv4 address to serve on (default 127.0.0.1)
   --api-key-file FILE  the API key clients must send (16 to 256 characters)
-  --memory GB     one model-memory budget for every model, excluding KV (default: automatic)
-  --reserve GB    one process-wide available-memory target, 2-1024 GiB (default 10)
+  --memory GB     an upper limit of model memory for every model, excluding KV (default: none; the memory
+                  that other programs leave, less --reserve, decides)
+  --reserve GB    memory kept available to other programs, 2-1024 GiB (default 10)
   --kv-cache GB   total KV states and snapshots across all models, GiB (default 8)
   --tui           a live view in the terminal (requests, speed, experts, memory, the KV cache) instead of the
                   log on stderr; q stops the server, n shows the next model, and the last log lines print on exit

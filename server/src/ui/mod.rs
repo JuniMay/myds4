@@ -102,6 +102,9 @@ pub struct Snapshot {
     kv_total_gib: f64,
     #[serde(default)]
     reserve_gib: f64,
+    /// The memory setting, an upper limit; 0: none.
+    #[serde(default)]
+    memory_gib: f64,
     #[serde(default)]
     model_memory: Vec<ModelMemory>,
     #[serde(default)]
@@ -1194,11 +1197,12 @@ mod tests {
     }
 
     #[test]
-    fn mac_memory_counts_file_cache_as_available() {
+    fn mac_memory_counts_file_cache_beyond_the_kept_share_as_available() {
         let mut s = snapshot();
         s.memory.total = 128 * 1024u64.pow(3);
         s.memory.free = 58 * 1024u64.pow(3);
         s.memory.file = 36 * 1024u64.pow(3);
+        s.memory.file_kept = 20 * 1024u64.pow(3);
         let lines = overview::draw(&s, &History::default(), &[], 240, 60);
         let mac = lines
             .iter()
@@ -1210,8 +1214,8 @@ mod tests {
             })
             .find(|l| l.starts_with(" Mac "))
             .expect("Mac memory row");
-        assert!(mac.contains("34.0 / 128 GiB"), "{mac}");
-        assert!(mac.contains("available 94.0"), "{mac}");
+        assert!(mac.contains("54.0 / 128 GiB"), "{mac}");
+        assert!(mac.contains("available 74.0"), "{mac}");
         assert!(mac.contains("file cache 36.0"), "{mac}");
     }
 

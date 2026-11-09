@@ -579,11 +579,16 @@ pub fn draw(
         l.push(Line::from(line));
     }
     {
-        // the Mac's memory in use: without the file cache, then the file cache
+        // the Mac's memory in use: without the file cache, then the file cache.
+        // Available: the free pages and the file cache beyond the share the
+        // kernel keeps (none counts when the share is unknown), as the engine
+        // counts it.
         let swap0 = h.swapouts.unwrap_or(m.swapouts);
-        let spare = (m.free.saturating_add(m.file).min(m.total)) as f64 / GIB;
+        let beyond = if m.file_kept > 0 { m.file.saturating_sub(m.file_kept) } else { 0 };
+        let spare = (m.free.saturating_add(beyond).min(m.total)) as f64 / GIB;
         let file = m.file as f64 / GIB;
-        let used = ram - spare;
+        let used = ram - spare; // not available: the kept file cache included
+        let apps = (ram - m.free as f64 / GIB - file).max(0.0); // in use without the file cache
         let level = if m.pressure >= 4 {
             Span::styled("critical", color(t.sources[4]))
         } else if m.pressure >= 2 {
@@ -594,7 +599,7 @@ pub fn draw(
         let mut line = vec![text(" "), strong("Mac"), text("  ")];
         line.extend(bar(
             gw,
-            &[(share(used, ram), Style::new()), (share(file, ram), dim())],
+            &[(share(apps, ram), Style::new()), (share(file, ram), dim())],
         ));
         line.push(text("  "));
         line.extend(pad(

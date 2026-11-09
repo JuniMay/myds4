@@ -30,9 +30,8 @@ static void usage(void) {
         "  --prefill-prune  skip decoder batches outside required history (default off); CED and substitution must be off\n"
         "  --ced off|N   approximate prefill: replay N decoder tokens, 128-1048576 (default off);\n"
         "                keeps the verification rewind margin; decoding uses all layers\n"
-        "  --memory GB   global model-memory ceiling, excluding KV (default: automatic)\n"
-        "  --kv-cache GB separate KV allowance for automatic memory sizing (default: 8)\n"
-        "  --reserve GB  memory the expert cache leaves to other programs, 2-1024 (default 10)\n"
+        "  --memory GB   upper limit of model memory, excluding KV (default: none; the free memory decides)\n"
+        "  --reserve GB  memory kept available to other programs, 2-1024 (default 10)\n"
         "  --cache-half-life N  score half-life in forward passes, 1-1000000 (default 50)\n"
         "  --cache-read-cost   weight decode eviction priority by expert read bytes (default off)\n"
         "  --tokens IDS  comma-separated token ids, or @FILE (commas, spaces or newlines between them); run\n"
@@ -96,7 +95,7 @@ int main(int argc, char **argv) {
   double temp = 0, top_p = 1;
   uint64_t seed = 0;
   int seed_set = 0;
-  double memory_gb = 0, kv_gb = 8, reserve_gb = 10;
+  double memory_gb = 0, reserve_gb = 10;
   Options o = {.ctx = 16384, .dump_fd = -1, .routes_fd = -1};
   const char *media_path[16];
   int nmedia = 0, vision_fd = -1, media_kind = -1;
@@ -179,7 +178,6 @@ int main(int argc, char **argv) {
       o.deepseek.ced = (int)n;
     } else if (!strcmp(a, "--ctx")) o.ctx = atoi(v);
     else if (!strcmp(a, "--memory")) memory_gb = sampling_option("memory", v, 1024);
-    else if (!strcmp(a, "--kv-cache")) kv_gb = sampling_option("kv-cache", v, 1024);
     else if (!strcmp(a, "--reserve")) {
       char *end;
       double gib = strtod(v, &end);
@@ -249,10 +247,10 @@ int main(int argc, char **argv) {
   if (o.deepseek.predictor_state) shutdown_watch();
   if (bench) {
     o.ctx = 2048;
-    if (!memory_configure(memory_gb, kv_gb, reserve_gb)) die("no space remains for the automatic model-memory budget");
+    memory_configure(memory_gb, reserve_gb);
     model = model_open(dir, &o);
-    if (!model) die("model weights do not fit --memory");
     if (shutdown_requested()) return complete();
+    if (!model) die("model weights do not fit the free memory less --reserve, or --memory");
     ops->bench();
     return complete();
   }
@@ -295,10 +293,10 @@ int main(int argc, char **argv) {
     for (int i = 0; i < n; i++) printf("%d%c", tokens[i], i + 1 < n ? ',' : '\n');
     return 0;
   }
-  if (!memory_configure(memory_gb, kv_gb, reserve_gb)) die("no space remains for the automatic model-memory budget");
+  memory_configure(memory_gb, reserve_gb);
   model = model_open(dir, &o);
-  if (!model) die("model weights do not fit --memory");
   if (shutdown_requested()) return complete();
+  if (!model) die("model weights do not fit the free memory less --reserve, or --memory");
   const int V = ops->vocab();
   ModelState *st = ops->state_new();
   for (int i = 0; i < nmedia; i++) {

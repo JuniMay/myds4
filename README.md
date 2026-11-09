@@ -7,9 +7,10 @@ Nemotron 3.5 Transcribe in NVFP4 with its optional BF16 DFlash2 drafter.
 
 The server can serve these architectures in one process. It registers their
 metadata at startup and loads each model's weights on its first inference
-request. Every model has its own request queue and state; memory reserve
-and KV-cache budgets are shared. The model-memory ceiling covers all
-models and excludes the separate KV budget.
+request. Every model has its own request queue and state. All models share
+the memory that other programs leave, less a reserve kept available to
+them, and one KV-cache budget; an optional model-memory limit covers all
+models and excludes KV (see [Usage](docs/usage.md#memory)).
 
 ## Build
 

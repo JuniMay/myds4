@@ -15,7 +15,7 @@ int main(int argc, char **argv) {
       die("audio fixture exceeds 16 MiB");
     str_put(&bytes, chunk, count);
   }
-  memory_configure(28, 4, 10);
+  memory_configure(28, 10);
   if (argc == 3 && !strcmp(argv[2], "--decode")) {
     Media audio = {0};
     const char *error;

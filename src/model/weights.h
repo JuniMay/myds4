@@ -34,7 +34,10 @@ void weights_expanded(WeightSet *set, Buf *target, Tensor weight, Tensor scales,
 void weights_generated(WeightSet *set, Buf *target, size_t bytes, WeightFill fill,
                        const void *parameters, size_t parameter_bytes);
 void weights_alias(WeightSet *set, Buf *target, const Buf *source);
+// 0 when the budget refuses the group, or when quitting stopped a model's load.
 int weights_load(WeightSet *set);
+// On while a model loads (model_load): quitting then stops the load.
+void weights_stop_on_quit(int on);
 // The caller pins a nonempty set of unique selections before loading. Reads run in a bounded worker
 // group; Metal allocation, accounting and error reporting stay on the caller.
 int weights_load_many(WeightSet *const *sets, int count);

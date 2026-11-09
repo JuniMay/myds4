@@ -40,6 +40,24 @@ build/tests/tokenizer-reference /path/to/transcribe tests/fixtures/tokenizer_nem
 pins, expert-before-backbone eviction and separate KV storage.
 It also checks reclaiming idle entries for the shared RAM reserve without
 discarding pinned weights or inflating recorded peak memory.
+`build/tests/memory-budget` runs the engine's memory code on a simulated
+Mac (128 GiB installed, other programs holding 28 GiB): model memory stays
+within the installed memory less the reserve less other programs, never
+takes the space that KV occupies, stays under a lower `memory` setting, a
+load after other programs grew first takes back idle experts, KV growth
+takes its space back from idle experts, and expert slots charged before
+their reads write them are not room. Its simulated kernel counts memory as
+used once it is written, as macOS does.
+`build/tests/cache-memory` checks the cache's resizing under controlled
+memory counters, and which slot bytes count as not yet written: a slot whose
+read is under way, a load that dropped a piece, and the part of a slot
+beyond a smaller expert.
+`build/tests/weights-read` checks that a model's weights are read in
+16 KiB-aligned spans into aligned memory, so that a load does not fill the
+file cache, and that each tensor's bytes arrive intact.
+`build/tests/weights-stop` checks that quitting stops a model's load after
+the weight being read, returns its memory and leaves it unloaded, while a
+load that a pass makes completes.
 `build/tests/memory-model CHECKPOINT MEMORY_GIB` evicts a real model's
 weights, retains its KV state and compares every next-token logit after
 reloading. Its competing reservation is synthetic; it is a correctness

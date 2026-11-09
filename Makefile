@@ -47,7 +47,7 @@ server-check: build/libmyds4.a
 	$(CARGO) test --release --locked --manifest-path server/Cargo.toml --target-dir build/cargo
 
 # Fast tests never acquire model weights or run GPU kernels.
-CPU_CHECKS = activation-format-check context-lookup-check workspace-check state-fork-check verification-schedule-check sampling-check shutdown-check cache-ready-check draft-cache-check prefetch-metrics-check prefetch-queue-check prefetch-admission-check prefetch-demote-check prefetch-refine-race-check cache-policy-check memory-available-check cache-memory-check
+CPU_CHECKS = activation-format-check context-lookup-check workspace-check state-fork-check verification-schedule-check sampling-check shutdown-check cache-ready-check draft-cache-check prefetch-metrics-check prefetch-queue-check prefetch-admission-check prefetch-demote-check prefetch-refine-race-check cache-policy-check memory-available-check cache-memory-check memory-budget-check weights-stop-check weights-read-check
 EXTRA_CPU = memory metadata qwen-state-accounting attention-candidate prefill-prune cache-hold cache-progress cache-mapping predictor-learning predictor-state predictor-numerics
 
 test: $(CPU_CHECKS) $(addprefix build/tests/,$(EXTRA_CPU)) build/myds4-server
@@ -262,6 +262,27 @@ build/tests/cache-memory: tests/unit/cache_memory.c src/engine/io.c src/engine/g
 cache-memory-check: build/tests/cache-memory
 	./build/tests/cache-memory
 
+build/tests/memory-budget: tests/unit/memory_budget.c src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/memory.c src/engine/myds4.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -o $@ tests/unit/memory_budget.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)
+
+memory-budget-check: build/tests/memory-budget
+	./build/tests/memory-budget
+
+build/tests/weights-stop: tests/unit/weights_stop.c src/model/weights.c src/model/weights.h src/engine/memory.c src/engine/util.c src/engine/myds4.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -o $@ tests/unit/weights_stop.c src/engine/memory.c src/engine/util.c $(LDLIBS)
+
+weights-stop-check: build/tests/weights-stop
+	./build/tests/weights-stop
+
+build/tests/weights-read: tests/unit/weights_read.c src/model/weights.c src/model/weights.h src/engine/memory.c src/engine/util.c src/engine/myds4.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -o $@ tests/unit/weights_read.c src/engine/memory.c src/engine/util.c $(LDLIBS)
+
+weights-read-check: build/tests/weights-read
+	./build/tests/weights-read
+
 # ---- GPU checks without a model ----
 
 build/tests/residency: tests/gpu/residency.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(MODEL_HEADERS)
@@ -347,4 +368,4 @@ build/tests/moe-tasks: tests/gpu/expert_tasks.c src/model/deepseek/expert_tasks.
 clean:
 	rm -rf build
 
-.PHONY: clean server server-check test activation-format-check context-lookup-check workspace-check state-fork-check verification-schedule-check sampling-check shutdown-check cache-ready-check draft-cache-check prefetch-metrics-check prefetch-queue-check prefetch-admission-check prefetch-demote-check prefetch-refine-race-check cache-policy-check memory-available-check cache-memory-check gpu-clock-check gguf-decode-check
+.PHONY: clean server server-check test activation-format-check context-lookup-check workspace-check state-fork-check verification-schedule-check sampling-check shutdown-check cache-ready-check draft-cache-check prefetch-metrics-check prefetch-queue-check prefetch-admission-check prefetch-demote-check prefetch-refine-race-check cache-policy-check memory-available-check cache-memory-check memory-budget-check weights-stop-check weights-read-check gpu-clock-check gguf-decode-check

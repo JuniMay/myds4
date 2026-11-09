@@ -15,9 +15,12 @@ Use a real workload appropriate to the proposed change. A small kernel
 check establishes only that kernel's behavior.
 
 Run one model process at a time on AC power. Record competing GPU/CPU work,
-physical memory availability and cache adaptation. Count reclaimable file
-pages as available. For `vm_stat` text, add "Pages free" and "File-backed
-pages": the printed free count already excludes speculative pages.
+physical memory availability and cache adaptation. Count as available the
+free pages and the file cache beyond the share the kernel keeps
+(`vm.vm_page_filecache_min`, about 24 GiB with 128 GiB); below that share the
+kernel compresses and swaps programs' memory rather than drop cached files.
+For `vm_stat` text, add "Pages free" and "File-backed pages" less that share:
+the printed free count already excludes speculative pages.
 In-memory compression is allowed; new swap-outs
 invalidate a run. A warm file cache changes the meaning of an I/O result.
 

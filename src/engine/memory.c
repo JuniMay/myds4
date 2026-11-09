@@ -1,6 +1,7 @@
 #include "memory.h"
 #include "myds4.h"
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -11,6 +12,44 @@ static MemoryUsage usage;
 static int pool_initialized;
 static void (*collect_released)(void);
 static _Thread_local MemorySlot *current;
+
+// The available memory decides with the limit (memory_follow). The kernel's
+// counters show what this program uses (allocated model memory and KV) only
+// as its pages are written, and released memory a little late. So a reading
+// is adjusted by this program's own changes since it was taken, charges not
+// yet allocated count as used, the charged bytes not written at the reading
+// (memory_unwritten) count as used, and no reading is taken within 1.5 s
+// after a release unless the last one is 5 s old. An addition of 1 GiB or
+// more (a model load) reads the counters; others use a reading up to a
+// second old.
+static uint64_t (*read_available)(void), (*read_unwritten)(void), reserve;
+// The last reading, what this program used then, and how much of that was
+// not written yet.
+static uint64_t read_bytes, read_used, read_pending;
+static double read_at = -1e9, released_at = -1e9;
+
+static uint64_t in_use(void) { return usage.allocated + usage.kv; }
+#define GIB_F 1073741824.0
+
+static uint64_t available(uint64_t adding) {
+  double t = now();
+  if ((t - released_at >= 1.5 || t - read_at >= 5) && (adding >= 1ull << 30 || t - read_at >= 1)) {
+    read_bytes = read_available(), read_used = in_use(), read_at = t;
+    read_pending = read_unwritten ? read_unwritten() : 0;
+  }
+  uint64_t used = in_use(), promised = usage.committed > usage.allocated ? usage.committed - usage.allocated : 0;
+  uint64_t a = used >= read_used ? (read_bytes > used - read_used ? read_bytes - (used - read_used) : 0)
+                                 : read_bytes + (read_used - used);
+  a = a > read_pending ? a - read_pending : 0;
+  return a > promised ? a - promised : 0;
+}
+
+// How far adding `bytes` would take the available memory below the reserve.
+static uint64_t shortage(uint64_t bytes) {
+  if (!read_available || !bytes) return 0;
+  uint64_t a = available(bytes), room = a > reserve ? a - reserve : 0;
+  return bytes > room ? bytes - room : 0;
+}
 
 static uint64_t charged(const MemoryAccount *account) {
   return account->bytes > account->minimum ? account->bytes : account->minimum;
@@ -31,6 +70,19 @@ void memory_init(uint64_t limit) {
 }
 
 void memory_set_limit(uint64_t bytes) { usage.limit = bytes; pool_initialized = 1; }
+
+void memory_follow(uint64_t (*reader)(void), uint64_t reserve_bytes) {
+  read_available = reader, reserve = reserve_bytes, read_at = -1e9;
+}
+
+void memory_unwritten(uint64_t (*source)(void)) { read_unwritten = source; }
+
+uint64_t memory_current_limit(void) {
+  if (!read_available) return usage.limit;
+  uint64_t a = available(0), room = a > reserve ? a - reserve : 0;
+  uint64_t limit = UINT64_MAX - usage.committed < room ? UINT64_MAX : usage.committed + room;
+  return limit < usage.limit ? limit : usage.limit;
+}
 
 void memory_account_init(MemoryAccount *account, const char *name) {
   if (!pool_initialized) memory_init(0);
@@ -153,12 +205,16 @@ static MemorySlot *victim(MemorySlot *const *wanted, const uint64_t *sizes, size
   return best;
 }
 
-static void release_entry(MemorySlot *slot) {
+// Returns the charge it took back.
+static uint64_t release_entry(MemorySlot *slot) {
+  uint64_t before = usage.committed;
   slot->evict(slot->context);
   if (slot->payload) die("memory eviction retained its payload");
   change(slot, 0);
   memory_publish(slot, 0);
   usage.evictions++;
+  released_at = now();
+  return before - usage.committed;
 }
 
 uint64_t memory_reclaim(uint64_t bytes) {
@@ -173,23 +229,40 @@ uint64_t memory_reclaim(uint64_t bytes) {
   return freed;
 }
 
+// What an addition needs back past the limit (UINT64_MAX: more than can come back).
+static uint64_t over_limit(uint64_t extra) {
+  if (fits(extra)) return 0;
+  return extra == UINT64_MAX || usage.committed > usage.limit ? UINT64_MAX : extra - (usage.limit - usage.committed);
+}
+
 int memory_admit(MemorySlot *const *wanted, const uint64_t *sizes, size_t n, MemoryAdmission mode) {
   int evicted = 0;
   uint64_t extra = growth(wanted, sizes, n);
-  if (mode == MEMORY_SPECULATIVE && !fits(extra)) { usage.refusals++; return 0; }
-  if (!fits(extra) && (extra == UINT64_MAX || usage.committed > usage.limit ||
-      extra - (usage.limit - usage.committed) > reclaimable(wanted, sizes, n, mode))) {
+  // What the addition needs past the reserve comes back from idle model
+  // memory in the same order as what it needs past the limit.
+  uint64_t short_by = extra == UINT64_MAX ? 0 : shortage(extra), over = over_limit(extra);
+  uint64_t need = over > short_by ? over : short_by, freed = 0;
+  if (mode == MEMORY_SPECULATIVE && need) { usage.refusals++; return 0; }
+  if (need && (need == UINT64_MAX || need > reclaimable(wanted, sizes, n, mode))) {
+    if (short_by)
+      fprintf(stderr, "memory: %s: %.2f GiB to add, %.2f GiB short of the %.1f GiB reserve, too little idle: refused\n",
+              wanted[0]->name, extra / GIB_F, short_by / GIB_F, reserve / GIB_F);
     usage.refusals++;
     return 0;
   }
-  while (!fits(extra)) {
-    uint64_t need = extra - (usage.limit - usage.committed);
-    MemorySlot *best = victim(wanted, sizes, n, mode, need);
+  int taken = 0;
+  while ((over = over_limit(extra)) || freed < short_by) {
+    uint64_t left = freed < short_by ? short_by - freed : 0, want = over > left ? over : left;
+    MemorySlot *best = victim(wanted, sizes, n, mode, want);
     if (!best) die("memory reservation changed during eviction");
-    release_entry(best);
-    evicted = 1;
+    freed += release_entry(best);
+    evicted = 1, taken++;
     extra = growth(wanted, sizes, n);
   }
+  if (short_by)
+    fprintf(stderr, "memory: %s: %.2f GiB to add, %.2f GiB short of the %.1f GiB reserve (reading %.1f s old): "
+            "took back %.2f GiB from %d idle entries\n", wanted[0]->name, extra / GIB_F, short_by / GIB_F,
+            reserve / GIB_F, now() - read_at, freed / GIB_F, taken);
   for (size_t i = 0; i < n; i++) change(wanted[i], sizes[i] > wanted[i]->payload ? sizes[i] : wanted[i]->payload);
   if (evicted && collect_released) collect_released();
   return 1;
@@ -237,8 +310,23 @@ void memory_release(MemorySlot *slot, uint64_t bytes) {
 }
 void memory_trim(MemorySlot *slot) { change(slot, slot->payload); }
 void memory_kv_change(uint64_t bytes, int allocated) {
-  if (allocated) usage.kv += bytes;
-  else usage.kv -= bytes;
+  if (!allocated) {
+    usage.kv -= bytes;
+    return;
+  }
+  uint64_t short_by = shortage(bytes), freed = 0;
+  int released = 0;
+  while (freed < short_by) {
+    MemorySlot *slot = victim(NULL, NULL, 0, MEMORY_REQUIRED, short_by - freed);
+    if (!slot) break;  // nothing idle is left: the once-a-second check frees idle KV
+    freed += release_entry(slot);
+    released++;
+  }
+  if (released && collect_released) collect_released();
+  if (short_by)
+    fprintf(stderr, "memory: KV grows %.2f GiB, %.2f GiB short of the %.1f GiB reserve: took back %.2f GiB from %d idle "
+            "entries\n", bytes / GIB_F, short_by / GIB_F, reserve / GIB_F, freed / GIB_F, released);
+  usage.kv += bytes;
 }
 MemoryUsage memory_usage(void) { return usage; }
 void memory_collect_with(void (*collect)(void)) { collect_released = collect; }

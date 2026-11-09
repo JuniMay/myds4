@@ -34,7 +34,7 @@ static void complete_piece(int slot, int piece) {
   metrics_io_end(s, 0, began);
   __atomic_fetch_add(&cache_stats.bytes, s->piece[piece].len, __ATOMIC_RELAXED);
   metrics_piece_done(s, s->piece[piece].len);
-  piece_finished(s, piece);
+  piece_finished(s, piece, 1);
 }
 
 static int snapshot(uint32_t out[QMAX]) {

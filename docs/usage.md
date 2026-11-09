@@ -20,9 +20,9 @@ The root contains server settings and a nonempty `models` list:
 | `api_key_file` | File containing a 16–256 character API key. Without a file, use `MYDS4_API_KEY`. |
 | `tui` | Show the terminal interface; default false. `--tui` enables it and `--no-tui` disables it. |
 | `tui_theme` | `auto`, `light` or `dark`; default `auto`. |
-| `memory` | Shared model-memory ceiling in GiB: all loaded weights, experts, vision and model workspaces. KV is separate. Default 0 uses physical RAM minus `reserve` and `kv_cache`. |
-| `reserve` | One process-wide target for available system memory, in GiB; default 10, range 2–1024. |
-| `kv_cache` | One budget for all models' attention states and snapshots, in GiB; default 8. |
+| `memory` | Optional upper limit of model memory in GiB: all loaded weights, experts, vision and model workspaces; KV is separate. Default 0: no limit; the memory that other programs leave decides (see [Memory](#memory)). |
+| `reserve` | Memory kept available to other programs, in GiB; default 10, range 2–1024. |
+| `kv_cache` | One budget for all models' attention states and snapshots, in GiB; default 8. Experts use the part that KV does not occupy. |
 | `models` | Each model's checkpoint and inference settings. |
 
 Explicit server flags override file settings regardless of argument order.
@@ -92,18 +92,61 @@ scheduler handles multiple requests. Pipeline therefore does not replace
 
 ## Memory
 
-Available memory includes free and reclaimable file-backed pages. The
-shared reserve is a headroom target. The model-memory pool holds variable-sized
-entries. A dense model's weights form one entry. MoE experts are separate
-entries that must be evicted before their dense backbone. Active requests
-pin the weights they need. Unused weight groups can be unloaded and later
-reloaded while their KV state remains in the separate pool.
+The server's memory is what other programs leave: the installed memory less
+`reserve` less what other programs hold at that moment. It follows them; it
+is not a fixed number. Available memory means the free pages and the file
+cache beyond the share that macOS keeps (`vm.vm_page_filecache_min`, about
+24 GiB with 128 GiB). While its file cache is below that share, macOS
+compresses and swaps programs' memory rather than drop cached files, so that
+share never counts as available.
 
-The `memory` ceiling counts managed model allocations, including Metal
-buffers and model-owned host buffers. Request text, tokenizer metadata,
-framework and driver overhead also contribute to the process footprint.
-`kv_cache` controls the shared KV pool independently. Inspect total process
-memory when choosing the two budgets together.
+While the server idles, the GPU driver takes its model memory out of wired
+memory within a few seconds, so macOS could swap it under memory pressure.
+The rules below keep the server from causing that pressure (see
+[Design](design.md)).
+
+- **Additions keep the reserve.** Before model memory or KV is added, the
+  engine checks the available memory: an addition may not take it below
+  `reserve`. When it would, idle model memory goes back first.
+- **What goes back, and in what order.**
+  - The model memory holds variable-sized entries. A dense model's weights
+    form one entry, and MoE experts are separate entries that go back before
+    their dense backbone.
+  - The least recently used entries go back first.
+  - The weights of a model that is serving are never taken: active requests
+    pin the weights they need.
+  - Unused weight groups can be unloaded and later reloaded while their KV
+    state remains in the separate pool.
+- **A load that does not fit is refused.** A model load that still does not
+  fit is refused; the log gives the numbers, the request fails, and nothing
+  is swapped.
+- **When other programs grow.** The expert cache gives memory back. Once a
+  second, the server also takes back idle model memory, then idle KV, until
+  the available memory is back at `reserve`.
+- **KV comes first, within `kv_cache`.** The experts may use the space that
+  KV does not occupy. When KV grows, idle experts give that space back
+  before it is allocated. Experts never take the space that KV occupies.
+- **`memory` is an upper limit, not a reservation.** It counts managed model
+  allocations, including Metal buffers and model-owned host buffers. Without
+  it, the available memory alone decides. Request text, tokenizer metadata,
+  framework and driver overhead lie outside it, but they use available
+  memory like anything else.
+- **Reading the available memory.** macOS counts memory as in use only once
+  its pages are written, and counts released memory a little late. The
+  engine charges a buffer when it allocates it. So it adjusts its last
+  reading by its own allocations and releases, and it counts expert slots
+  that their reads have not written yet as in use. It reads again at each
+  model load and at most once a second otherwise, but not within 1.5 s after
+  it released memory unless the last reading is 5 s old.
+
+The Memory tab and `/v1/models/{id}` show the current limit: the model memory
+held plus the available memory above `reserve`, within `memory`.
+
+Quitting (Ctrl-C, SIGTERM, or `q` in the terminal interface) stops a model's
+load between weights; the load frees what it took, and requests waiting for
+it end as a shutdown. Weights that a pass loads (routed experts, vision
+weights) complete with their pass first. A DeepSeek prompt's prefill runs to
+its end before the server quits.
 
 Prefill uses chunks that fit available model workspace. A long prompt does
 not require its entire working buffer at once. If the smallest supported

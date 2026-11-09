@@ -1,4 +1,8 @@
-// Available memory includes reclaimable file pages without counting them twice.
+// Available memory is the free pages (with the speculative ones) and the file
+// cache beyond the share the kernel keeps (vm.vm_page_filecache_min): while
+// the file cache is below that share the kernel compresses and swaps other
+// programs' memory rather than drop cached files. When the share cannot be
+// read, only the free pages count.
 #include <sys/sysctl.h>
 #include <errno.h>
 #include <stdint.h>
@@ -29,27 +33,23 @@ static void expect(const char *name, uint64_t actual, uint64_t wanted) {
 
 int main(void) {
   vm_statistics64_data_t pages = {.free_count = 100, .external_page_count = 500, .speculative_count = 20};
-  reported_floor = 0;
-  expect("zero floor includes reclaimable files", avail_of(pages), 580 * vm_page_size);
-  reported_floor = 200;
-  expect("kernel floor does not mark cached files as used", avail_of(pages), 580 * vm_page_size);
-  reported_floor = 450;
-  expect("changing floor does not change available bytes", avail_of(pages), 580 * vm_page_size);
-  reported_floor = 600;
-  expect("all cached files remain reclaimable", avail_of(pages), 580 * vm_page_size);
   query_failed = 1;
-  expect("unavailable floor does not discard cached files", avail_of(pages), 580 * vm_page_size);
+  expect("an unreadable share counts only the free pages", avail_of(pages), 100 * vm_page_size);
   query_failed = 0, reported_floor = 200;
-  expect("query recovery preserves available bytes", avail_of(pages), 580 * vm_page_size);
-  pages.external_page_count = 10;
-  expect("speculative pages cannot underflow file count", avail_of(pages), 100 * vm_page_size);
-  pages.external_page_count = 20;
-  expect("speculative pages are counted only in free pages", avail_of(pages), 100 * vm_page_size);
-  pages.external_page_count = 0, pages.speculative_count = 0;
-  expect("no file cache leaves only free pages", avail_of(pages), 100 * vm_page_size);
+  expect("the file cache beyond the kept share counts", avail_of(pages), (100 + 480 - 200) * vm_page_size);
+  reported_floor = 450;
+  expect("a larger kept share leaves less", avail_of(pages), (100 + 30) * vm_page_size);
+  reported_floor = 600;
+  expect("file cache within the kept share does not count", avail_of(pages), 100 * vm_page_size);
+  reported_floor = 0;
+  expect("a share read as zero counts only the free pages", avail_of(pages), 100 * vm_page_size);
+  reported_floor = 200, pages.external_page_count = 10;
+  expect("speculative pages cannot underflow the file count", avail_of(pages), 100 * vm_page_size);
+  pages.external_page_count = 220;
+  expect("speculative pages are counted only in the free pages", avail_of(pages), 100 * vm_page_size);
   pages.free_count = 0, pages.external_page_count = 500;
-  expect("cached pages remain available with no free pages", avail_of(pages), 500 * vm_page_size);
-  expect("available memory does not query the cache floor", queries, 0);
+  expect("file cache beyond the share remains available with no free pages", avail_of(pages), 280 * vm_page_size);
+  expect("available memory reads the kept share", queries > 0, 1);
   fprintf(stderr, "available memory: %d/%d CPU checks passed\n", checks - failures, checks);
   return failures != 0;
 }

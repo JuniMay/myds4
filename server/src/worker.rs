@@ -357,7 +357,6 @@ pub fn start(
         .spawn(move || {
             if !engine::init(
                 budgets.memory_gb,
-                budgets.kv_gb,
                 budgets.reserve_gb,
                 on_log,
                 on_die,
@@ -558,7 +557,7 @@ pub fn status(model: usize) -> Value {
         "waiting": waiting, "sessions": sessions,
         "kv_cache_gib": round(st.kv_bytes as f64 / GIB, 3), "kv_cache_limit_gib": round(kv_limit as f64 / GIB, 3),
         "kv_cache_scope": "server", "kv_cache_total_gib": round(s.kv_used.load(Ordering::Relaxed) as f64 / GIB, 3),
-        "reserve_gib": s.budgets.reserve_gb, "model_memory": allocations,
+        "reserve_gib": s.budgets.reserve_gb, "memory_gib": s.budgets.memory_gb, "model_memory": allocations,
         "model_memory_budget": {"limit": c.model_memory_limit, "allocated": c.model_memory_used,
                                 "committed": c.model_memory_committed, "peak": c.model_memory_peak},
         "totals": {"requests": st.requests, "prompt_tokens": st.prompt_tokens, "generated_tokens": st.generated_tokens},
@@ -637,7 +636,7 @@ pub fn view(model: usize) -> String {
         "kinds": {"new": st.kinds[0], "continued": st.kinds[1], "saved": st.kinds[2], "forked": st.kinds[3]},
         "sessions": st.states.len(), "kv_gib": round(st.kv_bytes as f64 / GIB, 3), "kv_limit_gib": round(kv_limit as f64 / GIB, 3),
         "kv_total_gib": round(s.kv_used.load(Ordering::Relaxed) as f64 / GIB, 3),
-        "reserve_gib": s.budgets.reserve_gb, "model_memory": allocations,
+        "reserve_gib": s.budgets.reserve_gb, "memory_gib": s.budgets.memory_gb, "model_memory": allocations,
         "model_memory_budget": {"limit": c.model_memory_limit, "allocated": c.model_memory_used,
                                 "committed": c.model_memory_committed, "peak": c.model_memory_peak},
         "tree": tree,
@@ -949,6 +948,9 @@ impl Worker {
             }
             if !slot.model.loaded() {
                 if let Err(error) = slot.model.load() {
+                    if engine::stopping() {
+                        continue; // quitting stopped the load: the stop ends its requests
+                    }
                     lock(&self.s.models[slot.index].status).load_error = Some(error.clone());
                     for generation in std::mem::take(&mut slot.gens) {
                         let snapshots = self.memory.cache.remove(generation.state);
@@ -1181,6 +1183,10 @@ impl Slot {
                         self.set_status(s, "loading");
                     }
                     if let Err(error) = self.model.load() {
+                        if engine::stopping() {
+                            end_waiting(job, Finish::Shutdown); // quitting stopped the load
+                            continue;
+                        }
                         lock(&s.models[self.index].status).load_error = Some(error.clone());
                         engine::log(&format!("{}: {error}", self.served.id));
                         job.last(Event::Failed(error));
@@ -1608,12 +1614,15 @@ impl Slot {
             self.model
                 .prefill(st, prompt, done, replay, inner, p.media.as_ref())
         else {
+            if engine::stopping() {
+                return; // quitting stopped the prefill: the stop ends the request
+            }
             let generation = self.gens.remove(i);
             let snapshots = memory.cache.remove(generation.state);
             memory.free(Vec::new(), vec![(generation.state, snapshots)]);
             memory.publish(s);
             generation.job.last(Event::Failed(
-                "the model's minimum working set cannot fit the shared memory budget".into(),
+                "the prefill's working memory does not fit: memory is short".into(),
             ));
             return;
         };
@@ -1923,6 +1932,28 @@ impl Slot {
         memory.publish(s);
     }
 
+    /// A decoding pass that failed because experts it needed could not load:
+    /// quitting stopped their reads, or memory stayed short after idle memory
+    /// went back. While quitting, its requests end as every request does at
+    /// the stop. Otherwise they end with an error, and their states, which the
+    /// pass may have changed in part, are discarded.
+    fn pass_failed(&mut self, failed: &[usize], memory: &mut Memory) {
+        if engine::stopping() {
+            return;
+        }
+        let mut failed = failed.to_vec();
+        failed.sort_unstable_by(|a, b| b.cmp(a));
+        for i in failed {
+            let generation = self.gens.remove(i);
+            let snapshots = memory.cache.remove(generation.state);
+            memory.free(Vec::new(), vec![(generation.state, snapshots)]);
+            engine::log(&format!("req {}: a pass could not load its experts: memory is short", generation.job.id));
+            generation.job.last(Event::Failed(
+                "a pass could not load the model's experts: memory is short".into(),
+            ));
+        }
+    }
+
     /// One token for each decoding generation: alone with its drafts, or
     /// together, each row as it would run alone.
     fn advance(&mut self, memory: &mut Memory) {
@@ -1971,27 +2002,30 @@ impl Slot {
             self.make_room(state, pos + 1 + k, memory);
             let model = self.model.clone();
             let g = &mut self.gens[gi];
-            let (next, a) = if k > 0 {
+            let pass = if k > 0 {
                 let probabilities = if proposal == 0 {
                     rows.resize(k + 1, 0);
                     model.draft(st, g.t, g.pos, &mut rows[1..], &mut g.sampler)
                 } else {
                     std::ptr::null()
                 };
-                let lg = model
-                    .verify(st, &rows, g.pos)
-                    .expect("a verify pass in the limits");
-                let (next, a) = model.sample_verify(lg, &rows[1..], probabilities, &mut g.sampler);
-                g.draft_passes += 1;
-                g.draft_accepted += a;
-                model.accept(st, &rows[..a + 1], g.pos);
-                (next, a)
+                model.verify(st, &rows, g.pos).map(|lg| {
+                    let (next, a) = model.sample_verify(lg, &rows[1..], probabilities, &mut g.sampler);
+                    g.draft_passes += 1;
+                    g.draft_accepted += a;
+                    model.accept(st, &rows[..a + 1], g.pos);
+                    (next, a)
+                })
             } else {
-                let lg = model
+                model
                     .rows(&mut [st], &[g.t], &[g.pos as i32])
-                    .expect("a decoding pass in the context");
-                (model.sample(lg, &mut g.sampler), 0)
+                    .map(|lg| (model.sample(lg, &mut g.sampler), 0))
             };
+            let Some((next, a)) = pass else {
+                self.pass_failed(&[gi], memory);
+                return;
+            };
+            let g = &mut self.gens[gi];
             if proposal > 0
                 && let Some(l) = g.lookup.as_mut()
             {
@@ -2025,9 +2059,10 @@ impl Slot {
         let tokens: Vec<i32> = decoding.iter().map(|&i| self.gens[i].t).collect();
         let pos: Vec<i32> = decoding.iter().map(|&i| self.gens[i].pos as i32).collect();
         let model = self.model.clone();
-        let lg = model
-            .rows(&mut st, &tokens, &pos)
-            .expect("rows in the limits");
+        let Some(lg) = model.rows(&mut st, &tokens, &pos) else {
+            self.pass_failed(&decoding, memory);
+            return;
+        };
         let vocab = model.vocab();
         for (r, &i) in decoding.iter().enumerate() {
             let g = &mut self.gens[i];

@@ -26,8 +26,29 @@ option union. The Rust configuration uses the corresponding backend enum.
 
 Registration reads metadata and tokenizers without loading weights.
 An inference request triggers loading only for its selected model. The
-process manages its own memory budgets. Each loaded model owns its tensor
-index; deferred media encoding uses that model's index.
+process's memory follows the memory that other programs leave, less the
+reserve (src/engine/memory.c, `memory_follow`): every addition of model
+memory or KV is checked against the available memory, and idle model
+memory goes back first when it would fall below the reserve; a load that
+still does not fit is refused. The `memory` setting is an upper limit
+within that. macOS counts a new buffer's pages as in use only once they are
+written, while the engine charges the buffer when it allocates it. A reading
+of the counters therefore counts the expert-cache bytes that no completed
+read has written as in use (`memory_unwritten`; `cache_unwritten` in
+src/engine/io.c): slots whose reads are under way, and the part of a slot
+beyond a smaller expert. Each loaded model owns its tensor index; deferred media
+encoding uses that model's index.
+
+Weights are read in 16 KiB-aligned spans into a page-aligned buffer and
+copied out (`read_bytes`, src/model/weights.c): checkpoint files are opened
+with `F_NOCACHE`, but unaligned uncached reads still fill the page cache,
+which the kernel then keeps. Quitting stops a model's load (`model_load`)
+between weights and between the 16 MiB pieces it reads: the load frees
+what it took and fails, and the server ends the requests waiting for it as
+a shutdown. Weights that a pass loads
+complete with the pass. A pass that fails because its experts could not
+load ends its requests: as a shutdown while quitting, otherwise with an
+error, discarding their states.
 
 File validation errors during loading return a service error while the
 server remains available. Fatal backend or device errors still terminate
@@ -69,9 +90,25 @@ Each set targets 5% of the device's recommended working-set size, with a
 the set-count limit can exceed that per-set target. Views share the original
 allocation's membership. Only changed sets are committed. This bounds the
 amount of memory in each set while preserving buffer addresses and execution
-order. DeepSeek uses Metal's working-set recommendation to decide how many
-expert buffers to map. The global model-memory and KV budgets still control
-allocation. The engine does not change system wired-memory settings.
+order.
+
+DeepSeek uses Metal's working-set recommendation to decide how many expert
+buffers to map. Allocation follows the available memory and the reserve,
+within the `memory` and KV settings. The engine does not change system
+wired-memory settings.
+
+Resident memory stays wired only while the GPU works. About half a second
+after the last command buffer, the GPU driver starts taking the process's
+resident memory out of wired memory, and once it is unwired macOS can swap
+it. Measured on 2026-11-09 with DeepSeek idle: wired memory fell from 50 to
+6 GiB within 3.5 s, stayed there while the server idled, and returned within
+2 s of the next request. So an idle server's model memory can be swapped
+under memory pressure. The engine never causes that pressure itself:
+- every addition keeps the reserve free;
+- a load first takes back what it needs;
+- weights are read without filling the file cache.
+
+The once-a-second maintenance gives memory back when other programs grow.
 
 The engine allocates selected missing experts and their decoding scratch
 space before starting up to eight read workers. Workers read checkpoint

@@ -12,6 +12,7 @@
 static vm_statistics64_data_t vm_fixture;
 static int pressure_fixture = 1;
 static uint64_t compressed_fixture, wakeups_fixture, working_set_fixture = 128ull << 30;
+static uint64_t filecache_min_fixture;  // pages; set in main
 static kern_return_t fixture_host(host_t host, host_flavor_t flavor, host_info64_t out, mach_msg_type_number_t *n) {
   memcpy(out, &vm_fixture, sizeof vm_fixture);
   return KERN_SUCCESS;
@@ -24,7 +25,8 @@ static kern_return_t fixture_task(task_name_t task, task_flavor_t flavor, task_i
 static int fixture_sysctl(const char *name, void *out, size_t *n, void *in, size_t len) {
   uint64_t value = !strcmp(name, "hw.memsize") ? 128ull << 30 :
                    !strcmp(name, "kern.memorystatus_vm_pressure_level") ? pressure_fixture :
-                   !strcmp(name, "vm.compressor.swapper.wakeups.total") ? wakeups_fixture : 0;
+                   !strcmp(name, "vm.compressor.swapper.wakeups.total") ? wakeups_fixture :
+                   !strcmp(name, "vm.vm_page_filecache_min") ? filecache_min_fixture : 0;
   if (!out || !n) return -1;
   size_t size = *n < sizeof value ? *n : sizeof value;
   memcpy(out, &value, size), *n = size;
@@ -59,6 +61,7 @@ static void child_case(int kind) {
   nslots = cap = max_slots - 256;
   if (kind == 7) nslots = 0;
   if (kind == 8) nslots = cap = 2 * EXPERTS;
+  if (kind == 9) vm_fixture.external_page_count = (8ull << 30) / vm_page_size;  // within the kept share
   int before = cap;
   if (kind == 2) pressure_fixture = 2;
   resize(-1);
@@ -90,8 +93,49 @@ static void child_case(int kind) {
     _exit(cap > before && cap <= max_slots ? 0 : 1);
   }
   if (kind == 3) _exit(cap == before ? 0 : 1);
+  if (kind == 9) {
+    fprintf(stderr, "cache reproduction %d: 1 GiB free and 8 GiB of file cache within a 10 GiB kept share: limit %d -> %d\n",
+            kind, before, cap);
+    _exit(cap < before ? 0 : 1);
+  }
   _exit(cap < before ? 0 : 1);
 }
+// macOS counts a slot's pages as in use only once a read writes them, so the
+// cache reports the charged bytes no completed load has written
+// (memory_unwritten). Layer 1's experts here are smaller than the slot.
+static void reads(Slot *s, int from, int to) {  // a reader completes pieces from..to-1
+  for (int k = from; k < to; k++) atomic_store(&s->taken[k], 1), piece_finished(s, k, 1);
+}
+static void unwritten_checks(void) {
+  for (int e = 0; e < EXPERTS; e++) expert_span[1][e][0].len = EXPERT_W / 2;
+  Slot *s = &slots[0];
+  uint64_t whole = gpu_allocation_size(SLOT_SIZE);
+  s->b = (Buf){.obj = s, .ptr = malloc(whole), .allocated = whole};  // a new buffer, never touched
+  s->layer = 1, s->expert = 0;
+  start(0, 0);
+  expect("a new slot counts as unwritten while its read is under way", cache_unwritten() == whole);
+  reads(s, 0, s->npiece - 1);
+  expect("a partly read slot still counts as unwritten", cache_unwritten() == whole);
+  reads(s, s->npiece - 1, s->npiece);
+  uint64_t small = s->extent;
+  expect("a completed read counts as written before the model thread reaps it",
+         small && small < whole && cache_unwritten() == whole - small);
+  finish(0);
+  expect("a reaped read leaves unwritten only the slot beyond its smaller expert",
+         s->written == small && cache_unwritten() == whole - small);
+  s->layer = 0;
+  start(0, 0);
+  reads(s, 0, 1);
+  cancel(0);
+  expect("a load that dropped a piece adds nothing written", s->written == small && cache_unwritten() == whole - small);
+  start(0, 0);
+  reads(s, 0, s->npiece);
+  finish(0);
+  expect("a larger expert's completed read writes the rest of the slot",
+         s->written == s->extent && cache_unwritten() == whole - s->extent && s->extent > small);
+  memset(s, 0, sizeof *s);
+}
+
 int main(void) {
   alarm(10);
   working_set_fixture = 0;
@@ -100,6 +144,7 @@ int main(void) {
   expect("residency follows Metal's working-set recommendation", mem_gpu_limit() == (int64_t)working_set_fixture);
   working_set_fixture = 128ull << 30;
   expect("an early query does not freeze the residency target", mem_gpu_limit() == (int64_t)working_set_fixture);
+  filecache_min_fixture = (10ull << 30) / vm_page_size;
   vm_fixture.free_count = (48ull << 30) / vm_page_size;
   vm_fixture.external_page_count = (30ull << 30) / vm_page_size;
   vm_fixture.speculative_count = (2ull << 30) / vm_page_size;
@@ -112,19 +157,23 @@ int main(void) {
   }
   cache_reserve(4);
   cache_init(NULL, 56ull << 30, LAYERS);
-  expect("initial capacity uses file cache to fit the requested 56 GiB", cap == (int)((56ull << 30) / SLOT_SIZE));
+  expect("initial capacity uses file cache beyond the kept share to fit the requested 56 GiB",
+         cap == (int)((56ull << 30) / SLOT_SIZE));
   expect("initial capacity respects the configured upper bound", cap <= max_slots);
-  const char *names[] = {"low free pages with ample file cache do not shrink", "calm growth uses available file cache",
+  const char *names[] = {"low free pages with file cache beyond the kept share do not shrink",
+                         "calm growth uses file cache beyond the kept share",
                          "actual memory pressure still shrinks", "compression alone does not shrink", "new swapping still shrinks",
                          "compression alone does not prevent growth", "a swapper wakeup without swap-outs does not shrink",
-                         "a global swap-out cannot reclaim an empty expert cache", "a minimum-sized cache can recover using available memory"};
-  for (int kind = 0; kind < 9; kind++) {
+                         "a global swap-out cannot reclaim an empty expert cache", "a minimum-sized cache can recover using available memory",
+                         "file cache within the kept share does not count: low free pages shrink"};
+  for (int kind = 0; kind < 10; kind++) {
     pid_t pid = fork();
     if (!pid) child_case(kind);
     int status;
     if (pid < 0 || waitpid(pid, &status, 0) != pid) return 1;
     expect(names[kind], WIFEXITED(status) && WEXITSTATUS(status) == 0);
   }
+  unwritten_checks();
   free(slots), free(score), free(free_list);
   printf("cache memory policy: %d/%d CPU checks passed\n", checks - failures, checks);
   return failures != 0;

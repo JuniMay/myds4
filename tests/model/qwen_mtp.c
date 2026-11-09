@@ -42,7 +42,7 @@ static void check_hidden(const char *directory, ModelState *state, const float *
 
 int main(int argc, char **argv) {
   if (argc != 2) die("usage: qwen-mtp CHECKPOINT");
-  memory_configure(32, 8, 10);
+  memory_configure(32, 10);
   Options options = {.ctx = 4096, .draft = 5, .dump_fd = -1, .routes_fd = -1, .quiet = 1};
   Model *model = model_open(argv[1], &options);
   CHECK(model != NULL);

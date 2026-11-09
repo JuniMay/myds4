@@ -1,4 +1,6 @@
-// One budget for model allocations. KV storage is counted separately.
+// Model allocations under an optional limit, and within the memory that
+// other programs leave: memory_follow keeps the available memory at or
+// above a reserve. KV storage is counted separately and comes first.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -35,8 +37,18 @@ typedef struct {
   uint64_t limit, allocated, committed, peak, kv, evictions, refusals;
 } MemoryUsage;
 
-void memory_init(uint64_t limit);
+void memory_init(uint64_t limit); // 0: no limit
 void memory_set_limit(uint64_t bytes); // absolute temporary limit, including zero
+// Additions keep available() (free pages and file pages the kernel can drop)
+// at or above `reserve`: idle model memory goes back first, as for the limit.
+void memory_follow(uint64_t (*available)(void), uint64_t reserve);
+// macOS counts a new buffer's pages as in use only once they are written,
+// while the engine charges the buffer when it allocates it. `unwritten`
+// returns the charged bytes not written yet; readings count them as in use.
+void memory_unwritten(uint64_t (*unwritten)(void));
+// The most model memory this program may hold now: what it holds and the
+// available memory above the reserve, within the limit.
+uint64_t memory_current_limit(void);
 void memory_account_init(MemoryAccount *account, const char *name);
 void memory_slot_init(MemorySlot *slot, MemoryAccount *account, MemorySlot *dependency,
                       const char *name, void (*evict)(void *), void *context);
@@ -53,6 +65,8 @@ int memory_minimum_mode(MemoryAccount *account, uint64_t bytes, MemoryAdmission 
 int memory_claim(MemorySlot *slot, uint64_t bytes, MemoryAdmission mode);
 void memory_release(MemorySlot *slot, uint64_t bytes);
 void memory_trim(MemorySlot *slot);
+// Before KV grows, idle model memory gives back the space it needs above the
+// reserve: KV comes first, and the experts use only the space it leaves.
 void memory_kv_change(uint64_t bytes, int allocated);
 MemoryUsage memory_usage(void);
 void memory_collect_with(void (*collect)(void));

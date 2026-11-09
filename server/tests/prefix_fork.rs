@@ -788,18 +788,18 @@ fn a_saved_prompt_again_fits_a_full_kv_cache() {
     );
 }
 
-/// A conversation with `lo` to `hi` prompt tokens: a cut of docs/design.md as
-/// the system prompt, and a question whose answer is long.
+/// A conversation with `lo` to `hi` prompt tokens: a cut of docs/design.md,
+/// repeated as often as that size needs, as the system prompt, and a question
+/// whose answer is long.
 fn sized_prompt(s: &Setup, lo: usize, hi: usize) -> (Value, usize) {
-    let design: Vec<char> = std::fs::read_to_string(root().join("docs/design.md"))
-        .expect("docs/design.md")
-        .chars()
-        .collect();
-    let make = |c: usize| {
-        let cut: String = design[..c].iter().collect();
-        json!([{"role": "system", "content": format!("You review this project's design. Reference:\n\n{cut}")},
+    let text = std::fs::read_to_string(root().join("docs/design.md")).expect("docs/design.md");
+    let conversation = |reference: &str| {
+        json!([{"role": "system", "content": format!("You review this project's design. Reference:\n\n{reference}")},
                {"role": "user", "content": "List every heading of the reference, one per line, each with a one-sentence summary."}])
     };
+    let once = tokens(s, &conversation(&text)).len();
+    let design: Vec<char> = text.repeat(hi / once + 1).chars().collect();
+    let make = |c: usize| conversation(&design[..c].iter().collect::<String>());
     let (mut a, mut b) = (0, design.len());
     while a < b {
         let c = (a + b) / 2;

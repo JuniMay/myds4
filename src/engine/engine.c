@@ -79,7 +79,7 @@ void myds4_log(const char *line) { say("%s", line); }
 int myds4_init(const myds4_process *p) {
   if (!p || p->abi != MYDS4_ABI || initialized) return -1;
   if (p->reserve_gb && !(p->reserve_gb >= CACHE_RESERVE_MIN && p->reserve_gb <= CACHE_RESERVE_MAX)) return -1;
-  if (!memory_configure(p->memory_gb, p->kv_gb, p->reserve_gb)) return -1;
+  memory_configure(p->memory_gb, p->reserve_gb);
   proc = *p;
   die_hook = p->on_die;
   pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);  // the models' GPU work goes before background work
@@ -156,7 +156,12 @@ int myds4_load(myds4_model *m) {
   int was_loaded = myds4_loaded(m);
   if (!model_load(m->m, &m->opt)) {
     model_active(m->m, 0);
-    say("%s: the global model-memory budget cannot fit this request", m->dir);
+    MemoryUsage u = memory_usage();
+    uint64_t limit = memory_current_limit();
+    if (shutdown_requested()) say("%s: loading stopped", m->dir);
+    else say("%s: not loaded: it does not fit; %.1f GiB more model memory fits now (%.1f GiB held, %.1f GiB of KV)",
+             m->dir, (limit > u.committed ? limit - u.committed : 0) / 1073741824.0, u.committed / 1073741824.0,
+             u.kv / 1073741824.0);
     return 0;
   }
   model_active(m->m, 1);
@@ -364,7 +369,7 @@ void myds4_refresh_stats(void) {
   MemInfo mi;
   mem_info(&mi);
   process_stats = (myds4_stats){.footprint = mem_footprint(), .gpu_in_use = mem_gpu(),
-    .available = mi.free + mi.file, .gpu_limit = mem_gpu_limit(), .total = mi.total,
+    .available = mem_available(), .gpu_limit = mem_gpu_limit(), .total = mi.total,
     .free = mi.free, .file = mi.file, .file_kept = mi.file_kept, .wired = mi.wired,
     .compressor = mi.compressor, .compressed = mi.compressed, .swap_used = mi.swap_used,
     .swapouts = mi.swapouts, .pressure = mi.pressure};
@@ -393,7 +398,7 @@ void myds4_stats_get(const myds4_model *m, myds4_stats *s) {
   s->prefill_layer = model.prefill_layer; s->prefill_rows_now = model.prefill_rows_now;
   s->dense_bytes = model.dense_bytes; s->layers = model.layers; s->experts_per_row = model.experts_per_row;
   MemoryUsage memory = memory_usage();
-  s->model_memory_limit = memory.limit; s->model_memory_used = memory.allocated;
+  s->model_memory_limit = memory_current_limit(); s->model_memory_used = memory.allocated;
   s->model_memory_committed = memory.committed; s->model_memory_peak = memory.peak;
   s->kv_allocated = memory.kv;
   s->model_workspace = m->m->memory.bytes - c.dense_bytes - c.cache_bytes;

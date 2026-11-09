@@ -51,7 +51,7 @@ static double run(int kernel, int experts, int chosen, int normalized, const Buf
   return (gpu_busy - before) * 1e6 / repeat;
 }
 int main(void) {
-  memory_configure(1, 1, 10);
+  memory_configure(1, 10);
   size_t source_bytes;
   const char *source = gpu_source(&source_bytes);
   char *code = xmalloc(source_bytes + sizeof reference + 1);

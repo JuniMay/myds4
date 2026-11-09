@@ -158,15 +158,23 @@ static uint64_t sysctl_u64(const char *name) {  // 0 if there is no such value
   return sysctlbyname(name, &v, &n, 0, 0) ? 0 : v;
 }
 
-// Free pages already include speculative file pages. The remaining file
-// pages are reclaimable too; the kernel's cache target is not used memory.
+// Free pages already include speculative file pages; these are the others.
 static uint64_t file_of(vm_statistics64_data_t s) {
   uint64_t file = s.external_page_count > s.speculative_count ? s.external_page_count - s.speculative_count : 0;
   return file * vm_page_size;
 }
 
+// Memory available to this program: the free pages and the file cache
+// beyond the share the kernel keeps (vm.vm_page_filecache_min, 23.9 GiB with
+// 128 GiB). While the file cache is below that share, the kernel compresses
+// and swaps other programs' memory rather than drop cached files: on the
+// machine measured it compressed 8.6 pages for every file page it dropped,
+// and on 2026-11-09, with that share counted as available, free pages fell
+// to 2.2 GiB with 23 GiB of file cache, and macOS swapped. When the share
+// cannot be read, only the free pages count.
 static uint64_t avail_of(vm_statistics64_data_t s) {
-  return (uint64_t)s.free_count * vm_page_size + file_of(s);
+  uint64_t keep = sysctl_u64("vm.vm_page_filecache_min"), file = file_of(s) / vm_page_size;
+  return ((uint64_t)s.free_count + (keep && file > keep ? file - keep : 0)) * vm_page_size;
 }
 
 uint64_t mem_available(void) { return avail_of(vm()); }
@@ -254,6 +262,9 @@ typedef struct {
   int background_load; // this load originally occupied a prefetch admission
   _Atomic int unfinished; // read or cancelled pieces that have not completed
   _Atomic char taken[16];  // piece k has been started (or dropped)
+  _Atomic int read;        // pieces of this load that a reader completed
+  uint64_t extent;         // bytes of b this load writes
+  uint64_t written;        // bytes of b that completed loads have written
   MemorySlot memory;
 } Slot;
 
@@ -273,17 +284,16 @@ static int nslots, cap, max_slots, *free_list, nfree, npinned;
 static int nmapped, mcap;  // slots mapped for the GPU, and how many may be
 static uint64_t reserve, pinned_bytes;
 
-int memory_configure(double model_gib, double kv_gib, double reserve_gib) {
-  MemInfo info;
-  mem_info(&info);
-  double reserve_value = reserve_gib > 0 ? reserve_gib : CACHE_RESERVE_DEFAULT;
-  double kv_value = kv_gib > 0 ? kv_gib : 8;
-  uint64_t bytes = model_gib > 0 ? (uint64_t)(model_gib * GiB) :
-      (info.total > (reserve_value + kv_value) * GiB ? info.total - (uint64_t)((reserve_value + kv_value) * GiB) : 0);
-  if (!bytes) return 0;
-  memory_init(bytes);
-  cache_reserve(reserve_value);
-  return 1;
+// This program's memory is what other programs leave, less the reserve kept
+// available to them: model memory and KV follow the available memory
+// (memory_follow), within `model_gib` when it is set. Expert slots whose
+// reads have not written them yet count as in use (memory_unwritten).
+static uint64_t cache_unwritten(void);
+void memory_configure(double model_gib, double reserve_gib) {
+  memory_init(model_gib > 0 ? (uint64_t)(model_gib * GiB) : 0);
+  cache_reserve(reserve_gib);
+  memory_follow(mem_available, reserve);
+  memory_unwritten(cache_unwritten);
 }
 
 void cache_reserve(double gib) { reserve = (uint64_t)((gib > 0 ? gib : CACHE_RESERVE_DEFAULT) * GiB); }
@@ -685,7 +695,7 @@ void cache_init(TensorIndex *index, uint64_t budget, int layers) {
   for (int i = max_slots - 1; i >= 0; i--) free_list[nfree++] = i;
   for (int i = max_slots; i < max_slots + npinned; i++) {  // separate, MXFP4-sized draft pools
     Slot *s = &slots[i];
-    s->b = pool_buffer(i, pin_size, 1);
+    s->b = pool_buffer(i, pin_size, 1), s->written = 0;
     if (!s->b.obj) die("reserved draft expert memory is unavailable");
     s->layer = LAYERS + (i - max_slots) / draft_capacity;
     s->expert = draft_capacity == DRAFT_EXPERTS ? (i - max_slots) % draft_capacity : -1;
@@ -758,7 +768,9 @@ void cache_wait_progress(uint64_t epoch) {
   pthread_mutex_unlock(&progress_lock);
 }
 
-static void piece_finished(Slot *s, int piece) {
+// `read`: a reader wrote the piece; 0 when it is dropped unread.
+static void piece_finished(Slot *s, int piece, int read) {
+  if (read) atomic_fetch_add_explicit(&s->read, 1, memory_order_release);
   // Release the admission when the last I/O/cancellation finishes. Deferring
   // this to a dispatch notification can block a newer forecast after data is ready.
   int last_piece = atomic_fetch_sub_explicit(&s->unfinished, 1, memory_order_acq_rel) == 1;
@@ -793,7 +805,7 @@ static void *reader(void *arg) {
       metrics_io_end(s, 0, began);
       __atomic_fetch_add(&cache_stats.bytes, s->piece[q & 15].len, __ATOMIC_RELAXED);
       metrics_piece_done(s, s->piece[q & 15].len);
-      piece_finished(s, q & 15);
+      piece_finished(s, q & 15, 1);
     }
   }
 }
@@ -816,7 +828,7 @@ static void read_demand(void *ctx) {
   metrics_io_end(s, 1, began);
   __atomic_fetch_add(&cache_stats.bytes, s->piece[q & 15].len, __ATOMIC_RELAXED);
   metrics_piece_done(s, s->piece[q & 15].len);
-  piece_finished(s, q & 15);
+  piece_finished(s, q & 15, 1);
   if (--demand == 0) pthread_mutex_lock(&qlock), pthread_cond_broadcast(&qcond), pthread_mutex_unlock(&qlock);
 }
 
@@ -848,6 +860,10 @@ static void finish(int i) {
   dispatch_group_wait(slots[i].loading, DISPATCH_TIME_FOREVER);
   dispatch_release(slots[i].loading);
   slots[i].loading = 0;
+  // A load that dropped a piece adds nothing: its pages may be partly written.
+  if (atomic_load_explicit(&slots[i].read, memory_order_acquire) == slots[i].npiece &&
+      slots[i].extent > slots[i].written)
+    slots[i].written = slots[i].extent;
 }
 
 void cache_drain(void) {
@@ -859,8 +875,25 @@ void cache_drain(void) {
 static void cancel(int i) {
   if (!slots[i].loading) return;
   for (int k = 0; k < slots[i].npiece; k++)
-    if (!atomic_exchange(&slots[i].taken[k], 1)) piece_finished(&slots[i], k);
+    if (!atomic_exchange(&slots[i].taken[k], 1)) piece_finished(&slots[i], k, 0);
   finish(i);
+}
+
+// The charged slot bytes that no completed load has written (memory_unwritten):
+// a new buffer's pages are in use only once a read writes them, and a slot
+// beyond its expert's bytes stays unwritten until a larger expert fills it.
+// A load whose pieces were all read counts before the model thread reaps it.
+static uint64_t cache_unwritten(void) {
+  uint64_t bytes = 0;
+  for (int i = 0; slots && i < max_slots + npinned; i++) {
+    const Slot *s = &slots[i];
+    if (!s->b.obj) continue;
+    uint64_t written = s->written;
+    if (s->loading && atomic_load_explicit(&s->read, memory_order_acquire) == s->npiece && s->extent > written)
+      written = s->extent;
+    if (s->b.allocated > written) bytes += s->b.allocated - written;
+  }
+  return bytes;
 }
 
 // The layer a prompt pass is at (-1: decoding). The pass still needs the
@@ -962,7 +995,7 @@ static int take(int layer, int e, int optional) {
     }
   } else {
     i = free_list[--nfree];
-    slots[i].b = buffer;
+    slots[i].b = buffer, slots[i].written = 0;
     // CPU reads fill the buffer. cache_get maps it when GPU work uses it;
     // a forecast that is never selected does not occupy GPU residency.
     slots[i].mapped = slots[i].fresh = slots[i].mapped_once = 0;
@@ -991,6 +1024,9 @@ static void start(int i, int urgent) {
     region += REGION(p->len);
   }
   s->npiece = n;
+  s->extent = 0;
+  for (int k = 0; k < n; k++) s->extent += s->piece[k].len;
+  atomic_store_explicit(&s->read, 0, memory_order_relaxed);
   s->background_load = !urgent;
   atomic_store_explicit(&s->unfinished, n, memory_order_relaxed);
   metrics_start(i, urgent);
@@ -1062,7 +1098,7 @@ static int draft_request(int layer, const int *experts, int n) {
       Slot *s = &slots[i];
       if (s->expert >= 0) where[s->layer][s->expert] = -1, cache_stats.evictions++;
       if (!s->b.obj) {
-        s->b = pool_buffer(i, pinned_slot_size, 1);
+        s->b = pool_buffer(i, pinned_slot_size, 1), s->written = 0;
         if (!s->b.obj) die("reserved draft expert memory is unavailable");
       }
       s->layer = layer, s->expert = e;
@@ -1256,7 +1292,7 @@ static int discard_unstarted(int layer, const int *keep, int n) {
   // Complete the groups before making these buffers available for reuse.
   for (int k = 0; k < nr; k++) {
     int i = retired[k], expert = slots[i].expert;
-    for (int p = 0; p < slots[i].npiece; p++) piece_finished(&slots[i], p);
+    for (int p = 0; p < slots[i].npiece; p++) piece_finished(&slots[i], p, 0);
     finish(i);
     metrics_retire(i, 0);
     where[layer][expert] = -1;
@@ -1351,9 +1387,10 @@ static void resize(int below) {
   if (trace && (cap != old_cap || mcap != old_mcap))
     fprintf(stderr, "cache resize: limit %d -> %d, allocated %d, map limit %d -> %d, mapped %d, "
                     "maximum %d, pressure %d, swap-outs +%llu, available %.2f GiB, free %.2f GiB, "
-                    "GPU room %.2f GiB, growth uses %s\n",
+                    "slots not yet written %.2f GiB, GPU room %.2f GiB, growth uses %s\n",
             old_cap, cap, nslots, old_mcap, mcap, nmapped, max_slots, level, (unsigned long long)swap_delta,
-            avail / GiB, free / GiB, room / GiB, now() - bad > 300 ? "available memory" : "free pages");
+            avail / GiB, free / GiB, cache_unwritten() / GiB, room / GiB,
+            now() - bad > 300 ? "available memory" : "free pages");
 }
 
 // Between tokens (pass < 0) no GPU work references a slot, so any slot can be

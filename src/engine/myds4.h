@@ -149,7 +149,9 @@ typedef struct {
   int pressure;                           // as mem_pressure
 } MemInfo;
 void mem_info(MemInfo *m);
-int memory_configure(double model_gib, double kv_gib, double reserve_gib);
+// Model memory follows the available memory, keeping reserve_gib (0: the
+// default) for other programs, within model_gib when it is above 0.
+void memory_configure(double model_gib, double reserve_gib);
 int64_t mem_gpu_limit(void);  // Metal's residency target (INT64_MAX before GPU initialization)
 uint64_t mem_gpu(void);       // the GPU driver's resident memory for all processes
 int64_t mem_gpu_room(void);   // target minus total driver residency (INT64_MAX before initialization)

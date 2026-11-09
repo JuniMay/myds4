@@ -36,7 +36,7 @@ int main(void) {
   pthread_create(&thread, NULL, waiter, &epoch);
   while (!atomic_load(&waiting)) sched_yield();
   // The second expert finishes first; the first expert remains pending.
-  piece_finished(&b, 0);
+  piece_finished(&b, 0, 1);
   pthread_join(thread, NULL);
   CHECK(atomic_load(&returned));
   CHECK(atomic_load(&wait_result) == 0);
@@ -44,7 +44,7 @@ int main(void) {
   CHECK(dispatch_group_wait(b.loading, DISPATCH_TIME_NOW) == 0);
   CHECK(cache_read_epoch() > epoch);
   epoch = cache_read_epoch();
-  piece_finished(&a, 0);
+  piece_finished(&a, 0, 1);
   CHECK(cache_read_epoch() > epoch);
   // This must observe the completed epoch without sleeping for the timeout.
   int calls = atomic_load(&wait_calls);

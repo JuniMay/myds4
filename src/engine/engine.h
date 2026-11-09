@@ -21,15 +21,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYDS4_ABI 15
+#define MYDS4_ABI 16
 
 // ---- the process ----
 
 typedef struct {
   int abi;  // MYDS4_ABI
-  double memory_gb;  // shared model allocations, excluding KV; 0: automatic
-  double kv_gb;      // separate KV budget for automatic model-memory sizing
-  double reserve_gb; // process-wide available-memory target, 0: default 10 GiB
+  double memory_gb;  // upper limit of model memory, excluding KV; 0: none (the free memory decides)
+  double reserve_gb; // memory kept available to other programs; 0: default 10 GiB
   // The log's lines, each with its time, go to on_log instead of stderr when
   // it is set. It runs on the thread that logs, one line at a time under the
   // log's lock: it must return quickly and must not call myds4_log.
@@ -272,6 +271,8 @@ typedef struct {
   uint64_t total, free, file, file_kept, wired, compressor, compressed, swap_used, swapouts;
   int pressure;  // 1 normal, 2 warn, 4 critical
   int layers, experts_per_row;  // 0 without routed experts
+  // model_memory_limit: the most model memory now, what it holds and the free
+  // memory above the reserve, within --memory
   uint64_t model_memory_limit, model_memory_used, model_memory_committed, model_memory_peak;
   uint64_t kv_allocated, model_workspace;
 } myds4_stats;

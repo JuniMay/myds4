@@ -9,13 +9,12 @@ use std::ptr;
 
 use deepseek_recipe::stream::StreamTokenizer;
 
-const ABI: c_int = 15;
+const ABI: c_int = 16;
 
 #[repr(C)]
 struct RawProcess {
     abi: c_int,
     memory_gb: f64,
-    kv_gb: f64,
     reserve_gb: f64,
     on_log: Option<extern "C" fn(*const c_char)>,
     on_die: Option<extern "C" fn()>,
@@ -346,7 +345,6 @@ fn c_string(s: &str) -> CString {
 /// needs a 16 MiB stack). False when called twice.
 pub fn init(
     memory_gb: f64,
-    kv_gb: f64,
     reserve_gb: f64,
     on_log: Option<extern "C" fn(*const c_char)>,
     on_die: Option<extern "C" fn()>,
@@ -354,7 +352,6 @@ pub fn init(
     let p = RawProcess {
         abi: ABI,
         memory_gb,
-        kv_gb,
         reserve_gb,
         on_log,
         on_die,

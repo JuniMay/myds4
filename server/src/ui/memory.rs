@@ -68,10 +68,12 @@ pub fn draw(buf: &mut Buffer, area: Rect, s: &Snapshot) {
     let width = area.width as usize;
     let used = s.kv_total_gib.max(s.kv_gib);
     let lines = [
+        // the limit follows the memory other programs leave, less the reserve
         Line::from(strong(format!(
-            "All models · memory: {:.2} / {:.2} GiB",
+            "All models · memory: {:.2} / {:.2} GiB now{}",
             s.model_memory_budget.allocated as f64 / GIB,
-            s.model_memory_budget.limit as f64 / GIB
+            s.model_memory_budget.limit as f64 / GIB,
+            if s.memory_gib > 0.0 { format!(" (setting {:.0} GiB)", s.memory_gib) } else { String::new() }
         ))),
         Line::from(text(format!(
             "Shared KV budget: {:.2} / {:.2} GiB",
