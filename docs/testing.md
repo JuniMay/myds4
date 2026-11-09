@@ -49,9 +49,10 @@ takes its space back from idle experts, and expert slots charged before
 their reads write them are not room. Its simulated kernel counts memory as
 used once it is written, as macOS does.
 `build/tests/cache-memory` checks the cache's resizing under controlled
-memory counters, and which slot bytes count as not yet written: a slot whose
-read is under way, a load that dropped a piece, and the part of a slot
-beyond a smaller expert.
+memory counters, including that a shortfall without memory pressure gives
+back only the slots that restore the reserve. It also checks which slot
+bytes count as not yet written: a slot whose read is under way, a load that
+dropped a piece, and the part of a slot beyond a smaller expert.
 `build/tests/weights-read` checks that a model's weights are read in
 16 KiB-aligned spans into aligned memory, so that a load does not fill the
 file cache, and that each tensor's bytes arrive intact.

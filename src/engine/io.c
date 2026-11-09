@@ -1323,8 +1323,10 @@ void cache_refine(int layer, const int *keep, int n) {
 
 // Resizes the cache. It gives slots back, the least recently used of the
 // layers below `below` first, on memory pressure or when the available
-// memory falls below the reserve. Actual swap-outs also shrink a cache
-// above its minimum. A global swap-out cannot reclaim an empty cache.
+// memory falls below the reserve: a sixteenth of the cache (a quarter at
+// critical pressure) under pressure or swapping, and otherwise the slots
+// that restore the reserve. Actual swap-outs also shrink a cache above its
+// minimum. A global swap-out cannot reclaim an empty cache.
 // Compression in RAM has no separate limit. Growth uses a quarter of the
 // headroom after 32 calm calls; for five minutes after swap-driven
 // reclamation it uses only free pages.
@@ -1348,7 +1350,7 @@ static void resize(int below) {
   uint64_t headroom = now() - bad > 300 ? avail : free;
   if (low && (level >= 4 || swapped || now() - gave > 1)) {
     uint64_t to = avail;
-    int64_t give = level >= 4 ? nslots / 4 : nslots / 16 + 1;
+    int64_t give = level >= 4 ? nslots / 4 : level >= 2 || swapped ? nslots / 16 + 1 : 0;
     if (to < reserve && (int64_t)((reserve - to) / slot) + 1 > give) give = (reserve - to) / slot + 1;
     cap = nslots - (int)give > minimum_slots ? nslots - (int)give : minimum_slots;
     calm = 0, gave = now();

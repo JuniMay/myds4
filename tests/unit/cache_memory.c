@@ -61,10 +61,17 @@ static void child_case(int kind) {
   nslots = cap = max_slots - 256;
   if (kind == 7) nslots = 0;
   if (kind == 8) nslots = cap = 2 * EXPERTS;
-  if (kind == 9) vm_fixture.external_page_count = (8ull << 30) / vm_page_size;  // within the kept share
+  if (kind == 9 || kind == 10) vm_fixture.external_page_count = (8ull << 30) / vm_page_size;  // within the kept share
+  if (kind == 10) vm_fixture.free_count = (15ull << 28) / vm_page_size;  // 3.75 GiB: 0.25 GiB short of the reserve
   int before = cap;
   if (kind == 2) pressure_fixture = 2;
   resize(-1);
+  if (kind == 10) {  // the slots that restore the reserve, not a sixteenth of the cache
+    int expected = before - (int)(((4ull << 30) - (15ull << 28)) / SLOT_SIZE) - 1;
+    fprintf(stderr, "cache reproduction %d: 0.25 GiB short of the reserve, no pressure: limit %d -> %d (expected %d)\n",
+            kind, before, cap, expected);
+    _exit(cap == expected ? 0 : 1);
+  }
   if (kind == 0) _exit(cap == before ? 0 : 1);
   if (kind == 1) {
     for (int i = 0; i < 32; i++) resize(-1);
@@ -165,8 +172,9 @@ int main(void) {
                          "actual memory pressure still shrinks", "compression alone does not shrink", "new swapping still shrinks",
                          "compression alone does not prevent growth", "a swapper wakeup without swap-outs does not shrink",
                          "a global swap-out cannot reclaim an empty expert cache", "a minimum-sized cache can recover using available memory",
-                         "file cache within the kept share does not count: low free pages shrink"};
-  for (int kind = 0; kind < 10; kind++) {
+                         "file cache within the kept share does not count: low free pages shrink",
+                         "a shortfall without pressure gives back only the slots that restore the reserve"};
+  for (int kind = 0; kind < 11; kind++) {
     pid_t pid = fork();
     if (!pid) child_case(kind);
     int status;

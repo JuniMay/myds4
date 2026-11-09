@@ -120,9 +120,11 @@ The rules below keep the server from causing that pressure (see
 - **A load that does not fit is refused.** A model load that still does not
   fit is refused; the log gives the numbers, the request fails, and nothing
   is swapped.
-- **When other programs grow.** The expert cache gives memory back. Once a
-  second, the server also takes back idle model memory, then idle KV, until
-  the available memory is back at `reserve`.
+- **When other programs grow.** The expert cache gives back the slots that
+  bring the available memory back to `reserve`; under memory pressure or
+  swapping it gives back a sixteenth of its slots at a time. Once a second,
+  the server also takes back idle model memory, then idle KV, until the
+  available memory is back at `reserve`.
 - **KV comes first, within `kv_cache`.** The experts may use the space that
   KV does not occupy. When KV grows, idle experts give that space back
   before it is allocated. Experts never take the space that KV occupies.
