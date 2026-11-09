@@ -557,6 +557,17 @@ def model_check(checkpoint, cache=None):
     agree = sum(int(want["logits"][p].argmax()) == int(got["logits"][p].argmax()) for p in range(n))
     print("logit SNR per position (dB):", " ".join(f"{snr(want['logits'][p], got['logits'][p]):.0f}" for p in range(n)))
     print(f"argmax agreement: {agree} of {n} positions")
+    divergences = []
+    for p in range(n):
+        a, b = want["logits"][p].astype(np.float64), got["logits"][p].astype(np.float64)
+        a -= a.max()
+        b -= b.max()
+        a -= np.log(np.exp(a).sum())
+        b -= np.log(np.exp(b).sum())
+        divergences.append(float((np.exp(a) * (a - b)).sum()))
+    print("KL(reference || engine) per position (nats):", " ".join(f"{v:.6g}" for v in divergences))
+    print(f"KL mean {np.mean(divergences):.6g}, max {max(divergences):.6g} nats")
+    print("The acceptance check below covers top-token agreement; it does not establish numerical equivalence.")
     return agree >= n - 1
 
 

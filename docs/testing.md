@@ -141,7 +141,11 @@ runtime engine dependencies. They use local checkpoints and disable
 online model downloads.
 
 `tests/reference/deepseek.py` compares tokenization, prompt formatting,
-vision and model intermediates. `tests/reference/qwen.py` compares text
+vision and model intermediates. Its full-model check reports routing,
+per-layer SNR, top-token agreement and KL divergence of the output
+distributions. Its exit status checks top-token agreement only; inspect
+the numerical measurements before claiming equivalence.
+`tests/reference/qwen.py` compares text
 logits and vision features with Transformers. Its `--image FILE` option
 runs a CPU BF16 vision reference followed by the native encoder; `-` reads
 image bytes from stdin. It reports SNR, cosine similarity and maximum
