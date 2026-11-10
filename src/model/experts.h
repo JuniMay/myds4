@@ -61,6 +61,18 @@ int experts_table(const ExpertWork *work, const Expert *experts, const Buf *tabl
 void experts_resident(ExpertWork *work, const Buf *table, size_t offset, const Buf *selected,
                        const Buf *coefficients, const Buf *input, const Buf *unique, size_t unique_offset,
                        int rows, int prompt);
+// A layer's selections in a buffer that holds every layer's for the pass, so
+// that they outlast the layer: rows × chosen expert ids at the layer's place.
+static inline Buf experts_selection(const Buf *selected, int layer, int rows, int chosen) {
+  size_t offset = (size_t)layer * rows * chosen * 4;
+  Buf b = *selected;
+  b.ptr += offset, b.gpu += offset, b.off += offset, b.size -= offset;
+  return b;
+}
+// After a pass that reached a layer's experts through its table, marks the
+// experts its rows chose used, as an acquisition does: eviction takes the
+// experts used longest ago first.
+void experts_mark_used(const ExpertWork *work, const Expert *experts, const uint32_t *selected, int rows);
 static inline int experts_count(const ExpertWork *work, int expert) {
   return ((const uint32_t *)work->plan.ptr)[expert];
 }

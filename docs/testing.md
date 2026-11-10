@@ -83,7 +83,13 @@ logits and the repaired draft-head history.
 against independent CPU calculations. `build/tests/nemotron-model TARGET
 DFLASH2` compares all logits of a 16-row verification pass with sequential
 decoding. It then checks several accepted prefixes, their next target
-logits and their next draft proposals. `tests/reference/nemotron.py`
+logits and their next draft proposals. Eviction takes the experts used
+longest ago first, so each decoded row must mark exactly its chosen experts
+used in the memory pool. The check then brings nearly every expert into
+memory with 1,500 varied tokens. The next row must mark its experts used
+too, and at least one layer must reach its experts through its table of
+resident experts. The program prints hashes of its logits, so that two
+builds can be compared. `tests/reference/nemotron.py`
 compares selected backbone blocks with the upstream CPU implementation.
 
 `build/tests/speech-model CHECKPOINT` reads bounded audio on stdin and
@@ -129,7 +135,10 @@ a short shape report.
 
 `build/tests/flash-model CHECKPOINT --long` checks a color response, complete
 logits after state restoration, and state forks beyond the sparse indexer's
-2,048-token selection budget. `tests/reference/flash.py --checkpoint DIR
+2,048-token selection budget. Each decoded row must mark exactly its chosen
+experts used. The program prints hashes of its logits, so that two builds
+can be compared. Within its 32 GiB no layer holds all of its 512 experts,
+so its rows do not reach the table path. `tests/reference/flash.py --checkpoint DIR
 --layer N` compares a requested text block with Transformers using the same
 input and only that block's selected experts.
 

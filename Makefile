@@ -74,7 +74,7 @@ build/tests/qwen-mtp: tests/model/qwen_mtp.c build/libmyds4.a $(MODEL_HEADERS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/model/qwen_mtp.c build/libmyds4.a $(LDLIBS)
 
-build/tests/flash-model: tests/model/flash.c build/libmyds4.a $(MODEL_HEADERS)
+build/tests/flash-model: tests/model/flash.c tests/model/recency.h build/libmyds4.a $(MODEL_HEADERS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/model/flash.c build/libmyds4.a $(LDLIBS)
 
@@ -94,7 +94,7 @@ build/tests/speech-model: tests/model/speech.c build/libmyds4.a $(MODEL_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ tests/model/speech.c build/libmyds4.a $(LDLIBS)
 
-build/tests/nemotron-model: tests/model/nemotron.c build/libmyds4.a $(MODEL_HEADERS)
+build/tests/nemotron-model: tests/model/nemotron.c tests/model/recency.h build/libmyds4.a $(MODEL_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ tests/model/nemotron.c build/libmyds4.a $(LDLIBS)
 

@@ -257,7 +257,7 @@ static uint64_t workspace(int rows, int blocks, int allocate) {
   B(result, r * nm.hidden);
   B(shared_result, r * nm.hidden);
   B(routing, r * nm.experts);
-  B(selected, rows * nm.chosen * 4);
+  B(selected, (size_t)nm.layers * rows * nm.chosen * 4);  // every layer's, kept for the pass (experts_selection)
   B(coefficients, r * nm.chosen);
   B(gathered, r * nm.hidden);
   B(up, r * (nm.shared > nm.intermediate ? nm.shared : nm.intermediate));
@@ -576,6 +576,7 @@ static int routed(Layer *y, int rows) {
     y->table_generation = y->presence.generation;
   }
   resident &= y->table_valid;
+  Buf selected = experts_selection(&nm.selected, y->number, rows, nm.chosen);
   feed_forward(&y->shared, &nm.norm, &nm.shared_result, rows);
   product(&y->router, &nm.norm, &nm.routing, rows, 0, 0);
   struct {
@@ -586,12 +587,12 @@ static int routed(Layer *y, int rows) {
   gpu_kern(nm.route_kernel);
   gpu_buf(0, &nm.routing, 0);
   gpu_buf(1, &y->correction, 0);
-  gpu_buf(2, &nm.selected, 0);
+  gpu_buf(2, &selected, 0);
   gpu_buf(3, &nm.coefficients, 0);
   gpu_bytes(4, &p, sizeof p);
   gpu_go(rows, 1, 1, 128, 1, 1);
   if (resident) {
-    experts_resident(&nm.routed, &nm.resident_table, offset, &nm.selected, &nm.coefficients, &nm.norm,
+    experts_resident(&nm.routed, &nm.resident_table, offset, &selected, &nm.coefficients, &nm.norm,
                       &nm.resident_counts, y->number * 4, rows, nm.prompt_pass);
     experts_sum(&nm.routed, &nm.result);
     add(&nm.result, &nm.shared_result, rows * nm.hidden);
@@ -599,7 +600,7 @@ static int routed(Layer *y, int rows) {
   }
   gpu_commit();
   gpu_sync();
-  if (!experts_acquire(&nm.routed, y->experts, (const uint32_t *)nm.selected.ptr,
+  if (!experts_acquire(&nm.routed, y->experts, (const uint32_t *)selected.ptr,
                        (const float *)nm.coefficients.ptr, rows, nm.prompt_pass, &nm.cache.stats))
     return 0;
   gpu_begin();
@@ -714,11 +715,15 @@ static const float *pass(const Row *rows, int count, int logits, int prompt) {
   gpu_commit();
   gpu_sync();
   for (int i = 0; i < resident_count; i++) {
+    const Layer *y = nm.layer + resident_layers[i];
+    Buf selected = experts_selection(&nm.selected, y->number, count, nm.chosen);
+    experts_mark_used(&nm.routed, y->experts, (const uint32_t *)selected.ptr, count);
     uint32_t unique = ((uint32_t *)nm.resident_counts.ptr)[resident_layers[i]];
     nm.cache.stats.hits += unique;
     nm.cache.stats.row_unique += unique;
     nm.cache.stats.row_own += (uint64_t)count * nm.chosen;
   }
+  nm.counters.table_layers += resident_count;
   experts_release(&nm.routed);
   if (nm.dump_fd >= 0) {
     size_t bytes = (size_t)logits * nm.vocab * 4;

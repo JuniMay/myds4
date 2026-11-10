@@ -408,7 +408,7 @@ static uint64_t workspace(int n, int allocate) {
   B(shared, r * h);
   B(shared_gate, r);
   B(routing, r * f.experts);
-  B(selected, n * f.chosen * 4);
+  B(selected, (size_t)f.layers * n * f.chosen * 4);  // every layer's, kept for the pass (experts_selection)
   B(coefficients, r * f.chosen);
   B(gathered, r * h);
   B(gate, r * f.inter);
@@ -1048,25 +1048,26 @@ static int routed(FlashLayer *y, int n) {
     y->table_generation = y->presence.generation;
   }
   resident &= y->table_valid;
+  Buf selected = experts_selection(&f.selected, y->number, n, f.chosen);
   feed_forward(&y->shared, &f.mixed, &f.shared, n, 0);
   product(&y->shared_gate, &f.mixed, 0, &f.shared_gate, n, 0, 1);
   product(&y->router, &f.mixed, 0, &f.routing, n, 0, 1);
   uint32_t p[4] = {(uint32_t)f.experts, (uint32_t)f.chosen, (uint32_t)f.normalize_topk, 0};
   gpu_kern(f.route);
   gpu_buf(0, &f.routing, 0);
-  gpu_buf(1, &f.selected, 0);
+  gpu_buf(1, &selected, 0);
   gpu_buf(2, &f.coefficients, 0);
   gpu_bytes(3, p, sizeof p);
   gpu_go(n, 1, 1, 512, 1, 1);
   if (resident) {
-    experts_resident(&f.routed, &f.resident_table, offset, &f.selected, &f.coefficients, &f.mixed,
+    experts_resident(&f.routed, &f.resident_table, offset, &selected, &f.coefficients, &f.mixed,
                       &f.resident_counts, y->number * 4, n, 1);
     routed_sum(n);
     return 2;
   }
   gpu_commit();
   gpu_sync();
-  if (!experts_acquire(&f.routed, y->experts, (const uint32_t *)f.selected.ptr,
+  if (!experts_acquire(&f.routed, y->experts, (const uint32_t *)selected.ptr,
                        (const float *)f.coefficients.ptr, n, 1, &f.cache.stats))
     return 0;
   gpu_begin();
@@ -1180,11 +1181,15 @@ static const float *pass(const Row *rows, int n, int logits, int prompt) {
   gpu_commit();
   gpu_sync();
   for (int i = 0; i < resident_count; i++) {
+    const FlashLayer *y = f.layer + resident_layers[i];
+    Buf selected = experts_selection(&f.selected, y->number, n, f.chosen);
+    experts_mark_used(&f.routed, y->experts, (const uint32_t *)selected.ptr, n);
     uint32_t unique = ((uint32_t *)f.resident_counts.ptr)[resident_layers[i]];
     f.cache.stats.hits += unique;
     f.cache.stats.row_unique += unique;
     f.cache.stats.row_own += (uint64_t)n * f.chosen;
   }
+  f.counters.table_layers += resident_count;
   experts_release(&f.routed);
   if (f.dump_fd >= 0) {
     size_t bytes = (size_t)logits * f.vocab * 4;

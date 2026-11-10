@@ -119,6 +119,15 @@ int experts_acquire(ExpertWork *w, const Expert *experts, const uint32_t *select
       tiles[w->matrix_tiles++] = (ExpertTile){group, row};
   return 1;
 }
+void experts_mark_used(const ExpertWork *w, const Expert *experts, const uint32_t *selected, int rows) {
+  uint8_t marked[w->experts];
+  memset(marked, 0, sizeof marked);
+  for (int i = 0; i < rows * w->chosen; i++)
+    if (!marked[selected[i]]) {
+      marked[selected[i]] = 1;
+      memory_touch(weights_slot(experts[selected[i]].weights));
+    }
+}
 void experts_release(ExpertWork *w) {
   for (int i = 0; i < w->held_count; i++)
     memory_pin(weights_slot(w->held[w->active_ids[i]].weights), 0);

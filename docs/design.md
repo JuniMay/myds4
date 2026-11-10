@@ -79,9 +79,12 @@ FP32. Workspaces remain charged to the model-memory pool.
 
 When every expert of a layer is resident, GPU routing feeds the expert batch
 planner directly. The engine records residency changes and rebuilds that
-layer's weight-address table after a reload. Cache-use counters are collected
-after the pass completes. Layers with missing experts return their selections
-to the engine for loading.
+layer's weight-address table after a reload. Each layer's selections stay in
+the pass's selection buffer until the pass completes. The engine then
+collects the cache-use counters and marks the experts that each such layer's
+rows chose as used, as it does for loaded selections, so that eviction keeps
+them. Layers with missing experts return their selections to the engine for
+loading.
 
 The expert batch stays in the current GPU command buffer with the following
 layer work. Selected weights remain pinned until the next CPU routing read

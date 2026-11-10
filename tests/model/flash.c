@@ -1,5 +1,7 @@
-// Real Flash-Next smoke and state restoration checks; no throughput claims.
-#include "../../src/model/model.h"
+// Real Flash-Next smoke, state restoration and expert recency checks; no
+// throughput claims. The checks print hashes of their logits, so that two
+// builds can be compared.
+#include "recency.h"
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +20,7 @@ int main(int argc, char **argv) {
   Model *model = model_open(argv[1], &options);
   CHECK(model != NULL);
   const ModelOps *ops = model->ops;
+  ModelCounters counters;
   Tokenizer *tokenizer = tok_open(argv[1], NULL);
   char prompt[256];
   ops->chat(prompt, sizeof prompt, "Name two colors.", 0, 0);
@@ -25,11 +28,14 @@ int main(int argc, char **argv) {
   ModelState *state = ops->state_new();
   const float *logits = ops->prefill(state, tokens, count, 0, 0, -1, NULL, NULL);
   CHECK(logits != NULL);
+  uint64_t prefill_hash = logits_hash(logits, (size_t)ops->vocab() * 4);
   ModelSnapshot *start = ops->snapshot_take(state, count, 0);
   int token = sample_argmax(logits, ops->vocab()), first = token;
   char output[1024] = {0};
   size_t used = 0;
   float *expected = xmalloc((size_t)ops->vocab() * 4);
+  int rows = 0, ready = 0;
+  ops->counters(&counters);
   for (int i = 0; i < 16 && !ops->stop(token); i++) {
     int length;
     const char *piece = tok_piece(tokenizer, token, &length);
@@ -37,11 +43,21 @@ int main(int argc, char **argv) {
     memcpy(output + used, piece, length);
     used += length;
     int position = count + i;
+    double began = now();
     logits = ops->rows(&state, &token, &position, 1);
+    int touched = touched_experts(began, &ready);
+    if (touched != counters.experts_per_row)
+      die("Flash-Next check: decoded row %d marked %d experts used, not its %d", i, touched, counters.experts_per_row);
+    rows++;
     if (!i)
       memcpy(expected, logits, (size_t)ops->vocab() * 4);
     token = sample_argmax(logits, ops->vocab());
   }
+  uint64_t tables = counters.table_layers;
+  ops->counters(&counters);
+  printf("each of %d decoded rows marked exactly its %d chosen experts used (%d experts in memory, %llu layer passes "
+         "through tables)\n",
+         rows, counters.experts_per_row, ready, (unsigned long long)(counters.table_layers - tables));
   for (size_t i = 0; i < used; i++)
     output[i] = (char)tolower((unsigned char)output[i]);
   static const char *colors[] = {"red",    "blue",  "green", "yellow", "orange",
@@ -50,6 +66,9 @@ int main(int argc, char **argv) {
   for (size_t i = 0; i < sizeof colors / sizeof *colors; i++)
     found += strstr(output, colors[i]) != NULL;
   printf("color response: %s\n", output);
+  printf("prefill logits %016llx, first decoded logits %016llx, response %016llx\n", (unsigned long long)prefill_hash,
+         (unsigned long long)logits_hash(expected, (size_t)ops->vocab() * 4),
+         (unsigned long long)logits_hash(output, used));
   CHECK(found >= 2);
   ops->snapshot_restore(state, start);
   logits = ops->rows(&state, &first, &count, 1);
@@ -76,6 +95,8 @@ int main(int argc, char **argv) {
     expected = xmalloc((size_t)ops->vocab() * 4);
     int position = N;
     memcpy(expected, ops->rows(&state, &token, &position, 1), (size_t)ops->vocab() * 4);
+    printf("logits after %d positions %016llx\n", N,
+           (unsigned long long)logits_hash(expected, (size_t)ops->vocab() * 4));
     CHECK(!memcmp(expected, ops->rows(&fork, &token, &position, 1), (size_t)ops->vocab() * 4));
     ops->snapshot_restore(state, start);
     CHECK(!memcmp(expected, ops->rows(&state, &token, &position, 1), (size_t)ops->vocab() * 4));
