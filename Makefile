@@ -54,7 +54,7 @@ EXTRA_CPU = memory metadata qwen-state-accounting attention-candidate prefill-pr
 BUILD_ONLY = $(addprefix build/tests/,nemotron experts routing vision residency mxfp4-activation gpu-wait gpu-clock \
   pass-eviction gguf-decode moe-tasks memory-model qwen-mtp flash-model speech-model nemotron-model prefill-prune-model \
   draft-rows prefix-fork verification-model ced dspark-state prefill-state runahead-model state-file-model) \
-  build/benchmarks/decode build/benchmarks/products
+  build/benchmarks/decode build/benchmarks/products build/benchmarks/steps build/benchmarks/pass-binding
 
 test: $(CPU_CHECKS) $(addprefix build/tests/,$(EXTRA_CPU)) $(BUILD_ONLY) build/myds4-server
 	@set -e; for test in $(EXTRA_CPU); do ./build/tests/$$test; done
@@ -381,6 +381,16 @@ build/benchmarks/decode: benchmarks/decode.c build/libmyds4.a $(MODEL_HEADERS)
 build/benchmarks/products: benchmarks/products.c build/libmyds4.a $(MODEL_HEADERS)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ benchmarks/products.c build/libmyds4.a $(LDLIBS)
+
+# What the pass scheduler's GPU steps depend on: overlap in one command
+# buffer, the cost of cutting work into short ones, the cost of binding a pass.
+build/benchmarks/steps: benchmarks/steps.c build/libmyds4.a $(MODEL_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -o $@ benchmarks/steps.c build/libmyds4.a $(LDLIBS)
+
+build/benchmarks/pass-binding: benchmarks/pass_binding.c build/libmyds4.a $(MODEL_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -o $@ benchmarks/pass_binding.c build/libmyds4.a $(LDLIBS)
 
 # ---- Diagnostics ----
 

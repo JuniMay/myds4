@@ -80,6 +80,8 @@ Their throughput does not represent ordinary inference.
 | `benchmarks/prefill.py` | CED prefill and continuation comparisons. |
 | `benchmarks/decode.c` | Batched model-row timing. |
 | `benchmarks/products.c` | Common matrix-product correctness and warmed vector-kernel timing; these are not model throughput or physical memory-bandwidth measurements. |
+| `benchmarks/steps.c` | Whether a matrix product and a chain of vector products overlap in one command buffer, and what cutting long work into short command buffers costs. |
+| `benchmarks/pass_binding.c` | The CPU cost of binding a DeepSeek pass's buffers. |
 | `benchmarks/expert_reads.py` | Expert-sized reads from checkpoint storage, with file-cache caveats. |
 | `benchmarks/evaluate.py` | Bounded public-dataset and conversation diagnostics. |
 

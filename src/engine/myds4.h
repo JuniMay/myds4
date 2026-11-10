@@ -115,6 +115,9 @@ uint64_t gpu_working_set(void);
 void *gpu_open(void);        // a command buffer that runs after those opened before
 void gpu_encode(void *cmd);  // encode into it until gpu_commit or the next gpu_encode
 void gpu_begin(void);        // gpu_encode(gpu_open())
+void gpu_encode_concurrent(void *cmd);  // gpu_encode whose dispatches may overlap unless a barrier lies between them
+void gpu_barrier(void);                 // the dispatches encoded before it finish before those after it
+void gpu_barrier_on(const Buf *const *buffers, int count);  // the same, for what they wrote to these buffers
 void *gpu_close(void);       // ends the current command buffer's encoding without committing it
 void gpu_submit(void *cmd);
 void gpu_kern(int k);

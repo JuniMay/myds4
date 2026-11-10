@@ -404,6 +404,25 @@ void gpu_encode(void *c) {
 
 void gpu_begin(void) { gpu_encode(gpu_open()); }
 
+// As gpu_encode, but the dispatches may run at the same time unless a barrier
+// lies between them.
+void gpu_encode_concurrent(void *c) {
+  if (enc) MSG(void (*)(id, SEL), enc, S("endEncoding"));
+  cb = c;
+  enc = MSG(id (*)(id, SEL, unsigned long), cb, S("computeCommandEncoderWithDispatchType:"), 1ul);  // MTLDispatchTypeConcurrent
+  nused = 0;
+}
+
+void gpu_barrier(void) {
+  MSG(void (*)(id, SEL, unsigned long), enc, S("memoryBarrierWithScope:"), 1ul);  // MTLBarrierScopeBuffers
+}
+
+void gpu_barrier_on(const Buf *const *buffers, int count) {
+  id resources[count];
+  for (int i = 0; i < count; i++) resources[i] = (id)buffers[i]->obj;
+  MSG(void (*)(id, SEL, const id *, unsigned long), enc, S("memoryBarrierWithResources:count:"), resources, (unsigned long)count);
+}
+
 // A command buffer that joins the queue only when gpu_submit commits it, so
 // that buffers committed after its opening may run before it.
 
