@@ -129,8 +129,10 @@ weight-address table after any of its experts moves. Each layer's selections
 stay in the pass's selection buffer until the pass completes. The engine
 then collects the cache-use counters and marks the experts that each such
 layer's rows chose as used, as it does for loaded selections, so that
-eviction keeps them. Layers with missing experts return their selections to
-the engine for loading.
+eviction keeps them. A prompt's are marked before its pass ends, so that
+they count toward the eviction priority of prompts, not of decoding (the
+store's `decode_uses` counts decoding's). Layers with missing experts
+return their selections to the engine for loading.
 
 The expert batch stays in the current GPU command buffer with the following
 layer work. Selected experts remain held until the next CPU routing read or

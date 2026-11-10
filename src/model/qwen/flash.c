@@ -1256,9 +1256,9 @@ static const float *pass(const Row *rows, int n, int logits, int prompt) {
   product(&f.head, &f.mixed, (size_t)(n - logits) * f.hidden * 4, &f.logits, logits, 0, 0);
   gpu_commit();
   gpu_sync();
-  if (prompt)
-    cache_pass(f.store, -1);
-  for (int i = 0; i < resident_count; i++) {  // the store counts their experts as hits
+  // The store counts the experts reached through tables as hits; a prompt's,
+  // before its pass ends, as a prompt's use.
+  for (int i = 0; i < resident_count; i++) {
     const FlashLayer *y = f.layer + resident_layers[i];
     Buf selected = experts_selection(&f.selected, y->number, n, f.chosen);
     stats->row_unique += experts_mark_used(&f.routed, y->experts, y->number, (const uint32_t *)selected.ptr, n);
@@ -1266,6 +1266,8 @@ static const float *pass(const Row *rows, int n, int logits, int prompt) {
       experts_routes_record(&f.routes, f.store, y->number, (const uint32_t *)selected.ptr, n, 1);
     stats->row_own += (uint64_t)n * f.chosen;
   }
+  if (prompt)
+    cache_pass(f.store, -1);
   f.counters.table_layers += resident_count;
   experts_release(&f.routed);
   // The pass's GPU work has completed and no expert is held: between passes

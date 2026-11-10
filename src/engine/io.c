@@ -1223,6 +1223,7 @@ static int draft_request(ExpertStore *st, int layer, const int *experts, int n) 
     st->draft_age[i - st->max_slots] = ++st->draft_touch_clock;
     st->score[i] = st->escore[layer * st->experts + e] += st->weight;
     st->dscore[layer * st->experts + e] += st->weight;  // drafts run only while decoding
+    st->stats.decode_uses++;
     reading += slot_reading(st, i);
   }
   return reading;
@@ -1237,7 +1238,7 @@ static void mark_used(ExpertStore *st, int layer, int e, int i) {
   double *history = &st->escore[layer * st->experts + e];
   *history += st->weight;
   st->score[i] = *history;
-  if (st->pass_layer < 0) st->dscore[layer * st->experts + e] += st->weight;
+  if (st->pass_layer < 0) st->dscore[layer * st->experts + e] += st->weight, st->stats.decode_uses++;
 }
 
 int cache_request(ExpertStore *st, int layer, const int *experts, int n) {

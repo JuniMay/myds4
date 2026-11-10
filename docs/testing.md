@@ -103,9 +103,10 @@ longest ago first, so each decoded row must mark exactly its chosen experts
 used in the memory pool. Each decoded row must also leave its routes: each
 MoE layer's chosen experts, each once and within the layer's experts, with
 where each one was. The check then brings nearly every expert into
-memory with 1,500 varied tokens. The next row must mark its experts used
-too, and at least one layer must reach its experts through its table of
-resident experts. The program prints hashes of its logits, so that two
+memory with 1,500 varied tokens; that prompt must count none of its expert
+uses as decoding's, those of its layers that ran through their tables
+included. The next row must mark its experts used too, and at least one
+layer must reach its experts through its table of resident experts. The program prints hashes of its logits, so that two
 builds can be compared, and the experts read and evicted. With
 `--memory GIB` below its default 28, its experts are evicted and their
 slots reused; no layer then holds all of its experts, so the resident-layer

@@ -52,10 +52,19 @@ static void resident_check(const ModelOps *ops, uint64_t *hash) {
     tokens[i] = 1000 + (int)((seed >> 8) % 99000);
   }
   ModelState *state = ops->state_new();
-  CHECK(ops->prefill(state, tokens, WARM, 0, 0, -1, NULL, NULL));
   ModelCounters counters;
   ops->counters(&counters);
-  printf("%d of %d experts in memory after %d varied tokens\n", counters.cache_slots, counters.experts, WARM);
+  CacheStats before = counters.cache;
+  uint64_t tables_before = counters.table_layers;
+  CHECK(ops->prefill(state, tokens, WARM, 0, 0, -1, NULL, NULL));
+  ops->counters(&counters);
+  printf("%d of %d experts in memory after %d varied tokens (%llu prompt layer passes through tables)\n",
+         counters.cache_slots, counters.experts, WARM, (unsigned long long)(counters.table_layers - tables_before));
+  // A prompt's experts, through tables too, count toward the eviction
+  // priority of prompts, not of decoding.
+  if (counters.cache.decode_uses != before.decode_uses)
+    die("Nemotron state check: the prompt counted %llu expert uses as decoding's",
+        (unsigned long long)(counters.cache.decode_uses - before.decode_uses));
   int tables;
   *hash = logits_hash(decoded_row(ops, &state, tokens[WARM - 1], WARM, &ready, &tables), (size_t)ops->vocab() * 4);
   printf("the row after them marked exactly its %d chosen experts used; %d layers reached them through their "

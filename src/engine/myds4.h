@@ -169,6 +169,7 @@ typedef struct {
   uint64_t substituted;      // experts replaced by --substitute
   uint64_t remaps;           // slots in memory mapped for the GPU again
   uint64_t given_back;       // slots released when the cache shrank for memory
+  uint64_t decode_uses;      // uses counted toward decoding's eviction priority (a prompt's count none)
   // The decoded rows' selections (routed_rows), each counted for its row, by
   // where its expert was: in memory, read ahead, read ahead and still being
   // read, a substitute (--substitute), or only on the SSD.
