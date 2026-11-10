@@ -47,7 +47,10 @@ int main(int argc, char **argv) {
   int rows = 0, ready = 0;
   uint64_t guessed = 0;
   int bounded = 0;  // rows that evicted: their count is bounded, not exact
+  int sources[5] = {0};  // the decoded rows' routes, by where each expert was
   ops->counters(&counters);
+  if (routes_valid(ops, &counters, sources))
+    die("Flash-Next check: a prompt's rows left routes");
   uint64_t tables = counters.table_layers;
   for (int i = 0; i < 16 && !ops->stop(token); i++) {
     int length;
@@ -73,6 +76,8 @@ int main(int argc, char **argv) {
           touched, chosen, evicted ? "at most" : "exactly", unchosen);
     guessed += unchosen;
     bounded += evicted;
+    if (!routes_valid(ops, &counters, sources))
+      die("Flash-Next check: decoded row %d's routes are missing or invalid", i);
     rows++;
     if (!i)
       memcpy(expected, logits, (size_t)ops->vocab() * 4);
@@ -83,6 +88,8 @@ int main(int argc, char **argv) {
          "%d rows evicted, bounded; %d experts in memory, %llu layer passes through tables)\n",
          rows, counters.experts_per_row, (unsigned long long)guessed, bounded, ready,
          (unsigned long long)(counters.table_layers - tables));
+  printf("their routes: %d in memory, %d read ahead, %d late, %d from the SSD\n", sources[0], sources[1], sources[2],
+         sources[4]);
   for (size_t i = 0; i < used; i++)
     output[i] = (char)tolower((unsigned char)output[i]);
   static const char *colors[] = {"red",    "blue",  "green", "yellow", "orange",

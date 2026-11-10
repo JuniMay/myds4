@@ -100,6 +100,12 @@ pub struct Snapshot {
     requests: Vec<Req>,
     layers: u64,
     experts_per_row: u64,
+    /// The layers with routed experts (experts_per_row / routed_layers
+    /// chosen in each), and each one's experts.
+    #[serde(default)]
+    routed_layers: u64,
+    #[serde(default)]
+    experts_per_layer: u64,
     prefill: Prefill,
     totals: Totals,
     kinds: Kinds,
@@ -1161,7 +1167,8 @@ mod tests {
     const SNAPSHOT: &str = r#"{"uptime_seconds": 3725, "phase": "decode", "phase_seconds": 2.5, "waiting": 1,
         "requests": [{"number": 12, "session": 3, "prompt": 41234, "reused": 40000, "generated": 77},
                      {"number": 13, "session": 4, "prompt": 900, "reused": 0, "generated": 5}],
-        "layers": 40, "experts_per_row": 240, "prefill": {"layer": 0, "rows": 0},
+        "layers": 40, "experts_per_row": 240, "routed_layers": 40, "experts_per_layer": 384,
+        "prefill": {"layer": 0, "rows": 0},
         "totals": {"requests": 13, "prompt_tokens": 90000, "reused_tokens": 60000, "generated_tokens": 4000},
         "kinds": {"new": 4, "continued": 6, "saved": 2, "forked": 1},
         "sessions": 4, "kv_gib": 1.234, "kv_limit_gib": 8.000, "tree": [
@@ -1737,6 +1744,34 @@ mod tests {
         // narrower: four experts a cell
         let (b, _) = draw(Tab::Experts, 160, 60, |_| {});
         assert!(all(&b).contains("a cell: four experts"));
+    }
+
+    /// Another model's geometry: 48 layers of 512 experts, ten chosen in
+    /// each, as Flash-Next's.
+    #[test]
+    fn the_expert_map_takes_the_models_geometry() {
+        let mut s = snapshot();
+        (s.layers, s.routed_layers, s.experts_per_layer, s.experts_per_row) = (48, 48, 512, 480);
+        let mut h = History::default();
+        for k in 0..12 {
+            let mut r = routed(12, k, |i| (i % 5) as u8);
+            let experts = (0..480).map(|i| (k + i as u16 * 7) % 512).collect();
+            r.route = Some(Routed {
+                experts,
+                sources: (0..480).map(|i| (i % 5) as u8).collect(),
+            });
+            s.requests = vec![r];
+            h.observe(&s, 0.5 * k as f64);
+        }
+        let area = Rect::new(0, 0, 160, 60);
+        let mut b = Buffer::empty(area);
+        experts::draw(&mut b, area, &s, &h, &mut Ui::default());
+        let screen = all(&b);
+        assert!(screen.contains("12 tokens"), "{screen}");
+        assert!(screen.contains("a cell: four experts"), "{screen}");
+        assert!(screen.contains("511") && screen.contains("448"), "the axis:\n{screen}");
+        assert!(screen.contains(" 48 "), "layer 48's row:\n{screen}");
+        assert!(screen.contains("120 experts per layer"), "12 tokens of ten:\n{screen}");
     }
 
     #[test]

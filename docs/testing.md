@@ -97,7 +97,9 @@ DFLASH2` compares all logits of a 16-row verification pass with sequential
 decoding. It then checks several accepted prefixes, their next target
 logits and their next draft proposals. Eviction takes the experts used
 longest ago first, so each decoded row must mark exactly its chosen experts
-used in the memory pool. The check then brings nearly every expert into
+used in the memory pool. Each decoded row must also leave its routes: each
+MoE layer's chosen experts, each once and within the layer's experts, with
+where each one was. The check then brings nearly every expert into
 memory with 1,500 varied tokens. The next row must mark its experts used
 too, and at least one layer must reach its experts through its table of
 resident experts. The program prints hashes of its logits, so that two
@@ -165,7 +167,10 @@ experts used, plus the experts it read ahead that the next layer did not
 choose (the store's read-ahead and read-ahead hit counts give that number).
 When the row evicts, a later miss may take such a read-ahead's slot, which
 then counts once for both; the count must then lie between the chosen
-experts and the two together. The program prints hashes of its logits, so that two builds
+experts and the two together. Each decoded row must also leave its routes
+(each layer's chosen experts, each once and within the layer's experts,
+with where each one was), and a prompt's rows none. The program prints
+hashes of its logits, so that two builds
 can be compared, and the experts read and evicted. Within its default
 32 GiB no layer holds all of its 512 experts, so its rows do not reach the
 table path. `--memory GIB` sets a lower limit, under which experts are

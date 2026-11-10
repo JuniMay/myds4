@@ -369,12 +369,14 @@ void myds4_stats_get(const myds4_model *m, myds4_stats *s) {
                      .prefill_rows = c.prefill_rows, .decode_seconds = c.decode_seconds,
                      .decode_gpu_seconds = c.decode_gpu_seconds, .prefill_layer = c.prefill_layer,
                      .prefill_rows_now = c.prefill_rows_now, .dense_bytes = c.dense_bytes,
-                     .layers = c.layers, .experts_per_row = c.experts_per_row};
+                     .layers = c.layers, .experts_per_row = c.experts_per_row,
+                     .routed_layers = c.routed_layers, .experts_per_layer = c.experts_per_layer};
   s->decode = model.decode; s->prefill = model.prefill;
   s->decode_rows = model.decode_rows; s->prefill_rows = model.prefill_rows;
   s->decode_seconds = model.decode_seconds; s->decode_gpu_seconds = model.decode_gpu_seconds;
   s->prefill_layer = model.prefill_layer; s->prefill_rows_now = model.prefill_rows_now;
   s->dense_bytes = model.dense_bytes; s->layers = model.layers; s->experts_per_row = model.experts_per_row;
+  s->routed_layers = model.routed_layers; s->experts_per_layer = model.experts_per_layer;
   MemoryUsage memory = memory_usage();
   s->model_memory_limit = memory_current_limit(); s->model_memory_used = memory.allocated;
   s->model_memory_committed = memory.committed; s->model_memory_peak = memory.peak;

@@ -110,6 +110,16 @@ A wrong prediction costs a read, never a result. A pass whose rows choose
 at least as many experts as a layer has (a prompt of 52 rows or more)
 needs nearly every expert and reads nothing ahead.
 
+Every family with routed experts records, for each row of its latest
+decoding pass, the experts chosen in each layer with routed experts and
+where each one was then: in memory, read ahead, late (read ahead and still
+being read), substituted (DeepSeek only) or from the SSD (`myds4_routes`).
+Flash-Next and Transcribe take where each one was from the store just
+before the layer acquires its experts; a layer reached through its table
+had all of them in memory. The engine's statistics give the layers with
+routed experts and each one's experts (`routed_layers`,
+`experts_per_layer`), from which the live view draws its Experts tab.
+
 When every expert of a layer is resident, GPU routing feeds the expert batch
 planner directly. With a store, resident means in a slot, read, mapped for
 the GPU and committed to the residency set. The engine rebuilds the layer's

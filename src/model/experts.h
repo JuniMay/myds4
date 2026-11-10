@@ -118,6 +118,27 @@ static inline Buf experts_selection(const Buf *selected, int layer, int rows, in
 // experts used longest ago first. With a store, the store counts them as
 // hits. Returns how many different experts the rows chose.
 int experts_mark_used(const ExpertWork *work, const Expert *experts, int layer, const uint32_t *selected, int rows);
+// The experts that each row of a model's latest decoding pass chose in each
+// store layer, and where each one was when chosen: 0 in memory, 1 read
+// ahead, 2 late (read ahead and still being read), 4 from the SSD
+// (myds4_routes). Each decoding pass begins a step; a row's routes are
+// complete when every layer recorded it in the latest step.
+typedef struct {
+  int rows, layers, chosen;  // capacity
+  uint16_t *id;              // [rows][layers][chosen]
+  uint8_t *from;             // [rows][layers][chosen]
+  uint64_t *step;            // [rows][layers]: the step that recorded the row's layer
+  uint64_t steps;            // decoding passes begun
+} ExpertRoutes;
+void experts_routes_init(ExpertRoutes *routes, int rows, int layers, int chosen);
+static inline void experts_routes_begin(ExpertRoutes *routes) { routes->steps++; }
+// Records a store layer's selections of n rows ([n][chosen]) before the
+// layer's experts are acquired; a layer reached through its table (table)
+// had every expert in memory.
+void experts_routes_record(ExpertRoutes *routes, ExpertStore *store, int layer, const uint32_t *selected, int n,
+                           int table);
+// Copies row `row`'s routes of the latest step; 0 when they are incomplete.
+int experts_routes_get(const ExpertRoutes *routes, int row, uint16_t *id, uint8_t *from);
 static inline int experts_count(const ExpertWork *work, int expert) {
   return ((const uint32_t *)work->plan.ptr)[expert];
 }

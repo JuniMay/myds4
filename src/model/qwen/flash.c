@@ -69,6 +69,8 @@ static struct {
   ExpertStore *store;
   int store_ready;
   ExpertFiles files;
+  ExpertRoutes routes;  // each decoded row's experts (myds4_routes)
+  int recording;        // a decoding pass: its routes are recorded
   FlashLayer *layer;
   Hyper final;
   Buf embedding;
@@ -349,6 +351,7 @@ static void prepare(const char *directory) {
       }
   }
   store_layout(weight, scales, exceptions);
+  experts_routes_init(&f.routes, FLASH_BATCH, f.layers, f.chosen);
   free(weight), free(scales), free(exceptions);
   snprintf(path, sizeof path, "%s/generation_config.json", directory);
   char *generation = read_file(path, NULL);
@@ -1131,6 +1134,8 @@ static int routed(FlashLayer *y, int n) {
   }
   gpu_commit();
   gpu_sync();
+  if (f.recording)
+    experts_routes_record(&f.routes, f.store, y->number, (const uint32_t *)selected.ptr, n, 0);
   experts_acquire(&f.routed, y->experts, y->number, (const uint32_t *)selected.ptr,
                   (const float *)f.coefficients.ptr, n, 1, cache_counters(f.store));
   cache_demote(f.store, y->number);  // its read-aheads that it did not choose go first
@@ -1204,6 +1209,9 @@ static const float *pass(const Row *rows, int n, int logits, int prompt) {
   }
   double began = now(), gpu = gpu_busy;
   CacheStats *stats = cache_counters(f.store), before = *stats;
+  f.recording = !prompt;
+  if (f.recording)
+    experts_routes_begin(&f.routes);
   int resident_layers[f.layers], resident_count = 0;
   gpu_begin();
   if (prompt)
@@ -1252,6 +1260,8 @@ static const float *pass(const Row *rows, int n, int logits, int prompt) {
     const FlashLayer *y = f.layer + resident_layers[i];
     Buf selected = experts_selection(&f.selected, y->number, n, f.chosen);
     stats->row_unique += experts_mark_used(&f.routed, y->experts, y->number, (const uint32_t *)selected.ptr, n);
+    if (f.recording)
+      experts_routes_record(&f.routes, f.store, y->number, (const uint32_t *)selected.ptr, n, 1);
     stats->row_own += (uint64_t)n * f.chosen;
   }
   f.counters.table_layers += resident_count;
@@ -1395,8 +1405,9 @@ static uint64_t cached_bytes(void) {
 }
 static void counters(ModelCounters *out) {
   *out = f.counters;
-  out->layers = f.layers;
+  out->layers = out->routed_layers = f.layers;
   out->experts_per_row = f.layers * f.chosen;
+  out->experts_per_layer = f.experts;
   out->dense_bytes = weights_resident_bytes(f.core) + qwen_vision_bytes(f.vision);
   if (!f.store)
     return;
@@ -1411,6 +1422,9 @@ static void counters(ModelCounters *out) {
 }
 static void plan(ModelPlan *out) {
   *out = f.plan;
+}
+static int routes(int row, uint16_t *id, uint8_t *from) {
+  return experts_routes_get(&f.routes, row, id, from);
 }
 static void chat(char *out, size_t cap, const char *prompt, int images, int think) {
   size_t at = snprintf(out, cap, "<|im_start|>user\n");
@@ -1444,6 +1458,7 @@ const ModelOps flash_ops = {.family = "Qwen3.8 Flash-Next",
                             .load = load,
                             .weight_slot = weight_slot,
                             .counters = counters,
+                            .routes = routes,
                             .cache_bytes = cached_bytes,
                             .plan = plan,
                             .vocab = vocab,

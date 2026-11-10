@@ -21,7 +21,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYDS4_ABI 16
+#define MYDS4_ABI 17
 
 // ---- the process ----
 
@@ -275,6 +275,9 @@ typedef struct {
   uint64_t total, free, file, file_kept, wired, compressor, compressed, swap_used, swapouts;
   int pressure;  // 1 normal, 2 warn, 4 critical
   int layers, experts_per_row;  // 0 without routed experts
+  // the layers with routed experts (experts_per_row / routed_layers chosen
+  // in each), and each one's experts
+  int routed_layers, experts_per_layer;
   // model_memory_limit: the most model memory now, what it holds and the free
   // memory above the reserve, within --memory
   uint64_t model_memory_limit, model_memory_used, model_memory_committed, model_memory_peak;
@@ -283,8 +286,9 @@ typedef struct {
 void myds4_refresh_stats(void); // sample process memory once for all models
 void myds4_stats_get(const myds4_model *m, myds4_stats *s);
 // The experts that row `row` of the model's latest decoding pass chose in
-// each layer, experts_per_row / layers per layer, and where each one was: 0
-// in memory, 1 read ahead, 2 late, 3 substituted, 4 from the SSD. Returns 0,
+// each layer with routed experts, experts_per_row / routed_layers per layer,
+// and where each one was: 0 in memory, 1 read ahead, 2 late, 3 substituted,
+// 4 from the SSD. Returns 0,
 // and leaves both unset, for a model without routed experts or a row that
 // did not run every layer. From the engine thread, after the pass.
 int myds4_routes(const myds4_model *m, int row, uint16_t *experts, uint8_t *sources);

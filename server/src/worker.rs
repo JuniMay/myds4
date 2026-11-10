@@ -627,7 +627,7 @@ pub fn view(model: usize) -> String {
     let pinned = c
         .cache_bytes
         .saturating_sub(c.slots.max(0) as u64 * c.slot_bytes);
-    let v = json!({
+    let mut v = json!({
         "model": m.served.id, "models": s.models.len(),
         "uptime_seconds": round(s.started.elapsed().as_secs_f64(), 0),
         "phase": if control_phase != Phase::Running { control_phase.label() } else if st.phase.is_empty() { "idle" } else { st.phase },
@@ -663,6 +663,9 @@ pub fn view(model: usize) -> String {
                    "compressor": c.compressor, "compressed": c.compressed, "swap_used": c.swap_used,
                    "swapouts": c.swapouts, "pressure": c.pressure},
     });
+    // the routed experts' geometry (past the json! macro's recursion limit)
+    v["routed_layers"] = json!(c.routed_layers);
+    v["experts_per_layer"] = json!(c.experts_per_layer);
     // the decoding passes take the status's lock; the text is written without it
     drop(st);
     v.to_string()

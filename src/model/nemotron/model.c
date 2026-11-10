@@ -48,6 +48,7 @@ static struct {
   ExpertStore *store;
   int moe_layers, store_ready;
   ExpertFiles files;
+  ExpertRoutes routes;  // each decoded row's experts in the MoE layers (myds4_routes)
   Buf embedding, final_norm;
   Linear head;
   Buf tokens, embeddings, sequences, x, norm, quant, packed, projected_values, convolved, scan, gated;
@@ -228,6 +229,7 @@ static void prepare(const char *directory) {
 #undef VEC
   }
   store_layout(weight, scales, exceptions);
+  experts_routes_init(&nm.routes, NM_BATCH, nm.moe_layers, nm.chosen);
   free(weight), free(scales), free(exceptions);
   snprintf(path, sizeof path, "%s/generation_config.json", directory);
   if (!access(path, R_OK)) {
@@ -638,6 +640,8 @@ static int routed(Layer *y, int rows) {
   }
   gpu_commit();
   gpu_sync();
+  if (!nm.prompt_pass)
+    experts_routes_record(&nm.routes, nm.store, y->moe, (const uint32_t *)selected.ptr, rows, 0);
   experts_acquire(&nm.routed, y->experts, y->moe, (const uint32_t *)selected.ptr,
                   (const float *)nm.coefficients.ptr, rows, nm.prompt_pass, cache_counters(nm.store));
   gpu_begin();
@@ -704,6 +708,8 @@ static const float *pass(const Row *rows, int count, int logits, int prompt) {
   }
   double began = now(), gpu = gpu_busy;
   CacheStats *stats = cache_counters(nm.store), before = *stats;
+  if (!prompt)
+    experts_routes_begin(&nm.routes);
   int resident_layers[nm.layers], resident_count = 0;
   gpu_begin();
   uint32_t hidden = (uint32_t)nm.hidden;
@@ -757,6 +763,8 @@ static const float *pass(const Row *rows, int count, int logits, int prompt) {
     const Layer *y = nm.layer + resident_layers[i];
     Buf selected = experts_selection(&nm.selected, y->number, count, nm.chosen);
     stats->row_unique += experts_mark_used(&nm.routed, y->experts, y->moe, (const uint32_t *)selected.ptr, count);
+    if (!prompt)
+      experts_routes_record(&nm.routes, nm.store, y->moe, (const uint32_t *)selected.ptr, count, 1);
     stats->row_own += (uint64_t)count * nm.chosen;
   }
   nm.counters.table_layers += resident_count;
@@ -900,6 +908,8 @@ static void counters(ModelCounters *out) {
   *out = nm.counters;
   out->layers = nm.layers;
   out->experts_per_row = (nm.layers - nm.recurrent - nm.attention) * nm.chosen;
+  out->routed_layers = nm.moe_layers;
+  out->experts_per_layer = nm.experts;
   out->dense_bytes = weights_resident_bytes(nm.core) + speech_weight_bytes(nm.speech) + dflash_weight_bytes(nm.draft);
   if (!nm.store)
     return;
@@ -911,6 +921,9 @@ static void counters(ModelCounters *out) {
   out->max_slots = cache_max(nm.store);
   out->experts = nm.moe_layers * nm.experts;
   out->slot_bytes = cache_slot_bytes(nm.store);
+}
+static int routes(int row, uint16_t *id, uint8_t *from) {
+  return experts_routes_get(&nm.routes, row, id, from);
 }
 static void plan(ModelPlan *out) {
   *out = nm.plan;
@@ -974,6 +987,7 @@ const ModelOps nemotron_ops = {.family = "Nemotron 3.5 Transcribe",
                                .media = media,
                                .active = active,
                                .counters = counters,
+                               .routes = routes,
                                .cache_bytes = store_bytes,
                                .plan = plan,
                                .vocab = vocab,

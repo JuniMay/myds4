@@ -3559,7 +3559,8 @@ static const char *ds_refuse(const Options *o) { return 0; }
 static void ds_counters(ModelCounters *c) {
   *c = (ModelCounters){.decode_rows = decode_rows, .prefill_rows = prefill_rows, .decode_seconds = decode_s,
                        .decode_gpu_seconds = decode_gpu_s, .prefill_layer = prefill_layer, .prefill_rows_now = prefill_n,
-                       .layers = LAYERS, .experts_per_row = LAYERS * TOPK, .dense_bytes = weights_resident_bytes(core_weights) + weights_resident_bytes(vision_weights),
+                       .layers = LAYERS, .experts_per_row = LAYERS * TOPK, .routed_layers = LAYERS,
+                       .experts_per_layer = EXPERTS, .dense_bytes = weights_resident_bytes(core_weights) + weights_resident_bytes(vision_weights),
                        .decode = decode_stats, .prefill = prefill_stats};
   c->experts = LAYERS * EXPERTS;
   if (!experts_store) return;  // registered, never loaded

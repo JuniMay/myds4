@@ -49,6 +49,7 @@ typedef struct {
   double decode_seconds, decode_gpu_seconds;
   int prefill_layer, prefill_rows_now;  // the prompt pass running: its layer (0: none) and rows
   int layers, experts_per_row;          // 0 without routed experts
+  int routed_layers, experts_per_layer; // the layers with routed experts, and each one's experts
   uint64_t table_layers;                // layer passes that reached every expert through the layer's table
   uint64_t dense_bytes;                 // the weights always resident
   CacheStats decode, prefill;           // the expert cache's, of decoded rows and of prompt rows

@@ -240,6 +240,34 @@ int experts_mark_used(const ExpertWork *w, const Expert *experts, int layer, con
   cache_use(w->store, layer, ids, n);
   return n;
 }
+void experts_routes_init(ExpertRoutes *r, int rows, int layers, int chosen) {
+  *r = (ExpertRoutes){.rows = rows, .layers = layers, .chosen = chosen};
+  r->id = xmalloc((size_t)rows * layers * chosen * sizeof *r->id);
+  r->from = xmalloc((size_t)rows * layers * chosen);
+  r->step = xmalloc((size_t)rows * layers * sizeof *r->step);
+}
+void experts_routes_record(ExpertRoutes *r, ExpertStore *store, int layer, const uint32_t *selected, int n,
+                           int table) {
+  static const uint8_t from[4] = {4, 0, 1, 2};  // by cache_where: the SSD, memory, read ahead, still being read
+  for (int row = 0; row < n && row < r->rows; row++) {
+    size_t at = ((size_t)row * r->layers + layer) * r->chosen;
+    for (int k = 0; k < r->chosen; k++) {
+      uint32_t e = selected[row * r->chosen + k];
+      r->id[at + k] = (uint16_t)e;
+      r->from[at + k] = table ? 0 : from[cache_where(store, layer, (int)e)];
+    }
+    r->step[(size_t)row * r->layers + layer] = r->steps;
+  }
+}
+int experts_routes_get(const ExpertRoutes *r, int row, uint16_t *id, uint8_t *from) {
+  if (row < 0 || row >= r->rows || !r->steps) return 0;
+  for (int l = 0; l < r->layers; l++)
+    if (r->step[(size_t)row * r->layers + l] != r->steps) return 0;  // the row did not reach every layer then
+  size_t first = (size_t)row * r->layers * r->chosen, count = (size_t)r->layers * r->chosen;
+  memcpy(id, r->id + first, count * sizeof *id);
+  memcpy(from, r->from + first, count);
+  return 1;
+}
 void experts_release(ExpertWork *w) {
   if (w->held_count) {
     int ids[w->held_count];

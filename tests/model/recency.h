@@ -38,3 +38,24 @@ static int touched_experts(double since, int *ready) {
   memory_slot_remove(&probe);
   return touched;
 }
+
+// The latest decoded row's routes (ModelOps.routes): each routed layer's
+// chosen experts, each once in its layer and within the layer's experts,
+// and where each one was (0 in memory, 1 read ahead, 2 late, 4 from the
+// SSD). Adds them to sources[5]; 0 when the routes are missing or invalid.
+static int routes_valid(const ModelOps *ops, const ModelCounters *c, int sources[5]) {
+  int layers = c->routed_layers, chosen = layers ? c->experts_per_row / layers : 0;
+  if (!ops->routes || !chosen || layers * chosen != c->experts_per_row) return 0;
+  uint16_t id[c->experts_per_row];
+  uint8_t from[c->experts_per_row];
+  if (!ops->routes(0, id, from)) return 0;
+  for (int l = 0; l < layers; l++)
+    for (int k = 0; k < chosen; k++) {
+      int e = id[l * chosen + k], s = from[l * chosen + k];
+      if (e >= c->experts_per_layer || s > 4 || s == 3) return 0;
+      for (int j = 0; j < k; j++)
+        if (id[l * chosen + j] == e) return 0;
+      sources[s]++;
+    }
+  return 1;
+}

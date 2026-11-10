@@ -9,7 +9,7 @@ use std::ptr;
 
 use deepseek_recipe::stream::StreamTokenizer;
 
-const ABI: c_int = 16;
+const ABI: c_int = 17;
 
 #[repr(C)]
 struct RawProcess {
@@ -178,6 +178,8 @@ pub struct Stats {
     pub pressure: c_int,
     pub layers: c_int,
     pub experts_per_row: c_int,
+    pub routed_layers: c_int,
+    pub experts_per_layer: c_int,
     pub model_memory_limit: u64,
     pub model_memory_used: u64,
     pub model_memory_committed: u64,

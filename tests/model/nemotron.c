@@ -11,8 +11,12 @@
       die("Nemotron state check: %s", #x);                                                                             \
   } while (0)
 
-// Decodes one row and requires it to mark exactly its chosen experts used.
-// *tables: the layers that reached their experts through their tables.
+// The latest decoded row's routes, by where each expert was (routes_valid).
+static int row_sources[5];
+
+// Decodes one row and requires it to mark exactly its chosen experts used,
+// and to leave its routes. *tables: the layers that reached their experts
+// through their tables.
 static const float *decoded_row(const ModelOps *ops, ModelState **state, int token, int position, int *ready,
                                 int *tables) {
   ModelCounters counters;
@@ -28,6 +32,9 @@ static const float *decoded_row(const ModelOps *ops, ModelState **state, int tok
     die("Nemotron state check: the row at position %d marked %d experts used, not its %d (%d layers through their "
         "tables)",
         position, touched, counters.experts_per_row, *tables);
+  memset(row_sources, 0, sizeof row_sources);
+  if (!routes_valid(ops, &counters, row_sources))
+    die("Nemotron state check: the row at position %d's routes are missing or invalid", position);
   return logits;
 }
 
@@ -52,8 +59,8 @@ static void resident_check(const ModelOps *ops, uint64_t *hash) {
   int tables;
   *hash = logits_hash(decoded_row(ops, &state, tokens[WARM - 1], WARM, &ready, &tables), (size_t)ops->vocab() * 4);
   printf("the row after them marked exactly its %d chosen experts used; %d layers reached them through their "
-         "tables\n",
-         counters.experts_per_row, tables);
+         "tables; its routes: %d in memory, %d read ahead, %d late, %d from the SSD\n",
+         counters.experts_per_row, tables, row_sources[0], row_sources[1], row_sources[2], row_sources[4]);
   if (!tables)
     die("Nemotron state check: no layer reached its experts through its table; nothing was checked there");
   ops->state_free(state);

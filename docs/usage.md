@@ -327,6 +327,13 @@ show one model at a time, and `n` selects the next. The KV cache tab lists
 every model with its sessions and their KV at its top; a click there shows
 that model's sessions. The Log and Memory tabs cover every model.
 
+The Experts tab maps a decoding request's experts in each layer with routed
+experts, for DeepSeek, Flash-Next and Transcribe alike: each expert of its
+last sampled tokens in the color of where it was when last chosen (in
+memory, read ahead, late, substituted or from the SSD), and at the right
+each layer's experts of those tokens by where each one was. A cell holds
+two experts where the terminal is wide enough, otherwise four or more.
+
 The Memory tab draws the Mac's installed memory as a treemap: each
 rectangle's area follows its bytes, and a character cell counts as twice
 as tall as wide. Each model in memory is a rectangle under its name, split
