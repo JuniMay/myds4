@@ -130,13 +130,12 @@ static void hyper(Hyper *h, const char *stem, int inject) {
 // The shared expert is part of the backbone.
 static void shared_expert(Expert *e, const char *stem) {
   char name[384];
-  e->weights = f.core;
   snprintf(name, sizeof name, "%s.gate_proj", stem);
-  matrix(e->weights, &e->gate, name);
+  matrix(f.core, &e->gate, name);
   snprintf(name, sizeof name, "%s.up_proj", stem);
-  matrix(e->weights, &e->up, name);
+  matrix(f.core, &e->up, name);
   snprintf(name, sizeof name, "%s.down_proj", stem);
-  matrix(e->weights, &e->down, name);
+  matrix(f.core, &e->down, name);
 }
 // A routed expert's matrices, and their tensors (gate, up, down: experts_files).
 static void routed_expert(Expert *e, const char *stem, Tensor *weight, Tensor *scales, Tensor *exceptions) {
@@ -1099,9 +1098,8 @@ static int routed(FlashLayer *y, int n) {
   }
   gpu_commit();
   gpu_sync();
-  if (!experts_acquire(&f.routed, y->experts, y->number, (const uint32_t *)selected.ptr,
-                       (const float *)f.coefficients.ptr, n, 1, cache_counters(f.store)))
-    return 0;
+  experts_acquire(&f.routed, y->experts, y->number, (const uint32_t *)selected.ptr,
+                  (const float *)f.coefficients.ptr, n, 1, cache_counters(f.store));
   gpu_begin();
   experts_encode(&f.routed, y->experts, &f.mixed);
   for (int i = 0; i < f.routed.active; i++) {
@@ -1197,9 +1195,7 @@ static const float *pass(const Row *rows, int n, int logits, int prompt) {
     mix(&y->mlp_hyper, n);
     if (prompt)
       cache_pass(f.store, y->number);  // a prompt's reads evict earlier layers' experts first
-    int result = routed(y, n);
-    if (!result) return NULL;
-    if (result == 2) resident_layers[resident_count++] = l;
+    if (routed(y, n) == 2) resident_layers[resident_count++] = l;
     inject(n);
     if (f.dump_fd >= 0) {
       gpu_commit();

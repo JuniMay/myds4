@@ -119,11 +119,9 @@ included: the pass's GPU work has completed, so any slot that is not held
 may go back, and slots mapped during the pass join the residency set for
 the next one.
 
-The shared weight loader packs a weight group's matrices and scales into
-one Metal allocation with aligned views. Loading registers that allocation
-once; eviction releases and accounts for it once. Checkpoint bytes and
-scale decoding remain unchanged. Tensors that require a separate aligned
-read buffer retain their own allocations.
+The shared weight loader gives each weight of a group its own Metal
+allocation. A group is one memory entry: loading charges all of its
+allocations together, and eviction releases them together.
 
 The Metal backend distributes mapped allocations across residency sets.
 Each set targets 5% of the device's recommended working-set size, with a
@@ -167,11 +165,11 @@ weights. The account's workspace and the model's KV states stay; the next
 request's load reads the weights again. While a yield holds the memory,
 nothing unloads for idleness.
 
-The engine allocates selected missing experts and their decoding scratch
-space before starting up to eight read workers. Workers read checkpoint
-bytes and decode compressed scales. The engine publishes completed weights,
-updates memory accounting and reports read failures after those workers
-finish. The selected experts stay pinned throughout this operation.
+The expert batch planner holds a layer's selected experts in the store
+before any of them is read, then waits for the missing ones. The model waits
+for these reads, so they go to the system's dispatch queues at once, ahead of
+the store's four background readers. The selected experts stay held until
+the next selection or the end of the pass.
 
 Routing and numerical boundaries belong to the model. Flash-Next uses SwiGLU
 and rounds each expert's contribution and each addition to BF16. Nemotron uses
@@ -187,8 +185,7 @@ lists. Equal scores retain the lower expert index. Softmax normalization uses
 the full router vector. Selected weights are normalized in rank order and
 rounded to BF16.
 DeepSeek uses its MXFP4 and GGUF expert kernels, which already combine expert
-work and overlap ready experts with pending reads. Its streaming cache uses
-the same memory pool while retaining its read scheduling and packed layouts.
+work and overlap ready experts with pending reads.
 
 ## Scheduling and state
 

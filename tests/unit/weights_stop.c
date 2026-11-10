@@ -30,14 +30,12 @@ static void fixture_free(Buf *b) {
 static size_t fixture_allocation_size(size_t size) { return size; }
 static void fixture_resident(const Buf *b, int on) {}
 static void fixture_commit(void) {}
-static void fixture_use(const Buf *b) {}
 static void fixture_read(int fd, uint64_t off, uint64_t len, Buf *dst) {}
 #define gpu_new fixture_new
 #define gpu_free fixture_free
 #define gpu_allocation_size fixture_allocation_size
 #define gpu_resident fixture_resident
 #define gpu_residency_commit fixture_commit
-#define gpu_use fixture_use
 #define io_read fixture_read
 #include "../../src/model/weights.c"
 #undef gpu_new
@@ -45,7 +43,6 @@ static void fixture_read(int fd, uint64_t off, uint64_t len, Buf *dst) {}
 #undef gpu_allocation_size
 #undef gpu_resident
 #undef gpu_residency_commit
-#undef gpu_use
 #undef io_read
 
 enum { WEIGHTS = 8, BYTES = 4096 };

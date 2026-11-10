@@ -4,20 +4,11 @@
 #include "../engine/memory.h"
 
 typedef struct WeightSet WeightSet;
-typedef struct { unsigned count; uint64_t generation; } WeightPresence;
-typedef struct {
-  CacheStats stats;
-  uint64_t bytes;
-  int slots, capacity;
-} WeightCache;
 typedef void (*WeightFill)(Buf *buffer, const void *parameters);
 enum { WEIGHT_ADD = 1, WEIGHT_EXP = 2 };
 
 WeightSet *weights_new(MemoryAccount *account, const char *name);
-WeightSet *weights_cached(WeightSet *backbone, WeightCache *cache, const char *name);
 WeightSet *weights_dependent(WeightSet *backbone, const char *name);
-// Attach the layer's residency counter before the group's first load.
-void weights_track(WeightSet *set, WeightPresence *presence);
 MemorySlot *weights_slot(WeightSet *set);
 uint64_t weights_required(const WeightSet *set);
 uint64_t weights_resident_bytes(const WeightSet *set);
@@ -38,10 +29,6 @@ void weights_alias(WeightSet *set, Buf *target, const Buf *source);
 int weights_load(WeightSet *set);
 // On while a model loads (model_load): quitting then stops the load.
 void weights_stop_on_quit(int on);
-// The caller pins a nonempty set of unique selections before loading. Reads run in a bounded worker
-// group; Metal allocation, accounting and error reporting stay on the caller.
-int weights_load_many(WeightSet *const *sets, int count);
-void weights_use(const WeightSet *set);
 void weights_reside(WeightSet *set, int resident);
 void weights_free(WeightSet *set);
 void weights_remove(WeightSet *set, Buf *target);

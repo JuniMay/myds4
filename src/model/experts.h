@@ -18,13 +18,10 @@ static inline ExpertMatrix expert_matrix(const Linear *m) {
   return (ExpertMatrix){m->w.gpu, m->s.gpu, m->scale * m->input_scale, m->input_scale};
 }
 
-// An expert's matrices. A routed expert's weights are either its own weight
-// group (weights) or, with an expert store (experts_store), a slot of the
-// store: then its matrices' buffers are views of the slot, set while the
-// expert is held, and weights is null.
+// An expert's matrices. A routed expert's buffers are views of its slot in
+// the expert store (experts_store), set while the expert is held.
 typedef struct {
   Linear gate, up, down;
-  WeightSet *weights;
 } Expert;
 // Where each matrix of an expert lies in its slot (gate, up, down): its
 // weights and scales, each a span and an offset in it. Compressed scales
@@ -61,7 +58,7 @@ typedef struct {
   uint32_t *active_ids;
   const Expert *held;
   int held_count;
-  ExpertStore *store;          // or null: each expert has its own weight group
+  ExpertStore *store;          // the routed experts' store (experts_store)
   const ExpertFiles *files;    // the store's layout of them
   int held_layer;              // the store layer of the held experts
   const Buf **slot;            // [experts]: a held expert's slot
@@ -90,9 +87,9 @@ void experts_decode(void *files, int layer, int expert, uint8_t *slot, const uin
 uint64_t experts_workspace(ExpertWork *work, int rows, int allocate);
 uint64_t experts_bytes(const ExpertWork *work);
 // Routing and the preceding expert work have completed. Release the previous
-// selection, then pin every new selection before loading any miss. `layer`:
-// the store layer (with a store).
-int experts_acquire(ExpertWork *work, Expert *experts, int layer, const uint32_t *selected, const float *weights,
+// selection, then hold every new selection in the store before reading any
+// miss, and wait for the reads. `layer`: the store layer.
+void experts_acquire(ExpertWork *work, Expert *experts, int layer, const uint32_t *selected, const float *weights,
                      int rows, int prompt, CacheStats *stats);
 // Call after the queued expert work completes. Resident planning retains this
 // selection until a later acquisition or the end of the model pass.

@@ -80,11 +80,10 @@ static void vector(Buf *out, const char *name, int exponential) {
 // The shared expert is part of the backbone.
 static void shared_expert(Expert *e, const char *prefix) {
   char name[256];
-  e->weights = nm.core;
   snprintf(name, sizeof name, "%s.up_proj", prefix);
-  linear_load(e->weights, &e->up, nm.checkpoint, name);
+  linear_load(nm.core, &e->up, nm.checkpoint, name);
   snprintf(name, sizeof name, "%s.down_proj", prefix);
-  linear_load(e->weights, &e->down, nm.checkpoint, name);
+  linear_load(nm.core, &e->down, nm.checkpoint, name);
 }
 // A routed expert's matrices (up and down; squared ReLU has no gate), and
 // their tensors at index 1 and 2 of its three (experts_files).
@@ -639,9 +638,8 @@ static int routed(Layer *y, int rows) {
   }
   gpu_commit();
   gpu_sync();
-  if (!experts_acquire(&nm.routed, y->experts, y->moe, (const uint32_t *)selected.ptr,
-                       (const float *)nm.coefficients.ptr, rows, nm.prompt_pass, cache_counters(nm.store)))
-    return 0;
+  experts_acquire(&nm.routed, y->experts, y->moe, (const uint32_t *)selected.ptr,
+                  (const float *)nm.coefficients.ptr, rows, nm.prompt_pass, cache_counters(nm.store));
   gpu_begin();
   experts_encode(&nm.routed, y->experts, &nm.norm);
   for (int i = 0; i < nm.routed.active; i++) {
@@ -730,9 +728,7 @@ static const float *pass(const Row *rows, int count, int logits, int prompt) {
     else {
       if (prompt)
         cache_pass(nm.store, y->moe);  // a prompt's reads evict earlier layers' experts first
-      int result = routed(y, count);
-      if (!result) return NULL;
-      if (result == 2) resident_layers[resident_count++] = l;
+      if (routed(y, count) == 2) resident_layers[resident_count++] = l;
     }
     add(&nm.x, &nm.result, count * nm.hidden);
     dflash_capture(nm.draft, l, &nm.x, &nm.captured, count);

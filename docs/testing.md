@@ -138,6 +138,16 @@ then allocates past a 64 MiB limit so that an idle expert goes back. The
 eviction must not wait for the GPU; a wait that never ends fails the check
 by its 20-second alarm.
 
+`build/tests/experts` needs no model. It checks that the grouped NVFP4
+expert kernels give each product, BF16 boundary and ordered mixture of
+separate kernels, for SwiGLU and squared ReLU and for 1 to 32 rows, through
+the planner's groups and through a layer's table. On a store of three small
+experts read from a temporary file, it checks that the planner's held
+selection survives memory pressure, that the table path's output equals the
+acquired path's, that a new selection moves the holds, and that a release
+lets every slot go back. It also compares the 16-row prompt matrix tile with
+the 128-row tile for 1 to 64 rows.
+
 ```sh
 make build/tests/vision
 build/tests/vision

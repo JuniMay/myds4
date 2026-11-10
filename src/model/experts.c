@@ -161,7 +161,7 @@ uint64_t experts_bytes(const ExpertWork *w) {
   for (size_t i = 0; i < sizeof buffers / sizeof *buffers; i++) bytes += buffers[i]->allocated;
   return bytes;
 }
-int experts_acquire(ExpertWork *w, Expert *experts, int layer, const uint32_t *selected, const float *weights,
+void experts_acquire(ExpertWork *w, Expert *experts, int layer, const uint32_t *selected, const float *weights,
                      int rows, int prompt, CacheStats *stats) {
   experts_release(w);
   uint32_t *count = counts(w), *start = offsets(w), *small = grouped(w);
@@ -187,40 +187,24 @@ int experts_acquire(ExpertWork *w, Expert *experts, int layer, const uint32_t *s
     uint32_t r = entries[i].row;
     order[r * w->chosen + row_count[r]++] = i;
   }
-  if (w->store) {
-    int ids[w->active];
-    for (int i = 0; i < w->active; i++) {
-      ids[i] = (int)w->active_ids[i];
-      if (cache_ready(w->store, layer, ids[i])) stats->row_own += count[ids[i]];
-      else stats->row_ssd += count[ids[i]];
-    }
-    // Held, the experts stay in their slots until experts_release.
-    cache_hold(w->store, layer, ids, w->active);
-    w->held = experts;
-    w->held_count = w->active;
-    w->held_layer = layer;
-    cache_wait(w->store, layer, ids, w->active);
-    for (int i = 0; i < w->active; i++) {
-      uint32_t at[STORE_PARTS];
-      int fresh;
-      w->slot[ids[i]] = cache_get(w->store, layer, ids[i], at, &fresh);
-      w->fresh[ids[i]] = (uint8_t)fresh;
-      views(experts + ids[i], w->slot[ids[i]], at, w->files, layer, ids[i]);
-    }
-  } else {
-    for (int i = 0; i < w->active; i++)
-      memory_pin(weights_slot(experts[w->active_ids[i]].weights), 1);
-    w->held = experts;
-    w->held_count = w->active;
-    WeightSet *selected_sets[w->active];
-    for (int i = 0; i < w->active; i++) {
-      int e = w->active_ids[i];
-      selected_sets[i] = experts[e].weights;
-      if (memory_ready(weights_slot(selected_sets[i]))) stats->row_own += count[e];
-      else stats->row_ssd += count[e];
-    }
-    int loaded = weights_load_many(selected_sets, w->active);
-    if (!loaded) { experts_release(w); return 0; }
+  int ids[w->active];
+  for (int i = 0; i < w->active; i++) {
+    ids[i] = (int)w->active_ids[i];
+    if (cache_ready(w->store, layer, ids[i])) stats->row_own += count[ids[i]];
+    else stats->row_ssd += count[ids[i]];
+  }
+  // Held, the experts stay in their slots until experts_release.
+  cache_hold(w->store, layer, ids, w->active);
+  w->held = experts;
+  w->held_count = w->active;
+  w->held_layer = layer;
+  cache_wait(w->store, layer, ids, w->active);
+  for (int i = 0; i < w->active; i++) {
+    uint32_t at[STORE_PARTS];
+    int fresh;
+    w->slot[ids[i]] = cache_get(w->store, layer, ids[i], at, &fresh);
+    w->fresh[ids[i]] = (uint8_t)fresh;
+    views(experts + ids[i], w->slot[ids[i]], at, w->files, layer, ids[i]);
   }
   ExpertGroup *groups = (ExpertGroup *)w->groups.ptr;
   uint32_t *row_groups = (uint32_t *)w->row_groups.ptr;
@@ -243,7 +227,6 @@ int experts_acquire(ExpertWork *w, Expert *experts, int layer, const uint32_t *s
   for (int group = capacity - matrix_groups; group < capacity; group++)
     for (uint32_t row = 0; row < groups[group].count; row += 16)
       tiles[w->matrix_tiles++] = (ExpertTile){group, row};
-  return 1;
 }
 int experts_mark_used(const ExpertWork *w, const Expert *experts, int layer, const uint32_t *selected, int rows) {
   uint8_t marked[w->experts];
@@ -254,20 +237,15 @@ int experts_mark_used(const ExpertWork *w, const Expert *experts, int layer, con
       marked[selected[i]] = 1;
       ids[n++] = (int)selected[i];
     }
-  if (w->store)
-    cache_use(w->store, layer, ids, n);
-  else
-    for (int i = 0; i < n; i++) memory_touch(weights_slot(experts[ids[i]].weights));
+  cache_use(w->store, layer, ids, n);
   return n;
 }
 void experts_release(ExpertWork *w) {
-  if (w->store && w->held_count) {
+  if (w->held_count) {
     int ids[w->held_count];
     for (int i = 0; i < w->held_count; i++) ids[i] = (int)w->active_ids[i];
     cache_unhold(w->store, w->held_layer, ids, w->held_count);
-  } else
-    for (int i = 0; i < w->held_count; i++)
-      memory_pin(weights_slot(w->held[w->active_ids[i]].weights), 0);
+  }
   w->held = NULL;
   w->held_count = 0;
 }
@@ -315,9 +293,7 @@ void experts_encode(const ExpertWork *w, const Expert *experts, const Buf *input
   if (!w->group_count && !w->matrix_tiles) return;
   for (int i = 0; i < w->active; i++) {
     int e = w->active_ids[i];
-    if (!grouped(w)[e]) continue;
-    if (!w->store) weights_use(experts[e].weights);
-    else if (w->fresh[e]) gpu_use(w->slot[e]);
+    if (grouped(w)[e] && w->fresh[e]) gpu_use(w->slot[e]);
   }
   encode_groups(w, input);
 }
@@ -335,13 +311,12 @@ int experts_table(const ExpertWork *w, Expert *experts, int layer, const Buf *ta
     Expert *x = experts + e;
     if (x->up.kind != 'n' || x->down.kind != 'n' ||
         (w->activation == EXPERT_SWIGLU && x->gate.kind != 'n')) return 0;
-    if (w->store) {  // every expert is mapped (cache_layer_ready): cache_get changes nothing
-      uint32_t at[STORE_PARTS];
-      int fresh;
-      const Buf *slot = cache_get(w->store, layer, e, at, &fresh);
-      if (!slot || fresh) return 0;
-      views(x, slot, at, w->files, layer, e);
-    }
+    // Every expert is mapped (cache_layer_ready): cache_get changes nothing.
+    uint32_t at[STORE_PARTS];
+    int fresh;
+    const Buf *slot = cache_get(w->store, layer, e, at, &fresh);
+    if (!slot || fresh) return 0;
+    views(x, slot, at, w->files, layer, e);
     entries[e] = (ExpertGroup){expert_matrix(&x->gate), expert_matrix(&x->up), expert_matrix(&x->down), 0, 0};
   }
   return 1;

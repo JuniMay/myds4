@@ -1,12 +1,8 @@
 // Grouped experts must retain each product, BF16 boundary and ordered mixture.
 #include "../../src/model/experts.h"
 #include <math.h>
-#include <fcntl.h>
-#include <pthread.h>
-#include <setjmp.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 enum { H = 2688, I = 1856, E = 3, N = 32 };
@@ -14,136 +10,93 @@ typedef struct { uint32_t row; float weight; } Entry;
 static Linear matrices[E][3];
 static Buf input, groups, entries, order, row_groups, tiles, xg, xu, hidden, quantized, parts, output;
 static Buf gathered, q, gate, up, middle, reference, expected, expected_middle, expected_parts, bf16;
-static jmp_buf read_failure;
-static pthread_t engine_thread;
 
-static void catch_read_failure(void) {
-  if (!pthread_equal(engine_thread, pthread_self())) _Exit(3);
-  longjmp(read_failure, 1);
-}
-static int failed_batch(const char *path) {
-  int fd = open(path, O_RDONLY);
-  struct stat stat;
-  if (fd < 0 || fstat(fd, &stat)) return 0;
-  static MemoryAccount account;
-  memory_account_init(&account, "read-error fixture");
-  WeightSet *core = weights_new(&account, "read-error backbone");
-  static WeightCache cache;
-  WeightSet *sets[] = {weights_cached(core, &cache, "readable expert"),
-                       weights_cached(core, &cache, "truncated expert")};
-  static Buf values[2];
-  weights_tensor(sets[0], &values[0], (Tensor){.fd = fd, .off = 0, .size = 64}, 0);
-  weights_tensor(sets[1], &values[1], (Tensor){.fd = fd, .off = stat.st_size + 1, .size = 64}, 0);
-  uint64_t allocated = memory_usage().allocated;
-  engine_thread = pthread_self();
-  die_hook = catch_read_failure;
-  int caught = 0;
-  if (setjmp(read_failure) == 0) weights_load_many(sets, 2);
-  else caught = 1;
-  die_hook = NULL;
-  int restored = !values[0].obj && !values[1].obj && !cache.slots && !cache.bytes &&
-                  memory_usage().allocated == allocated;
-  weights_free(sets[0]); weights_free(sets[1]); weights_free(core);
-  close(fd);
-  printf("parallel read failure: caller received error=%d, allocations restored=%d\n", caught != 0, restored);
-  return caught && restored;
-}
-
-static void fill_weight(Buf *buffer, const void *context) {
-  unsigned char value = *(const unsigned char *)context;
-  memset(buffer->ptr, value, buffer->size);
-}
+// A store of one layer of three experts, each with 64x64 NVFP4 gate, up and
+// down matrices (weights filled with 0x11 + expert, scales 1.0) read from a
+// file. The planner's held selection survives memory pressure and resident
+// planning, the table path's output equals the acquired path's, a new
+// selection moves the holds, and a release lets every slot go back.
 static int held_selection(void) {
+  enum { WEIGHT = 64 * 64 / 2, SCALES = 64 * 64 / 16, MATRIX = WEIGHT + SCALES };
+  const char *directory = getenv("TMPDIR");
+  char path[1024];
+  snprintf(path, sizeof path, "%s/myds4-experts-XXXXXX", directory && *directory ? directory : "/tmp");
+  int fd = mkstemp(path);
+  if (fd < 0) return 0;
+  unlink(path);
+  Tensor weight[9], scales[9], exceptions[9] = {0};
+  Expert fake[3] = {0};
+  for (int e = 0; e < 3; e++) {
+    Linear *m[] = {&fake[e].gate, &fake[e].up, &fake[e].down};
+    for (int k = 0; k < 3; k++) {
+      unsigned char bytes[MATRIX];
+      memset(bytes, 0x11 + e, WEIGHT);
+      memset(bytes + WEIGHT, 0x38, SCALES);
+      off_t at = (off_t)(e * 3 + k) * MATRIX;
+      if (pwrite(fd, bytes, MATRIX, at) != MATRIX) return 0;
+      weight[e * 3 + k] = (Tensor){.fd = fd, .off = at, .size = WEIGHT, .dtype = 'u'};
+      scales[e * 3 + k] = (Tensor){.fd = fd, .off = at + WEIGHT, .size = SCALES, .dtype = '8'};
+      *m[k] = (Linear){.rows = 64, .cols = 64, .kind = 'n', .scale = .125f, .input_scale = 1};
+    }
+  }
   static MemoryAccount account;
   memory_account_init(&account, "held-expert fixture");
   WeightSet *core = weights_new(&account, "held-expert backbone");
-  WeightCache cache = {0};
-  Expert fake[3] = {0};
+  const Expert *layers[] = {fake};
+  static ExpertFiles files;
+  experts_files(&files, weight, scales, exceptions, layers, 1, 3);
+  ExpertStore *store = cache_create(&(ExpertLayout){.layers = 1, .scored_layers = 1, .experts = 3, .chosen = 2,
+                                                    .parts = files.parts, .span = files.span, .spans = files.spans});
+  cache_memory(store, weights_slot(core));
+  cache_working_rows(store, 1);
+  cache_init(store, 0, 1);
+  cache_active(store, 0);  // an idle model: only holds keep its slots from the memory pool
   ExpertWork w = {0};
   experts_init(&w, 64, 64, 3, 2, EXPERT_SWIGLU, EXPERT_SUM_BF16);
   experts_workspace(&w, 1, 1);
+  experts_store(&w, store, &files);
   Buf x = gpu_alloc(64 * 4), a = gpu_alloc(64 * 4), b = gpu_alloc(64 * 4);
   Buf table = gpu_alloc(3 * sizeof(ExpertGroup)), selected = gpu_alloc(8), coefficients = gpu_alloc(8);
   Buf unique = gpu_alloc(4);
   for (int i = 0; i < 64; i++) ((float *)x.ptr)[i] = .015625f;
   ((uint32_t *)selected.ptr)[0] = 1; ((uint32_t *)selected.ptr)[1] = 0;
   ((float *)coefficients.ptr)[0] = .25f; ((float *)coefficients.ptr)[1] = .75f;
-  for (int e = 0; e < 3; e++) {
-    fake[e].weights = weights_cached(core, &cache, "held expert");
-    Linear *m[] = {&fake[e].gate, &fake[e].up, &fake[e].down};
-    for (int k = 0; k < 3; k++) {
-      *m[k] = (Linear){.rows = 64, .cols = 64, .kind = 'n', .scale = .125f, .input_scale = 1};
-      unsigned char value = 0x11 + e, scale = 0x38;
-      weights_generated(fake[e].weights, &m[k]->w, 2048, fill_weight, &value, 1);
-      weights_generated(fake[e].weights, &m[k]->s, 256, fill_weight, &scale, 1);
-    }
-    if (!weights_load(fake[e].weights)) return 0;
-  }
-  experts_table(&w, fake, 0, &table, 0);
-  if (!experts_acquire(&w, fake, 0, (uint32_t *)selected.ptr, (float *)coefficients.ptr, 1, 0, &cache.stats))
-    return 0;
+  // Every expert read, mapped and committed: the layer runs through its table.
+  int all[] = {0, 1, 2}, fresh;
+  uint32_t at[STORE_PARTS];
+  uint64_t generation;
+  cache_hold(store, 0, all, 3);
+  cache_wait(store, 0, all, 3);
+  for (int e = 0; e < 3; e++) cache_get(store, 0, e, at, &fresh);
+  cache_unhold(store, 0, all, 3);
+  cache_adapt(store);
+  int ready = cache_layer_ready(store, 0, &generation) && experts_table(&w, fake, 0, &table, 0);
+  experts_acquire(&w, fake, 0, (uint32_t *)selected.ptr, (float *)coefficients.ptr, 1, 0, cache_counters(store));
   gpu_begin();
   experts_encode(&w, fake, &x); experts_sum(&w, &a);
   experts_resident(&w, &table, 0, &selected, &coefficients, &x, &unique, 0, 1, 0);
   experts_sum(&w, &b);
   gpu_commit();
-  memory_reclaim(cache.bytes);
-  int held = memory_ready(weights_slot(fake[0].weights)) && memory_ready(weights_slot(fake[1].weights)) &&
-             !memory_ready(weights_slot(fake[2].weights));
+  memory_reclaim(cache_bytes(store));
+  int held = cache_slot(store, 0, 0) && cache_slot(store, 0, 1) && !cache_slot(store, 0, 2);
   gpu_sync();
   int equal = !memcmp(a.ptr, b.ptr, a.size);
   ((uint32_t *)selected.ptr)[0] = 2;
-  if (!experts_acquire(&w, fake, 0, (uint32_t *)selected.ptr, (float *)coefficients.ptr, 1, 0, &cache.stats))
-    return 0;
-  memory_reclaim(cache.bytes);
-  int replaced = memory_ready(weights_slot(fake[0].weights)) && !memory_ready(weights_slot(fake[1].weights)) &&
-                 memory_ready(weights_slot(fake[2].weights));
+  experts_acquire(&w, fake, 0, (uint32_t *)selected.ptr, (float *)coefficients.ptr, 1, 0, cache_counters(store));
+  memory_reclaim(cache_bytes(store));
+  int replaced = cache_slot(store, 0, 0) && !cache_slot(store, 0, 1) && cache_slot(store, 0, 2);
   gpu_begin(); experts_encode(&w, fake, &x); experts_sum(&w, &a); gpu_commit(); gpu_sync();
   experts_release(&w);
-  memory_reclaim(cache.bytes);
-  int released = !cache.slots && !cache.bytes;
-  for (int e = 0; e < 3; e++) weights_free(fake[e].weights);
+  memory_reclaim(cache_bytes(store));
+  int released = !cache_slots(store);
+  close(fd);
   weights_free(core);
   Buf *buffers[] = {&w.plan, &w.entries, &w.order, &w.groups, &w.row_groups, &w.tiles, &w.input, &w.second,
                     &w.hidden_values, &w.quantized, &w.output, &x, &a, &b, &table, &selected, &coefficients, &unique};
   for (size_t i = 0; i < sizeof buffers / sizeof *buffers; i++) gpu_free(buffers[i]);
-  printf("held selection: survives resident planning=%d, output equal=%d, next selection=%d, released=%d\n",
-         held, equal, replaced, released);
-  return held && equal && replaced && released;
-}
-static int packed_weights(void) {
-  static MemoryAccount account;
-  memory_account_init(&account, "expert fixture");
-  WeightSet *core = weights_new(&account, "backbone fixture");
-  WeightCache cache = {0};
-  WeightSet *expert = weights_cached(core, &cache, "expert fixture");
-  WeightPresence presence = {0};
-  weights_track(expert, &presence);
-  Buf backbone = {0}, a = {0}, b = {0};
-  unsigned char one = 0x35, two = 0xa9;
-  weights_generated(core, &backbone, 256, fill_weight, &one, 1);
-  weights_generated(expert, &a, 257, fill_weight, &one, 1);
-  weights_generated(expert, &b, 700, fill_weight, &two, 1);
-  if (!weights_load(core)) return 0;
-  memory_pin(weights_slot(core), 1);
-  for (int pass = 0; pass < 2; pass++) {
-    if (!weights_load(expert)) return 0;
-    int shared = a.obj == b.obj && b.off >= a.off + a.size;
-    int values = a.size == 257 && b.size == 700;
-    for (size_t i = 0; i < a.size; i++) values &= a.ptr[i] == one;
-    for (size_t i = 0; i < b.size; i++) values &= b.ptr[i] == two;
-    int charged = cache.slots == 1 && cache.bytes == gpu_allocation_size(512 + 700) &&
-                   presence.count == 1 && presence.generation == (unsigned)(pass * 2 + 1);
-    printf("expert allocation pass %d: shared=%d, values=%d, single charge=%d\n", pass, shared, values, charged);
-    if (!shared || !values || !charged) return 0;
-    memory_reclaim(cache.bytes);
-    if (cache.slots || cache.bytes || a.obj || b.obj || presence.count ||
-        presence.generation != (unsigned)(pass * 2 + 2)) return 0;
-  }
-  memory_pin(weights_slot(core), 0);
-  weights_free(expert);
-  weights_free(core);
-  return 1;
+  printf("held selection: table ready=%d, survives resident planning=%d, output equal=%d, next selection=%d, "
+         "released=%d\n", ready, held, equal, replaced, released);
+  return ready && held && equal && replaced && released;
 }
 
 static double prompt_product(int kernel, int tile, int rows, const Buf *x, const Buf *out, int repeats) {
@@ -366,5 +319,5 @@ int main(int argc, char **argv) {
       if (!resident_groups(n, relu, 2)) return 1;
     }
   }
-  return packed_weights() && held_selection() && prompt_tiles() && failed_batch(argv[0]) ? 0 : 1;
+  return held_selection() && prompt_tiles() ? 0 : 1;
 }
