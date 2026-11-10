@@ -594,25 +594,68 @@ static size_t state_bytes(const ModelState *state, int positions) {
   return gpu_allocation_size(gdn_bytes()) + gpu_allocation_size(conv_bytes()) + gpu_allocation_size(ple_bytes()) +
          gpu_allocation_size(kv_bytes(cap)) + index_bytes(cap) + tail_bytes() + (size_t)cap * 3 * 4;
 }
+// The rows state_copy copies: each attention layer's keys, then its values,
+// then each one's index keys (one per completed block of 4 positions), then
+// the positions' M-RoPE coordinates. With fill, s first takes that many
+// positions.
+static int state_regions(ModelState *state, int positions, int fill, StateRegion *out) {
+  FlashState *s = (FlashState *)state;
+  if (fill) reserve_state(s, positions), s->pos = positions;
+  else if (positions < 0 || positions > s->cap) die("flash: the rows of %d positions of a state of %d", positions, s->cap);
+  gpu_sync();
+  size_t row = (size_t)f.kv_heads * f.head_dim * 2;
+  int n = 0;
+  for (int l = 0; l < 2 * f.attention; l++)
+    out[n++] = (StateRegion){s->kv.ptr + (size_t)l * s->cap * row, (uint32_t)row, 1, 0, 0};
+  for (int l = 0; l < f.attention; l++)
+    out[n++] = (StateRegion){s->index + (size_t)l * ((s->cap + 3) / 4) * 128, 128 * 4, 4, 0, 0};
+  out[n++] = (StateRegion){s->positions, 3 * 4, 1, 0, 0};
+  return n;
+}
 static void state_copy(ModelState *to, const ModelState *from, int positions) {
   FlashState *d = (FlashState *)to;
   const FlashState *s = (const FlashState *)from;
-  reserve_state(d, positions);
-  gpu_sync();
+  StateRegion dr[STATE_REGIONS_MAX], sr[STATE_REGIONS_MAX];
+  int n = state_regions(to, positions, 1, dr);
+  state_regions((ModelState *)from, positions, 0, sr);
   memcpy(d->gdn.ptr, s->gdn.ptr, gdn_bytes());
   memcpy(d->conv.ptr, s->conv.ptr, conv_bytes());
   memcpy(d->ple.ptr, s->ple.ptr, ple_bytes());
   memcpy(d->tail, s->tail, tail_bytes());
-  size_t row = (size_t)f.kv_heads * f.head_dim * 2;
-  for (int l = 0; l < 2 * f.attention; l++)
-    memcpy(d->kv.ptr + (size_t)l * d->cap * row, s->kv.ptr + (size_t)l * s->cap * row, (size_t)positions * row);
-  for (int l = 0; l < f.attention; l++)
-    memcpy(d->index + (size_t)l * ((d->cap + 3) / 4) * 128, s->index + (size_t)l * ((s->cap + 3) / 4) * 128,
-           (size_t)(positions / 4) * 128 * 4);
-  memcpy(d->positions, s->positions, (size_t)positions * 3 * 4);
-  d->pos = positions;
+  regions_copy(dr, sr, n, positions);
   d->rope_delta = s->rope_delta;
   memcpy(d->previous, s->previous, sizeof d->previous);
+}
+// A snapshot's recurrent states, convolution rows, PLE history, index tail
+// and logits, or a state's as at pos; its integers: position, rope_delta and
+// the two previous tokens.
+static int snapshot_parts(ModelSnapshot *snap, ModelState *state, int pos, SnapshotPart *out, int32_t *meta, int *nmeta) {
+  FlashSnapshot *x = (FlashSnapshot *)snap;
+  FlashState *s = (FlashState *)state;
+  if (!x && pos != s->pos) return -1;  // its rolling rows are as at its own position only
+  gpu_sync();
+  Buf *gdn = x ? &x->gdn : &s->gdn, *conv = x ? &x->conv : &s->conv, *ple = x ? &x->ple : &s->ple;
+  const int *previous = x ? x->previous : s->previous;
+  meta[0] = x ? x->pos : pos, meta[1] = x ? x->rope_delta : s->rope_delta, meta[2] = previous[0], meta[3] = previous[1];
+  *nmeta = 4;
+  int n = 0;
+  out[n++] = (SnapshotPart){gdn->ptr, gdn_bytes()};
+  out[n++] = (SnapshotPart){conv->ptr, conv_bytes()};
+  out[n++] = (SnapshotPart){ple->ptr, ple_bytes()};
+  out[n++] = (SnapshotPart){x ? x->tail : s->tail, tail_bytes()};
+  if (x && x->logits) out[n++] = (SnapshotPart){x->logits, (size_t)f.vocab * 4};
+  return n;
+}
+static ModelSnapshot *snapshot_alloc(const int32_t *meta, int nmeta, int with_logits) {
+  if (nmeta != 4) return NULL;
+  FlashSnapshot *x = xmalloc(sizeof *x);
+  x->gdn = gpu_alloc_kv(gdn_bytes());
+  x->conv = gpu_alloc_kv(conv_bytes());
+  x->ple = gpu_alloc_kv(ple_bytes());
+  x->tail = memory_host_required(tail_bytes(), 1);
+  x->pos = meta[0], x->rope_delta = meta[1], x->previous[0] = meta[2], x->previous[1] = meta[3];
+  if (with_logits) x->logits = memory_host_required((size_t)f.vocab * 4, 1);
+  return (ModelSnapshot *)x;
 }
 static ModelSnapshot *snapshot_take(ModelState *state, int pos, int with_logits) {
   FlashState *s = (FlashState *)state;
@@ -1490,6 +1533,10 @@ const ModelOps flash_ops = {.family = "Qwen3.8 Flash-Next",
                             .snapshot_free = snapshot_free,
                             .snapshot_bytes = snapshot_bytes,
                             .snapshot_logits = snapshot_logits,
+                            .state_version = 1,
+                            .state_regions = state_regions,
+                            .snapshot_parts = snapshot_parts,
+                            .snapshot_alloc = snapshot_alloc,
                             .prefill = prefill,
                             .replay_rows = replay_rows,
                             .replay_start = replay_start,

@@ -8,6 +8,8 @@
 // and their states runs on one thread: the GPU code keeps state per thread,
 // and a family's buffers are its own.
 #pragma once
+#include <string.h>
+
 #include "myds4.h"
 #include "../engine/memory.h"
 
@@ -41,6 +43,35 @@ typedef struct {
 
 typedef struct ModelState ModelState;        // one sequence: a family's own state
 typedef struct ModelSnapshot ModelSnapshot;  // a state's rolling part at one position
+
+// One append-only array of a state's rows, which state_copy copies and saved
+// states hold (src/engine/state_file.c): row 0 at data, unit bytes a row. A
+// state of p positions holds its first (p - lag) / ratio + guard rows (none
+// while p < lag), and the rows before (p - lag) / ratio do not change at
+// later positions: a guard row is computed again where the state continues
+// (the last of a compressed pair; with lag 1, a row that needs the next
+// position's token, as Qwen's MTP keys).
+typedef struct {
+  void *data;
+  uint32_t unit, ratio, guard, lag;
+} StateRegion;
+// One part of a snapshot's bytes, in its family's order.
+typedef struct {
+  void *data;
+  size_t bytes;
+} SnapshotPart;
+enum { STATE_REGIONS_MAX = 128, SNAPSHOT_PARTS_MAX = 160, SNAPSHOT_META_MAX = 8 };
+static inline int64_t region_stable(const StateRegion *r, int positions) {
+  return positions < (int)r->lag ? 0 : (positions - (int)r->lag) / r->ratio;
+}
+static inline int64_t region_rows(const StateRegion *r, int positions) {
+  return positions < (int)r->lag ? 0 : region_stable(r, positions) + r->guard;
+}
+// The rows before `positions` of n regions, src's into dst's (both listed for
+// that many positions).
+static inline void regions_copy(const StateRegion *dst, const StateRegion *src, int n, int positions) {
+  for (int i = 0; i < n; i++) memcpy(dst[i].data, src[i].data, (size_t)region_rows(&src[i], positions) * src[i].unit);
+}
 
 // A model's counters since it loaded, for the server's status. The expert
 // cache's (io.c) belong to a model with routed experts (experts_per_row > 0).
@@ -108,6 +139,25 @@ typedef struct {
   void (*snapshot_free)(ModelSnapshot *x);
   size_t (*snapshot_bytes)(int with_logits);
   const float *(*snapshot_logits)(const ModelSnapshot *x);  // null without
+
+  // Saved states (src/engine/state_file.c). The layout of the regions and
+  // snapshot parts below: a saved state of another version is not read.
+  int state_version;
+  // s's regions for `positions` positions (at most STATE_REGIONS_MAX), the
+  // arrays state_copy copies. With fill, s is first made to take them: it
+  // holds `positions` positions and continues as after a state_copy of that
+  // many, until a snapshot is restored into it (or a replay rebuilds the
+  // rest). Returns the count.
+  int (*state_regions)(ModelState *s, int positions, int fill, StateRegion *out);
+  // The parts of snapshot x, or (x null) of state s's rolling rows as at pos,
+  // in one order (at most SNAPSHOT_PARTS_MAX; a snapshot's logits, if it has
+  // them, last), and its integers in meta (at most SNAPSHOT_META_MAX; *nmeta
+  // gets their count). Returns the part count, or -1 when s's rolling rows
+  // cannot be as at pos (a family whose state knows its own position).
+  int (*snapshot_parts)(ModelSnapshot *x, ModelState *s, int pos, SnapshotPart *out, int32_t *meta, int *nmeta);
+  // An empty snapshot with those integers, for its parts to be read into;
+  // null when they do not suit the model.
+  ModelSnapshot *(*snapshot_alloc)(const int32_t *meta, int nmeta, int with_logits);
 
   // Prefills positions from .. n - 1 of a prompt (tokens: all n of them) in
   // s and returns the last one's logits. With replay the state holds only the

@@ -1,6 +1,8 @@
 //! A Qwen3.8 model through HTTP: what the worker
 //! keeps of a request that ends early, the token budget and the context's end
-//! with drafts and without, and a Qwen model served beside DeepSeek.
+//! with drafts and without, a Qwen model served beside DeepSeek, and (with
+//! MYDS4_FLASH) a Flash-Next conversation continued from its state saved on
+//! the SSD at quit.
 //!
 //! It runs only when MYDS4_QWEN names a Qwen3.8 checkpoint directory, one
 //! model process at a time:
@@ -79,6 +81,11 @@ impl Server {
             .map(PathBuf::from)
             .unwrap_or_else(|_| root().join("build/myds4-server"));
         args.extend(["--serve".to_string(), port.to_string()]);
+        // no saved states unless a test gives their folder: a baseline stays
+        // cold, and nothing is written to the SSD
+        if !args.iter().any(|a| a == "--kv-dir") {
+            args.extend(["--kv-disk".to_string(), "0".to_string()]);
+        }
         let mut child = Command::new(server)
             .args(&args)
             .env("MYDS4_API_KEY", &key)
@@ -1121,6 +1128,56 @@ fn vision_distinguishes_images_and_reuses_a_conversation_with_mtp() {
             ask.join().unwrap();
         }
     });
+}
+
+/// Flash-Next keeps no rewind margin: a conversation continues after a reply
+/// only from a snapshot at its state's end. A state saved at quit holds one,
+/// written from the state itself; after a restart the next turn continues
+/// from it as the state in memory does, with the same reuse and reply.
+#[test]
+fn flash_continues_after_a_reply_from_the_state_saved_at_quit() {
+    let Ok(dir) = std::env::var("MYDS4_FLASH") else {
+        return;
+    };
+    let _one = one_model();
+    let folder = std::env::temp_dir().join(format!("myds4-qwen-kv-disk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    let flags = ["--ctx", "8192", "--draft", "0", "--memory", "32"];
+    let saving = [&flags[..], &["--kv-dir", folder.to_str().expect("a UTF-8 path"), "--kv-disk-tokens", "256"]].concat();
+    let first = json!([{"role": "system", "content": long_system(60)}, {"role": "user", "content": "Name three fruits."}]);
+    let next = |reply: &Value| {
+        json!([
+            first[0], first[1], {"role": "assistant", "content": content(reply)},
+            {"role": "user", "content": "Now name three vegetables, in one line."}
+        ])
+    };
+    // the reference: the conversation in memory
+    let (reply, reference) = {
+        let s = Server::start(&dir, &flags);
+        let reply = s.chat(&body(first.clone(), 24, false));
+        let reference = s.chat(&body(next(&reply), 24, false));
+        (reply, reference)
+    };
+    {
+        let s = Server::start(&dir, &saving);
+        let again = s.chat(&body(first.clone(), 24, false));
+        assert_eq!(content(&again), content(&reply), "the first turn as on the reference server");
+    } // stopped: its state is saved
+    let s = Server::start(&dir, &saving);
+    let resumed = s.chat(&body(next(&reply), 24, false));
+    let hit = |a: &Value| a["usage"]["prompt_cache_hit_tokens"].as_i64().unwrap_or(-1);
+    eprintln!(
+        "in memory: {} reused, {:?}\nfrom the SSD: {} reused, {:?}",
+        hit(&reference),
+        content(&reference),
+        hit(&resumed),
+        content(&resumed)
+    );
+    drop(s);
+    let _ = std::fs::remove_dir_all(&folder);
+    assert!(hit(&reference) > 0, "the reference continued in memory");
+    assert_eq!(hit(&resumed), hit(&reference), "the saved end resumes where the state in memory does");
+    assert_eq!(content(&resumed), content(&reference), "the reply as from memory");
 }
 
 #[test]

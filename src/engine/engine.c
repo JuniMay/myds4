@@ -16,6 +16,7 @@
 
 #include "engine.h"
 #include "myds4.h"
+#include "state_file.h"
 #include "../model/model.h"
 #include "../model/draft.h"
 
@@ -30,6 +31,8 @@ struct myds4_model {
   Options opt;
   char *dir;
   atomic_int loaded;
+  uint8_t identity[32];  // myds4_state_identity's, once known
+  int identified;
 };
 
 struct myds4_media {
@@ -63,6 +66,8 @@ int myds4_init(const myds4_process *p) {
 }
 
 int myds4_stopping(void) { return shutdown_requested(); }
+
+int myds4_stop_requests(void) { return shutdown_requests(); }
 
 void myds4_request_stop(void) { shutdown_request(); }
 
@@ -193,6 +198,58 @@ void myds4_snapshot_restore(myds4_model *m, myds4_state *s, const myds4_snapshot
 void myds4_snapshot_free(myds4_model *m, myds4_snapshot *x) { m->ops->snapshot_free(x); }
 size_t myds4_snapshot_bytes(const myds4_model *m, int with_logits) { return m->ops->snapshot_bytes(with_logits); }
 const float *myds4_snapshot_logits(const myds4_model *m, const myds4_snapshot *x) { return m->ops->snapshot_logits(x); }
+
+// ---- saved states ----
+
+int64_t myds4_state_write(myds4_model *m, myds4_state *s, int from, int to, int fd) {
+  memory_scope(&m->m->work);
+  return state_file_write(m->ops, s, from, to, fd);
+}
+int myds4_state_read(myds4_model *m, myds4_state *s, int positions, const int *fds, int count) {
+  memory_scope(&m->m->work);
+  return state_file_read(m->ops, s, positions, fds, count);
+}
+int64_t myds4_snapshot_write(myds4_model *m, const myds4_snapshot *x, myds4_state *s, int pos, int fd) {
+  memory_scope(&m->m->work);
+  return snapshot_file_write(m->ops, (myds4_snapshot *)x, s, pos, fd);
+}
+myds4_snapshot *myds4_snapshot_read(myds4_model *m, int fd) {
+  memory_scope(&m->m->work);
+  return snapshot_file_read(m->ops, fd);
+}
+
+static void identity_number(CC_SHA256_CTX *h, int64_t v) { CC_SHA256_Update(h, &v, sizeof v); }
+
+void myds4_state_identity(myds4_model *m, uint8_t out[32]) {
+  if (!m->identified) {
+    CC_SHA256_CTX h;
+    CC_SHA256_Init(&h);
+    static const char tag[] = "myds4 saved state";
+    CC_SHA256_Update(&h, tag, sizeof tag);
+    CC_SHA256_Update(&h, m->ops->family, (CC_LONG)strlen(m->ops->family) + 1);
+    identity_number(&h, m->ops->state_version);
+    identity_folder(&h, m->dir);
+    identity_number(&h, m->opt.draft);
+    identity_number(&h, m->opt.lookup);
+    if (m->ops == &deepseek_ops) {
+      const DeepSeekOptions *d = &m->opt.deepseek;
+      uint32_t substitute;
+      memcpy(&substitute, &d->substitute, sizeof substitute);
+      identity_number(&h, d->ced);
+      identity_number(&h, d->prefill_prune);
+      identity_number(&h, substitute);
+      identity_number(&h, d->experts != NULL);
+      if (d->experts) identity_gguf_set(&h, d->experts);
+    }
+    if (m->ops == &nemotron_ops) {
+      identity_number(&h, m->opt.nemotron.draft_model != NULL);
+      if (m->opt.nemotron.draft_model) identity_folder(&h, m->opt.nemotron.draft_model);
+    }
+    CC_SHA256_Final(m->identity, &h);
+    m->identified = 1;
+  }
+  memcpy(out, m->identity, 32);
+}
 
 // ---- running a model ----
 

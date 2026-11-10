@@ -414,21 +414,55 @@ static size_t state_bytes(const ModelState *state, int positions) {
   return (nm.draft_depth + 1) * (gpu_allocation_size(recurrent_bytes()) + gpu_allocation_size(convolution_bytes())) +
          gpu_allocation_size(kv_bytes(cap)) + (nm.draft ? gpu_allocation_size(dflash_kv_bytes(cap)) : 0);
 }
+// The rows state_copy copies: each attention layer's keys, then its values,
+// and with DFlash2 its 12 key and value planes. With fill, s first takes
+// that many positions.
+static int state_regions(ModelState *state, int positions, int fill, StateRegion *out) {
+  State *s = (State *)state;
+  if (fill) reserve(s, positions), s->pos = positions;
+  else if (positions < 0 || positions > s->cap) die("nemotron: the rows of %d positions of a state of %d", positions, s->cap);
+  gpu_sync();
+  size_t row = (size_t)nm.kv_heads * nm.head_dim * 2;
+  int n = 0;
+  for (int l = 0; l < 2 * nm.attention; l++)
+    out[n++] = (StateRegion){s->kv.ptr + (size_t)l * s->cap * row, (uint32_t)row, 1, 0, 0};
+  for (int l = 0; nm.draft && l < 12; l++)
+    out[n++] = (StateRegion){s->draft_kv.ptr + (size_t)l * s->cap * row, (uint32_t)row, 1, 0, 0};
+  return n;
+}
 static void state_copy(ModelState *destination, const ModelState *source, int positions) {
   State *d = (State *)destination;
   const State *s = (const State *)source;
-  reserve(d, positions);
-  gpu_sync();
+  StateRegion dr[STATE_REGIONS_MAX], sr[STATE_REGIONS_MAX];
+  int n = state_regions(destination, positions, 1, dr);
+  state_regions((ModelState *)source, positions, 0, sr);
   memcpy(d->state.ptr, s->state.ptr, recurrent_bytes());
   memcpy(d->conv.ptr, s->conv.ptr, convolution_bytes());
-  size_t row = (size_t)nm.kv_heads * nm.head_dim * 2;
-  for (int l = 0; l < 2 * nm.attention; l++)
-    memcpy(d->kv.ptr + (size_t)l * d->cap * row, s->kv.ptr + (size_t)l * s->cap * row, (size_t)positions * row);
-  if (nm.draft)
-    for (int l = 0; l < 12; l++)
-      memcpy(d->draft_kv.ptr + (size_t)l * d->cap * row, s->draft_kv.ptr + (size_t)l * s->cap * row,
-             (size_t)positions * row);
-  d->pos = positions;
+  regions_copy(dr, sr, n, positions);
+}
+// A snapshot's recurrent state, convolution rows and logits, or a state's as
+// at pos; its integer: the position.
+static int snapshot_parts(ModelSnapshot *snapshot, ModelState *state, int pos, SnapshotPart *out, int32_t *meta,
+                          int *nmeta) {
+  Snapshot *x = (Snapshot *)snapshot;
+  State *s = (State *)state;
+  if (!x && pos != s->pos) return -1;  // its rolling rows are as at its own position only
+  gpu_sync();
+  meta[0] = x ? x->pos : pos, *nmeta = 1;
+  int n = 0;
+  out[n++] = (SnapshotPart){x ? x->state.ptr : s->state.ptr, recurrent_bytes()};
+  out[n++] = (SnapshotPart){x ? x->conv.ptr : s->conv.ptr, convolution_bytes()};
+  if (x && x->logits) out[n++] = (SnapshotPart){x->logits, (size_t)nm.vocab * 4};
+  return n;
+}
+static ModelSnapshot *snapshot_alloc(const int32_t *meta, int nmeta, int with_logits) {
+  if (nmeta != 1) return NULL;
+  Snapshot *x = xmalloc(sizeof *x);
+  x->state = gpu_alloc_kv(recurrent_bytes());
+  x->conv = gpu_alloc_kv(convolution_bytes());
+  x->pos = meta[0];
+  if (with_logits) x->logits = memory_host_required((size_t)nm.vocab * 4, 1);
+  return (ModelSnapshot *)x;
 }
 static ModelSnapshot *snapshot_take(ModelState *state, int position, int logits) {
   State *s = (State *)state;
@@ -1008,6 +1042,10 @@ const ModelOps nemotron_ops = {.family = "Nemotron 3.5 Transcribe",
                                .snapshot_free = snapshot_free,
                                .snapshot_bytes = snapshot_bytes,
                                .snapshot_logits = snapshot_logits,
+                               .state_version = 1,
+                               .state_regions = state_regions,
+                               .snapshot_parts = snapshot_parts,
+                               .snapshot_alloc = snapshot_alloc,
                                .prefill = prefill,
                                .replay_rows = replay_rows,
                                .replay_start = replay_start,

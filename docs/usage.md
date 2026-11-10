@@ -23,6 +23,9 @@ The root contains server settings and a nonempty `models` list:
 | `memory` | Optional upper limit of model memory in GiB: all loaded weights, experts, vision and model workspaces; KV is separate. Default 0: no limit; the memory that other programs leave decides (see [Memory](#memory)). |
 | `reserve` | Memory kept available to other programs, in GiB; default 10, range 2–1024. |
 | `kv_cache` | One budget for all models' attention states and snapshots, in GiB; default 8. Experts use the part that KV does not occupy. |
+| `kv_disk` | Room on the SSD for saved states, in GiB; default 32, 0 turns saving and reading off (see [Saved states](#saved-states)). |
+| `kv_dir` | The saved states' folder; default `~/.cache/myds4/kv` (from `HOME`). |
+| `kv_disk_tokens` | A state is saved only when it holds at least this many tokens that no other kept state holds; default 8,192. |
 | `idle_unload` | Seconds a model may go without requests before its weights and experts unload; default 600, range 0–1,000,000, 0 never. A model's own `idle_unload` overrides it (see [Memory](#memory)). |
 | `models` | Each model's checkpoint and inference settings. |
 
@@ -172,6 +175,9 @@ it end as a shutdown. Weights that a pass loads (routed experts, vision
 weights) complete with their pass first. A DeepSeek prompt's prefill stops
 before its next batch of up to 8,192 rows, and its request ends as a shutdown;
 other models' prefills stop between the calls the server makes for them.
+Then the server saves its states to the SSD (see [Saved states](#saved-states));
+a second Ctrl-C, SIGTERM or `q` ends the saving, and the states not saved yet
+are lost.
 
 Prefill uses chunks that fit available model workspace. A long prompt does
 not require its entire working buffer at once. If the smallest supported
@@ -183,11 +189,94 @@ The KV pool evicts spare snapshots and then idle states across all models
 in least-recently-used order. Prefix matching never crosses model
 boundaries. Admission accounts for state growth and promised snapshots.
 An active generation may exceed the budget when only active states remain;
-this is logged. New requests must fit before they are admitted.
+this is logged. New requests must fit before they are admitted. A prompt
+whose cheapest resume would keep a state that does not fit beside its own
+takes the next cheapest, down to a cold start in that state's place; only a
+prompt that does not fit even then is refused.
 
 Context capacity is allocated as it grows. With MTP, a full 256K Qwen
 state takes about 17.3 GiB before snapshots. Configuring eight concurrent
 requests does not reserve or guarantee memory for eight such states.
+
+### Saved states
+
+A state that leaves memory is saved to the SSD, in `kv_dir`, within
+`kv_disk`; a later prompt that starts like it reads it back instead of
+prefilling that part again.
+
+- **When a state is saved.** When the KV pool evicts it, and at quit for
+  every state still in memory, the most recently used first. A state is
+  saved only when it holds at least `kv_disk_tokens` (8,192) tokens that no
+  other state kept in memory and no saved state holds; an older turn of a
+  conversation whose newer turn is kept is not written. A state whose
+  prefill or decoding pass the stop cut short is not saved.
+- **What is written.** The state's rows, its newest prompt-end snapshot
+  (with the logits of the prompt's next token), its newest branch
+  snapshot, and its end: the rolling rows where the conversation stands, so
+  that the next turn continues there also for Qwen, Flash-Next and Nemotron,
+  which keep no rewind margin. A state that was itself read from a saved
+  state writes only its rows from where it parted from it, as one more part
+  of that saved state, when the saved state holds fewer than
+  `kv_disk_tokens` tokens after that point; otherwise it is written as a new
+  saved state, and the old one keeps its own tokens. A saved state whose
+  replaced rows would outnumber its own is written whole once more.
+- **When a state is read.** A prompt resumes from a saved state as from a
+  state in memory: at the longest prefix they share, from a snapshot there
+  or (DeepSeek) with a replay. A state in memory, and a cold prefill, go
+  first when they cost as much. The log names each read (`req N: P
+  positions of saved state S read in T s`). A saved state that is damaged
+  or missing a file is deleted, and the request is planned again without
+  it; one whose files cannot be opened at the moment (their permissions,
+  too many open files) stays, and only that request does without it.
+- **Which states are read.** A saved state belongs to its model's checkpoint
+  and settings: the `config.json`, `.safetensors` and `.gguf` files of the
+  checkpoint folder (by name, size and their first and last 64 KiB), the
+  `experts` GGUF set, the DFlash2 checkpoint, and `draft`, `lookup`, `ced`,
+  `prefill_prune` and `substitute`. It is read after a rebuild of the server
+  as long as these are unchanged; a rebuild whose kernels compute
+  differently then continues it from rows the old build computed. Saved
+  states of another checkpoint or other settings stay until their room is
+  needed, and go first then.
+- **Room.** The least recently used saved states go first to keep within
+  `kv_disk`; a state is saved in the room of states used before it only,
+  so a quit does not replace newer saved states with older ones; they are
+  deleted once the new one is written, so a save that fails takes no room. A
+  save that would leave less than 10 GiB free on the volume is skipped. The log
+  names every save and skip with its tokens, GiB and seconds; the terminal
+  interface's KV cache tab shows the saved states and the GiB written since
+  the start.
+- **SSD writes.** A state's rows take per position: DeepSeek 3.1 KiB, Qwen
+  27B 68 KiB, Flash-Next 25.5 KiB, Nemotron 12 KiB with DFlash2; its end
+  snapshot about 5.6 MiB (DeepSeek), 157 MB (Qwen 27B), 120 MB (Flash-Next)
+  or 50 MB (Nemotron). A conversation's first save writes all its rows; its
+  later saves write the rows added since and its snapshots. A quit writes
+  at most what `kv_cache` holds. Files are written past the page cache
+  (`F_NOCACHE`), on the engine thread between passes: decoding pauses while
+  a state is written.
+- **Measured speeds.** On an M5 Max with 128 GB, on AC power, one request at
+  a time through the server with `--batch 1`:
+  - Qwen 27B (`--memory 40 --draft 0`): a 14,533-token state wrote 1.18 GiB
+    in 0.25 s (4.7 GiB/s) and read back 1.03 GiB in 0.12 s (8.6 GiB/s). Its
+    prompt was answered 0.14 s after it arrived, against 22.9 s cold.
+  - DeepSeek (UD-IQ1_M experts, `--memory 56`): a 14,255-token state wrote
+    0.05 GiB in 0.02 s and read back in 0.01 s. Its prompt was answered in
+    0.10 s, against 24.3 s cold.
+  - Saved states cost decoding nothing while none is written or read. DeepSeek
+    (the same settings, a 27-token prompt, 256 tokens) decoded at 22.3 and
+    22.5 tokens/s with them on, and 22.2 and 22.5 with `kv_disk: 0`, with the
+    same text.
+- **The folder.** Each saved state is an index (`ID.kv`), its parts
+  (`ID-N.rows`) and its snapshots (`ID-V-POS.snap`); each file is written
+  under a temporary name, synced and renamed, the index last. At start the
+  server reads the indexes and deletes damaged ones and files of these
+  names that no index names; it deletes no other files, and keeps the
+  indexes of another version of the server, with their files. One server uses a
+  folder at a time (a lock on its `lock` file): another starts without saved
+  states and logs why. The folder is made with mode 0700, the files 0600.
+- **Privacy.** Saved states hold the token ids of the prompts and replies,
+  so the conversations stay on the SSD as long as their saved states do. To
+  remove them, stop the server and delete the folder; `kv_disk: 0` saves and
+  reads nothing.
 
 ## API
 
@@ -195,7 +284,7 @@ requests does not reserve or guarantee memory for eight such states.
 | --- | --- |
 | `GET /health` | Server health. Does not load model weights. |
 | `GET /v1/models` | Registered model IDs and context limits. Does not load model weights. |
-| `GET /v1/models/{id}` | Model metadata and status, including `loaded`, memory and queue information. |
+| `GET /v1/models/{id}` | Model metadata and status, including `loaded`, memory and queue information, and `kv_disk`: the saved states' folder, count, GiB and budget and this run's loads, saves and GiB written (null without saved states). |
 | `POST /v1/chat/completions` | Generate with the model named in the request. Its first request loads its weights. |
 | `GET /v1/control` | Process-wide execution state, effective budgets and retained model/KV bytes. |
 | `POST /v1/control/yield` | Pause inference and reclaim to temporary budgets. |
@@ -325,7 +414,11 @@ Keys 1–6 select Overview, KV cache, Experts, Last minute, Log and Memory.
 With several models, the Overview, KV cache, Experts and Last minute tabs
 show one model at a time, and `n` selects the next. The KV cache tab lists
 every model with its sessions and their KV at its top; a click there shows
-that model's sessions. The Log and Memory tabs cover every model.
+that model's sessions. Below it a line counts the requests by how they
+resumed (new, continued, saved, forked, loaded from the SSD) and, with saved
+states, another shows them: how many, their GiB of `kv_disk`, this run's
+reads and saves, the GiB written, and the folder. The Log and Memory tabs
+cover every model.
 
 The Experts tab maps a decoding request's experts in each layer with routed
 experts, for DeepSeek, Flash-Next and Transcribe alike: each expert of its

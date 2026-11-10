@@ -100,6 +100,8 @@ fn the_live_view_draws_every_tab_with_a_model() {
             "56",
             "--kv-cache",
             "8",
+            "--kv-disk",
+            "0", // nothing written to the SSD
             "--ctx",
             "32768",
         ])
@@ -279,7 +281,7 @@ fn the_live_view_draws_every_tab_with_a_model() {
                 // below the tab's two header rows and a blank one
                 let map: Vec<&str> = tabs["memory"].lines().skip(6).collect();
                 map.iter()
-                    .any(|l| l.starts_with(" deepseek-v4.1-flash ") && l.contains(" GiB"))
+                    .any(|l| l.contains(" deepseek-v4.1-flash ") && l.contains(" GiB"))
                     && map
                         .iter()
                         .any(|l| l.contains(" experts ") && l.contains(" GiB"))

@@ -87,6 +87,30 @@ file cache, and that each tensor's bytes arrive intact.
 `build/tests/weights-stop` checks that quitting stops a model's load after
 the weight being read, returns its memory and leaves it unloaded, while a
 load that a pass makes completes.
+`build/tests/state-file` checks the saved states' files with a fake model
+family whose rows and snapshots live in plain memory: four regions like the
+real ones (plain rows, compressed pairs with a guard row and more than one
+4 MiB block, one row per four positions, and rows a position late, as
+Qwen's MTP keys). Every prefix of one part, of a part and its append, and
+of a part that starts earlier (a rewind) must read back the rows that a
+state_copy of the live state holds; a prefix past the last part, parts out
+of order, a damaged block that the prefix needs, a damaged header, a short
+part and another shape are refused, and a damaged block the prefix does
+not need is not read. A snapshot with logits and a live state's end come
+back byte for byte, a damaged snapshot is refused, and a second stop
+request ends a write. A checkpoint's identity changes with its
+`config.json`, a weights file's first bytes or size, and any file of a GGUF
+set, and not with documents or files whose names start with a dot. The
+server's tests (`make server-check`) check the saved states' policy in
+`kv.rs` (plans from saved states, which states are saved and how, links
+through copies and continuations, room and coverage, and that a save
+neither changes the saved state an admitted request reads next nor cuts
+off a saved state's own tail) and the store in `disk.rs` (index round
+trips and damage, the store's file names, which files a start keeps and
+deletes, another version's index kept, the folder's lock, and, through a
+fake state, that a failed save takes no room, that an append and a
+replacement count what they replace as room, and that a file that cannot
+be opened at the moment does not count as damage).
 `build/tests/memory-model CHECKPOINT MEMORY_GIB` evicts a real model's
 weights, retains its KV state and compares every next-token logit after
 reloading. Its competing reservation is synthetic; it is a correctness
@@ -185,6 +209,19 @@ evicted more often. `tests/reference/flash.py --checkpoint DIR
 --layer N` compares a requested text block with Transformers using the same
 input and only that block's selected experts.
 
+`build/tests/state-file-model CHECKPOINT` checks saved states with a real
+model of any family. A state's parts, read back for a prefix, must hold the
+rows a state_copy of the live state held when they were written, also into
+a state of another capacity, across an append and across a part from an
+earlier position. A state read back with a saved snapshot, or with its end
+written straight from the live state, must decode 24 rows with the same
+logits, byte for byte, as the state itself; a damaged block is refused.
+`--draft N`, `--lookup N`, `--experts GGUF` and `--draft-model DIR` set the
+model's options, `--image` puts a generated test image in the prompt, and
+`--unload` also writes a state while the model's weights are unloaded and
+continues it after they are back. It writes its files to a temporary
+folder, removed before it exits.
+
 `build/tests/gguf-decode [GGUF]` compares GPU dequantization with llama.cpp's
 scalar formulas. It covers Q2_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S,
 IQ3_XXS and the Q6_K output head, including both IQ2_S kernel layouts.
@@ -216,7 +253,10 @@ Its terminal emulator scrolls, as a terminal does, when a line ends on the
 bottom row. It prints every tab's screen when a check fails, or when
 `MYDS4_PRINT_TABS` is set.
 
-Set `MYDS4_FLASH` for Flash-Next's image and conversation-reuse check.
+Set `MYDS4_FLASH` for Flash-Next's image and conversation-reuse check, and
+for its saved-state check: a conversation's next turn after a restart
+continues from the state saved at quit with the same reuse and reply as the
+state kept in memory gives.
 Set `MYDS4_NEMOTRON` and `MYDS4_DFLASH` for Transcribe's shared-memory
 lifecycle check. The audio reuse test also reads a JSON chat request from
 `MYDS4_AUDIO_REQUEST`; it must contain inline `input_audio` data. The path
@@ -241,7 +281,23 @@ to exit within 5 s and to answer that request with 503. With
 after a reply, with at least 90% of its model memory given back, the
 process's footprint down by at least 90%, and its session kept. The model
 must stay unloaded for 35 s while the server keeps calling its idle hook;
-the same request must then load it again and give the same greedy reply.
+the same request must then load it again and give the same greedy reply. A
+prompt that shares only its first tokens with the one idle state, in a cache
+with room for one state, must be answered in that state's place.
+
+The `kv_disk` target needs `MYDS4_CHECKPOINT` (DeepSeek; `MYDS4_EXPERTS`
+optional) and saves states in temporary folders with `--kv-disk-tokens
+256`. A state that another one evicts is saved, and its conversation's next
+turn reads it back with the same reuse and reply as a server that kept it
+in memory. A state saved at quit answers its prompt again after a restart
+from its saved prompt end, without a prefill and with the same reply. A
+part damaged after the start is refused when it is read: the prompt is
+prefilled cold, with the cold reply, and the saved state is deleted.
+Within a `--kv-disk` room for two of three states, the two most recently
+used are kept. A second server on the same folder runs without saved
+states; neither server loads its weights. The other HTTP targets start
+their servers with `--kv-disk 0`, so that their cold baselines stay cold
+and they write nothing to the SSD.
 
 Model checks cover prefix forks, draft rollback, batched rows, compressed
 history, dependency pruning and concurrent execution. Build the relevant

@@ -100,8 +100,8 @@ impl ModelConfig {
             "prefill_prune" => e.deepseek_mut()?.prefill_prune = flag()?,
             "runahead" => e.deepseek_mut()?.runahead = flag()?,
             "pipeline" => e.deepseek_mut()?.pipeline = flag()?,
-            "memory" | "reserve" | "kv_cache" | "port" | "host" | "api_key_file" | "tui"
-            | "tui_theme" => {
+            "memory" | "reserve" | "kv_cache" | "kv_disk" | "kv_disk_tokens" | "kv_dir" | "port" | "host"
+            | "api_key_file" | "tui" | "tui_theme" => {
                 return Err(format!("{name} is server-wide; move it outside models"));
             }
             "batch" => {
@@ -148,7 +148,8 @@ impl ModelConfig {
     }
 }
 
-/// Listener, authentication and terminal settings for the whole server.
+/// Listener, authentication, terminal and saved-state settings for the whole
+/// server.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Server {
     pub port: Option<u16>,
@@ -156,6 +157,9 @@ pub struct Server {
     pub api_key_file: Option<String>,
     pub tui: bool,
     pub tui_theme: ui::Colors,
+    /// The folder of the states saved on the SSD (server/src/disk.rs); None:
+    /// [`default_kv_dir`].
+    pub kv_dir: Option<String>,
 }
 
 impl Default for Server {
@@ -166,8 +170,16 @@ impl Default for Server {
             api_key_file: None,
             tui: false,
             tui_theme: ui::Colors::Auto,
+            kv_dir: None,
         }
     }
+}
+
+/// $HOME/.cache/myds4/kv: where states are saved unless kv_dir says otherwise.
+pub fn default_kv_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|s| !s.is_empty())
+        .map(|home| PathBuf::from(home).join(".cache/myds4/kv"))
 }
 
 impl Server {
@@ -195,6 +207,7 @@ impl Server {
                 self.host = host.into();
             }
             "api_key_file" => self.api_key_file = Some(text()?.into()),
+            "kv_dir" => self.kv_dir = Some(text()?.into()),
             "tui" => self.tui = value.as_bool().ok_or("tui takes true or false")?,
             "tui_theme" => {
                 self.tui_theme = match text()? {
@@ -217,8 +230,9 @@ fn idle_seconds(v: &Value) -> Result<f64, String> {
         .ok_or("idle_unload takes 0 (never) to 1000000 seconds".into())
 }
 
-/// Global model-memory and KV budgets, the process-wide reserve, and the
-/// seconds a model may go without requests before it unloads.
+/// Global model-memory and KV budgets, the process-wide reserve, the
+/// seconds a model may go without requests before it unloads, and the room
+/// for saved states on the SSD.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Budgets {
     pub memory_gb: f64,
@@ -226,6 +240,11 @@ pub struct Budgets {
     pub kv_gb: f64,
     /// 0: never; a model's own idle_unload setting overrides it.
     pub idle_unload_s: f64,
+    /// What saved states may take on the SSD; 0: none are saved or read.
+    pub kv_disk_gb: f64,
+    /// A state is saved when it holds at least this many tokens that no
+    /// other kept state holds.
+    pub kv_disk_tokens: usize,
 }
 
 impl Default for Budgets {
@@ -235,6 +254,8 @@ impl Default for Budgets {
             reserve_gb: 10.0,
             kv_gb: 8.0,
             idle_unload_s: 600.0,
+            kv_disk_gb: 32.0,
+            kv_disk_tokens: 8192,
         }
     }
 }
@@ -258,8 +279,14 @@ impl Budgets {
             }
             "reserve" if (2.0..=1024.0).contains(&n) => self.reserve_gb = n,
             "kv_cache" if n > 0.0 && n <= 1024.0 => self.kv_gb = n,
+            "kv_disk" if (0.0..=65536.0).contains(&n) => self.kv_disk_gb = n,
+            "kv_disk_tokens" if n >= 1.0 && n <= (1 << 20) as f64 && n.fract() == 0.0 => {
+                self.kv_disk_tokens = n as usize
+            }
             "reserve" => return Err("reserve takes 2 to 1024 GiB".into()),
             "kv_cache" => return Err("kv_cache takes a positive budget up to 1024 GiB".into()),
+            "kv_disk" => return Err("kv_disk takes 0 (off) or a GiB budget up to 65536".into()),
+            "kv_disk_tokens" => return Err("kv_disk_tokens takes 1 to 1048576 tokens".into()),
             _ => return Err(format!("no server budget {name}")),
         }
         Ok(())
@@ -298,6 +325,9 @@ pub fn parse(root: &Value) -> Result<Config, String> {
             "memory",
             "reserve",
             "kv_cache",
+            "kv_disk",
+            "kv_disk_tokens",
+            "kv_dir",
             "idle_unload",
             "port",
             "host",
@@ -310,13 +340,13 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         return Err(format!("no server setting {k}"));
     }
     let mut budgets = Budgets::default();
-    for name in ["memory", "reserve", "kv_cache", "idle_unload"] {
+    for name in ["memory", "reserve", "kv_cache", "kv_disk", "kv_disk_tokens", "idle_unload"] {
         if let Some(value) = obj.get(name) {
             budgets.set(name, value)?;
         }
     }
     let mut server = Server::default();
-    for name in ["port", "host", "api_key_file", "tui", "tui_theme"] {
+    for name in ["port", "host", "api_key_file", "kv_dir", "tui", "tui_theme"] {
         if let Some(value) = obj.get(name) {
             server.set(name, value)?;
         }

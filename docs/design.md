@@ -246,17 +246,88 @@ snapshot; copied attention keys alone cannot reconstruct that state.
 The pool charges allocated capacity and pending growth before admission.
 It also charges snapshots promised to an admitted prefill. Eviction first
 removes spare snapshots, then idle states. Active states and a branch's
-source remain protected. The configured limit may be exceeded by active
-state growth when nothing idle remains to evict.
+source remain protected. A prompt takes the cheapest plan that fits: each
+plan keeps the state it reuses, so when that state does not fit beside the
+prompt's own, the next plan is tried, down to a cold start, which keeps
+nothing. The configured limit may be exceeded by active state growth when
+nothing idle remains to evict.
 
 Each stored sequence owns its native state, snapshots and model handle.
-Eviction drops those resources together. Rust ownership keeps native model handles on the engine thread. HTTP
+Eviction saves the state to the SSD when the rules below say so, then drops
+those resources together; a state discarded after a failure is never saved.
+Rust ownership keeps native model handles on the engine thread. HTTP
 handlers and the terminal receive copied statistics, without sharing the
 native model handle or checking thread identity on each call.
 
 Each prefill call receives its own image context. Image preprocessing and
 feature storage belong to the request; model-specific position state is
 kept in the sequence and its snapshots.
+
+### Saved states
+
+States evicted from the pool, and those in memory at quit, are written to
+the SSD (`server/src/disk.rs`, `src/engine/state_file.c`); the policy is in
+`server/src/kv.rs`, with tests that need no model.
+
+**Rows and snapshots.** Each family lists a state's append-only arrays as
+regions (`ModelOps.state_regions`): row 0's address, the row's bytes, the
+positions a row covers (`ratio`), whether a guard row follows, and a `lag`.
+A state of p positions holds `(p - lag) / ratio + guard` rows; the rows
+before `(p - lag) / ratio` never change at later positions. DeepSeek's
+compressed rows and index keys have ratio 2 (layer 20: 1) and a guard row,
+the row a compressed pair shares with the next position; Flash-Next's
+index keys have ratio 4; Qwen 27B's MTP key at the last position waits for
+the next token (lag 1, guard 1). `state_copy` copies exactly these regions,
+so copying, saving and reading use one list. A snapshot's parts
+(`ModelOps.snapshot_parts`) are its buffers, host arrays and integers; the
+same list over a live state's rolling rows writes a state's end without
+allocating a snapshot, and `snapshot_alloc` makes an empty one to read into.
+
+**Files.** A part holds each region's rows from those that its first
+position leaves unchanged to its end, at 16 KiB-aligned offsets, with a
+CRC32C (ARM crc32c instructions) for each 4 MiB block and each region's
+shape in its header. A saved state is a list of parts, the first from
+position 0, each starting at or before the previous one's end. Reading a
+prefix takes each row from the latest part that holds it, reads only the
+blocks the prefix needs and checks each one; a shape that differs from the
+model's, a short file or a bad block fails the read. Files move through
+aligned buffers and `F_NOCACHE`, so they pass the page cache, which would
+otherwise grow by their size and count as memory in use. An index
+(`ID.kv`) holds the model's identity (`myds4_state_identity`: the family's
+state format version, the checkpoint's files by name, size and first and
+last 64 KiB, the expert and DFlash2 files, and the options that change a
+state's rows or shapes), the tokens, the parts and snapshots, and a SHA-256
+of the rest. Files are written under temporary names, synced and renamed,
+the index last; the index's modification time is the saved state's last
+use, for the order of eviction after a restart.
+
+**Rules.** A state is saved when it holds at least `kv_disk_tokens` tokens
+that no other kept state holds (in memory, or saved); at quit, when no
+state stays in memory, states are taken most recently used first, so that
+of a conversation's turns the newest is written and the older ones it holds
+are not. Each in-memory state carries a link: the saved state whose rows its
+own equal before some position, and that saved state's version then. A
+read sets it, a copy of rows (`Snapshot`, `Replay`) passes it on lowered to
+the copy's position, and continuing in place lowers it to where the state
+continues. A save appends one part from the linked position while the saved
+state is as the link knew it, holds fewer than `kv_disk_tokens` tokens after
+the state's (an append ends it where the state ends), and is not the one an
+admitted request reads next; otherwise, or when the saved state's replaced
+rows would outnumber its own, it writes a new saved state. Rows computed by
+decoding and by prefill differ in rounding, so only rows that are the same
+bytes are joined: a link exists only where the rows were copied from the
+saved state. A save also writes the newest prompt-end snapshot (with
+logits), the newest branch snapshot and the state's end; saved states that
+the new one covers (holding fewer than `kv_disk_tokens` tokens beyond it)
+are deleted. Room within `kv_disk` comes from saved states of no model
+here, then the least recently used, used before the state being saved, and
+counts the files that the save replaces; the saved state that an admitted
+request reads next is kept, and the room is taken only once the new saved
+state is written. A read that finds a file damaged or missing deletes its
+saved state, and the request is planned again without it; one that cannot
+open a file at the moment passes the saved state over for that request
+only. An index of another version of the store, with its files, is left as
+it is.
 
 ## DeepSeek V4.1 Flash
 

@@ -114,6 +114,9 @@ pub struct Snapshot {
     kv_limit_gib: f64,
     #[serde(default)]
     kv_total_gib: f64,
+    /// The states saved on the SSD; none without them.
+    #[serde(default)]
+    kv_disk: Option<KvDisk>,
     #[serde(default)]
     reserve_gib: f64,
     /// The memory setting, an upper limit; 0: none.
@@ -193,6 +196,21 @@ struct Kinds {
     continued: u64,
     saved: u64,
     forked: u64,
+    #[serde(default)]
+    loaded: u64,
+}
+
+/// The states saved on the SSD: their folder, count and GiB against the
+/// budget, and this run's reads, saves and GiB written.
+#[derive(Deserialize, Default)]
+struct KvDisk {
+    dir: String,
+    states: u64,
+    gib: f64,
+    limit_gib: f64,
+    loads: u64,
+    saves: u64,
+    written_gib: f64,
 }
 
 /// A run of positions that a set of sessions share: the sessions' prefix tree.
@@ -1532,6 +1550,31 @@ mod tests {
             row(&b, 44)
         );
         assert!(!screen.contains("prompt pass"));
+    }
+
+    #[test]
+    fn the_kv_tab_shows_the_states_saved_on_the_ssd() {
+        let mut s = snapshot();
+        let area = Rect::new(0, 0, 160, 46);
+        let mut b = Buffer::empty(area);
+        kv::draw(&mut b, area, &s, &mut Ui::default());
+        assert!(!all(&b).contains("on the SSD"), "no line without saved states");
+        s.kv_disk = Some(KvDisk {
+            dir: "/home/kv".into(),
+            states: 3,
+            gib: 1.25,
+            limit_gib: 32.0,
+            loads: 2,
+            saves: 5,
+            written_gib: 4.5,
+        });
+        s.kinds.loaded = 2;
+        let mut b = Buffer::empty(area);
+        kv::draw(&mut b, area, &s, &mut Ui::default());
+        let screen = all(&b);
+        assert!(screen.contains("on the SSD 3 saved states 1.25 / 32.0 GiB"), "{screen}");
+        assert!(screen.contains("read 2 · saved 5 (4.50 GiB written)   in /home/kv"), "{screen}");
+        assert!(screen.contains("loaded 2"), "{screen}");
     }
 
     #[test]

@@ -432,20 +432,61 @@ void qwen_state_reserve(QwenState *s, int positions) {
   grow_blocks(cap);
 }
 
+// The rows state_copy copies: each attention layer's keys, then each one's
+// values (the MTP head's last: its key at a state's last position waits for
+// the next token, a row with lag 1). With fill, s first takes that many
+// positions.
+static int qwen_state_regions(QwenState *s, int positions, int fill, StateRegion *out) {
+  if (fill) {
+    qwen_reside(1);
+    qwen_state_reserve(s, positions > 0 ? positions : 1);
+    s->pos = positions;
+    for (int i = 0; i < s->copies; i++) s->saved_pos[i] = -1;
+    s->mtp_next = positions > 0 ? positions - 1 : 0;  // the last key waits for the next token
+  } else if (positions < 0 || positions > s->pos)
+    die("qwen: the rows of %d positions of a state of %d", positions, s->pos);
+  gpu_sync();
+  size_t row = (size_t)c.kv_heads * c.head_dim * 2;
+  int n = 0;
+  for (int l = 0; l < 2 * kv_layers(); l++) {
+    uint32_t head = mtp && l % kv_layers() == c.attention;
+    out[n++] = (StateRegion){s->kv.ptr + (size_t)l * s->cap * row, (uint32_t)row, 1, head, head};
+  }
+  return n;
+}
+
 void qwen_state_copy(QwenState *dst, const QwenState *src, int positions) {
   qwen_reside(1);
   if (dst == src) return;
   if (positions < 0 || positions > src->pos) die("qwen: a copy of %d positions from a state of %d", positions, src->pos);
-  qwen_state_reserve(dst, positions > 0 ? positions : 1);
-  gpu_sync();
+  StateRegion to[STATE_REGIONS_MAX], from[STATE_REGIONS_MAX];
+  int n = qwen_state_regions(dst, positions, 1, to);
+  qwen_state_regions((QwenState *)src, positions, 0, from);
   memcpy(dst->gdn[dst->cur].ptr, src->gdn[src->cur].ptr, gdn_bytes());
   memcpy(dst->conv[dst->cur].ptr, src->conv[src->cur].ptr, conv_bytes());
   memcpy(dst->hid[dst->cur].ptr, src->hid[src->cur].ptr, hid_bytes());
-  kv_rows(dst->kv.ptr, dst->cap, src->kv.ptr, src->cap, positions);
-  dst->pos = positions;
-  for (int i = 0; i < dst->copies; i++) dst->saved_pos[i] = -1;
+  regions_copy(to, from, n, positions);
   dst->rope_delta = src->rope_delta;
-  dst->mtp_next = positions > 0 ? positions - 1 : 0;  // the last key waits for the next token
+}
+
+// A snapshot's recurrent state, convolution rows and MTP hidden vector, or a
+// state's current ones; its integers: position, rope_delta.
+static int qwen_snap_parts(const QwenSnap *x, QwenState *s, SnapshotPart *out, int32_t *meta) {
+  gpu_sync();
+  const Buf *gdn = x ? &x->gdn : &s->gdn[s->cur], *conv = x ? &x->conv : &s->conv[s->cur], *hid = x ? &x->hid : &s->hid[s->cur];
+  meta[0] = x ? x->pos : s->pos, meta[1] = x ? x->rope_delta : s->rope_delta;
+  out[0] = (SnapshotPart){gdn->ptr, gdn_bytes()};
+  out[1] = (SnapshotPart){conv->ptr, conv_bytes()};
+  out[2] = (SnapshotPart){hid->ptr, hid_bytes()};
+  return 3;
+}
+
+static QwenSnap *qwen_snap_new(int pos, int rope_delta) {
+  qwen_reside(1);
+  QwenSnap *n = calloc(1, sizeof *n);
+  n->gdn = own(gpu_alloc_kv(gdn_bytes())), n->conv = own(gpu_alloc_kv(conv_bytes()));
+  n->hid = own(gpu_alloc_kv(hid_bytes())), n->pos = pos, n->rope_delta = rope_delta;
+  return n;
 }
 
 void qwen_state_back(QwenState *s, int checkpoint) {
@@ -923,6 +964,23 @@ static void q_snapshot_free(ModelSnapshot *x) {
 }
 static size_t q_snapshot_bytes(int with_logits) { return qwen_snap_bytes() + (with_logits ? (size_t)c.vocab * 4 : 0); }
 static const float *q_snapshot_logits(const ModelSnapshot *x) { return ((const Taken *)x)->logits; }
+static int q_state_regions(ModelState *s, int positions, int fill, StateRegion *out) {
+  return qwen_state_regions((QwenState *)s, positions, fill, out);
+}
+static int q_snapshot_parts(ModelSnapshot *x, ModelState *s, int pos, SnapshotPart *out, int32_t *meta, int *nmeta) {
+  const Taken *t = (const Taken *)x;
+  if (!t && pos != ((QwenState *)s)->pos) return -1;  // its rolling rows are as at its own position only
+  int n = qwen_snap_parts(t ? t->snap : NULL, (QwenState *)s, out, meta);
+  *nmeta = 2;
+  if (t && t->logits) out[n++] = (SnapshotPart){t->logits, (size_t)c.vocab * 4};
+  return n;
+}
+static ModelSnapshot *q_snapshot_alloc(const int32_t *meta, int nmeta, int with_logits) {
+  if (nmeta != 2) return NULL;
+  Taken *t = xmalloc(sizeof *t);
+  *t = (Taken){qwen_snap_new(meta[0], meta[1]), with_logits ? memory_host_required((size_t)c.vocab * 4, 1) : NULL};
+  return (ModelSnapshot *)t;
+}
 
 // Complete the key at the last committed target hidden, paired with its next token.
 static const float *mtp_fill(QwenState *s, int token, int logits) {
@@ -1064,7 +1122,8 @@ const ModelOps qwen_ops = {
     .prefill_rows = q_prefill_rows,
     .state_new = q_state_new, .state_free = q_state_free, .state_bytes = q_state_bytes, .state_copy = q_state_copy,
     .snapshot_take = q_snapshot_take, .snapshot_restore = q_snapshot_restore, .snapshot_free = q_snapshot_free,
-    .snapshot_bytes = q_snapshot_bytes, .snapshot_logits = q_snapshot_logits, .prefill = q_prefill,
+    .snapshot_bytes = q_snapshot_bytes, .snapshot_logits = q_snapshot_logits, .state_version = 1,
+    .state_regions = q_state_regions, .snapshot_parts = q_snapshot_parts, .snapshot_alloc = q_snapshot_alloc, .prefill = q_prefill,
     .replay_rows = q_replay_rows, .replay_start = q_replay_start, .rows = q_rows, .draft = q_draft, .verify = q_verify, .accept = q_accept,
     .seek = q_seek, .idle = q_idle, .chat = q_chat,
     .prepare_media = qwen_prepare_image, .encode_media = q_image, .media = q_images};

@@ -15,7 +15,8 @@
 //! cache (kv.rs). The worker also builds each model's status and the live
 //! view's snapshot.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -29,7 +30,8 @@ use crate::control::{self, Action, Control, Phase, Target};
 use crate::engine::{
     self, CacheCounts, Logits, Lookup, Media, Model, PrefillInfo, RawSnapshot, RawState, Sampler,
 };
-use crate::kv::{self, Cache, Kind, Limits, Plan, Snap};
+use crate::disk::{Engine, LoadError, Store};
+use crate::kv::{self, Cache, Entry, Freed, Kind, Limits, Plan, Snap};
 
 /// Requests waiting for a model at most; more are answered 429.
 pub const WAITING: usize = 16;
@@ -244,7 +246,7 @@ struct Status {
     prompt_tokens: u64,
     reused_tokens: u64,
     generated_tokens: u64,
-    kinds: [u64; 4], // new, continued, saved, forked
+    kinds: [u64; 5], // new, continued, saved, forked, loaded
     prefill: PrefillInfo,
     /// The ended prefills: their time, and the engine's prompt rows and their
     /// expert bytes when the latest ended. The engine counts those at each
@@ -279,7 +281,23 @@ struct Shared {
     models: Vec<ModelShared>,
     budgets: crate::config::Budgets,
     kv_used: AtomicU64,
+    /// The states saved on the SSD, for the status and the live view.
+    disk: Mutex<DiskStatus>,
     started: Instant,
+}
+
+/// The saved states: whether the store is open (its folder), how many there
+/// are and their bytes against the budget, and this run's loads, saves and
+/// bytes written.
+#[derive(Clone, Debug, Default)]
+pub struct DiskStatus {
+    pub dir: Option<String>,
+    pub states: usize,
+    pub bytes: u64,
+    pub limit: u64,
+    pub loads: u64,
+    pub saves: u64,
+    pub written: u64,
 }
 
 static SHARED: Mutex<Option<Arc<Shared>>> = Mutex::new(None);
@@ -349,6 +367,7 @@ pub fn models() -> Vec<(String, engine::Tokenizer, Served)> {
 pub fn start(
     served: Vec<Served>,
     budgets: crate::config::Budgets,
+    kv_dir: Option<PathBuf>,
     on_log: Option<extern "C" fn(*const std::ffi::c_char)>,
     on_die: Option<extern "C" fn()>,
 ) -> bool {
@@ -399,15 +418,17 @@ pub fn start(
                 models,
                 budgets,
                 kv_used: AtomicU64::new(0),
+                disk: Mutex::new(DiskStatus::default()),
                 started: Instant::now(),
             });
             *SHARED.lock().unwrap() = Some(s.clone());
             // A failure here ends the process, as the engine's own do: the
             // requests could not end otherwise. (The panic's message is out.)
             let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut w = Worker::new(s.clone(), engines);
+                let mut w = Worker::new(s.clone(), engines, kv_dir);
                 let _ = tx.send(true);
                 w.run();
+                w.save_at_quit();
                 for slot in &w.slots {
                     slot.model.finish();
                 }
@@ -428,8 +449,13 @@ pub fn start(
 }
 
 /// Requests the stop as SIGINT does and wakes the worker (the live view's q).
+/// A second request while the states are saved at quit ends that saving.
 pub fn request_stop() {
     engine::request_stop();
+    wake();
+}
+
+fn wake() {
     if let Some(s) = SHARED.lock().unwrap().clone() {
         let _q = lock(&s.queue);
         s.wake.notify_all();
@@ -459,10 +485,15 @@ pub fn text(model: usize, ids: &[i32]) -> Vec<(String, bool)> {
         .unwrap_or_default()
 }
 
-/// Requests the stop, waits for the worker to end every request, save the
-/// models' states and return.
+/// Requests the stop (unless one was: that request is the user's, and a
+/// second one would end saving the states), waits for the worker to end every
+/// request, save the states and the models' own and return.
 pub fn stop() {
-    request_stop();
+    if engine::stopping() {
+        wake();
+    } else {
+        request_stop();
+    }
     if let Some(h) = THREAD.lock().unwrap().take() {
         let _ = h.join();
     }
@@ -560,6 +591,7 @@ pub fn status(model: usize) -> Value {
         "waiting": waiting, "sessions": sessions,
         "kv_cache_gib": round(st.kv_bytes as f64 / GIB, 3), "kv_cache_limit_gib": round(kv_limit as f64 / GIB, 3),
         "kv_cache_scope": "server", "kv_cache_total_gib": round(s.kv_used.load(Ordering::Relaxed) as f64 / GIB, 3),
+        "kv_disk": disk_json(&s),
         "reserve_gib": s.budgets.reserve_gb, "memory_gib": s.budgets.memory_gb, "model_memory": allocations,
         "model_memory_budget": {"limit": c.model_memory_limit, "allocated": c.model_memory_used,
                                 "committed": c.model_memory_committed, "peak": c.model_memory_peak},
@@ -579,6 +611,18 @@ pub fn status(model: usize) -> Value {
                          "read_gb": round(c.cache.bytes as f64 / 1e9, 1), "slots_released": c.cache.given_back},
         "memory": {"available_gib": round(c.available as f64 / GIB, 1), "footprint_gib": round(c.footprint as f64 / GIB, 1)},
     })
+}
+
+/// The states saved on the SSD (null without them): their folder, count and
+/// GiB against the budget, and this run's loads, saves and GiB written.
+fn disk_json(s: &Shared) -> Value {
+    let d = lock(&s.disk).clone();
+    match d.dir {
+        None => Value::Null,
+        Some(dir) => json!({"dir": dir, "states": d.states, "gib": round(d.bytes as f64 / GIB, 3),
+                            "limit_gib": round(d.limit as f64 / GIB, 3), "loads": d.loads, "saves": d.saves,
+                            "written_gib": round(d.written as f64 / GIB, 3)}),
+    }
 }
 
 /// The live view's snapshot of model `model` (JSON): phase, requests,
@@ -636,7 +680,8 @@ pub fn view(model: usize) -> String {
         "prefill": {"layer": c.prefill_layer, "rows": c.prefill_rows_now},
         "totals": {"requests": st.requests, "prompt_tokens": st.prompt_tokens, "reused_tokens": st.reused_tokens,
                    "generated_tokens": st.generated_tokens},
-        "kinds": {"new": st.kinds[0], "continued": st.kinds[1], "saved": st.kinds[2], "forked": st.kinds[3]},
+        "kinds": {"new": st.kinds[0], "continued": st.kinds[1], "saved": st.kinds[2], "forked": st.kinds[3],
+                  "loaded": st.kinds[4]},
         "sessions": st.states.len(), "kv_gib": round(st.kv_bytes as f64 / GIB, 3), "kv_limit_gib": round(kv_limit as f64 / GIB, 3),
         "kv_total_gib": round(s.kv_used.load(Ordering::Relaxed) as f64 / GIB, 3),
         "reserve_gib": s.budgets.reserve_gb, "memory_gib": s.budgets.memory_gb, "model_memory": allocations,
@@ -663,9 +708,11 @@ pub fn view(model: usize) -> String {
                    "compressor": c.compressor, "compressed": c.compressed, "swap_used": c.swap_used,
                    "swapouts": c.swapouts, "pressure": c.pressure},
     });
-    // the routed experts' geometry (past the json! macro's recursion limit)
+    // the routed experts' geometry and the saved states (past the json!
+    // macro's recursion limit)
     v["routed_layers"] = json!(c.routed_layers);
     v["experts_per_layer"] = json!(c.experts_per_layer);
+    v["kv_disk"] = disk_json(&s);
     // the decoding passes take the status's lock; the text is written without it
     drop(st);
     v.to_string()
@@ -763,6 +810,11 @@ struct Memory {
     cache: Cache,
     entries: HashMap<kv::Id, StoredState>,
     published: Instant,
+    /// The states saved on the SSD (server/src/disk.rs); none without them.
+    disk: Option<Store>,
+    /// States whose prefill or decoding pass the stop cut short: their rows
+    /// are not saved.
+    cut: HashSet<kv::Id>,
 }
 
 impl Memory {
@@ -771,6 +823,48 @@ impl Memory {
             cache: Cache::new(limit, STATES),
             entries: HashMap::new(),
             published: Instant::now(),
+            disk: None,
+            cut: HashSet::new(),
+        }
+    }
+
+    /// What eviction gave up: its snapshots freed, and its states saved to
+    /// the SSD (as the cache decides; the most recently used first, so that
+    /// an older state that a newer one holds is not written) and freed.
+    fn evicted(&mut self, (snaps, mut states): Freed) {
+        for (id, snapshot) in snaps {
+            self.free_snap(id, snapshot.pos);
+        }
+        states.sort_by_key(|(_, e)| std::cmp::Reverse(e.used));
+        for (id, e) in states {
+            self.save(id, &e, true);
+            self.entries.remove(&id);
+        }
+    }
+
+    /// Writes state `id` (its entry `e`, out of the cache) to the SSD as the
+    /// cache decides; `kept`: the states still in the cache stay in memory.
+    fn save(&mut self, id: kv::Id, e: &Entry, kept: bool) {
+        let Memory {
+            disk: Some(store),
+            cache,
+            entries,
+            cut,
+            ..
+        } = self
+        else {
+            return;
+        };
+        let Some(st) = entries.get(&id) else {
+            return;
+        };
+        if cut.contains(&id) {
+            return;
+        }
+        let snapshot = |pos: usize| st.snapshots.get(&pos).copied().unwrap_or(std::ptr::null_mut());
+        let used = std::time::SystemTime::now() - st.used.elapsed();
+        if let Some(line) = store.save(cache, &Engine { model: &st.owner, state: st.raw }, &snapshot, e, used, kept) {
+            engine::log(&format!("kv: {line}"));
         }
     }
 
@@ -859,6 +953,18 @@ impl Memory {
                 })
                 .sum();
         }
+        *lock(&s.disk) = match &self.disk {
+            Some(store) => DiskStatus {
+                dir: Some(store.dir().display().to_string()),
+                states: self.cache.saved.len(),
+                bytes: self.cache.saved_bytes(),
+                limit: self.cache.disk_limit,
+                loads: store.loads,
+                saves: store.saves,
+                written: store.written,
+            },
+            None => DiskStatus::default(),
+        };
         self.published = now;
     }
 }
@@ -872,8 +978,8 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(s: Arc<Shared>, engines: Vec<Rc<Model>>) -> Worker {
-        let slots = s
+    fn new(s: Arc<Shared>, engines: Vec<Rc<Model>>, kv_dir: Option<PathBuf>) -> Worker {
+        let slots: Vec<Slot> = s
             .models
             .iter()
             .zip(engines)
@@ -895,13 +1001,82 @@ impl Worker {
                 }
             })
             .collect();
-        let memory = Memory::new((s.budgets.kv_gb * GIB) as u64);
-        Worker {
+        let mut memory = Memory::new((s.budgets.kv_gb * GIB) as u64);
+        if let Some(dir) = kv_dir {
+            Self::open_store(&mut memory, &slots, &s.budgets, &dir);
+        }
+        let mut w = Worker {
             s,
             slots,
             memory,
             maintained: Instant::now(),
             published: Instant::now(),
+        };
+        w.memory.publish(&w.s);
+        w
+    }
+
+    /// The saved states in `dir`: those whose identity is a model's here
+    /// can be read for its prompts; the others stay until room is needed.
+    fn open_store(memory: &mut Memory, slots: &[Slot], budgets: &crate::config::Budgets, dir: &std::path::Path) {
+        let (store, found) = match Store::open(dir) {
+            Ok(x) => x,
+            Err(m) => {
+                engine::log(&format!("kv: no saved states: {m}"));
+                return;
+            }
+        };
+        let identities: Vec<[u8; 32]> = slots.iter().map(|x| x.model.state_identity()).collect();
+        memory.cache.disk_limit = (budgets.kv_disk_gb * GIB) as u64;
+        memory.cache.disk_tokens = budgets.kv_disk_tokens;
+        let (mut usable, mut tokens) = (0, 0);
+        for mut f in found {
+            f.saved.model = identities.iter().position(|i| *i == f.identity);
+            if f.saved.model.is_some() {
+                usable += 1;
+                tokens += f.saved.tokens.len();
+            }
+            memory.cache.insert_saved(f.id, f.saved);
+        }
+        engine::log(&format!(
+            "kv: saved states in {}: {} ({:.1} GiB of {:.1} GiB); {usable} of them, {tokens} tokens, for the models here",
+            dir.display(),
+            memory.cache.saved.len(),
+            memory.cache.saved_bytes() as f64 / GIB,
+            budgets.kv_disk_gb
+        ));
+        memory.disk = Some(store);
+        // a smaller budget than the states take: the oldest go now
+        if let (Some(room), Some(store)) = (memory.cache.disk_room(0, None, None), memory.disk.as_mut()) {
+            for id in room {
+                store.forget(&mut memory.cache, id);
+            }
+        }
+    }
+
+    /// At quit, after the requests ended: every state not cut short is
+    /// saved as the cache decides, the most recently used first. A second
+    /// stop request ends the saving.
+    fn save_at_quit(&mut self) {
+        if self.memory.disk.is_none() {
+            return;
+        }
+        let mut order: Vec<(u64, kv::Id)> = self.memory.cache.entries.iter().map(|(&id, e)| (e.used, id)).collect();
+        order.sort_unstable_by(|a, b| b.cmp(a));
+        let (count, t) = (order.len(), Instant::now());
+        for (done, (_, id)) in order.into_iter().enumerate() {
+            if engine::stop_requests() >= 2 {
+                engine::log(&format!("kv: a second stop: {} states not saved", count - done));
+                break;
+            }
+            // out of the cache: the states not saved yet do not hold its tokens for it
+            let Some(e) = self.memory.cache.entries.remove(&id) else {
+                continue;
+            };
+            self.memory.save(id, &e, false);
+        }
+        if count > 0 {
+            engine::log(&format!("kv: {count} states considered at quit in {:.1} s", t.elapsed().as_secs_f64()));
         }
     }
 
@@ -966,7 +1141,7 @@ impl Worker {
             let deficit = deficit.saturating_sub(engine::reclaim(deficit));
             if deficit > 0 {
                 let (snaps, states) = self.memory.cache.reclaim(deficit);
-                self.memory.free(snaps, states);
+                self.memory.evicted((snaps, states));
                 self.memory.publish(&self.s);
             }
         }
@@ -1029,7 +1204,7 @@ impl Worker {
                     Target::Minimum => u64::MAX,
                     Target::Bytes(cap) => self.memory.cache.bytes().saturating_sub(cap),
                 });
-                self.memory.free(snaps, states);
+                self.memory.evicted((snaps, states));
                 engine::drain();
                 let used = engine::memory();
                 let retained = control::Limits {
@@ -1207,7 +1382,7 @@ fn end_waiting(job: Job, finish: Finish) {
 
 impl Slot {
     /// The model's limits for its cache's plans.
-    fn plan(&self, prompt: &[i32], memory: &Memory) -> Plan {
+    fn plans(&self, prompt: &[i32], memory: &Memory) -> Vec<Plan> {
         let model = self.model.clone();
         let cost = move |k: usize| model.replay_rows(k).unwrap_or(0);
         let limits = Limits {
@@ -1215,7 +1390,32 @@ impl Slot {
             replay: self.model.replay_rows(1).is_some(),
             replay_cost: &cost,
         };
-        memory.cache.plan_for(self.index, prompt, limits)
+        memory.cache.plans_for(self.index, prompt, limits)
+    }
+
+    /// What a prompt of `n` tokens started by `plan` adds to the KV cache: the
+    /// state at the prompt's end and its first token, a saved state's snapshot
+    /// read before it is restored (with its logits, the prompt-end snapshot of
+    /// the same prompt again), and the snapshots the plan takes.
+    fn plan_need(&self, plan: &Plan, n: usize, memory: &Memory) -> u64 {
+        let state = match *plan {
+            Plan::InPlace { state, .. } => self
+                .model
+                .state_bytes(memory.entries[&state].raw, n + 1)
+                .saturating_sub(memory.cache.entries[&state].bytes),
+            _ => self.model.state_bytes(std::ptr::null(), n + 1),
+        };
+        let loaded = match plan {
+            Plan::Load { snap: Some(_), .. } => self.model.snapshot_bytes(true),
+            _ => 0,
+        };
+        state
+            + loaded
+            + plan.snapshot_need(
+                n,
+                self.model.snapshot_bytes(false),
+                self.model.snapshot_bytes(true),
+            )
     }
 
     /// One step of the model: its admitted requests start, one prefill call
@@ -1346,7 +1546,7 @@ impl Slot {
             id,
             self.model.state_bytes(memory.entries[&id].raw, positions),
         );
-        memory.free(snaps, states);
+        memory.evicted((snaps, states));
         let after = memory.cache.entries[&id].bytes;
         if after > before && memory.cache.over() > 0 {
             engine::log(&format!(
@@ -1426,27 +1626,20 @@ impl Slot {
             return refuse(job, "invalid sampling settings");
         };
         let max_new = (job.request.max_tokens.max(1) as usize).min(self.ctx - n);
-        let plan = self.plan(&prompt, memory);
-        let origin = memory.cache.origin(&plan, n);
-        let capture = plan.capture(n);
-        // The state at the prompt's end and its first token, and the
-        // snapshots the plan takes.
-        let state_need = match plan {
-            Plan::InPlace { state, .. } => self
-                .model
-                .state_bytes(memory.entries[&state].raw, n + 1)
-                .saturating_sub(memory.cache.entries[&state].bytes),
-            _ => self.model.state_bytes(std::ptr::null(), n + 1),
-        };
-        let need = state_need
-            + plan.snapshot_need(
-                n,
-                self.model.snapshot_bytes(false),
-                self.model.snapshot_bytes(true),
-            );
-        let new_state = !matches!(plan, Plan::InPlace { .. });
-        let keep: Vec<kv::Id> = plan.source().into_iter().collect();
-        let Some(ev) = memory.cache.fit(need, new_state, &keep) else {
+        // The cheapest plan that fits. Each keeps what it reuses; the last, a
+        // cold start, keeps nothing, so that a state that does not fit beside
+        // the prompt's own can go.
+        let mut need = 0;
+        let mut admitted = None;
+        for p in self.plans(&prompt, memory) {
+            need = self.plan_need(&p, n, memory);
+            let keep: Vec<kv::Id> = p.source().into_iter().collect();
+            if let Some(ev) = memory.cache.fit(need, !matches!(p, Plan::InPlace { .. }), &keep) {
+                admitted = Some((p, ev));
+                break;
+            }
+        }
+        let Some((plan, ev)) = admitted else {
             let busy: u64 = memory
                 .cache
                 .entries
@@ -1463,9 +1656,26 @@ impl Slot {
             );
             return refuse(job, &m);
         };
+        let origin = memory.cache.origin(&plan, n);
+        let capture = plan.capture(n);
+        // the saved state the plan reads, as planned: what eviction saves now
+        // leaves it as it is
+        let planned = match plan {
+            Plan::Load { saved, .. } => {
+                memory.cache.pinned = Some(saved);
+                memory.cache.saved.get(&saved).map(|d| d.version)
+            }
+            _ => None,
+        };
         let wait = job.queued.elapsed().as_secs_f64();
         let (snaps, states) = memory.cache.evict(&ev);
-        memory.free(snaps, states);
+        memory.evicted((snaps, states));
+        if let Plan::Load { saved, .. } = plan
+            && memory.cache.saved.get(&saved).map(|d| d.version) != planned
+        {
+            memory.cache.pinned = None;
+            return self.waiting_start(s, job, memory); // it changed meanwhile: planned again
+        }
         let from = plan.reused();
         let id = match plan {
             Plan::Cold => {
@@ -1481,6 +1691,7 @@ impl Slot {
                 let st = memory.entries[&id].raw;
                 self.model.state_copy(st, memory.entries[&source].raw, at);
                 memory.cache.touch(source, at);
+                memory.cache.inherit(id, source, at);
                 memory.entries.get_mut(&source).expect("state").used = Instant::now();
                 if let Plan::Snapshot { snap, .. } = plan {
                     self.model
@@ -1488,11 +1699,74 @@ impl Slot {
                 }
                 id
             }
+            Plan::Load { saved, snap, at, .. } => {
+                let id = memory.add(self.index, self.model.clone());
+                let st = memory.entries[&id].raw;
+                let t = Instant::now();
+                let store = memory.disk.as_mut().expect("saved states have their store");
+                let read = store.load(&mut memory.cache, &Engine { model: &self.model, state: st }, saved, snap, at);
+                memory.cache.pinned = None;
+                match read {
+                    Ok(x) => {
+                        memory.cache.link_saved(id, saved, at);
+                        if !x.is_null() && at == n {
+                            memory.save_snapshot(id, n, x); // the same prompt again: restored below
+                        } else if !x.is_null() {
+                            self.model.snapshot_restore(st, x);
+                            self.model.snapshot_free(x);
+                        }
+                        engine::log(&format!(
+                            "req {}: {at} positions of saved state {saved} read in {:.2} s",
+                            job.id,
+                            t.elapsed().as_secs_f64()
+                        ));
+                        id
+                    }
+                    Err(error) => {
+                        // planned again without it: deleted when damaged, or
+                        // passed over for this request when it cannot be read now
+                        match error {
+                            LoadError::Damaged(m) => {
+                                engine::log(&format!(
+                                    "req {}: saved state {saved} cannot be read ({m}); it is deleted",
+                                    job.id
+                                ));
+                                store.forget(&mut memory.cache, saved);
+                            }
+                            LoadError::Unavailable(m) => {
+                                engine::log(&format!(
+                                    "req {}: saved state {saved} cannot be read now ({m}); planned without it",
+                                    job.id
+                                ));
+                                memory.cache.skip = Some(saved);
+                            }
+                        }
+                        let snapshots = memory.cache.remove(id);
+                        memory.free(Vec::new(), vec![(id, snapshots)]);
+                        self.waiting_start(s, job, memory);
+                        memory.cache.skip = None;
+                        return;
+                    }
+                }
+            }
         };
         let bytes = self.model.state_bytes(memory.entries[&id].raw, n + 1);
         let dropped = memory
             .cache
             .start(id, &prompt, from, bytes, kv::stale_at(origin, from));
+        if let Plan::Load { at, snap: Some(_), .. } = plan
+            && at == n
+        {
+            memory.cache.add_snap(
+                id,
+                Snap {
+                    pos: n,
+                    kind: Kind::PromptEnd,
+                    bytes: self.model.snapshot_bytes(true),
+                    stale: kv::stale_at(origin, n),
+                },
+            );
+        }
         let mut promised = Vec::new();
         if from < n {
             promised.push(Snap {
@@ -1530,7 +1804,7 @@ impl Slot {
                 "greedy"
             }
         ));
-        let replay = matches!(plan, Plan::Replay { .. });
+        let replay = plan.replays();
         if let Some(x) = media.as_mut() {
             // The media whose spans the prefill reaches: a replay computes again
             // from its first position, before the branch point.
@@ -1600,7 +1874,7 @@ impl Slot {
         };
         if from == n {
             // The same prompt again: its prompt-end snapshot holds its logits.
-            let source = plan.source().expect("a saved prompt");
+            let source = plan.source().unwrap_or(id); // a saved state's prompt end is the new state's own
             let x = memory.snapshot(source, n);
             if source == id {
                 self.model.snapshot_restore(memory.entries[&id].raw, x);
@@ -1705,7 +1979,7 @@ impl Slot {
                 let fits = capture == Some(end)
                     || memory.cache.fit(bytes, false, &[state]).is_some_and(|ev| {
                         let (snaps, states) = memory.cache.evict(&ev);
-                        memory.free(snaps, states);
+                        memory.evicted((snaps, states));
                         true
                     });
                 if fits {
@@ -1819,6 +2093,7 @@ impl Slot {
                 "new" => 0,
                 "kept" => 1,
                 "saved" => 2,
+                "loaded" => 4,
                 _ => 3,
             }] += 1;
         }
@@ -1909,7 +2184,12 @@ impl Slot {
             Finish::Shutdown => "stopped by the server's stop",
         };
         g.job.last(Event::Done { finish: why });
-        if g.prefill.is_some() {
+        if let Some(p) = &g.prefill {
+            // not saved: a prefill the stop cut short, and a replay that never
+            // ran (its rolling rows were never rebuilt)
+            if shutdown || (p.replay && p.done == g.from) {
+                memory.cut.insert(g.state);
+            }
             self.prefill_cut(&mut g, memory);
         }
         // The generation's end, for forks there, when the cache keeps it.
@@ -1931,7 +2211,7 @@ impl Slot {
                 .snapshot_take(memory.entries[&g.state].raw, g.pos, false);
             memory.save_snapshot(g.state, g.pos, x);
         }
-        memory.free(snaps, states);
+        memory.evicted((snaps, states));
         memory.entries.get_mut(&g.state).expect("state").used = Instant::now();
         let st = self.model.stats();
         {
@@ -1990,6 +2270,9 @@ impl Slot {
     /// pass may have changed in part, are discarded.
     fn pass_failed(&mut self, failed: &[usize], memory: &mut Memory) {
         if engine::stopping() {
+            for &i in failed {
+                memory.cut.insert(self.gens[i].state); // the pass may have changed it in part: not saved
+            }
             return;
         }
         let mut failed = failed.to_vec();

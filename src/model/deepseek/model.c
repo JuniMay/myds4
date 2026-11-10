@@ -3432,21 +3432,65 @@ int deepseek_snapshot_pos(const Snapshot *x) { return x->pos; }
 int deepseek_snapshot_extent(const Snapshot *x) { return x->extent; }
 const float *deepseek_snapshot_logits(const Snapshot *x) { return x->logits; }
 
+// The rows state_copy copies: the compressed rows and index keys of each KV
+// source. Global rows never change before a state's position. The row that a
+// position before `positions` shares with a later one (a compressed pair,
+// the guard row) is computed again by the prefill that continues there. With
+// fill, s first takes that many positions (s not the state in use).
+static int state_regions(State *s, int positions, int fill, StateRegion *out) {
+  if (positions < 0 || (!fill && positions > s->cap)) die("invalid rows of %d positions", positions);
+  gpu_sync();
+  if (fill) {
+    int cap = grown(start_cap(), positions);
+    if (s->cap != cap) resize(s, cap, 0);
+    memory_host_free(s->saved), s->saved = NULL;  // its rewind point belonged to its old rows
+  }
+  int n = 0;
+  for (int l = 0; l < LAYERS; l++) {
+    if (!L[l].kv_source) continue;
+    out[n++] = (StateRegion){s->comp[l].ptr, HEAD_DIM * 2, (uint32_t)L[l].ratio, 1, 0};
+    out[n++] = (StateRegion){s->keys[l].ptr, IDX_DIM * 2, (uint32_t)L[l].ratio, 1, 0};
+  }
+  return n;
+}
+
 void deepseek_state_copy(State *dst, const State *src, int positions) {
   if (dst == active || dst == src) die("the attention state in use cannot be overwritten");
   if (positions < 0 || positions > src->cap) die("invalid state copy of %d positions", positions);
+  StateRegion to[STATE_REGIONS_MAX], from[STATE_REGIONS_MAX];
+  int n = state_regions(dst, positions, 1, to);
+  state_regions((State *)src, positions, 0, from);
+  regions_copy(to, from, n, positions);
+}
+
+// A snapshot's rows block and logits, or a state's rolling rows in the
+// block's order (rolling()), as at pos.
+static int snapshot_parts(Snapshot *x, State *s, int pos, SnapshotPart *out, int32_t *meta, int *nmeta) {
   gpu_sync();
-  int cap = grown(start_cap(), positions);
-  if (dst->cap != cap) resize(dst, cap, 0);
-  memory_host_free(dst->saved), dst->saved = NULL;  // its rewind point belonged to its old rows
-  // Global rows never change before a state's position. The row that a
-  // position before `positions` shares with a later one (a compressed pair,
-  // the guard row) is computed again by the prefill that continues there.
-  for (int l = 0; l < LAYERS; l++) {
-    if (!L[l].kv_source) continue;
-    memcpy(dst->comp[l].ptr, src->comp[l].ptr, rows_bytes(l, positions, 0));
-    memcpy(dst->keys[l].ptr, src->keys[l].ptr, rows_bytes(l, positions, 1));
+  int n = 0;
+  *nmeta = 2;
+  if (x) {
+    meta[0] = x->pos, meta[1] = x->extent;
+    out[n++] = (SnapshotPart){x->rows, saved_bytes()};
+    if (x->logits) out[n++] = (SnapshotPart){x->logits, VOCAB * 4};
+    return n;
   }
+  meta[0] = pos, meta[1] = LAYERS - 1;
+  for (int l = 0; l < LAYERS; l++) {
+    out[n++] = (SnapshotPart){s->ring[l].ptr, s->ring[l].size};
+    if (L[l].kv_source) out[n++] = (SnapshotPart){s->cstate[l].ptr, s->cstate[l].size};
+  }
+  for (int d = 0; opt.draft && d < DRAFTS; d++) out[n++] = (SnapshotPart){s->dring[d].ptr, s->dring[d].size};
+  out[n++] = (SnapshotPart){s == active ? history : s->history, sizeof history};
+  return n;
+}
+
+static Snapshot *snapshot_alloc(const int32_t *meta, int nmeta, int with_logits) {
+  if (nmeta != 2 || meta[1] != LAYERS - 1) return NULL;  // a whole state's only
+  Snapshot *x = xmalloc(sizeof *x);
+  *x = (Snapshot){.pos = meta[0], .extent = meta[1], .rows = memory_host_required(saved_bytes(), 1)};
+  if (with_logits) x->logits = memory_host_required(VOCAB * 4, 1);
+  return x;
 }
 
 void deepseek_seek(const int *tokens, int pos) {
@@ -3511,6 +3555,16 @@ static void ds_snapshot_restore(ModelState *s, const ModelSnapshot *x) {
 static void ds_snapshot_free(ModelSnapshot *x) { deepseek_snapshot_free((Snapshot *)x); }
 static size_t ds_snapshot_bytes(int with_logits) { return deepseek_snapshot_bytes(with_logits); }
 static const float *ds_snapshot_logits(const ModelSnapshot *x) { return deepseek_snapshot_logits((const Snapshot *)x); }
+static int ds_state_regions(ModelState *s, int positions, int fill, StateRegion *out) {
+  if (fill) park(s);
+  return state_regions((State *)s, positions, fill, out);
+}
+static int ds_snapshot_parts(ModelSnapshot *x, ModelState *s, int pos, SnapshotPart *out, int32_t *meta, int *nmeta) {
+  return snapshot_parts((Snapshot *)x, (State *)s, pos, out, meta, nmeta);
+}
+static ModelSnapshot *ds_snapshot_alloc(const int32_t *meta, int nmeta, int with_logits) {
+  return (ModelSnapshot *)snapshot_alloc(meta, nmeta, with_logits);
+}
 
 static const float *ds_prefill(ModelState *s, const int *tokens, int n, int from, int replay, int capture,
                                ModelSnapshot **captured, float *every) {
@@ -3651,7 +3705,8 @@ const ModelOps deepseek_ops = {
     .stop = ds_stop, .state_new = ds_state_new, .state_free = ds_state_free, .state_bytes = ds_state_bytes,
     .state_copy = ds_state_copy, .snapshot_take = ds_snapshot_take, .snapshot_restore = ds_snapshot_restore,
     .snapshot_free = ds_snapshot_free, .snapshot_bytes = ds_snapshot_bytes, .snapshot_logits = ds_snapshot_logits,
-    .prefill = ds_prefill, .replay_rows = deepseek_replay_rows, .replay_start = deepseek_replay_start,
+    .state_version = 1, .state_regions = ds_state_regions, .snapshot_parts = ds_snapshot_parts,
+    .snapshot_alloc = ds_snapshot_alloc, .prefill = ds_prefill, .replay_rows = deepseek_replay_rows, .replay_start = deepseek_replay_start,
     .rows = ds_rows, .draft = ds_draft, .verify = ds_verify, .accept = ds_accept, .seek = ds_seek, .idle = ds_idle,
     .finish = ds_finish, .report = ds_report, .prepare_media = ds_prepare_image, .encode_media = deepseek_image, .media = deepseek_images, .chat = ds_chat,
     .bench = deepseek_bench};

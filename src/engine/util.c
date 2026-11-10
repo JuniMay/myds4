@@ -46,9 +46,15 @@ void say(const char *fmt, ...) {
 static volatile sig_atomic_t stop_requested;
 
 // Signal handlers only request a stop. The model owner saves state after
-// its current forward pass, outside the signal handler.
-static void request_shutdown(int signal_number) { stop_requested = 1; }
-void shutdown_request(void) { stop_requested = 1; }  // myds4_request_stop: the live view's q
+// its current forward pass, outside the signal handler. Each request counts:
+// the server stops saving its states at quit at the second
+// (server/src/worker.rs).
+static void request_shutdown(int signal_number) {
+  if (stop_requested < 1000) stop_requested++;
+}
+void shutdown_request(void) {  // myds4_request_stop: the live view's q
+  if (stop_requested < 1000) stop_requested++;
+}
 
 void shutdown_watch(void) {
   struct sigaction action = {.sa_handler = request_shutdown, .sa_flags = SA_RESTART};
@@ -60,6 +66,7 @@ void shutdown_watch(void) {
 }
 
 int shutdown_requested(void) { return stop_requested != 0; }
+int shutdown_requests(void) { return stop_requested; }
 
 _Noreturn void die(const char *fmt, ...) {
   va_list ap;

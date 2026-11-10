@@ -288,6 +288,8 @@ pub fn draw(buf: &mut Buffer, area: Rect, s: &Snapshot, ui: &mut Ui) {
         text(k.saved.to_string()),
         label(" · forked "),
         text(k.forked.to_string()),
+        label(" · loaded "),
+        text(k.loaded.to_string()),
     ]);
     buf.set_line(
         area.x,
@@ -295,6 +297,20 @@ pub fn draw(buf: &mut Buffer, area: Rect, s: &Snapshot, ui: &mut Ui) {
         &super::fit(head, area.width as usize),
         area.width,
     );
+    if let Some(d) = &s.kv_disk {
+        let line = Line::from(vec![
+            label(" on the SSD "),
+            strong(format!("{} saved state{}", d.states, if d.states == 1 { "" } else { "s" })),
+            text(format!(" {:.2} / {:.1} GiB", d.gib, d.limit_gib)),
+            label("   this run: read "),
+            text(d.loads.to_string()),
+            label(" · saved "),
+            text(format!("{} ({:.2} GiB written)", d.saves, d.written_gib)),
+            label("   in "),
+            text(d.dir.clone()),
+        ]);
+        buf.set_line(area.x, area.y + 1, &super::fit(line, area.width as usize), area.width);
+    }
     if s.tree.is_empty() || area.height < 8 || area.width < 40 {
         buf.set_line(
             area.x,

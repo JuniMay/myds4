@@ -37,11 +37,26 @@
 //! made ([`Cache::add`], [`Cache::add_snap`], [`Cache::push`],
 //! [`Cache::rejected`]). The cache owns no engine handles, so its tests need
 //! no model.
+//!
+//! **Saved states** (server/src/disk.rs) are states written to the SSD: their
+//! tokens, their parts' positions and their snapshots ([`Saved`]). A plan can
+//! take one as its source ([`Plan::Load`]) as it takes a state in memory: the
+//! rows before `at` are read back, then its snapshot is restored or a replay
+//! rebuilds the rolling rows. At equal work a state in memory, and a new state,
+//! go first. An evicted state is written when it holds at least
+//! [`Cache::disk_tokens`] tokens that no state kept in memory and no saved
+//! state holds ([`Cache::save_decision`]). A state whose rows equal a saved
+//! state's before some position ([`Link`]: it was read from it, or copied from
+//! a state that was) writes only its rows from there, as one more part of that
+//! saved state.
 
 use std::collections::BTreeMap;
 
 /// A state's key; the worker maps it to its engine state.
 pub type Id = u64;
+
+/// A saved state's key, also its files' (server/src/disk.rs).
+pub type DiskId = u64;
 
 /// Where a snapshot was taken.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +110,74 @@ pub struct Entry {
     pub number: u64,
     /// The positions requests reused from it, the last 32 of them.
     pub hits: Vec<usize>,
+    /// The saved state whose rows its own equal before some position.
+    pub saved: Option<Link>,
+}
+
+/// A state's rows before `shared` are those of saved state `saved` as of its
+/// `version`: the state was read from it, copied from a state that was, or
+/// written to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Link {
+    pub saved: DiskId,
+    pub version: u64,
+    pub shared: usize,
+}
+
+/// One part of a saved state: the rows that positions `from..to` wrote, in
+/// file `file` of `bytes` bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Part {
+    pub from: usize,
+    pub to: usize,
+    pub bytes: u64,
+    pub file: u32,
+}
+
+/// A saved snapshot: `snap.bytes` its file's, written by the save `version`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SavedSnap {
+    pub snap: Snap,
+    pub version: u64,
+}
+
+/// A state on the SSD, as the cache sees it.
+#[derive(Clone, Debug)]
+pub struct Saved {
+    /// The model whose identity it has; none when no model here has it (it
+    /// is never read, and goes first when room is needed).
+    pub model: Option<usize>,
+    /// The tokens whose rows it holds, from position 0.
+    pub tokens: Vec<i32>,
+    /// Its parts, the first written first; the last ends at its length.
+    pub parts: Vec<Part>,
+    pub snaps: Vec<SavedSnap>,
+    /// The positions whose rows in earlier parts a later part replaced.
+    pub replaced: usize,
+    /// The order of last use (a load or a save), for least-recently-used
+    /// eviction.
+    pub used: u64,
+    /// Which save wrote it last.
+    pub version: u64,
+}
+
+impl Saved {
+    /// The bytes its files take.
+    pub fn bytes(&self) -> u64 {
+        self.parts.iter().map(|p| p.bytes).sum::<u64>() + self.snaps.iter().map(|s| s.snap.bytes).sum::<u64>()
+    }
+}
+
+/// What saving an evicted state writes ([`Cache::save_decision`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Save {
+    /// Nothing: it holds too few tokens of its own.
+    Skip,
+    /// One more part of saved state `saved`, from position `from` to the
+    /// state's end.
+    Append { saved: DiskId, from: usize },
+    /// A new saved state; `replaces` is deleted once it is written.
+    New { replaces: Option<DiskId> },
 }
 
 /// How a prompt resumes.
@@ -121,6 +204,15 @@ pub enum Plan {
     /// A new state: the source's rows before `at`, then a replay at `at` (exact,
     /// or bounded with --ced), which captures the rolling rows there.
     Replay { source: Id, at: usize },
+    /// A new state from saved state `saved`: its rows before `at` read back,
+    /// then its snapshot at `snap` restored as in [`Plan::Snapshot`] (`branch`
+    /// as there), or without one a replay at `at` as in [`Plan::Replay`].
+    Load {
+        saved: DiskId,
+        snap: Option<usize>,
+        at: usize,
+        branch: usize,
+    },
 }
 
 impl Plan {
@@ -129,21 +221,27 @@ impl Plan {
         match *self {
             Plan::Cold => 0,
             Plan::InPlace { from, .. } => from,
-            Plan::Snapshot { at, .. } | Plan::Replay { at, .. } => at,
+            Plan::Snapshot { at, .. } | Plan::Replay { at, .. } | Plan::Load { at, .. } => at,
         }
     }
 
-    /// The state whose rows it reads, if any.
+    /// Whether its prefill replays at its start.
+    pub fn replays(&self) -> bool {
+        matches!(self, Plan::Replay { .. } | Plan::Load { snap: None, .. })
+    }
+
+    /// The state in memory whose rows it reads, if any.
     pub fn source(&self) -> Option<Id> {
         match *self {
-            Plan::Cold => None,
+            Plan::Cold | Plan::Load { .. } => None,
             Plan::InPlace { state, .. } => Some(state),
             Plan::Snapshot { source, .. } | Plan::Replay { source, .. } => Some(source),
         }
     }
 
     /// The log's name for it: new, kept (the state itself continues), saved (the
-    /// same prompt again, from its snapshot) or forked (a copy of another state).
+    /// same prompt again, from its snapshot), forked (a copy of another state)
+    /// or loaded (from the SSD).
     pub fn kind(&self, n: usize) -> &'static str {
         match *self {
             Plan::Cold => "new",
@@ -151,6 +249,7 @@ impl Plan {
             Plan::InPlace { .. } => "kept",
             Plan::Snapshot { at, .. } if at == n => "saved",
             Plan::Snapshot { .. } | Plan::Replay { .. } => "forked",
+            Plan::Load { .. } => "loaded",
         }
     }
 
@@ -160,8 +259,10 @@ impl Plan {
     /// resumes from and before the prompt's end.
     pub fn capture(&self, n: usize) -> Option<usize> {
         match *self {
-            Plan::Replay { at, .. } => Some(at),
-            Plan::Snapshot { at, branch, .. } if branch > at && branch < n => Some(branch),
+            Plan::Replay { at, .. } | Plan::Load { snap: None, at, .. } => Some(at),
+            Plan::Snapshot { at, branch, .. } | Plan::Load { at, branch, .. } if branch > at && branch < n => {
+                Some(branch)
+            }
             _ => None,
         }
     }
@@ -220,8 +321,8 @@ pub struct Eviction {
 }
 
 /// What the cache gave up, for the worker to free: snapshots, and whole
-/// states with their snapshots.
-pub type Freed = (Vec<(Id, Snap)>, Vec<(Id, Vec<Snap>)>);
+/// states (their entries, for the worker to save first).
+pub type Freed = (Vec<(Id, Snap)>, Vec<(Id, Entry)>);
 
 #[derive(Debug)]
 pub struct Cache {
@@ -230,6 +331,20 @@ pub struct Cache {
     pub limit: u64,
     /// At most this many states.
     pub max_states: usize,
+    /// The states on the SSD.
+    pub saved: BTreeMap<DiskId, Saved>,
+    /// --kv-disk: what saved states may take on the SSD, in bytes; 0: none
+    /// are written.
+    pub disk_limit: u64,
+    /// --kv-disk-tokens: a state is written only when it holds at least this
+    /// many tokens that no other kept state holds.
+    pub disk_tokens: usize,
+    /// A saved state that an admitted request reads next: what eviction
+    /// saves meanwhile neither changes, covers nor evicts it.
+    pub pinned: Option<DiskId>,
+    /// A saved state that cannot be read now: the request being planned
+    /// again passes it over.
+    pub skip: Option<DiskId>,
     clock: u64,
     next: Id,
     numbers: u64,
@@ -241,6 +356,11 @@ impl Cache {
             entries: BTreeMap::new(),
             limit,
             max_states,
+            saved: BTreeMap::new(),
+            disk_limit: 0,
+            disk_tokens: 8192,
+            pinned: None,
+            skip: None,
             clock: 0,
             next: 1,
             numbers: 0,
@@ -289,34 +409,58 @@ impl Cache {
         self.plan_for(0, p, limits)
     }
 
+    #[cfg(test)]
     pub fn plan_for(&self, model: usize, p: &[i32], limits: Limits<'_>) -> Plan {
+        self.plans_for(model, p, limits)[0]
+    }
+
+    /// The ways to resume the prompt `p` (exact, but for a replay under
+    /// --ced) that cost less than a cold start, the cheapest first, and the
+    /// cold start last: each keeps what it reuses, which may not fit beside
+    /// the prompt's state.
+    pub fn plans_for(&self, model: usize, p: &[i32], limits: Limits<'_>) -> Vec<Plan> {
         let n = p.len();
-        let mut best = (n, 3usize, Plan::Cold); // cost, then preference: in place, snapshot, replay, cold
+        // cost, then preference: in place, snapshot, replay, cold, then from the SSD
+        let mut found = vec![(n, 3usize, Plan::Cold)];
         let mut branch = 0; // where the prompt parts from every state
-        let mut consider = |cost: usize, rank: usize, plan: Plan| {
-            if (cost, rank) < (best.0, best.1) {
-                best = (cost, rank, plan);
-            }
+        let mut consider = |cost: usize, rank: usize, plan: Plan| found.push((cost, rank, plan));
+        let room = |stale: usize| limits.rewind.saturating_sub(stale);
+        // The longest prefix a state shares with the prompt where it resumes: the
+        // whole prompt only with its logits there, else its last token runs again.
+        let resumes = |tokens: &[i32], logits_at_n: bool| {
+            let k = common(p, tokens);
+            (k, if k >= n && !logits_at_n { n - 1 } else { k.min(n) })
         };
+        for (&id, d) in &self.saved {
+            if d.model != Some(model) || Some(id) == self.skip {
+                continue;
+            }
+            let (shared, k) = resumes(&d.tokens, d.snaps.iter().any(|s| s.snap.pos == n && s.snap.logits()));
+            branch = branch.max(shared.min(n));
+            if k == 0 {
+                continue;
+            }
+            for s in d.snaps.iter().map(|s| s.snap) {
+                let at = s.pos.min(k);
+                if s.pos <= k + room(s.stale) && (at < n || (s.pos == n && s.logits())) {
+                    let plan = Plan::Load { saved: id, snap: Some(s.pos), at, branch: 0 };
+                    consider(n - at, 4, plan);
+                }
+            }
+            if limits.replay && k < n {
+                let plan = Plan::Load { saved: id, snap: None, at: k, branch: 0 };
+                consider(n - k + (limits.replay_cost)(k), 5, plan);
+            }
+        }
         for (&id, e) in &self.entries {
             if e.model != model {
                 continue;
             }
-            let k = common(p, &e.tokens);
-            branch = branch.max(k.min(n));
+            let (shared, k) = resumes(&e.tokens, e.snaps.iter().any(|s| s.pos == n && s.logits()));
+            branch = branch.max(shared.min(n));
             if k == 0 {
                 continue;
             }
-            // The whole prompt matches: without its logits there, its last token runs again.
-            let k = if k >= n && !e.snaps.iter().any(|s| s.pos == n && s.logits()) {
-                n - 1
-            } else {
-                k.min(n)
-            };
-            if k == 0 {
-                continue;
-            }
-            let room = |stale: usize| limits.rewind.saturating_sub(stale);
             if !e.busy && e.tokens.len() <= k + room(e.stale) {
                 consider(n - k, 0, Plan::InPlace { state: id, from: k });
             }
@@ -345,17 +489,28 @@ impl Cache {
                 );
             }
         }
-        match best.2 {
-            Plan::Snapshot {
-                source, snap, at, ..
-            } => Plan::Snapshot {
-                source,
-                snap,
-                at,
-                branch: branch.max(at),
-            },
-            plan => plan,
-        }
+        found.sort_by_key(|&(cost, rank, _)| (cost, rank));
+        found.truncate(found.iter().position(|f| f.2 == Plan::Cold).expect("the cold start") + 1);
+        found
+            .into_iter()
+            .map(|(_, _, plan)| match plan {
+                Plan::Snapshot {
+                    source, snap, at, ..
+                } => Plan::Snapshot {
+                    source,
+                    snap,
+                    at,
+                    branch: branch.max(at),
+                },
+                Plan::Load { saved, snap: Some(snap), at, .. } => Plan::Load {
+                    saved,
+                    snap: Some(snap),
+                    at,
+                    branch: branch.max(at),
+                },
+                plan => plan,
+            })
+            .collect()
     }
 
     /// Where a prefill on `plan` for a prompt of `n` tokens starts: the
@@ -366,8 +521,12 @@ impl Cache {
         let stale = |id: Id, pos: usize| self.snap(id, pos).expect("the plan's snapshot").stale;
         match *plan {
             Plan::Cold => (0, 0),
-            Plan::Replay { at, .. } => (at, 0),
+            Plan::Replay { at, .. } | Plan::Load { snap: None, at, .. } => (at, 0),
             Plan::Snapshot { source, snap, .. } => (snap, stale(source, snap)),
+            Plan::Load { saved, snap: Some(snap), .. } => {
+                let s = self.saved[&saved].snaps.iter().find(|s| s.snap.pos == snap);
+                (snap, s.expect("the plan's saved snapshot").snap.stale)
+            }
             // the same prompt again: its prompt-end snapshot is restored into it
             Plan::InPlace { state, from } if from == n => (n, stale(state, n)),
             Plan::InPlace { state, .. } => (
@@ -401,6 +560,7 @@ impl Cache {
                 pending: Vec::new(),
                 number: self.numbers,
                 hits: Vec::new(),
+                saved: None,
             },
         );
         id
@@ -421,6 +581,9 @@ impl Cache {
         e.pending.clear();
         e.tokens.clear();
         e.tokens.extend_from_slice(&p[..from]);
+        if let Some(link) = &mut e.saved {
+            link.shared = link.shared.min(from);  // its rows from `from` on are written again
+        }
         let (keep, dropped): (Vec<Snap>, Vec<Snap>) =
             e.snaps.drain(..).partition(|s| s.pos <= from);
         e.snaps = keep;
@@ -656,7 +819,7 @@ impl Cache {
     }
 
     /// Applies an eviction from [`Cache::fit`]: the snapshots and states to free.
-    pub fn evict(&mut self, ev: &Eviction) -> (Vec<(Id, Snap)>, Vec<(Id, Vec<Snap>)>) {
+    pub fn evict(&mut self, ev: &Eviction) -> Freed {
         let mut snaps = Vec::new();
         for &(id, pos) in &ev.snaps {
             if let Some(e) = self.entries.get_mut(&id)
@@ -665,8 +828,147 @@ impl Cache {
                 snaps.push((id, e.snaps.remove(i)));
             }
         }
-        let states = ev.states.iter().map(|&id| (id, self.remove(id))).collect();
+        let states = ev
+            .states
+            .iter()
+            .filter_map(|&id| self.entries.remove(&id).map(|e| (id, e)))
+            .collect();
         (snaps, states)
+    }
+}
+
+// ---- saved states ----
+
+impl Cache {
+    /// The bytes saved states take on the SSD.
+    pub fn saved_bytes(&self) -> u64 {
+        self.saved.values().map(Saved::bytes).sum()
+    }
+
+    /// A saved state written now, or read at startup (those oldest first,
+    /// before every state of this run): it is used now.
+    pub fn insert_saved(&mut self, id: DiskId, mut saved: Saved) {
+        saved.used = self.tick();
+        self.saved.insert(id, saved);
+    }
+
+    /// A saved state was read: it is used now.
+    pub fn touch_saved(&mut self, id: DiskId) {
+        let used = self.tick();
+        if let Some(d) = self.saved.get_mut(&id) {
+            d.used = used;
+        }
+    }
+
+    /// State `id` was read from saved state `saved` up to `at`: its rows
+    /// before `at` are that saved state's.
+    pub fn link_saved(&mut self, id: Id, saved: DiskId, at: usize) {
+        let link = self.saved.get(&saved).map(|d| Link {
+            saved,
+            version: d.version,
+            shared: at,
+        });
+        if let Some(e) = self.entries.get_mut(&id) {
+            e.saved = link;
+        }
+    }
+
+    /// State `id` copied `source`'s rows before `at`: it shares `source`'s
+    /// link up to there.
+    pub fn inherit(&mut self, id: Id, source: Id, at: usize) {
+        let link = self.entries.get(&source).and_then(|e| e.saved).map(|l| Link {
+            shared: l.shared.min(at),
+            ..l
+        });
+        if let Some(e) = self.entries.get_mut(&id) {
+            e.saved = link;
+        }
+    }
+
+    /// What saving `e` writes: nothing when it holds fewer than
+    /// `disk_tokens` tokens that no state still in memory (with `kept`) and
+    /// no saved state of its model holds; one more part of the saved state it
+    /// links to while that is as it was (unless its replaced rows would then
+    /// outnumber its own, or it has 64 parts: then it is written whole); a new
+    /// saved state otherwise. The linked saved state's own tokens after `e`'s
+    /// (its tail) go with an append or a replacement, so it gets neither when
+    /// that tail holds `disk_tokens` tokens or more, nor while an admitted
+    /// request reads it next (`pinned`).
+    pub fn save_decision(&self, e: &Entry, kept: bool) -> Save {
+        let len = e.tokens.len();
+        if self.disk_limit == 0 || len == 0 {
+            return Save::Skip;
+        }
+        let in_memory = self.entries.values().filter(|o| kept && o.model == e.model).map(|o| &o.tokens[..]);
+        let on_disk = self.saved.values().filter(|d| d.model == Some(e.model)).map(|d| &d.tokens[..]);
+        let held = in_memory.chain(on_disk).map(|t| common(&e.tokens, t)).max().unwrap_or(0);
+        if len < held + self.disk_tokens {
+            return Save::Skip;
+        }
+        let joins = |d: &Saved| d.tokens.len() < common(&e.tokens, &d.tokens) + self.disk_tokens;
+        match e.saved {
+            Some(link)
+                if Some(link.saved) != self.pinned
+                    && self.saved.get(&link.saved).is_some_and(|d| d.version == link.version && joins(d)) =>
+            {
+                let d = &self.saved[&link.saved];
+                let replaced = d.replaced + d.tokens.len().saturating_sub(link.shared);
+                if replaced > len || d.parts.len() >= 64 {
+                    Save::New {
+                        replaces: Some(link.saved),
+                    }
+                } else {
+                    Save::Append {
+                        saved: link.saved,
+                        from: link.shared,
+                    }
+                }
+            }
+            _ => Save::New { replaces: None },
+        }
+    }
+
+    /// Saved states of `id`'s model that `id` covers: those holding fewer
+    /// than `disk_tokens` tokens beyond what they share with it.
+    pub fn covered(&self, id: DiskId) -> Vec<DiskId> {
+        let Some(new) = self.saved.get(&id) else {
+            return Vec::new();
+        };
+        self.saved
+            .iter()
+            .filter(|&(&other, d)| {
+                other != id && Some(other) != self.pinned && d.model.is_some() && d.model == new.model
+                    && d.tokens.len() < common(&d.tokens, &new.tokens) + self.disk_tokens
+            })
+            .map(|(&other, _)| other)
+            .collect()
+    }
+
+    /// The saved states to delete so that `need` more bytes fit within
+    /// `disk_limit`, `keep` apart: those of no model here first, then the
+    /// least recently used, all used before `before` (a state that is saved
+    /// takes the room of older ones only). None when they cannot make room.
+    pub fn disk_room(&self, need: u64, keep: Option<DiskId>, before: Option<u64>) -> Option<Vec<DiskId>> {
+        let mut total = self.saved_bytes() + need;
+        let mut order: Vec<(&DiskId, &Saved)> = self
+            .saved
+            .iter()
+            .filter(|(id, d)| {
+                Some(**id) != keep
+                    && Some(**id) != self.pinned
+                    && (d.model.is_none() || before.is_none_or(|b| d.used < b))
+            })
+            .collect();
+        order.sort_by_key(|(_, d)| (d.model.is_some(), d.used));
+        let mut out = Vec::new();
+        for (&id, d) in order {
+            if total <= self.disk_limit {
+                break;
+            }
+            total -= d.bytes();
+            out.push(id);
+        }
+        (total <= self.disk_limit).then_some(out)
     }
 }
 
@@ -848,6 +1150,22 @@ mod tests {
         }
         c.finish(id, 1 << 20);
         id
+    }
+
+    /// The plans for a prompt go from the cheapest to a cold start, and the
+    /// cold start can take the place of the state the others keep.
+    #[test]
+    fn plans_end_with_a_cold_start_that_needs_no_state_kept() {
+        let mut c = Cache::new(3 << 20, 16);
+        let a = state(&mut c, &seq(0..1000), &[]);
+        let mut p = seq(0..8);
+        p.extend(seq(5000..5900));
+        let plans = c.plans_for(0, &p, LIMITS);
+        assert_eq!(plans.first(), Some(&Plan::Replay { source: a, at: 8 }));
+        assert_eq!(plans.last(), Some(&Plan::Cold));
+        assert!(c.fit(5 << 20 >> 1, true, &[a]).is_none(), "beside the state it reuses");
+        let ev = c.fit(5 << 20 >> 1, true, &[]).expect("in the state's place");
+        assert_eq!(ev.states, vec![a]);
     }
 
     #[test]
@@ -1693,5 +2011,229 @@ mod tests {
         // end's is its own
         assert_eq!(t[0].via, c.entries[&nb].number);
         assert!(t[1..].iter().all(|x| x.via == x.number));
+    }
+
+    // ---- saved states ----
+
+    fn snap(pos: usize, kind: Kind) -> SavedSnap {
+        SavedSnap {
+            snap: Snap { pos, kind, bytes: SNAP, stale: 0 },
+            version: 1,
+        }
+    }
+
+    /// A saved state of model 0 holding `tokens` in one part, with snapshots.
+    fn saved(c: &mut Cache, id: DiskId, tokens: &[i32], snaps: &[SavedSnap]) {
+        c.insert_saved(
+            id,
+            Saved {
+                model: Some(0),
+                tokens: tokens.to_vec(),
+                parts: vec![Part { from: 0, to: tokens.len(), bytes: 100 * tokens.len() as u64, file: 0 }],
+                snaps: snaps.to_vec(),
+                replaced: 0,
+                used: 0,
+                version: 1,
+            },
+        );
+    }
+
+    fn disk_cache() -> Cache {
+        let mut c = Cache::new(1 << 30, 16);
+        c.disk_limit = 1 << 30;
+        c.disk_tokens = 100;
+        c
+    }
+
+    #[test]
+    fn a_saved_state_resumes_a_prompt_that_nothing_in_memory_holds() {
+        let mut c = disk_cache();
+        saved(&mut c, 7, &seq(0..1000), &[snap(1000, Kind::GenerationEnd), snap(640, Kind::Branch)]);
+        let plan = c.plan(&seq(0..1500), LIMITS);
+        assert_eq!(plan, Plan::Load { saved: 7, snap: Some(1000), at: 1000, branch: 1000 });
+        assert_eq!((plan.reused(), plan.kind(1500), plan.source(), plan.replays()), (1000, "loaded", None, false));
+        assert_eq!(c.origin(&plan, 1500), (1000, 0));
+        // parting before its end, past the rewind room: its branch snapshot
+        let mut p = seq(0..700);
+        p.extend(seq(5000..5100));
+        assert_eq!(c.plan(&p, LIMITS), Plan::Load { saved: 7, snap: Some(640), at: 640, branch: 700 });
+        assert_eq!(c.plan(&p, LIMITS).capture(800), Some(700), "the branch point is captured as in memory");
+    }
+
+    #[test]
+    fn a_saved_state_replays_where_no_snapshot_is_near() {
+        let mut c = disk_cache();
+        saved(&mut c, 3, &seq(0..5000), &[snap(200, Kind::Branch)]);
+        let mut p = seq(0..4000);
+        p.extend(seq(9000..9010));
+        let plan = c.plan(&p, LIMITS);
+        assert_eq!(plan, Plan::Load { saved: 3, snap: None, at: 4000, branch: 0 });
+        assert!(plan.replays());
+        assert_eq!((plan.capture(p.len()), c.origin(&plan, p.len())), (Some(4000), (4000, 0)));
+    }
+
+    #[test]
+    fn a_saved_prompt_end_answers_the_same_prompt_again() {
+        let mut c = disk_cache();
+        saved(&mut c, 1, &seq(0..300), &[snap(300, Kind::PromptEnd)]);
+        let plan = c.plan(&seq(0..300), LIMITS);
+        assert_eq!(plan, Plan::Load { saved: 1, snap: Some(300), at: 300, branch: 300 });
+        assert_eq!(plan.capture(300), None);
+        // without logits there, its last token runs again
+        let mut c = disk_cache();
+        saved(&mut c, 1, &seq(0..300), &[snap(299, Kind::Branch)]);
+        assert_eq!(c.plan(&seq(0..300), LIMITS).reused(), 299);
+    }
+
+    #[test]
+    fn at_equal_work_memory_and_a_new_state_go_before_the_ssd() {
+        let mut c = disk_cache();
+        saved(&mut c, 1, &seq(0..1000), &[snap(1000, Kind::GenerationEnd)]);
+        let s = state(&mut c, &seq(0..1000), &[1000]);
+        assert!(matches!(c.plan(&seq(0..1200), LIMITS), Plan::InPlace { state, from: 1000 } if state == s));
+        // a saved state of another model, or of no model here, is never read
+        let mut c = disk_cache();
+        saved(&mut c, 1, &seq(0..1000), &[snap(1000, Kind::GenerationEnd)]);
+        c.saved.get_mut(&1).unwrap().model = None;
+        assert_eq!(c.plan(&seq(0..1200), LIMITS), Plan::Cold);
+        c.saved.get_mut(&1).unwrap().model = Some(1);
+        assert_eq!(c.plan(&seq(0..1200), LIMITS), Plan::Cold);
+        // a replay that costs a cold prefill's work: the cold prefill
+        let mut c = disk_cache();
+        let limits = Limits { rewind: 5, replay: true, replay_cost: &|k| 2 * k };
+        saved(&mut c, 1, &seq(0..1000), &[]);
+        assert_eq!(c.plan_for(0, &seq(0..1200), limits), Plan::Cold);
+    }
+
+    #[test]
+    fn a_state_is_saved_when_it_holds_enough_tokens_of_its_own() {
+        let mut c = disk_cache();
+        let a = state(&mut c, &seq(0..1000), &[1000]);
+        let e = c.entries.remove(&a).unwrap();
+        assert_eq!(c.save_decision(&e, true), Save::New { replaces: None });
+        c.disk_limit = 0;
+        assert_eq!(c.save_decision(&e, true), Save::Skip, "no room on the SSD: nothing saved");
+        c.disk_limit = 1 << 30;
+        // a state kept in memory holds all but 60 of its tokens
+        let mut longer = seq(0..940);
+        longer.extend(seq(7000..7500));
+        state(&mut c, &longer, &[]);
+        assert_eq!(c.save_decision(&e, true), Save::Skip);
+        assert_eq!(c.save_decision(&e, false), Save::New { replaces: None }, "at quit no state stays in memory");
+        // a saved state holds all but 60
+        let mut c = disk_cache();
+        saved(&mut c, 9, &longer, &[]);
+        assert_eq!(c.save_decision(&e, false), Save::Skip);
+        // too short to be worth it
+        let mut c = disk_cache();
+        let short = state(&mut c, &seq(0..99), &[99]);
+        let e = c.entries.remove(&short).unwrap();
+        assert_eq!(c.save_decision(&e, false), Save::Skip);
+    }
+
+    #[test]
+    fn a_state_read_from_a_saved_one_adds_a_part_to_it() {
+        let mut c = disk_cache();
+        saved(&mut c, 4, &seq(0..1000), &[snap(1000, Kind::GenerationEnd)]);
+        let id = state(&mut c, &seq(0..1000), &[]);
+        c.link_saved(id, 4, 1000);
+        // it continued past the saved state's end
+        c.start(id, &seq(0..1400), 1000, 1 << 20, 0);
+        c.prefilled(id, &seq(0..1400), 0);
+        c.finish(id, 1 << 20);
+        let e = c.entries.remove(&id).unwrap();
+        assert_eq!(c.save_decision(&e, true), Save::Append { saved: 4, from: 1000 });
+        // a save into the saved state since: its link is old, a new saved state
+        c.saved.get_mut(&4).unwrap().version = 2;
+        assert_eq!(c.save_decision(&e, true), Save::New { replaces: None });
+        c.saved.get_mut(&4).unwrap().version = 1;
+        // its replaced rows would outnumber its own: written whole, replacing it
+        c.saved.get_mut(&4).unwrap().replaced = 1500;
+        assert_eq!(c.save_decision(&e, true), Save::New { replaces: Some(4) });
+    }
+
+    #[test]
+    fn links_follow_copies_and_continuations() {
+        let mut c = disk_cache();
+        saved(&mut c, 4, &seq(0..1000), &[]);
+        let a = state(&mut c, &seq(0..1000), &[]);
+        c.link_saved(a, 4, 1000);
+        assert_eq!(c.entries[&a].saved, Some(Link { saved: 4, version: 1, shared: 1000 }));
+        // a copy of its rows before 600 shares them up to there
+        let b = c.add(1 << 20);
+        c.inherit(b, a, 600);
+        assert_eq!(c.entries[&b].saved.map(|l| l.shared), Some(600));
+        // continuing before its end: its rows from there are written again
+        c.start(a, &seq(0..1000), 950, 1 << 20, 0);
+        assert_eq!(c.entries[&a].saved.map(|l| l.shared), Some(950));
+        // a part from there replaces the saved state's 50 rows after it
+        // (fewer than disk_tokens: its own tail is not worth keeping)
+        let mut p = seq(0..950);
+        p.extend(seq(3000..3200));
+        c.prefilled(a, &p, 0);
+        c.finish(a, 1 << 20);
+        let e = c.entries.remove(&a).unwrap();
+        assert_eq!(c.save_decision(&e, false), Save::Append { saved: 4, from: 950 });
+    }
+
+    #[test]
+    fn a_save_leaves_the_saved_state_a_request_reads_next_as_it_is() {
+        let mut c = disk_cache();
+        saved(&mut c, 4, &seq(0..1000), &[]);
+        let mut p = seq(0..990);
+        p.extend(seq(8000..8300));
+        let id = state(&mut c, &p, &[]);
+        c.link_saved(id, 4, 990);
+        let e = c.entries.remove(&id).unwrap();
+        assert_eq!(c.save_decision(&e, false), Save::Append { saved: 4, from: 990 });
+        c.pinned = Some(4);
+        assert_eq!(c.save_decision(&e, false), Save::New { replaces: None }, "not appended to");
+        c.saved.get_mut(&4).unwrap().replaced = 5000;
+        assert_eq!(c.save_decision(&e, false), Save::New { replaces: None }, "nor replaced");
+    }
+
+    #[test]
+    fn a_branch_does_not_cut_off_a_saved_state_s_own_tail() {
+        let mut c = disk_cache();
+        saved(&mut c, 4, &seq(0..1000), &[]);
+        // a branch read from it at 500, with 200 tokens of its own: the saved
+        // state's 500 tokens after the branch point stay
+        let mut p = seq(0..500);
+        p.extend(seq(9000..9200));
+        let id = state(&mut c, &p, &[]);
+        c.link_saved(id, 4, 500);
+        let e = c.entries.remove(&id).unwrap();
+        assert_eq!(c.save_decision(&e, false), Save::New { replaces: None }, "not appended to");
+        c.saved.get_mut(&4).unwrap().replaced = 5000;
+        assert_eq!(c.save_decision(&e, false), Save::New { replaces: None }, "nor replaced");
+    }
+
+    #[test]
+    fn a_new_saved_state_covers_older_ones_and_room_goes_oldest_first() {
+        let mut c = disk_cache();
+        saved(&mut c, 1, &seq(0..1000), &[]); // 60 tokens of its own beyond 2's prefix
+        let mut other = seq(0..940);
+        other.extend(seq(5000..5300)); // 300 of its own
+        saved(&mut c, 2, &other, &[]);
+        let mut newer = seq(0..940);
+        newer.extend(seq(6000..6500));
+        saved(&mut c, 3, &newer, &[]);
+        assert_eq!(c.covered(3), vec![1]);
+        c.pinned = Some(1);
+        assert!(c.covered(3).is_empty(), "the saved state a request reads next stays");
+        c.pinned = None;
+        // room: one of no model here first, then the least recently used
+        saved(&mut c, 4, &seq(0..10), &[]);
+        c.saved.get_mut(&4).unwrap().model = None;
+        let all = c.saved_bytes();
+        c.disk_limit = all;
+        assert_eq!(c.disk_room(0, None, None), Some(vec![]));
+        assert_eq!(c.disk_room(1, None, None), Some(vec![4]));
+        assert_eq!(c.disk_room(1001, None, None), Some(vec![4, 1]));
+        assert_eq!(c.disk_room(1001, Some(1), None), Some(vec![4, 2]));
+        assert_eq!(c.disk_room(all + 1, None, None), None, "more than the budget: no room");
+        // a state used before every saved one takes no room from them
+        assert_eq!(c.disk_room(1001, None, Some(1)), None);
+        assert_eq!(c.disk_room(1001, None, Some(3)), Some(vec![4, 1]));
     }
 }

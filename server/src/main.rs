@@ -10,6 +10,7 @@
 mod chat;
 mod config;
 mod control;
+mod disk;
 mod engine;
 mod http;
 mod kv;
@@ -47,6 +48,10 @@ const USAGE: &str = "usage: myds4-server [--config FILE | -m MODEL [model option
                   that other programs leave, less --reserve, decides)
   --reserve GB    memory kept available to other programs, 2-1024 GiB (default 10)
   --kv-cache GB   total KV states and snapshots across all models, GiB (default 8)
+  --kv-disk GB    room on the SSD for evicted states, written when evicted and at quit and read back for a
+                  prompt that starts like one, GiB; 0 off (default 32)
+  --kv-dir DIR    the saved states' folder (default ~/.cache/myds4/kv)
+  --kv-disk-tokens N  save a state only when it holds at least N tokens no other kept state holds (default 8192)
   --idle-unload S seconds a model may go without requests before its weights and experts unload (its KV
                   stays; the next request loads it again), 0 never (default 600; a model's own setting wins)
   --tui           a live view in the terminal (requests, speed, experts, memory, the KV cache) instead of the
@@ -132,7 +137,8 @@ fn parse(args: &[String]) -> Args {
                         one = Some(ModelConfig::new(v));
                     }
                     "--config" => file = Some(v.into()),
-                    "--memory" | "--reserve" | "--kv-cache" | "--idle-unload" => {
+                    "--memory" | "--reserve" | "--kv-cache" | "--kv-disk" | "--kv-disk-tokens"
+                    | "--idle-unload" => {
                         let name = flag[2..].replace('-', "_");
                         let value = serde_json::from_str::<Value>(v).unwrap_or(Value::Null);
                         budgets.push((name, value));
@@ -143,7 +149,7 @@ fn parse(args: &[String]) -> Args {
                             .unwrap_or_else(|_| die(&format!("--serve: not a port: {v}")));
                         server.push(("port".into(), Value::from(port)));
                     }
-                    "--host" | "--api-key-file" | "--tui-theme" => {
+                    "--host" | "--api-key-file" | "--kv-dir" | "--tui-theme" => {
                         server.push((flag[2..].replace('-', "_"), Value::String(v.clone())))
                     }
                     "--render" => a.render = Some(v.clone()),
@@ -735,7 +741,11 @@ fn main() {
     } else {
         (None, None)
     };
-    if !worker::start(served.clone(), a.budgets.clone(), on_log, on_die) {
+    // where states are saved (none without a folder, or with --kv-disk 0)
+    let kv_dir = (a.budgets.kv_disk_gb > 0.0)
+        .then(|| a.server.kv_dir.as_ref().map(std::path::PathBuf::from).or_else(config::default_kv_dir))
+        .flatten();
+    if !worker::start(served.clone(), a.budgets.clone(), kv_dir, on_log, on_die) {
         exit(2);
     }
     let loaded = worker::models();

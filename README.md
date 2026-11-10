@@ -43,6 +43,7 @@ below with your checkpoint and existing API-key paths:
   "memory": 80,
   "reserve": 10,
   "kv_cache": 24,
+  "kv_disk": 32,
   "idle_unload": 600,
   "models": [
     {

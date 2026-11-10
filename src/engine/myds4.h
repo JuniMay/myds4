@@ -17,6 +17,7 @@ char *read_file(const char *path, size_t *len);
 long b64_decode(const char *s, size_t n, uint8_t *out); // bytes written (at most 3 per 4 characters), -1 if not base64
 void shutdown_watch(void); // SIGINT/SIGTERM request a stop; handlers do no I/O
 int shutdown_requested(void);
+int shutdown_requests(void); // how many stops were requested
 void shutdown_request(void); // a stop, as SIGINT and SIGTERM request one
 // Sampling workspaces belong to the single model thread. Each non-greedy
 // ordinary token consumes one draw. Sampled proposals and acceptance use additional draws.

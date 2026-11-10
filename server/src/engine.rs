@@ -9,7 +9,7 @@ use std::ptr;
 
 use deepseek_recipe::stream::StreamTokenizer;
 
-const ABI: c_int = 17;
+const ABI: c_int = 18;
 
 #[repr(C)]
 struct RawProcess {
@@ -238,6 +238,30 @@ unsafe extern "C" {
     fn myds4_snapshot_free(m: *mut RawModel, x: *mut RawSnapshot);
     fn myds4_snapshot_bytes(m: *const RawModel, with_logits: c_int) -> usize;
     fn myds4_snapshot_logits(m: *const RawModel, x: *const RawSnapshot) -> *const f32;
+    fn myds4_stop_requests() -> c_int;
+    fn myds4_state_write(
+        m: *mut RawModel,
+        s: *mut RawState,
+        from: c_int,
+        to: c_int,
+        fd: c_int,
+    ) -> i64;
+    fn myds4_state_read(
+        m: *mut RawModel,
+        s: *mut RawState,
+        positions: c_int,
+        fds: *const c_int,
+        count: c_int,
+    ) -> c_int;
+    fn myds4_snapshot_write(
+        m: *mut RawModel,
+        x: *const RawSnapshot,
+        s: *mut RawState,
+        pos: c_int,
+        fd: c_int,
+    ) -> i64;
+    fn myds4_snapshot_read(m: *mut RawModel, fd: c_int) -> *mut RawSnapshot;
+    fn myds4_state_identity(m: *mut RawModel, out: *mut u8);
     fn myds4_prefill(
         m: *mut RawModel,
         s: *mut RawState,
@@ -365,6 +389,11 @@ pub fn init(
 /// Whether a stop was requested: SIGINT, SIGTERM or [`request_stop`].
 pub fn stopping() -> bool {
     unsafe { myds4_stopping() != 0 }
+}
+
+/// How many stops were requested: saving states at quit ends at the second.
+pub fn stop_requests() -> u32 {
+    unsafe { myds4_stop_requests().max(0) as u32 }
 }
 
 pub fn refresh_stats() {
@@ -778,6 +807,45 @@ impl Model {
     /// The logits a snapshot keeps (null without).
     pub fn snapshot_logits(&self, x: *const RawSnapshot) -> Logits {
         unsafe { myds4_snapshot_logits(self.raw, x) }
+    }
+
+    // ---- saved states (the engine thread; server/src/disk.rs) ----
+
+    /// One part of a saved state: the rows of `s` that positions from `from`
+    /// on wrote, up to `to`, into `fd`. The bytes written; None when a write
+    /// failed or a second stop request ended it.
+    pub fn state_write(&self, s: *mut RawState, from: usize, to: usize, fd: c_int) -> Option<u64> {
+        let n = unsafe { myds4_state_write(self.raw, s, from as c_int, to as c_int, fd) };
+        (n >= 0).then_some(n as u64)
+    }
+    /// Fills `s`, a new state, with the rows before `positions` from a saved
+    /// state's parts, the first written first. False when a part is short,
+    /// damaged or of another shape (`s` is then of no use).
+    pub fn state_read(&self, s: *mut RawState, positions: usize, fds: &[c_int]) -> bool {
+        unsafe { myds4_state_read(self.raw, s, positions as c_int, fds.as_ptr(), fds.len() as c_int) == 0 }
+    }
+    /// Snapshot `x`, or (null) the rolling rows of `s` at its end `pos`,
+    /// without logits, into `fd`. The bytes written, or None.
+    pub fn snapshot_write(
+        &self,
+        x: *const RawSnapshot,
+        s: *mut RawState,
+        pos: usize,
+        fd: c_int,
+    ) -> Option<u64> {
+        let n = unsafe { myds4_snapshot_write(self.raw, x, s, pos as c_int, fd) };
+        (n >= 0).then_some(n as u64)
+    }
+    /// A snapshot that snapshot_write wrote; null when the file is short,
+    /// damaged or of another shape.
+    pub fn snapshot_read(&self, fd: c_int) -> *mut RawSnapshot {
+        unsafe { myds4_snapshot_read(self.raw, fd) }
+    }
+    /// What this model's saved states depend on (engine.h).
+    pub fn state_identity(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        unsafe { myds4_state_identity(self.raw, out.as_mut_ptr()) };
+        out
     }
 
     // ---- running the model (the engine thread) ----

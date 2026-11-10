@@ -21,7 +21,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYDS4_ABI 17
+#define MYDS4_ABI 18
 
 // ---- the process ----
 
@@ -46,9 +46,11 @@ typedef struct {
 int myds4_init(const myds4_process *p);
 
 // Whether a stop was requested (SIGINT, SIGTERM or myds4_request_stop), and
-// a request for one.
+// a request for one. Each request counts: myds4_stop_requests says how many
+// there were (the server stops saving states at quit at the second).
 int myds4_stopping(void);
 void myds4_request_stop(void);
+int myds4_stop_requests(void);
 
 // A line for the log, with the time: on stderr, or to on_log.
 void myds4_log(const char *line);
@@ -170,6 +172,39 @@ void myds4_snapshot_restore(myds4_model *m, myds4_state *s, const myds4_snapshot
 void myds4_snapshot_free(myds4_model *m, myds4_snapshot *x);
 size_t myds4_snapshot_bytes(const myds4_model *m, int with_logits);
 const float *myds4_snapshot_logits(const myds4_model *m, const myds4_snapshot *x);  // null without
+
+// ---- saved states (the server's SSD KV store, server/src/disk.rs) ----
+
+// The server names, opens, syncs and renames the files; these calls write
+// and read their contents (src/engine/state_file.c): uncached (F_NOCACHE),
+// with a CRC32C for each 4 MiB block. A saved state is a list of parts.
+// One part: the rows of s (holding at least `to` positions) that positions
+// from `from` on wrote, up to `to` (the rows the first `from` positions leave
+// unchanged are in earlier parts). The bytes written, or -1 (a write failed,
+// or a second stop request ended it). With fd -1 nothing is written: the
+// bytes it would take (the same for myds4_snapshot_write).
+int64_t myds4_state_write(myds4_model *m, myds4_state *s, int from, int to, int fd);
+// Fills s, a new state, with the rows before `positions` from a saved
+// state's parts, in the order written (each part's rows replace the earlier
+// parts' from its own start), as myds4_state_copy of that many positions
+// would; a snapshot is restored into it next, or a prefill replays. 0, or -1
+// when a part is short, damaged or of another shape, or the parts leave rows
+// out (s is then of no use).
+int myds4_state_read(myds4_model *m, myds4_state *s, int positions, const int *fds, int count);
+// Snapshot x, or (x null) s's rolling rows as at pos (its end), without
+// logits. The bytes written, or -1.
+int64_t myds4_snapshot_write(myds4_model *m, const myds4_snapshot *x, myds4_state *s, int pos, int fd);
+// A snapshot myds4_snapshot_write wrote; null when the file is short,
+// damaged or of another shape.
+myds4_snapshot *myds4_snapshot_read(myds4_model *m, int fd);
+// What m's saved states depend on, available before its weights load: its
+// family's state layout, its checkpoint's weights (the config.json,
+// .safetensors and .gguf files of the folder, by name, size and first and
+// last 64 KiB), the experts' GGUF set and DFlash2's checkpoint, and the
+// options that change a state's rows or shapes (draft, lookup, ced,
+// prefill_prune, substitute). A state saved with another identity is not
+// read.
+void myds4_state_identity(myds4_model *m, uint8_t out[32]);
 
 // ---- running a model ----
 

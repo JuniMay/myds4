@@ -148,7 +148,8 @@ impl Server {
             std::process::id(),
             nanos ^ (port as u128) << 64
         );
-        let mut args: Vec<String> = ["-m", &s.checkpoint, "--memory", "56", "--kv-cache", "8"]
+        // no saved states: a cold server stays cold, and nothing is written to the SSD
+        let mut args: Vec<String> = ["-m", &s.checkpoint, "--memory", "56", "--kv-cache", "8", "--kv-disk", "0"]
             .iter()
             .map(|a| a.to_string())
             .collect();
@@ -782,6 +783,51 @@ fn a_saved_prompt_again_fits_a_full_kv_cache() {
         st.kv
     );
     assert_eq!(hit(&again), n, "the retry did not resume at its prompt end");
+    assert!(
+        st.kv <= st.limit,
+        "the cache takes {:.3} GiB of {:.3}",
+        st.kv,
+        st.limit
+    );
+}
+
+/// A prompt that shares only its first tokens with the one idle state, in a
+/// cache with room for one state, runs in that state's place: reusing those
+/// tokens would keep the state, and the two do not fit together.
+#[test]
+fn a_prompt_runs_in_place_of_the_state_whose_reuse_does_not_fit() {
+    let Some(s) = setup() else {
+        eprintln!("skipped: set MYDS4_CHECKPOINT and MYDS4_EXPERTS");
+        return;
+    };
+    let _one = one_model();
+    let cut = |doc: &str, question: &str| {
+        let text = std::fs::read_to_string(root().join("docs").join(doc)).expect("a document");
+        let reference: String = text.chars().take(6000).collect();
+        json!([{"role": "system", "content": format!("Answer from this reference.\n\n{reference}")},
+               {"role": "user", "content": question}])
+    };
+    let a = cut("design.md", "Which parts of the engine run on the GPU?");
+    let b = cut("usage.md", "How is the server configured?");
+    // What A's conversation takes alone: its state and its prompt-end snapshot.
+    let one = {
+        let server = Server::start(&s, &[]);
+        server.chat(&request(&a, 8));
+        settled(&server, 1).kv
+    };
+    let limit = format!("{:.4}", one * 1.5); // room for one such state, not two
+    let server = Server::start(&s, &["--kv-cache", &limit]);
+    server.chat(&request(&a, 8));
+    let answer = server.chat(&request(&b, 8));
+    let st = settled(&server, 2);
+    println!(
+        "a prompt beside a state it cannot keep: one state takes {one:.3} GiB, --kv-cache {limit}; \
+         B reused {} tokens; the cache holds states of {:?} positions in {:.3} GiB",
+        hit(&answer),
+        st.sessions,
+        st.kv
+    );
+    assert_eq!(st.sessions.len(), 1, "A's state stayed beside B's: {:?}", st.sessions);
     assert!(
         st.kv <= st.limit,
         "the cache takes {:.3} GiB of {:.3}",
