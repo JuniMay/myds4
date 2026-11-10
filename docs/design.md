@@ -100,7 +100,10 @@ size of every slot.
 
 While decoding, Flash-Next reads each layer's experts one layer ahead. A
 layer that reads its experts (one that does not run through its table)
-synchronizes with the GPU to read its routing. Before that point, the GPU
+waits for a GPU signal after its routing to read it; the layer's shared
+expert, which does not depend on the routing, follows the signal, so the
+GPU runs it meanwhile. The signal also follows the previous layer's expert
+work, whose experts' holds may then go. Before the signal, the GPU
 also applies the next layer's router to this layer's input. After the
 layer holds its own experts, the store's background readers start reading
 the next layer's predicted experts that are not in memory. The readers wait

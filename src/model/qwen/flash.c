@@ -1093,6 +1093,11 @@ static void read_ahead(int layer, int n) {
       seen[predicted[i]] = 1, ids[count++] = (int)predicted[i];
   cache_prefetch_from(f.store, layer, ids, count, 2 * f.experts, PF_OTHER);
 }
+// The layer's shared expert and its gate, which do not depend on routing.
+static void shared_expert_work(const FlashLayer *y, int n) {
+  feed_forward(&y->shared, &f.mixed, &f.shared, n, 0);
+  product(&y->shared_gate, &f.mixed, 0, &f.shared_gate, n, 0, 1);
+}
 static int routed(FlashLayer *y, int n) {
   size_t offset = (size_t)y->number * f.experts * sizeof(ExpertGroup);
   uint64_t generation;
@@ -1103,8 +1108,6 @@ static int routed(FlashLayer *y, int n) {
   }
   resident &= y->table_valid;
   Buf selected = experts_selection(&f.selected, y->number, n, f.chosen);
-  feed_forward(&y->shared, &f.mixed, &f.shared, n, 0);
-  product(&y->shared_gate, &f.mixed, 0, &f.shared_gate, n, 0, 1);
   product(&y->router, &f.mixed, 0, &f.routing, n, 0, 1);
   uint32_t p[4] = {(uint32_t)f.experts, (uint32_t)f.chosen, (uint32_t)f.normalize_topk, 0};
   gpu_kern(f.route);
@@ -1114,6 +1117,7 @@ static int routed(FlashLayer *y, int n) {
   gpu_bytes(3, p, sizeof p);
   gpu_go(n, 1, 1, 512, 1, 1);
   if (resident) {
+    shared_expert_work(y, n);
     experts_resident(&f.routed, &f.resident_table, offset, &selected, &f.coefficients, &f.mixed,
                       &f.resident_counts, y->number * 4, n, 1);
     routed_sum(n);
@@ -1132,8 +1136,13 @@ static int routed(FlashLayer *y, int n) {
     gpu_bytes(3, p, sizeof p);
     gpu_go(n, 1, 1, 512, 1, 1);
   }
+  // The routing is read at a signal; the shared expert, which does not
+  // depend on it, runs on the GPU meanwhile. The signal also follows the
+  // previous layer's expert work, so its experts' holds may go.
+  uint64_t routing = gpu_signal();
+  shared_expert_work(y, n);
   gpu_commit();
-  gpu_sync();
+  gpu_wait_signal(routing);
   if (f.recording)
     experts_routes_record(&f.routes, f.store, y->number, (const uint32_t *)selected.ptr, n, 0);
   experts_acquire(&f.routed, y->experts, y->number, (const uint32_t *)selected.ptr,
