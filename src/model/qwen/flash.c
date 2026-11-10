@@ -26,8 +26,7 @@ typedef struct {
 } Ple;
 typedef struct {
   int recurrent, index, ple_index, number, table_valid;
-  WeightPresence presence;
-  uint64_t table_generation;
+  uint64_t table_generation;  // the store's generation of the layer when its table was built
   Hyper attention_hyper, mlp_hyper;
   Linear qkv, z, a, b, output, q, k, v, index_qk;
   Buf conv, decay, bias, norm, qnorm, knorm, iqnorm, iknorm;
@@ -64,12 +63,16 @@ static struct {
   float eps, theta;
   TensorIndex *index;
   WeightSet *core;
-  WeightCache cache;
+  // The routed experts: the store reads each expert's tensors (files: its
+  // weights with their compressed scales, then the scales' exceptions) into a
+  // slot, and its readers decode the scales (experts_decode).
+  ExpertStore *store;
+  int store_ready;
+  ExpertFiles files;
   FlashLayer *layer;
   Hyper final;
   Buf embedding;
   Linear head;
-  uint64_t expert_minimum;
   Buf tokens, images, sequences, ple_states, x, normalized, mixed, mix_up, mix_down, injection, result;
   Buf xb, quantized, qkv, convolved, z, a, b, decay, beta, gdn, gated, qg, k, v, q, kr, attention_out;
   Buf index_qk, shared, shared_gate, routing, selected, coefficients, gathered, gate, up, intermediate, logits;
@@ -84,7 +87,7 @@ static struct {
   const Media *image_list;
   int image_count;
   int round, embed, norm_group, hc_silu, hc_mix, hc_inject, swiglu, shared_sum, route, gather, quant;
-  int conv_kernel, l2, gates, delta, norm_kernel, rope, store, attend, combine, ple_gate, ple_conv;
+  int conv_kernel, l2, gates, delta, norm_kernel, rope, store_kernel, attend, combine, ple_gate, ple_conv;
 } f;
 
 static double number(const Json *j, const char *name, double fallback) {
@@ -124,19 +127,40 @@ static void hyper(Hyper *h, const char *stem, int inject) {
     matrix(f.core, &h->inject, name);
   }
 }
-static void expert(Expert *e, const char *stem, WeightPresence *presence) {
-  int cached = presence != NULL;
+// The shared expert is part of the backbone.
+static void shared_expert(Expert *e, const char *stem) {
   char name[384];
-  e->weights = cached ? weights_cached(f.core, &f.cache, "Flash-Next expert") : f.core;
-  if (cached) weights_track(e->weights, presence);
+  e->weights = f.core;
   snprintf(name, sizeof name, "%s.gate_proj", stem);
   matrix(e->weights, &e->gate, name);
   snprintf(name, sizeof name, "%s.up_proj", stem);
   matrix(e->weights, &e->up, name);
   snprintf(name, sizeof name, "%s.down_proj", stem);
   matrix(e->weights, &e->down, name);
-  if (cached && weights_required(e->weights) > f.expert_minimum)
-    f.expert_minimum = weights_required(e->weights);
+}
+// A routed expert's matrices, and their tensors (gate, up, down: experts_files).
+static void routed_expert(Expert *e, const char *stem, Tensor *weight, Tensor *scales, Tensor *exceptions) {
+  static const char *const names[3] = {"gate_proj", "up_proj", "down_proj"};
+  char name[384];
+  *e = (Expert){0};
+  Linear *m[3] = {&e->gate, &e->up, &e->down};
+  for (int k = 0; k < 3; k++) {
+    snprintf(name, sizeof name, "%s.%s", stem, names[k]);
+    linear_describe(m[k], f.index, name, &weight[k], &scales[k], &exceptions[k]);
+  }
+}
+// The store of the routed experts, from their tensors ([layers][experts][3]).
+static void store_layout(const Tensor *weight, const Tensor *scales, const Tensor *exceptions) {
+  const Expert *experts[f.layers];
+  for (int l = 0; l < f.layers; l++)
+    experts[l] = f.layer[l].experts;
+  experts_files(&f.files, weight, scales, exceptions, experts, f.layers, f.experts);
+  f.store = cache_create(&(ExpertLayout){.layers = f.layers, .scored_layers = f.layers, .experts = f.experts,
+                                         .chosen = f.chosen, .parts = f.files.parts, .span = f.files.span,
+                                         .spans = f.files.spans, .extra = f.files.extra,
+                                         .transform = f.files.extra ? experts_decode : NULL, .context = &f.files});
+  cache_memory(f.store, weights_slot(f.core));
+  experts_store(&f.routed, f.store, &f.files);
 }
 static void ple_load(Ple *p, const char *stem, int parts) {
   char name[384];
@@ -238,7 +262,7 @@ static void prepare(const char *directory) {
   K(delta, "gdn");
   K(norm_kernel, "rms_norm");
   K(rope, "flash_rope");
-  K(store, "flash_kv_store");
+  K(store_kernel, "flash_kv_store");
   K(attend, "flash_attention_block");
   K(combine, "flash_attention_combine");
   K(ple_gate, "flash_ple_gate");
@@ -251,6 +275,9 @@ static void prepare(const char *directory) {
   matrix(f.core, &f.head, "lm_head");
   hyper(&f.final, "model.language_model.hyper_connection_mixer", 0);
   f.layer = xmalloc((size_t)f.layers * sizeof *f.layer);
+  size_t n_tensors = (size_t)f.layers * f.experts * 3;  // each routed expert's gate, up and down
+  Tensor *weight = xmalloc(n_tensors * sizeof *weight), *scales = xmalloc(n_tensors * sizeof *scales),
+         *exceptions = xmalloc(n_tensors * sizeof *exceptions);
   const Json *types = json_get(c, "layer_types"), *ple_ids = json_get(c, "ple_layer_ids");
   if (!types || types->n != f.layers)
     die("Flash-Next layer types do not match the configured layer count");
@@ -269,11 +296,12 @@ static void prepare(const char *directory) {
     snprintf(stem, sizeof stem, "model.language_model.layers.%d.mlp.shared_expert_gate", l);
     matrix(f.core, &y->shared_gate, stem);
     snprintf(stem, sizeof stem, "model.language_model.layers.%d.mlp.shared_expert", l);
-    expert(&y->shared, stem, 0);
+    shared_expert(&y->shared, stem);
     y->experts = xmalloc((size_t)f.experts * sizeof *y->experts);
     for (int e = 0; e < f.experts; e++) {
       snprintf(stem, sizeof stem, "model.language_model.layers.%d.mlp.experts.%d", l, e);
-      expert(y->experts + e, stem, &y->presence);
+      size_t at = ((size_t)l * f.experts + e) * 3;
+      routed_expert(y->experts + e, stem, weight + at, scales + at, exceptions + at);
     }
     if (y->recurrent) {
 #define MAT(field, suffix)                                                                                             \
@@ -320,6 +348,8 @@ static void prepare(const char *directory) {
         ple_load(y->ple, stem, number(c, "split_ngram_parts", 512));
       }
   }
+  store_layout(weight, scales, exceptions);
+  free(weight), free(scales), free(exceptions);
   snprintf(path, sizeof path, "%s/generation_config.json", directory);
   char *generation = read_file(path, NULL);
   Json *g = json_parse(generation);
@@ -488,7 +518,8 @@ static int prepare_rows(int n) {
   MemorySlot *work = memory_current();
   uint64_t fixed = work->payload - workspace_bytes();
   for (;;) {
-    uint64_t experts = (uint64_t)(n * f.chosen < f.experts ? n * f.chosen : f.experts) * f.expert_minimum;
+    cache_working_rows(f.store, n);  // the store's fewest slots: two layers' selections
+    uint64_t experts = cache_required(f.store, f.layers);
     if (memory_minimum(weights_slot(f.core)->account, weights_required(f.core) + fixed + workspace(n, 0) + experts)) {
       gpu_sync();
       workspace(n, 1);
@@ -918,7 +949,7 @@ static void attention(const FlashLayer *y, const Row *rows, int n) {
   gpu_bytes(3, &rp, sizeof rp);
   gpu_go(f.kv_heads, n, 1, 256, 1, 1);
   uint32_t kp[4] = {(uint32_t)n, (uint32_t)(f.kv_heads * 256), (uint32_t)y->index, 0};
-  gpu_kern(f.store);
+  gpu_kern(f.store_kernel);
   gpu_buf(0, &f.kr, 0);
   gpu_buf(1, &f.v, 0);
   gpu_buf(2, &f.sequences, 0);
@@ -1042,10 +1073,11 @@ static void routed_sum(int n) {
 }
 static int routed(FlashLayer *y, int n) {
   size_t offset = (size_t)y->number * f.experts * sizeof(ExpertGroup);
-  int resident = y->presence.count == (unsigned)f.experts;
-  if (resident && y->table_generation != y->presence.generation) {
+  uint64_t generation;
+  int resident = cache_layer_ready(f.store, y->number, &generation);
+  if (resident && y->table_generation != generation) {
     y->table_valid = experts_table(&f.routed, y->experts, y->number, &f.resident_table, offset);
-    y->table_generation = y->presence.generation;
+    y->table_generation = generation;
   }
   resident &= y->table_valid;
   Buf selected = experts_selection(&f.selected, y->number, n, f.chosen);
@@ -1068,7 +1100,7 @@ static int routed(FlashLayer *y, int n) {
   gpu_commit();
   gpu_sync();
   if (!experts_acquire(&f.routed, y->experts, y->number, (const uint32_t *)selected.ptr,
-                       (const float *)f.coefficients.ptr, n, 1, &f.cache.stats))
+                       (const float *)f.coefficients.ptr, n, 1, cache_counters(f.store)))
     return 0;
   gpu_begin();
   experts_encode(&f.routed, y->experts, &f.mixed);
@@ -1137,7 +1169,7 @@ static const float *pass(const Row *rows, int n, int logits, int prompt) {
       s->previous[1] = f.eos;
   }
   double began = now(), gpu = gpu_busy;
-  CacheStats before = f.cache.stats;
+  CacheStats *stats = cache_counters(f.store), before = *stats;
   int resident_layers[f.layers], resident_count = 0;
   gpu_begin();
   if (prompt)
@@ -1163,6 +1195,8 @@ static const float *pass(const Row *rows, int n, int logits, int prompt) {
       attention(y, rows, n);
     inject(n);
     mix(&y->mlp_hyper, n);
+    if (prompt)
+      cache_pass(f.store, y->number);  // a prompt's reads evict earlier layers' experts first
     int result = routed(y, n);
     if (!result) return NULL;
     if (result == 2) resident_layers[resident_count++] = l;
@@ -1180,17 +1214,20 @@ static const float *pass(const Row *rows, int n, int logits, int prompt) {
   product(&f.head, &f.mixed, (size_t)(n - logits) * f.hidden * 4, &f.logits, logits, 0, 0);
   gpu_commit();
   gpu_sync();
-  for (int i = 0; i < resident_count; i++) {
+  if (prompt)
+    cache_pass(f.store, -1);
+  for (int i = 0; i < resident_count; i++) {  // the store counts their experts as hits
     const FlashLayer *y = f.layer + resident_layers[i];
     Buf selected = experts_selection(&f.selected, y->number, n, f.chosen);
-    experts_mark_used(&f.routed, y->experts, y->number, (const uint32_t *)selected.ptr, n);
-    uint32_t unique = ((uint32_t *)f.resident_counts.ptr)[resident_layers[i]];
-    f.cache.stats.hits += unique;
-    f.cache.stats.row_unique += unique;
-    f.cache.stats.row_own += (uint64_t)n * f.chosen;
+    stats->row_unique += experts_mark_used(&f.routed, y->experts, y->number, (const uint32_t *)selected.ptr, n);
+    stats->row_own += (uint64_t)n * f.chosen;
   }
   f.counters.table_layers += resident_count;
   experts_release(&f.routed);
+  // The pass's GPU work has completed and no expert is held: between passes
+  // the store may evict any slot, its new slots join the residency set (the
+  // next pass reaches them through tables), and the scores age once.
+  cache_adapt(f.store);
   if (f.dump_fd >= 0) {
     size_t bytes = (size_t)logits * f.vocab * 4;
     if (write(f.dump_fd, f.logits.ptr, bytes) != (ssize_t)bytes)
@@ -1205,12 +1242,12 @@ static const float *pass(const Row *rows, int n, int logits, int prompt) {
   }
   if (prompt) {
     f.counters.prefill_rows += n;
-    add_stats(&f.counters.prefill, before, f.cache.stats);
+    add_stats(&f.counters.prefill, before, *stats);
   } else {
     f.counters.decode_rows += n;
     f.counters.decode_seconds += now() - began;
     f.counters.decode_gpu_seconds += gpu_busy - gpu;
-    add_stats(&f.counters.decode, before, f.cache.stats);
+    add_stats(&f.counters.decode, before, *stats);
   }
   f.counters.prefill_layer = 0;
   return f.last_logits = (const float *)f.logits.ptr;
@@ -1232,6 +1269,10 @@ static int load(const char *dir, const Options *o) {
     prepare(dir);
   memory_pin(weights_slot(f.core), 1);
   int loaded = prepare_rows(1) && weights_load(f.core);
+  if (loaded && !f.store_ready) {  // the store's slots and readers start once; a reload refills the slots
+    cache_init(f.store, 0, f.layers);
+    f.store_ready = 1;
+  }
   memory_pin(weights_slot(f.core), 0);
   return loaded;
 }
@@ -1310,22 +1351,31 @@ static int replay_start(int position) {
 }
 static void seek(ModelState *s, const int *tokens, int pos) {
 }
+// Before the first load there is no store, or no slot in it.
 static int idle(void) {
-  return f.cache.slots;
+  if (!f.store_ready)
+    return 0;
+  cache_idle(f.store);
+  return cache_slots(f.store);
 }
 static uint64_t cached_bytes(void) {
-  return f.cache.bytes;
+  return f.store_ready ? cache_bytes(f.store) : 0;
 }
 static void counters(ModelCounters *out) {
   *out = f.counters;
   out->layers = f.layers;
   out->experts_per_row = f.layers * f.chosen;
   out->dense_bytes = weights_resident_bytes(f.core) + qwen_vision_bytes(f.vision);
-  out->cache = f.cache.stats;
-  out->cache_bytes = f.cache.bytes;
-  out->cache_slots = out->mapped = out->cap = f.cache.slots;
-  out->max_slots = out->experts = f.cache.capacity;
-  out->slot_bytes = f.cache.slots ? f.cache.bytes / f.cache.slots : f.expert_minimum;
+  if (!f.store)
+    return;
+  out->cache = *cache_counters(f.store);
+  out->cache_bytes = cached_bytes();
+  out->cache_slots = cache_slots(f.store);
+  out->mapped = cache_mapped(f.store);
+  out->cap = cache_cap(f.store);
+  out->max_slots = cache_max(f.store);
+  out->experts = f.layers * f.experts;
+  out->slot_bytes = cache_slot_bytes(f.store);
 }
 static void plan(ModelPlan *out) {
   *out = f.plan;
@@ -1347,6 +1397,8 @@ static void images(const Media *input, int count) {
 }
 static void active(int on) {
   qwen_vision_reside(f.vision, on);
+  if (f.store)
+    cache_active(f.store, on);
 }
 static const char *const model_types[] = {"qwen4_exp", "qwen4_exp_text", NULL};
 const ModelOps flash_ops = {.family = "Qwen3.8 Flash-Next",

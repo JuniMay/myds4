@@ -83,22 +83,31 @@ void linear_load(WeightSet *weights, Linear *m, TensorIndex *index, const char *
     die("%s: matrix columns must be a multiple of 64", stem);
 }
 
-void linear_describe(Linear *m, TensorIndex *index, const char *stem, Tensor *weight, Tensor *scales) {
+void linear_describe(Linear *m, TensorIndex *index, const char *stem, Tensor *weight, Tensor *scales,
+                     Tensor *exceptions) {
   Tensor w = st_get(index, "%s.weight", stem);
-  if (w.dtype != 'u' || w.ndim != 2 || w.shape[0] < 1 || w.shape[1] < 1 || !st_has(index, "%s.weight_scale", stem))
-    die("%s: the expert store reads NVFP4 matrices with stored scales", stem);
+  if (w.dtype != 'u' || w.ndim != 2 || w.shape[0] < 1 || w.shape[1] < 1)
+    die("%s: the expert store reads NVFP4 matrices", stem);
   *m = (Linear){.rows = (int)w.shape[0], .cols = (int)w.shape[1] * 2, .kind = 'n', .scale = 1, .input_scale = 1};
-  Tensor s = st_get(index, "%s.weight_scale", stem);
-  if (s.size != (size_t)m->rows * m->cols / 16)
-    die("%s: NVFP4 scale dimensions differ", stem);
   if (m->cols % 64)
     die("%s: matrix columns must be a multiple of 64", stem);
+  *exceptions = (Tensor){0};
+  if (st_has(index, "%s.weight_scale", stem)) {
+    *scales = st_get(index, "%s.weight_scale", stem);
+    if (scales->size != (size_t)m->rows * m->cols / 16)
+      die("%s: NVFP4 scale dimensions differ", stem);
+  } else {  // compressed scales (CSF): the store's readers decode them (experts_decode)
+    *scales = st_get(index, "%s.weight_scale.nvfp4_csf_fixed", stem);
+    *exceptions = st_get(index, "%s.weight_scale.nvfp4_csf_exceptions", stem);
+    if (scales->dtype != 'u' || exceptions->dtype != 'U' || exceptions->size % 4 || m->rows % 16 ||
+        scales->size != (size_t)m->rows / 16 * (16 + m->cols / 16 * 8))
+      die("%s: compressed NVFP4 scales need U8 codes for 16-row slabs and U32 exceptions", stem);
+  }
   if (st_has(index, "%s.weight_scale_2", stem))
     m->scale = scalar(st_get(index, "%s.weight_scale_2", stem));
   if (st_has(index, "%s.input_scale", stem))
     m->input_scale = scalar(st_get(index, "%s.input_scale", stem));
   *weight = w;
-  *scales = s;
 }
 
 void linear_product(const Linear *m, const Buf *x, size_t xo, const Buf *y, size_t yo, int rows, int prompt,

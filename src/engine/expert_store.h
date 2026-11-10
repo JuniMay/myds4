@@ -30,6 +30,12 @@ typedef struct {
   int parts;             // spans per expert at most, at most STORE_PARTS
   const FileSpan *span;  // [layers][experts][parts]
   const int *spans;      // [layers]: spans per expert of the layer, 0: none yet
+  // Optional: after the reads of an expert's spans, a reader writes `extra`
+  // bytes at the slot's end (from slot_bytes - extra on), from the spans'
+  // bytes (span k at at[k]), before the expert counts as read.
+  uint64_t extra;
+  void (*transform)(void *context, int layer, int expert, uint8_t *slot, const uint32_t *at, uint64_t slot_bytes);
+  void *context;
 } ExpertLayout;
 ExpertStore *cache_create(const ExpertLayout *layout);
 CacheStats *cache_counters(ExpertStore *st);  // the store's statistics

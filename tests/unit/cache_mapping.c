@@ -1,11 +1,14 @@
 // CPU reads do not need GPU residency. Only an encoded use maps an expert.
 #include "../../src/model/deepseek/model.h"
 #include "myds4.h"
+#include <fcntl.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 static int added, removed;
-static Buf fixture_new(size_t bytes) {
-  void *p = calloc(1, bytes);
+static Buf fixture_new(size_t bytes) {  // filled with 0xaa, so that a read of zeros shows
+  void *p = malloc(bytes);
+  memset(p, 0xaa, bytes);
   return (Buf){.obj = p, .ptr = p, .size = bytes};
 }
 static void fixture_resident(const Buf *b, int on) { if (on) added++; else removed++; }
@@ -18,6 +21,29 @@ static void fixture_free(Buf *b) { free(b->ptr); *b = (Buf){0}; }
 #undef gpu_new
 #undef gpu_resident
 #undef gpu_free
+
+// The transform case's layout: each expert's two spans, and what its
+// transform saw (readers may run two at once): calls, calls before every
+// piece of the expert's slot was read, and bytes of the spans not read.
+static const uint64_t read_len[2] = {3 * PIECE + 5, 77};
+enum { EXTRA = 40 };
+typedef struct {
+  atomic_int calls, early, unread;
+  uint32_t at[2][2];
+  uint64_t size[2];
+} Marks;
+static void mark(void *context, int layer, int expert, uint8_t *slot, const uint32_t *at, uint64_t slot_bytes) {
+  Marks *m = context;
+  Slot *s = &st->slots[WHERE(layer, expert)];
+  m->early += atomic_load(&s->read) != s->npiece;
+  int unread = 0;
+  for (int k = 0; k < 2; k++)
+    for (uint64_t b = 0; b < read_len[k]; b++) unread += slot[at[k] + b] != 0;
+  m->unread += unread;
+  m->at[expert][0] = at[0], m->at[expert][1] = at[1], m->size[expert] = slot_bytes;
+  memset(slot + slot_bytes - EXTRA, expert + 1, EXTRA);
+  m->calls++;
+}
 
 int main(void) {
   st = deepseek_cache_create();
@@ -102,6 +128,46 @@ int main(void) {
   CHECK(WHERE(0, gone) < 0 && st->stats.misses == misses && st->stats.hits == hits + 1);
   CHECK(st->slots[WHERE(0, kept)].used == st->token && st->head == WHERE(0, kept));
   for (int i = 0; i < 8; i++) fixture_free(&slots[i].b);
+
+  // A layout's transform runs once an expert's pieces are all read, before
+  // the expert counts as read: it sees the read bytes at the spans' offsets
+  // and writes the layout's extra bytes at the slot's end, which the slot's
+  // size includes. One layer of 2 experts, each 2 spans (5 pieces) read from
+  // /dev/zero.
+  int zero = open("/dev/zero", O_RDONLY);
+  static FileSpan read_span[1][2][2];
+  static int read_spans[1] = {2};
+  for (int e = 0; e < 2; e++)
+    read_span[0][e][0] = (FileSpan){zero, SECTOR + 100 * e, read_len[0]},
+    read_span[0][e][1] = (FileSpan){zero, 7, read_len[1]};
+  static Marks marks;
+  st = cache_create(&(ExpertLayout){.layers = 1, .scored_layers = 1, .experts = 2, .chosen = 1, .parts = 2,
+                                    .span = &read_span[0][0][0], .spans = read_spans, .extra = EXTRA,
+                                    .transform = mark, .context = &marks});
+  cache_retention(st, 0, 0);
+  cache_required(st, 1);
+  CHECK(cache_slot_bytes(st) == EXTRA + REGION(read_len[0]) + REGION(read_len[1]));
+  Slot read_slots[2] = {0};
+  double read_scores[2] = {INFINITY, INFINITY};
+  int read_frees[2] = {1, 0};
+  st->slots = read_slots, st->score = read_scores, st->free_list = read_frees;
+  st->max_slots = st->cap = st->mcap = st->nfree = 2;
+  st->head = st->tail = st->pass_layer = st->serving = -1;
+  memset(st->where, 0xff, WHERE_BYTES);
+  int pair[] = {0, 1};
+  cache_hold(st, 0, pair, 2);  // returns the reads still pending when checked, which varies
+  cache_wait(st, 0, pair, 2);
+  CHECK(marks.calls == 2 && marks.early == 0 && marks.unread == 0);
+  for (int e = 0; e < 2; e++) {
+    const Buf *slot = cache_get(st, 0, e, at, &fresh);
+    int marked = slot != NULL;
+    for (int b = 0; marked && b < EXTRA; b++) marked = slot->ptr[slot->size - EXTRA + b] == e + 1;
+    CHECK(marked && marks.size[e] == slot->size && at[0] == marks.at[e][0] && at[1] == marks.at[e][1]);
+    CHECK(at[1] >= REGION(read_len[0]) && at[1] + read_len[1] <= slot->size - EXTRA);
+  }
+  cache_unhold(st, 0, pair, 2);
+  close(zero);
+  for (int i = 0; i < 2; i++) fixture_free(&read_slots[i].b);
   fprintf(stderr, "cache mapping: %d/%d CPU checks passed\n", checks - failures, checks);
   return failures != 0;
 }

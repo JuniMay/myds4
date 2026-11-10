@@ -10,10 +10,13 @@ typedef struct {
 
 void linear_init(void);
 void linear_load(WeightSet *weights, Linear *matrix, TensorIndex *index, const char *stem);
-// A matrix that the expert store reads (NVFP4 with stored scales): its shape,
-// format and scalar scales, and the tensors of its weights and scales. Its
-// buffers are views of an expert's slot, set while the expert is held.
-void linear_describe(Linear *matrix, TensorIndex *index, const char *stem, Tensor *weight, Tensor *scales);
+// A matrix that the expert store reads (NVFP4): its shape, format and scalar
+// scales, and the tensors of its weights and scales. Compressed scales (CSF)
+// give their fixed rows as `scales` and their exceptions; stored scales give
+// an empty `exceptions`. Its buffers are views of an expert's slot, set while
+// the expert is held.
+void linear_describe(Linear *matrix, TensorIndex *index, const char *stem, Tensor *weight, Tensor *scales,
+                     Tensor *exceptions);
 // Float activation rows; prompt inputs stage through the supplied BF16 buffer.
 // Rounded outputs retain FP32 storage with BF16 values.
 void linear_product(const Linear *matrix, const Buf *x, size_t x_offset, const Buf *y, size_t y_offset, int rows,

@@ -77,15 +77,26 @@ executes small groups together and batches larger prompt groups into 16-row
 matrix tiles. Quantized activations fit exactly in BF16; reductions retain
 FP32. Workspaces remain charged to the model-memory pool.
 
-Nemotron's routed experts live in its expert store, as DeepSeek's do. The
-model builds the store's layout from its checkpoint. Each expert's tensors
-that follow each other in a file share a span, when every expert of the
-layer lays them out alike; otherwise each tensor has its own span. Transcribe's
-experts take two spans: both weight matrices, then both scale matrices. A
-layer's matrices lie at the same places in each expert's slot. While the
-planner holds an expert, the expert's matrices are views of its slot.
-Flash-Next still keeps each routed expert as a weight group of its own; the
-shared loader packs that group's matrices and scales into one allocation.
+Nemotron's and Flash-Next's routed experts live in expert stores, one per
+model, as DeepSeek's do. Each model builds its store's layout from its
+checkpoint. An expert's tensors that follow each other in a file share a
+span. Transcribe's experts take two spans: both weight matrices, then both
+scale matrices. In 24,563 of Flash-Next's 24,576 experts, the three weight
+matrices and the fixed rows of their compressed scales form one 2.6 MB span,
+and the scales' three exception lists a second. The layout records where
+each expert's matrices lie in its slot. While the planner holds an expert,
+the expert's matrices are views of its slot.
+
+Flash-Next's checkpoint stores NVFP4 scales compressed (CSF): one code row
+per 16-row slab, plus a list of exceptions. The store reads them as they
+are. The reader that completes an expert's last read decodes its scales
+(`weights_csf_decode`, 307 KB) into a region at the end of the slot, and
+only then does the expert count as read. A slot is as large as the largest
+expert's read bytes plus the decoded scales: about 3.1 MB, against the
+2.76 MB that the expert's weights and decoded scales take alone. The
+compressed scales and the 16 KiB-aligned reads stay in the slot, and the
+largest exception lists (up to 112 KB, against 3.9 KB on average) set the
+size of every slot.
 
 When every expert of a layer is resident, GPU routing feeds the expert batch
 planner directly. With a store, resident means in a slot, read, mapped for
@@ -102,10 +113,11 @@ layer work. Selected experts remain held until the next CPU routing read or
 the end of the model pass. That synchronization completes the queued expert
 work before the engine releases its selection and loads another. Resident
 layers can run between these points without changing the held selection.
-Kernels and per-row summation order remain unchanged. Nemotron's store
-advances its clock after every pass, prompt chunks included: the pass's GPU
-work has completed, so any slot that is not held may go back, and slots
-mapped during the pass join the residency set for the next one.
+Kernels and per-row summation order remain unchanged. Nemotron's and
+Flash-Next's stores advance their clocks after every pass, prompt chunks
+included: the pass's GPU work has completed, so any slot that is not held
+may go back, and slots mapped during the pass join the residency set for
+the next one.
 
 The shared weight loader packs a weight group's matrices and scales into
 one Metal allocation with aligned views. Loading registers that allocation

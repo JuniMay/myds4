@@ -317,6 +317,9 @@ struct ExpertStore {
   int layers, scored_layers, experts, chosen, stage_experts, stage_min, parts;
   const FileSpan *span;
   const int *spans;
+  uint64_t extra;  // ExpertLayout.extra, transform and context
+  void (*transform)(void *context, int layer, int expert, uint8_t *slot, const uint32_t *at, uint64_t slot_bytes);
+  void *context;
   uint64_t SLOT_SIZE;  // the largest expert in use
   uint64_t token;
   Slot *slots;
@@ -412,6 +415,7 @@ ExpertStore *cache_create(const ExpertLayout *l) {
   st->layers = l->layers, st->scored_layers = l->scored_layers, st->experts = l->experts, st->chosen = l->chosen;
   st->stage_experts = l->stage_experts, st->stage_min = l->stage_min, st->parts = l->parts;
   st->span = l->span, st->spans = l->spans;
+  st->extra = l->transform ? l->extra : 0, st->transform = l->transform, st->context = l->context;
   size_t scored = (size_t)l->scored_layers * l->experts;
   st->where = xmalloc(WHERE_BYTES);
   memset(st->where, 0, WHERE_BYTES);
@@ -723,9 +727,10 @@ uint64_t cache_required(ExpertStore *st, int layers) {
   uint64_t pin_size = 0;  // the stages' slots
   for (int l = 0; l < layers; l++)  // a slot holds the layer's largest expert
     for (int e = 0; e < st->experts; e++) {
-      uint64_t size = 0, pieces = 0;
-      for (int k = 0; k < st->spans[l]; k++)
-        size += REGION(SPAN(l, e, k).len), pieces += (REGION(SPAN(l, e, k).len) + PIECE - 1) / PIECE;
+      uint64_t size = st->extra, pieces = 0;
+      for (int k = 0; k < st->spans[l]; k++)  // an empty span (an expert with fewer spans) takes no room
+        if (SPAN(l, e, k).len)
+          size += REGION(SPAN(l, e, k).len), pieces += (REGION(SPAN(l, e, k).len) + PIECE - 1) / PIECE;
       if (pieces > 16) die("layer %d's experts take %llu reads of %llu MiB, more than a slot tracks", l, pieces, PIECE >> 20);
       uint64_t *at = l < st->scored_layers ? &st->SLOT_SIZE : &pin_size;
       if (size > *at) *at = size;
@@ -861,6 +866,10 @@ static void piece_finished(ExpertStore *st, Slot *s, int piece, int read) {
   int last_piece = atomic_fetch_sub_explicit(&s->unfinished, 1, memory_order_acq_rel) == 1;
   if (last_piece) {
     if (s->background_load) atomic_fetch_sub_explicit(&st->prefetching, 1, memory_order_relaxed);
+    // The layout's step after a complete load, before its group completes:
+    // the expert counts as read only after it.
+    if (st->transform && atomic_load_explicit(&s->read, memory_order_acquire) == s->npiece)
+      st->transform(st->context, s->layer, s->expert, s->b.ptr, s->at, st->SLOT_SIZE);
   }
   dispatch_group_leave(s->loading);
   // Publish after leaving the group. Every piece signals: the reader that
@@ -1112,12 +1121,13 @@ static void start(ExpertStore *st, int i, int urgent) {
   uint64_t region = 0;
   for (int k = 0; k < st->spans[s->layer]; k++) {
     const FileSpan *p = &SPAN(s->layer, s->expert, k);
+    if (!p->len) continue;  // an expert with fewer spans than the layer's most
     n += split(s->piece + n, p->fd, p->off, p->len, s->b.ptr + region, &s->at[k]);
     s->at[k] += region;
     region += REGION(p->len);
   }
   s->npiece = n;
-  s->extent = 0;
+  s->extent = st->extra;  // the transform's bytes at the slot's end
   for (int k = 0; k < n; k++) s->extent += s->piece[k].len;
   atomic_store_explicit(&s->read, 0, memory_order_relaxed);
   s->background_load = !urgent;

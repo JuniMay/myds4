@@ -23,28 +23,30 @@ void experts_init(ExpertWork *w, int hidden, int intermediate, int experts, int 
   w->plan_kernel = gpu_kernel("expert_plan");
   w->sum_kernel = gpu_kernel(accumulation == EXPERT_SUM_BF16 ? "expert_sum" : "expert_sum_fp32");
 }
-void experts_store(ExpertWork *w, ExpertStore *store, const ExpertPlaces *places) {
+void experts_store(ExpertWork *w, ExpertStore *store, const ExpertFiles *files) {
   w->store = store;
-  w->places = places;
+  w->files = files;
   w->slot = xmalloc((size_t)w->experts * sizeof *w->slot);
   w->fresh = xmalloc((size_t)w->experts);
   memset(w->fresh, 0, (size_t)w->experts);
 }
-int experts_spans(const Tensor *tensors, int count, int merge, FileSpan *spans, ExpertPart *parts) {
-  int order[count], n = 0;
-  for (int i = 0; i < count; i++) {  // merged: by file and offset; otherwise span k holds tensor k
-    int k = i;
-    for (; merge && k > 0 &&
-           (tensors[order[k - 1]].fd > tensors[i].fd ||
-            (tensors[order[k - 1]].fd == tensors[i].fd && tensors[order[k - 1]].off > tensors[i].off));
+// An expert's nonempty tensors as spans: consecutive tensors of one file
+// share a span. Writes each tensor's span and offset; returns the spans.
+static int spans_of(const Tensor *tensors, int count, FileSpan *spans, ExpertPart *parts) {
+  int order[count], n = 0, used = 0;
+  for (int i = 0; i < count; i++) {  // by file and offset
+    if (!tensors[i].size) continue;
+    int k = used++;
+    for (; k > 0 && (tensors[order[k - 1]].fd > tensors[i].fd ||
+                     (tensors[order[k - 1]].fd == tensors[i].fd && tensors[order[k - 1]].off > tensors[i].off));
          k--)
       order[k] = order[k - 1];
     order[k] = i;
   }
-  for (int j = 0; j < count; j++) {
+  for (int j = 0; j < used; j++) {
     const Tensor *t = tensors + order[j];
     FileSpan *last = n ? spans + n - 1 : NULL;
-    if (merge && last && last->fd == t->fd && last->off + last->len == t->off) {
+    if (last && last->fd == t->fd && last->off + last->len == t->off) {
       parts[order[j]] = (ExpertPart){(uint8_t)(n - 1), (uint32_t)last->len};
       last->len += t->size;
     } else {
@@ -55,18 +57,74 @@ int experts_spans(const Tensor *tensors, int count, int merge, FileSpan *spans, 
   }
   return n;
 }
+void experts_files(ExpertFiles *f, const Tensor *weight, const Tensor *scales, const Tensor *exceptions,
+                   const Expert *const *experts, int layers, int count) {
+  *f = (ExpertFiles){.layers = layers, .experts = count, .parts = STORE_PARTS};
+  f->span = xmalloc((size_t)layers * count * STORE_PARTS * sizeof *f->span);
+  memset(f->span, 0, (size_t)layers * count * STORE_PARTS * sizeof *f->span);
+  f->spans = xmalloc((size_t)layers * sizeof *f->spans);
+  f->places = xmalloc((size_t)layers * count * sizeof *f->places);
+  const Expert *first = experts[0];
+  const Linear *m[3] = {&first->gate, &first->up, &first->down};
+  uint64_t decoded[3];
+  for (int k = 0; k < 3; k++) {  // a compressed matrix's scales decode to rows x cols bytes, one after another
+    f->rows[k] = m[k]->rows, f->cols[k] = m[k]->cols / 16;
+    decoded[k] = f->extra;
+    if (exceptions[k].dtype) f->extra += (uint64_t)f->rows[k] * f->cols[k];
+  }
+  for (int l = 0; l < layers; l++) {
+    f->spans[l] = 0;
+    for (int e = 0; e < count; e++) {
+      size_t at = (size_t)l * count + e;
+      Tensor t[9];
+      ExpertPart parts[9] = {0};
+      for (int k = 0; k < 3; k++)
+        t[3 * k] = weight[at * 3 + k], t[3 * k + 1] = scales[at * 3 + k], t[3 * k + 2] = exceptions[at * 3 + k];
+      int n = spans_of(t, 9, f->span + at * STORE_PARTS, parts);
+      if (n > f->spans[l]) f->spans[l] = n;  // fewer spans leave empty ones, which read nothing
+      ExpertPlaces *p = f->places + at;
+      *p = (ExpertPlaces){0};
+      for (int k = 0; k < 3; k++) {
+        if (!t[3 * k].size) continue;
+        if (t[3 * k].size != (size_t)f->rows[k] * f->cols[k] * 8 ||
+            (t[3 * k + 2].dtype != 0) != (exceptions[k].dtype != 0))
+          die("routed expert %d of layer %d differs in shape from the first", e, l);
+        p->weight[k] = parts[3 * k];
+        if (t[3 * k + 2].dtype) {  // compressed: its exceptions may be empty
+          p->fixed[k] = parts[3 * k + 1], p->fixed_bytes[k] = (uint32_t)t[3 * k + 1].size;
+          p->exceptions[k] = parts[3 * k + 2], p->exception_count[k] = (uint32_t)(t[3 * k + 2].size / 4);
+          p->scales[k] = (ExpertPart){EXPERT_DECODED, (uint32_t)decoded[k]};
+        } else
+          p->scales[k] = parts[3 * k + 1];
+      }
+    }
+  }
+}
+void experts_decode(void *context, int layer, int e, uint8_t *slot, const uint32_t *at, uint64_t slot_bytes) {
+  const ExpertFiles *f = context;
+  const ExpertPlaces *p = f->places + (size_t)layer * f->experts + e;
+  for (int k = 0; k < 3; k++)
+    if (p->fixed_bytes[k]) {
+      const uint8_t *fixed = slot + at[p->fixed[k].span] + p->fixed[k].offset;
+      const uint32_t *exceptions = (const uint32_t *)(slot + at[p->exceptions[k].span] + p->exceptions[k].offset);
+      uint8_t *out = slot + slot_bytes - f->extra + p->scales[k].offset;
+      if (!weights_csf_decode(out, fixed, p->fixed_bytes[k], exceptions, p->exception_count[k], f->rows[k], f->cols[k]))
+        die("invalid compressed NVFP4 scales of routed expert %d of layer %d", e, layer);
+    }
+}
 // The views of a held expert's matrices in its slot; at: the spans' offsets.
-static Buf part(const Buf *slot, const uint32_t *at, ExpertPart p, size_t bytes) {
-  size_t offset = at[p.span] + p.offset;
+static Buf part(const Buf *slot, const uint32_t *at, const ExpertFiles *f, ExpertPart p, size_t bytes) {
+  size_t offset = p.span == EXPERT_DECODED ? slot->size - f->extra + p.offset : at[p.span] + p.offset;
   return (Buf){.obj = slot->obj, .ptr = slot->ptr + offset, .gpu = slot->gpu + offset, .off = slot->off + offset,
                .size = bytes};
 }
-static void views(Expert *x, const Buf *slot, const uint32_t *at, const ExpertPlaces *p) {
+static void views(Expert *x, const Buf *slot, const uint32_t *at, const ExpertFiles *f, int layer, int e) {
+  const ExpertPlaces *p = f->places + (size_t)layer * f->experts + e;
   Linear *m[3] = {&x->gate, &x->up, &x->down};
   for (int k = 0; k < 3; k++)
     if (m[k]->rows) {
-      m[k]->w = part(slot, at, p->weight[k], (size_t)m[k]->rows * m[k]->cols / 2);
-      m[k]->s = part(slot, at, p->scales[k], (size_t)m[k]->rows * m[k]->cols / 16);
+      m[k]->w = part(slot, at, f, p->weight[k], (size_t)m[k]->rows * m[k]->cols / 2);
+      m[k]->s = part(slot, at, f, p->scales[k], (size_t)m[k]->rows * m[k]->cols / 16);
     }
 }
 uint64_t experts_workspace(ExpertWork *w, int rows, int allocate) {
@@ -147,7 +205,7 @@ int experts_acquire(ExpertWork *w, Expert *experts, int layer, const uint32_t *s
       int fresh;
       w->slot[ids[i]] = cache_get(w->store, layer, ids[i], at, &fresh);
       w->fresh[ids[i]] = (uint8_t)fresh;
-      views(experts + ids[i], w->slot[ids[i]], at, &w->places[layer]);
+      views(experts + ids[i], w->slot[ids[i]], at, w->files, layer, ids[i]);
     }
   } else {
     for (int i = 0; i < w->active; i++)
@@ -282,7 +340,7 @@ int experts_table(const ExpertWork *w, Expert *experts, int layer, const Buf *ta
       int fresh;
       const Buf *slot = cache_get(w->store, layer, e, at, &fresh);
       if (!slot || fresh) return 0;
-      views(x, slot, at, &w->places[layer]);
+      views(x, slot, at, w->files, layer, e);
     }
     entries[e] = (ExpertGroup){expert_matrix(&x->gate), expert_matrix(&x->up), expert_matrix(&x->down), 0, 0};
   }

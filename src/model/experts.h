@@ -26,10 +26,28 @@ typedef struct {
   Linear gate, up, down;
   WeightSet *weights;
 } Expert;
-// Where each matrix of an expert lies in its slot: the span and the offset in
-// it of the weights and of the scales of gate, up and down.
+// Where each matrix of an expert lies in its slot (gate, up, down): its
+// weights and scales, each a span and an offset in it. Compressed scales
+// (CSF) are read as their fixed rows and exceptions; the store's readers
+// decode them (experts_decode) into the region at the slot's end
+// (EXPERT_DECODED), where the scales' offset then points.
+enum { EXPERT_DECODED = 0xff };
 typedef struct { uint8_t span; uint32_t offset; } ExpertPart;
-typedef struct { ExpertPart weight[3], scales[3]; } ExpertPlaces;
+typedef struct {
+  ExpertPart weight[3], scales[3], fixed[3], exceptions[3];
+  uint32_t fixed_bytes[3], exception_count[3];  // 0 for stored scales
+} ExpertPlaces;
+// A family's routed experts in the store: per expert, the files' bytes
+// (spans), where its matrices lie (places), and the bytes its compressed
+// scales decode to (extra, the same for every expert).
+typedef struct {
+  int layers, experts, parts;  // parts: spans per expert in `span`, STORE_PARTS
+  FileSpan *span;              // [layers][experts][STORE_PARTS]
+  int *spans;                  // [layers]: the most spans an expert of the layer takes
+  ExpertPlaces *places;        // [layers][experts]
+  uint64_t extra;
+  int rows[3], cols[3];        // each matrix's scale rows and columns (cols / 16)
+} ExpertFiles;
 typedef struct {
   uint32_t row;
   float weight;
@@ -44,7 +62,7 @@ typedef struct {
   const Expert *held;
   int held_count;
   ExpertStore *store;          // or null: each expert has its own weight group
-  const ExpertPlaces *places;  // [store layers]
+  const ExpertFiles *files;    // the store's layout of them
   int held_layer;              // the store layer of the held experts
   const Buf **slot;            // [experts]: a held expert's slot
   uint8_t *fresh;              // [experts]: its slot needs gpu_use until the residency set is committed
@@ -56,12 +74,19 @@ typedef struct {
 
 void experts_init(ExpertWork *work, int hidden, int intermediate, int experts, int chosen,
                   ExpertActivation activation, ExpertAccumulation accumulation);
-// The routed experts' weights are in the store's slots, laid out by places.
-void experts_store(ExpertWork *work, ExpertStore *store, const ExpertPlaces *places);
-// An expert's tensors as store spans: consecutive tensors of one file share a
-// span when `merge` is set. Writes the spans and each tensor's span and
-// offset; returns the span count, at most STORE_PARTS.
-int experts_spans(const Tensor *tensors, int count, int merge, FileSpan *spans, ExpertPart *parts);
+// The routed experts' weights are in the store's slots, laid out by files.
+void experts_store(ExpertWork *work, ExpertStore *store, const ExpertFiles *files);
+// The store's layout from the routed experts' tensors and matrices: for each
+// expert ([layers][experts][3]), its matrices' weights, their stored scales
+// or compressed rows, and their exceptions (a zero Tensor, without a dtype,
+// for stored scales; all three zero for an absent matrix, such as squared
+// ReLU's gate). Consecutive tensors of one file share a span. Allocates the
+// layout's arrays.
+void experts_files(ExpertFiles *files, const Tensor *weight, const Tensor *scales, const Tensor *exceptions,
+                   const Expert *const *experts, int layers, int experts_per_layer);
+// The store's step after an expert's reads (ExpertLayout.transform; context:
+// its ExpertFiles): the compressed scales decoded into the slot's end.
+void experts_decode(void *files, int layer, int expert, uint8_t *slot, const uint32_t *at, uint64_t slot_bytes);
 uint64_t experts_workspace(ExpertWork *work, int rows, int allocate);
 uint64_t experts_bytes(const ExpertWork *work);
 // Routing and the preceding expert work have completed. Release the previous

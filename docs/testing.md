@@ -70,6 +70,11 @@ addresses: only once a hold of the whole layer has been read, reaped,
 mapped and committed. It stops being ready when the residency limit unmaps
 a slot or one of its experts leaves its slot. Experts that a table used count
 as used without a read, and one that left its slot is skipped.
+On a store whose layout has a transform (as Flash-Next's compressed scales
+do), it checks that the transform runs once per expert, only after every
+piece of the expert has been read and before the expert counts as read; that
+it sees the read bytes at the spans' offsets; and that its bytes at the
+slot's end fit in the slot's size.
 `build/tests/weights-read` checks that a model's weights are read in
 16 KiB-aligned spans into aligned memory, so that a load does not fill the
 file cache, and that each tensor's bytes arrive intact.

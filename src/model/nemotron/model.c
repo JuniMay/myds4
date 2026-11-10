@@ -43,13 +43,11 @@ static struct {
   TensorIndex *checkpoint;
   Layer *layer;
   WeightSet *core;
-  // The routed experts: the store reads each from two or four spans (spans,
-  // span) into a slot; places say where its matrices lie in the slot.
+  // The routed experts: the store reads each expert's tensors (files: two
+  // spans, weights then scales) into a slot.
   ExpertStore *store;
   int moe_layers, store_ready;
-  FileSpan *span;  // [moe_layers][experts][STORE_PARTS]
-  int *spans;      // [moe_layers]
-  ExpertPlaces *places;
+  ExpertFiles files;
   Buf embedding, final_norm;
   Linear head;
   Buf tokens, embeddings, sequences, x, norm, quant, packed, projected_values, convolved, scan, gated;
@@ -88,54 +86,30 @@ static void shared_expert(Expert *e, const char *prefix) {
   snprintf(name, sizeof name, "%s.down_proj", prefix);
   linear_load(e->weights, &e->down, nm.checkpoint, name);
 }
-// A routed expert's matrices, and its tensors: up's weights and scales, then
-// down's.
-static void routed_expert(Expert *e, const char *prefix, Tensor *tensors) {
+// A routed expert's matrices (up and down; squared ReLU has no gate), and
+// their tensors at index 1 and 2 of its three (experts_files).
+static void routed_expert(Expert *e, const char *prefix, Tensor *weight, Tensor *scales, Tensor *exceptions) {
   char name[256];
   *e = (Expert){0};
   snprintf(name, sizeof name, "%s.up_proj", prefix);
-  linear_describe(&e->up, nm.checkpoint, name, &tensors[0], &tensors[1]);
+  linear_describe(&e->up, nm.checkpoint, name, &weight[1], &scales[1], &exceptions[1]);
   snprintf(name, sizeof name, "%s.down_proj", prefix);
-  linear_describe(&e->down, nm.checkpoint, name, &tensors[2], &tensors[3]);
+  linear_describe(&e->down, nm.checkpoint, name, &weight[2], &scales[2], &exceptions[2]);
 }
-static int same_places(const ExpertPlaces *a, const ExpertPlaces *b) {
-  for (int k = 0; k < 3; k++)
-    if (a->weight[k].span != b->weight[k].span || a->weight[k].offset != b->weight[k].offset ||
-        a->scales[k].span != b->scales[k].span || a->scales[k].offset != b->scales[k].offset)
-      return 0;
-  return 1;
-}
-// The store's layout from the routed experts' tensors ([moe_layers][experts][4]).
-// A layer's experts share one placement of their matrices in a slot: the
-// tensors that follow each other in a file share a span when every expert of
-// the layer lays them out alike, and each tensor has its own span otherwise.
-static void store_layout(const Tensor *tensors) {
-  nm.span = xmalloc((size_t)nm.moe_layers * nm.experts * STORE_PARTS * sizeof *nm.span);
-  nm.spans = xmalloc((size_t)nm.moe_layers * sizeof *nm.spans);
-  nm.places = xmalloc((size_t)nm.moe_layers * sizeof *nm.places);
-  for (int m = 0; m < nm.moe_layers; m++)
-    for (int merge = 1; merge >= 0; merge--) {
-      int alike = 1;
-      for (int e = 0; e < nm.experts && alike; e++) {
-        size_t at = (size_t)m * nm.experts + e;
-        ExpertPart parts[4];
-        int n = experts_spans(tensors + at * 4, 4, merge, nm.span + at * STORE_PARTS, parts);
-        ExpertPlaces p = {.weight = {{0, 0}, parts[0], parts[2]}, .scales = {{0, 0}, parts[1], parts[3]}};
-        if (!e)
-          nm.spans[m] = n, nm.places[m] = p;
-        else
-          alike = n == nm.spans[m] && same_places(&p, &nm.places[m]);
-      }
-      if (alike)
-        break;
-      if (!merge)
-        die("Nemotron layer %d's experts have different tensors", m);
-    }
+// The store of the routed experts, from their tensors ([moe_layers][experts][3]).
+static void store_layout(const Tensor *weight, const Tensor *scales, const Tensor *exceptions) {
+  const Expert *experts[nm.moe_layers];
+  for (int l = 0; l < nm.layers; l++)
+    if (nm.layer[l].kind == 2)
+      experts[nm.layer[l].moe] = nm.layer[l].experts;
+  experts_files(&nm.files, weight, scales, exceptions, experts, nm.moe_layers, nm.experts);
   nm.store = cache_create(&(ExpertLayout){.layers = nm.moe_layers, .scored_layers = nm.moe_layers,
-                                          .experts = nm.experts, .chosen = nm.chosen, .parts = STORE_PARTS,
-                                          .span = nm.span, .spans = nm.spans});
+                                          .experts = nm.experts, .chosen = nm.chosen, .parts = nm.files.parts,
+                                          .span = nm.files.span, .spans = nm.files.spans,
+                                          .extra = nm.files.extra, .transform = nm.files.extra ? experts_decode : NULL,
+                                          .context = &nm.files});
   cache_memory(nm.store, weights_slot(nm.core));
-  experts_store(&nm.routed, nm.store, nm.places);
+  experts_store(&nm.routed, nm.store, &nm.files);
 }
 static void prepare(const char *directory) {
   char path[4096], name[256];
@@ -200,7 +174,11 @@ static void prepare(const char *directory) {
   int moe_layers = 0;
   for (int l = 0; l < nm.layers; l++)
     moe_layers += !strcmp(types->kid[l].s, "moe");
-  Tensor *tensors = xmalloc(((size_t)moe_layers * nm.experts * 4 + 1) * sizeof *tensors);
+  size_t n_tensors = (size_t)moe_layers * nm.experts * 3 + 1;  // each expert's gate, up and down
+  Tensor *weight = xmalloc(n_tensors * sizeof *weight), *scales = xmalloc(n_tensors * sizeof *scales),
+         *exceptions = xmalloc(n_tensors * sizeof *exceptions);
+  memset(weight, 0, n_tensors * sizeof *weight), memset(scales, 0, n_tensors * sizeof *scales);
+  memset(exceptions, 0, n_tensors * sizeof *exceptions);
   for (int l = 0; l < nm.layers; l++) {
     Layer *y = nm.layer + l;
     y->number = l;
@@ -242,15 +220,16 @@ static void prepare(const char *directory) {
       y->experts = xmalloc((size_t)nm.experts * sizeof *y->experts);
       for (int e = 0; e < nm.experts; e++) {
         snprintf(name, sizeof name, "backbone.layers.%d.mixer.experts.%d", l, e);
-        routed_expert(y->experts + e, name, tensors + ((size_t)y->moe * nm.experts + e) * 4);
+        size_t at = ((size_t)y->moe * nm.experts + e) * 3;
+        routed_expert(y->experts + e, name, weight + at, scales + at, exceptions + at);
       }
     } else
       die("unsupported Nemotron layer type: %s", type);
 #undef MAT
 #undef VEC
   }
-  store_layout(tensors);
-  free(tensors);
+  store_layout(weight, scales, exceptions);
+  free(weight), free(scales), free(exceptions);
   snprintf(path, sizeof path, "%s/generation_config.json", directory);
   if (!access(path, R_OK)) {
     char *source = read_file(path, NULL);

@@ -60,7 +60,11 @@ Flash-Next uses the same model entry and Qwen chat format. Its supported
 checkpoint types are `qwen4_exp` and `qwen4_exp_text`. It supports images
 when the checkpoint contains the vision encoder. Set `draft: 0` and
 `lookup: "off"`; speculative verification is not implemented for this
-architecture. Its routed experts share the global `memory` budget.
+architecture. Its routed experts are read into its expert store's slots as
+passes need them, as DeepSeek's are. The store stays within the global
+`memory` budget, keeps the experts used most, and gives slots back when
+other programs need the memory. Each slot takes about 3.1 MB: an expert's
+weights, its compressed scales as read, and the scales decoded.
 
 Nemotron 3.5 Transcribe uses checkpoint type `nemo_speechlm`. Its main model
 and speech encoder load on demand. Its routed experts are read into the
