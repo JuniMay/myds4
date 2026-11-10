@@ -37,6 +37,7 @@
 #include <time.h>
 
 #include "myds4.h"
+#include "pass.h"
 
 #define SECTOR 16384ull
 #define PIECE (2ull << 20)
@@ -1307,8 +1308,13 @@ int cache_hold(ExpertStore *st, int layer, const int *experts, int n) {
     resident[k] = i >= 0;
     if (i >= 0) st->slots[i].holds++;
   }
-  int pending = cache_request(st, layer, experts, n);
-  for (int k = 0; k < n; k++) if (!resident[k]) st->slots[WHERE(layer, experts[k])].holds++;
+  // Each missing one is held as soon as it has a slot: the slot of the next
+  // one must not be taken from it.
+  int pending = 0;
+  for (int k = 0; k < n; k++) {
+    pending += cache_request(st, layer, &experts[k], 1);
+    if (!resident[k]) st->slots[WHERE(layer, experts[k])].holds++;
+  }
   st->held_references += n;
   return pending;
 }
@@ -1348,8 +1354,31 @@ int cache_where(ExpertStore *st, int layer, int e) {  // as cache_request will c
   return i < 0 ? 0 : !st->slots[i].prefetched ? 1 : slot_reading(st, i) ? 3 : 2;
 }
 
+typedef struct { ExpertStore *st; int layer; const int *experts; int n; } ReadsWait;
+
+static int reads_ready(void *context) {
+  ReadsWait *w = context;
+  ExpertStore *st = w->st;
+  for (int k = 0; k < w->n; k++)
+    if (slot_reading(st, WHERE(w->layer, w->experts[k]))) return 0;
+  return 1;
+}
+
+static void reads_block(void *context) {
+  ReadsWait *w = context;
+  ExpertStore *st = w->st;
+  for (int k = 0; k < w->n; k++) {
+    dispatch_group_t g = st->slots[WHERE(w->layer, w->experts[k])].loading;
+    if (g) dispatch_group_wait(g, DISPATCH_TIME_FOREVER);
+  }
+}
+
 void cache_wait(ExpertStore *st, int layer, const int *experts, int n) {
   double t = now();
+  if (pass_current()) {
+    ReadsWait wait = {st, layer, experts, n};
+    pass_wait(&(PassWait){reads_ready, reads_block, &wait});
+  }
   for (int k = 0; k < n; k++) finish(st, WHERE(layer, experts[k]));
   st->stats.read_s += now() - t;
 }
@@ -1506,13 +1535,13 @@ static void resize(ExpertStore *st, int below) {
   }
   for (int i = st->tail; st->nslots > st->cap && i >= 0;) {
     int prev = st->slots[i].prev;
-    if (st->slots[i].layer < below) release(st, i), st->stats.given_back++;
+    if (st->slots[i].layer < below && !st->slots[i].holds) release(st, i), st->stats.given_back++;
     i = prev;
   }
   while (st->nmapped > st->mcap) {  // the mapped slots with the lowest scores that nothing of this pass still needs
     int best = -1;
     for (int j = 0; j < st->max_slots; j++)
-      if (st->slots[j].b.obj && st->slots[j].mapped && st->slots[j].layer < below &&
+      if (st->slots[j].b.obj && st->slots[j].mapped && st->slots[j].layer < below && !st->slots[j].holds &&
           !st->slots[j].loading && !st->slots[j].prefetched && (best < 0 || st->score[j] < st->score[best]))
         best = j;
     if (best < 0) break;
@@ -1532,11 +1561,11 @@ static void resize(ExpertStore *st, int below) {
             now() - st->bad > 300 ? "available memory" : "free pages");
 }
 
-// Between tokens (pass < 0) no GPU work references a slot, so any slot can be
-// released. Within a prompt pass at layer `pass` the GPU may still use the
-// slots of the layer before, so only those of earlier layers are released.
+// Between tokens (pass < 0) no GPU work of this pass references a slot, and
+// within a prompt pass at layer `pass` it may still use the slots of the
+// layer before, so only those of earlier layers are released; held slots
+// stay, for the work of any pass that holds them.
 void cache_adapt_pass(ExpertStore *st, int pass) {
-  if (st->held_references) die("cannot resize the cache during a runahead job");
   if (pass < 0) {
     advance_score_clock(st);
   }

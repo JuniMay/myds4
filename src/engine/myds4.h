@@ -114,6 +114,7 @@ typedef struct {
 void gpu_residency_info(GpuResidencyInfo *info);
 uint64_t gpu_working_set(void);
 void *gpu_open(void);        // a command buffer that runs after those opened before
+void *gpu_open_detached(void);  // one that joins the queue only when gpu_submit_detached commits it
 void gpu_encode(void *cmd);  // encode into it until gpu_commit or the next gpu_encode
 void gpu_begin(void);        // gpu_encode(gpu_open())
 void gpu_encode_concurrent(void *cmd);  // gpu_encode whose dispatches may overlap unless a barrier lies between them
@@ -121,6 +122,7 @@ void gpu_barrier(void);                 // the dispatches encoded before it fini
 void gpu_barrier_on(const Buf *const *buffers, int count);  // the same, for what they wrote to these buffers
 void *gpu_close(void);       // ends the current command buffer's encoding without committing it
 void gpu_submit(void *cmd);
+void gpu_submit_detached(void *cmd);  // gpu_submit of a buffer from gpu_open_detached
 void gpu_kern(int k);
 void gpu_buf(int idx, const Buf *b, size_t off);
 void gpu_bytes(int idx, const void *p, size_t n);
@@ -134,6 +136,9 @@ void gpu_keep_clock(double seconds);  // keeps the GPU's clock up for about that
 void gpu_commit(void);
 void gpu_wait_signal(uint64_t v);
 uint64_t gpu_signal_value(void);  // latest completed signal, without waiting
+// Inside a pass, its own event for its signals (see gpu_pass_variables, pass.h).
+void gpu_pass_begin(void);
+void gpu_pass_end(void);
 void gpu_sync(void);
 void gpu_reap(void);  // accounts for the command buffers that have finished, without waiting
 void gpu_drain(void); // complete both the compute and clock-keeping queues

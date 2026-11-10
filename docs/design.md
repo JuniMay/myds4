@@ -160,11 +160,12 @@ allocation's membership. Only changed sets are committed. This bounds the
 amount of memory in each set while preserving buffer addresses and execution
 order.
 
-Command buffers run in the order they are opened, and a decode step opens a
-layer's expert buffers before it commits the next layer's front behind
-them. Until those opened buffers are committed, no thread may wait for a
-command buffer committed after them: the GPU would run it only after buffers
-that the waiting thread commits later. So an eviction in the middle of a
+Command buffers run in the order they are opened. No thread may wait for a
+command buffer committed after one that is still open: the GPU would run it
+only after the open one, which the waiting thread commits later. A decode
+step therefore encodes the next layer's front into a detached command
+buffer (`gpu_open_detached`), which joins the queue only when it is
+committed, after the layer's expert buffer. An eviction in the middle of a
 pass (an allocation that takes back an idle expert) commits the residency
 change but does not wait for the GPU. Committed command buffers stay
 retained until they are accounted for (`gpu_reap`, `gpu_sync`), so the
@@ -266,6 +267,60 @@ native model handle or checking thread identity on each call.
 Each prefill call receives its own image context. Image preprocessing and
 feature storage belong to the request; model-specific position state is
 kept in the sequence and its snapshots.
+
+### Passes
+
+A pass is a piece of the engine's work that runs on its own stack and gives
+the processor back where it would wait, so that one thread can advance
+several passes (`src/engine/pass.c`). The worker and the command line do not
+create passes yet: each engine call still runs to completion on the engine
+thread. DeepSeek is the first family that can run as passes, and
+`build/tests/passes` runs two of its passes interleaved.
+
+A switch saves the callee-saved registers and the stack pointer, in a few
+lines of AArch64 assembly. A yield and a resume together take about 30 ns.
+A stack is address space with a guard page; only the pages a pass uses are
+committed.
+
+Inside a pass these waits yield: `gpu_sync`, `gpu_wait_signal`, the expert
+store's `cache_wait` and the wait for DeepSeek's Engram reader. Each yield
+carries the condition that ends it. The code that resumes the pass asks
+whether the condition holds (`pass_ready`) or waits for it (`pass_block`). A
+wait whose condition already holds does not yield. Outside a pass the same
+calls block on the calling thread.
+
+Other passes' GPU work can run only between a pass's command buffers, so no
+command buffer may be open at a yield; the GPU layer stops the program if
+one is. The detached front of the next layer is the exception, because it
+has no place in the queue until it is committed.
+
+These belong to one pass:
+- The model-wide variables that a family lists with `pass_variables`. They
+  are copied out when the pass yields and back when it resumes.
+- Buffers whose contents are used across a yield, and buffers that the CPU
+  fills for GPU work that may still be queued. Those are DeepSeek's routing
+  and selection buffers, the logits, what the routed experts read from the
+  layer's front (the residual streams `H1`, the FFN input `XQ` and the shared
+  expert's output `SHO`), and the tile tables and work lists of the expert
+  kernels. A pass allocates its own in `deepseek_pass_begin` and frees them
+  in `deepseek_pass_end`.
+- A Metal shared event for its signals. Signals fire in queue order, and
+  each pass numbers its signals as it encodes them, so a shared numbering
+  could report one pass's signal because of another pass's later work.
+
+The other work buffers stay shared between passes, because nothing in them
+is used across a yield. They only grow while passes are running.
+
+A pass holds the experts of the layer it has encoded until the GPU has
+finished the layer, because a store that evicted them could hand their
+slots to another pass. The expert cache's resize skips held slots. Requests
+take their holds one expert at a time, so a large request cannot evict an
+expert that it requested a moment earlier.
+
+The expert store's read epoch, `pass_layer`, `serving` and `minimum_slots`,
+and `gpu_sync`'s wait for the last command buffer of any pass, are still
+shared: the scheduler that runs passes of different requests must make them
+per-pass before it goes live.
 
 ### Saved states
 

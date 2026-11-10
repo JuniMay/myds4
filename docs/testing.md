@@ -24,6 +24,10 @@ Tests are grouped by role:
 - `tests/fixtures/` and `server/tests/fixtures/`: fixed test inputs.
 - `server/tests/`: HTTP, model lifecycle and terminal integration.
 
+`build/tests/pass` checks the coroutine switch without the GPU: resuming and
+yielding, waits that are over already, per-pass variables and many passes in
+turn. It prints what a yield and a resume cost together.
+
 Keep a regression when it proves a maintained behavior. Share fixture
 setup within a subsystem; do not retain separate experiments solely to
 preserve their former measurements.
@@ -165,11 +169,23 @@ the GPU. The Python measurement drivers enforce process, memory and GPU
 checks. Standalone C checks require the operator to provide that window.
 Do not interpret a correctness check's elapsed time as a throughput result.
 
-`make pass-eviction-check` needs no model. It opens two command buffers as
-a decode step opens a layer's expert buffers, commits a third behind them,
-then allocates past a 64 MiB limit so that an idle expert goes back. The
-eviction must not wait for the GPU; a wait that never ends fails the check
-by its 20-second alarm.
+`make pass-eviction-check` needs no model. It opens two command buffers,
+commits a third behind them, then allocates past a 64 MiB limit so that an
+idle expert goes back. The GPU runs the third only after the two open ones,
+so the eviction must not wait for the GPU; a wait that never ends fails the
+check by its 20-second alarm.
+
+`build/tests/passes CHECKPOINT --text FILE [--experts GGUF] [--memory GIB]
+[--tokens N] [--decode N] [--no-garbage]` needs a DeepSeek model and a text
+of at least twice `--tokens` tokens. It runs two passes, each a prefill and
+greedy decoding, alone and then interleaved at every yield, and compares
+every logit vector byte for byte. Between the passes' turns it fills the
+buffers that passes share with garbage. A buffer or variable that should
+belong to a pass but does not shows up as a difference. `--no-garbage`
+leaves GPU work queued across the switches, so that the two passes' command
+buffers overlap in the queue, which catches CPU-filled shared buffers. The
+check prints how long the passes took alone and interleaved. Run it with
+and without `--no-garbage`.
 
 `build/tests/gpu-steps` needs no model. A buffer that queued work uses must
 stay allocated and charged until that work has finished (`gpu_free_later`,

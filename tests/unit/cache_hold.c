@@ -7,7 +7,8 @@ int main(void) {
   st = deepseek_cache_create();
   Slot fixture[4] = {0};
   double priorities[4] = {1, 2, 3, 4};
-  st->slots = fixture, st->score = priorities, st->max_slots = st->cap = st->nslots = 4;
+  int free_slots[4];
+  st->slots = fixture, st->score = priorities, st->max_slots = st->cap = st->nslots = 4, st->free_list = free_slots;
   memset(st->where, 0xff, WHERE_BYTES);
   st->head = 3, st->tail = 0, st->pass_layer = st->serving = -1;
   st->token = 10, st->weight = 1;
@@ -42,6 +43,16 @@ int main(void) {
   CHECK(cache_ready(st, 0, 3) && fixture[3].holds == 1);
   cache_unhold(st, 0, pending, 1);
   CHECK(fixture[3].holds == 0 && st->held_references == 0);
+  // A resize gives back unheld slots, the least recently used first, and
+  // leaves held ones, whatever their age, for the work that holds them.
+  int oldest[] = {0, 1};
+  CHECK(cache_hold(st, 0, oldest, 2) == 0);
+  st->cap = 2;
+  cache_adapt_pass(st, 2);
+  CHECK(st->nslots == 2 && fixture[0].holds == 1 && fixture[1].holds == 1);
+  CHECK(WHERE(0, 0) == 0 && WHERE(0, 1) == 1 && WHERE(0, 2) < 0 && WHERE(0, 3) < 0);
+  CHECK(st->held_references == 2);
+  cache_unhold(st, 0, oldest, 2);
   printf("cache job reservations: %d/%d CPU checks passed\n", checks - failures, checks);
   return failures != 0;
 }

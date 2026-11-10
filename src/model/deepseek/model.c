@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include "myds4.h"
+#include "pass.h"
 #include "../model.h"
 
 #include "engram.h"
@@ -264,6 +265,18 @@ static Buf *const work_buffers[] = {
     &H1, &MA, &PART, &X, &XQ, &QA, &QR, &QRQ, &Q, &O, &OA, &AO, &KV, &CK, &CS, &LAT,
     &IK, &QI, &IW, &SC, &GL, &GP, &RT, &PR, &SHG, &SHU, &SHH, &SHO, &EROW, &EX, &EKV,
     &MH, &YK, &TILES, &XH, &MHH, &XB, &PTOK, &PW, &TP, &WIN};
+// Those that live across a wait within a layer, or that the CPU fills for
+// GPU work still queued, are each pass's own; the others hold data only
+// within one stretch of GPU work, and passes share them. pass_work_rows: the
+// rows of a pass's own, as work_rows of the shared ones.
+static Buf *const pass_work_buffers[] = {&H1, &XQ, &SHO, &RT, &GL, &GP, &PR, &EROW, &TILES, &PTOK, &PW, &TP};
+static int pass_work_rows;
+
+static int is_pass_work(const Buf *b) {
+  for (size_t i = 0; i < sizeof pass_work_buffers / sizeof *pass_work_buffers; i++)
+    if (pass_work_buffers[i] == b) return 1;
+  return 0;
+}
 
 static void gguf_experts(const char *path) {
   static const char *mat[3] = {"gate", "up", "down"};  // w1, w3, w2
@@ -322,12 +335,14 @@ static Buf zeros(size_t n) {
 
 // Temporary layer buffers grow for prefill and shrink for small forward
 // passes. Persistent KV, logits, request rows and draft history are separate.
-static uint64_t work_plan(int rows, int allocate) {
+// pass_part: the buffers each pass has of its own, or the shared ones.
+static uint64_t work_plan(int rows, int allocate, int pass_part) {
   uint64_t bytes = 0;
-#define W(buffer, amount) do { size_t size = (amount); bytes += gpu_allocation_size(size); if (allocate) buffer = zeros(size); } while (0)
+#define W(buffer, amount) do { if (pass_part) break; size_t size = (amount); bytes += gpu_allocation_size(size); if (allocate) buffer = zeros(size); } while (0)
+#define P(buffer, amount) do { if (!pass_part) break; size_t size = (amount); bytes += gpu_allocation_size(size); if (allocate) buffer = zeros(size); } while (0)
   size_t m = (size_t)rows, p = m * TOPK;
-  W(H1, m * HC * DIM * STREAM_BYTES); W(MA, m * MIX * 4); W(PART, m * 400 * 4);
-  W(X, m * DIM * 4); W(XQ, m * DIM * 4); W(QA, m * QRANK * 4); W(QR, m * QRANK * 4);
+  P(H1, m * HC * DIM * STREAM_BYTES); W(MA, m * MIX * 4); W(PART, m * 400 * 4);
+  W(X, m * DIM * 4); P(XQ, m * DIM * 4); W(QA, m * QRANK * 4); W(QR, m * QRANK * 4);
   W(QRQ, m * QRANK * 4); W(Q, m * HEADS * HEAD_DIM * 4); W(O, m * HEADS * HEAD_DIM * 4);
   W(OA, m * OGROUPS * ORANK * 4); W(AO, m * DIM * 4); W(KV, m * HEAD_DIM * 4);
   W(CK, (m + 2) * HEAD_DIM * 4); W(CS, (m + 2) * HEAD_DIM * 4); W(LAT, m * HEAD_DIM * 4);
@@ -338,31 +353,42 @@ static uint64_t work_plan(int rows, int allocate) {
   W(SC, (size_t)score_rows * opt.ctx * 4);
   size_t predicted = m > 2 * FEW ? m : 2 * FEW;
   size_t routed = m;
-  W(GL, m * EXPERTS * 4); W(GP, predicted * EXPERTS * 4); W(RT, routed * 16 * 4);
-  W(PR, (routed > predicted ? routed : predicted) * PREDICT * 4);
-  W(SHG, m * INTER * 4); W(SHU, m * INTER * 4); W(SHH, m * INTER * 4); W(SHO, m * DIM * 4);
-  W(EROW, m * DIM * 2); W(EX, m * ENGRAM_ROWS * ENGRAM_DIM * 4); W(EKV, m * (HC + 1) * DIM * 4);
-  W(MH, p * INTER * 4); W(YK, p * DIM * 4); W(TILES, (p / 32 + EXPERTS) * 32);
+  P(GL, m * EXPERTS * 4); P(GP, predicted * EXPERTS * 4); P(RT, routed * 16 * 4);
+  P(PR, (routed > predicted ? routed : predicted) * PREDICT * 4);
+  W(SHG, m * INTER * 4); W(SHU, m * INTER * 4); W(SHH, m * INTER * 4); P(SHO, m * DIM * 4);
+  P(EROW, m * DIM * 2); W(EX, m * ENGRAM_ROWS * ENGRAM_DIM * 4); W(EKV, m * (HC + 1) * DIM * 4);
+  W(MH, p * INTER * 4); W(YK, p * DIM * 4); P(TILES, (p / 32 + EXPERTS) * 32);
   W(XH, (p + 64) * DIM * 2); W(MHH, (p + 64) * INTER * 2);
   size_t matrix = ((m + 127) / 128) * 128 * XB_K * 2;
   size_t queries = (m < QB_ROWS ? m : QB_ROWS) * HEADS * HEAD_DIM * 2;
   size_t draft = opt.draft ? 128u * 3 * DIM * 2 : 0;
   size_t xb = matrix > queries ? matrix : queries;
   W(XB, xb > draft ? xb : draft);
-  W(PTOK, p * 4); W(PW, p * 4); W(TP, p * 4); W(WIN, (m + WINDOW) * HEAD_DIM * 2);
-  if (allocate) sc_rows = score_rows;
+  P(PTOK, p * 4); P(PW, p * 4); P(TP, p * 4); W(WIN, (m + WINDOW) * HEAD_DIM * 2);
+  if (allocate && !pass_part) sc_rows = score_rows;
 #undef W
+#undef P
   return bytes;
 }
 
+static uint64_t work_bytes(int rows) { return work_plan(rows, 0, 0) + work_plan(rows, 0, 1); }
+
+// The shared buffers follow the largest pass: inside a pass they only grow,
+// since another pass may need them larger.
 static void work_capacity(int rows) {
   int small = replay_margin() + 1;
   if (rows > MB) rows = MB;
   if (rows < small) rows = small;
-  if (rows <= work_rows && !(rows == small && work_rows > small)) return;
+  if (rows > pass_work_rows || (rows == small && pass_work_rows > small)) {
+    for (size_t i = 0; i < sizeof pass_work_buffers / sizeof *pass_work_buffers; i++) gpu_free_later(pass_work_buffers[i]);
+    work_plan(rows, 1, 1);
+    pass_work_rows = rows;
+  }
+  if (rows <= work_rows && !(rows == small && work_rows > small && !pass_current())) return;
   int resize_cache = work_rows != 0;
-  for (size_t i = 0; i < sizeof work_buffers / sizeof *work_buffers; i++) gpu_free_later(work_buffers[i]);
-  work_plan(rows, 1);
+  for (size_t i = 0; i < sizeof work_buffers / sizeof *work_buffers; i++)
+    if (!is_pass_work(work_buffers[i])) gpu_free_later(work_buffers[i]);
+  work_plan(rows, 1, 0);
   work_rows = rows;
   if (resize_cache) cache_idle(experts_store); // capacity maintenance does not represent another token or pass
 }
@@ -641,8 +667,8 @@ int deepseek_load(const char *dir, const Options *options) {
   cache_active(experts_store, 1);
   int small = replay_margin() + 1 > BATCH_ROWS ? replay_margin() + 1 : BATCH_ROWS;
   cache_working_rows(experts_store, 1);
-  uint64_t workspace = model_buffers_ready ? work->payload - resizable_bytes() + work_plan(small, 0) + request_plan(small, 0)
-                                          : fixed_plan(0) + work_plan(small, 0) + request_plan(small, 0);
+  uint64_t workspace = model_buffers_ready ? work->payload - resizable_bytes() + work_bytes(small) + request_plan(small, 0)
+                                          : fixed_plan(0) + work_bytes(small) + request_plan(small, 0);
   uint64_t minimum = weights_required(core_weights) + workspace + cache_required(experts_store, opt.draft ? CACHE_LAYERS : LAYERS);
   if (!memory_minimum(core->account, minimum)) { memory_pin(core, 0); return 0; }
   if (model_buffers_ready) request_capacity(1);
@@ -870,12 +896,12 @@ static void engram_hash(int token, int pos, int64_t rows[2][ENGRAM_ROWS]) {
 }
 
 // Reads the m tokens' table rows of Engram layer e into EC[e] and ES[e].
-static void engram_read(int e, const int64_t (*rows)[2][ENGRAM_ROWS], int m) {
+static void engram_read(int e, const int64_t (*rows)[2][ENGRAM_ROWS], int m, uint8_t *codes, uint8_t *scales) {
   Layer *y = &L[e ? 14 : 1];
   int64_t *r = memory_host_required((size_t)m * ENGRAM_ROWS * 8, 0);
   for (int i = 0; i < m; i++) memcpy(r + i * ENGRAM_ROWS, rows[i][e], ENGRAM_ROWS * 8);
-  io_rows(y->e_codes.fd, y->e_codes.off, ENGRAM_DIM, r, m * ENGRAM_ROWS, EC[e].ptr);
-  io_rows(y->e_scales.fd, y->e_scales.off, 8, r, m * ENGRAM_ROWS, ES[e].ptr);
+  io_rows(y->e_codes.fd, y->e_codes.off, ENGRAM_DIM, r, m * ENGRAM_ROWS, codes);
+  io_rows(y->e_scales.fd, y->e_scales.off, 8, r, m * ENGRAM_ROWS, scales);
   memory_host_free(r);
 }
 
@@ -1313,6 +1339,23 @@ static void experts_sum(int r, size_t mf, size_t hs) {
 // being read while the others ran, apart from those of the others.
 static size_t late_entries(int l, int r) { return (size_t)(LAYERS * FEW + DRAFTS * BLOCK + l * FEW + r) * 256; }
 
+// The experts that the pass's encoded GPU work still uses: they stay in the
+// cache until that work has finished (held_release, once it has).
+static struct { int layer, n, experts[EXPERTS]; } held;
+
+static void held_release(void) {
+  if (held.n) cache_unhold(experts_store, held.layer, held.experts, held.n), held.n = 0;
+}
+
+// Requests layer l's experts and holds them; the experts being read.
+static int hold_experts(int l, const int *experts, int n) {
+  if (held.n) die("experts of layer %d are still held", held.layer);
+  int reading = cache_hold(experts_store, l, experts, n);
+  held.layer = l, held.n = n;
+  memcpy(held.experts, experts, (size_t)n * sizeof *experts);
+  return reading;
+}
+
 // The read-aheads of m <= FEW decoded rows after layer l's routing, from
 // the predictions pr for the next two layers (see AHEAD; row r's at
 // r PREDICT and (m + r) PREDICT), while fewer than m INFLIGHT are reading.
@@ -1366,12 +1409,13 @@ int deepseek_routes(int row, uint16_t *id, uint8_t *from) {
   return 1;
 }
 
-// The routed experts of m <= FEW rows (RT), each as decoding runs it. While
-// some are still being read, those in memory run first, their down products
-// as parts (see moe_parts), in the command buffer open now, which is committed
-// at once; the others and the rows' sums follow in `rest` once they are in.
-// Returns whether it moved on to `rest`. approx: see substitute.
-static int routed_rows(const Batch *b, int l, int ahead, int inflight, int approx, void *rest) {
+// The routed experts of m <= FEW rows (RT), each as decoding runs it. With
+// may_split, while some are still being read, those in memory run first,
+// their down products as parts (see moe_parts), in a command buffer of their
+// own; the others and the rows' sums follow once they are in. No command
+// buffer is open while it waits; it leaves the last one open for the caller
+// to add to and commit. approx: see substitute.
+static void routed_rows(const Batch *b, int l, int ahead, int inflight, int approx, int may_split) {
   int m = b->m, *rt = (int *)RT.ptr, need[EXPERTS], nn = 0, nready = 0, chosen[FEW * TOPK];
   float *rw = (float *)RT.ptr;
   char used[EXPERTS] = {0}, ready[EXPERTS] = {0};
@@ -1404,7 +1448,7 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
     if (used[e]) need[nn++] = e;
   expert_stats()->row_unique += nn;
   double t0 = now();
-  int reading = cache_request(experts_store, l, need, nn);  // this layer's reads first, then the predicted ones
+  int reading = hold_experts(l, need, nn);  // this layer's reads first, then the predicted ones
   cache_demote(experts_store, l);
   if (reading) gpu_keep_clock(reading * 1e-3); // the GPU idles until they are in
   if (opt.deepseek.online_predictor) {
@@ -1420,16 +1464,20 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
     else read_ahead_rows(m, l, (const int *)PR.ptr, ahead, inflight);
   }
   for (int i = 0; i < nn; i++) nready += ready[need[i]] = cache_ready(experts_store, l, need[i]);
-  int split = rest && nready > 0 && nready < nn;
-  for (int r = 0; split && r < m; r++) {
-    size_t eo = (size_t)(l * FEW + r) * 256;
-    fill_entries(l, eo, rt + r * 16, rw + r * 16 + 8, ready, 1);
-    experts_go(l, r, eo, mf_off(b) + (size_t)r * MIX * 4, hs_off(b) + (size_t)r * HC * DIM * STREAM_BYTES, 1);
+  int split = may_split && nready > 0 && nready < nn;
+  if (split) {
+    gpu_begin();
+    for (int r = 0; r < m; r++) {
+      size_t eo = (size_t)(l * FEW + r) * 256;
+      fill_entries(l, eo, rt + r * 16, rw + r * 16 + 8, ready, 1);
+      experts_go(l, r, eo, mf_off(b) + (size_t)r * MIX * 4, hs_off(b) + (size_t)r * HC * DIM * STREAM_BYTES, 1);
+    }
+    gpu_commit();
   }
-  if (split) gpu_commit(), gpu_encode(rest);
   double t1 = now();
   cache_wait(experts_store, l, need, nn);
   phase_s[3] += t1 - t0, phase_s[2] += now() - t1, phase_s[4] -= now() - t0;
+  gpu_begin();
   for (int r = 0; r < m; r++) {
     size_t mf = mf_off(b) + (size_t)r * MIX * 4, hs = hs_off(b) + (size_t)r * HC * DIM * STREAM_BYTES;
     if (!split) {
@@ -1440,7 +1488,6 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
     experts_go(l, r, late_entries(l, r), mf, hs, 1);
     experts_sum(r, mf, hs);
   }
-  return split;
 }
 
 // A batch's routed experts: the (row, expert) pairs grouped by expert, in
@@ -1468,7 +1515,7 @@ static void routed_batch(const Batch *b, int l, int ahead, int inflight, int app
     if (count[e]) need[nn++] = e;
   }
   double t0 = now();
-  cache_request(experts_store, l, need, nn);
+  hold_experts(l, need, nn);
   cache_demote(experts_store, l);
   if (full_ahead(m)) read_ahead(l, m, (const int *)PR.ptr);
   else {
@@ -1481,6 +1528,7 @@ static void routed_batch(const Batch *b, int l, int ahead, int inflight, int app
   double t1 = now();
   cache_wait(experts_store, l, need, nn);
   phase_s[3] += t1 - t0, phase_s[2] += now() - t1, phase_s[4] -= now() - t0;
+  gpu_begin();
   int *ptok = (int *)PTOK.ptr, *tp = (int *)TP.ptr;
   float *pw = (float *)PW.ptr;
   for (int r = 0; r < m; r++) {
@@ -1634,6 +1682,7 @@ typedef struct {
   dispatch_group_t read[2];
   MemorySlot *owner;
   uint64_t reserved;
+  uint8_t *codes[2], *scales[2];  // where the reader writes, chosen by the pass that started it
 } Rows;
 
 static uint64_t row_scratch(int rows) {
@@ -1641,6 +1690,7 @@ static uint64_t row_scratch(int rows) {
 }
 
 static void rows_begin(Rows *rows) {
+  for (int e = 0; e < 2; e++) rows->codes[e] = (uint8_t *)EC[e].ptr, rows->scales[e] = (uint8_t *)ES[e].ptr;
   rows->owner = memory_current();
   rows->reserved = row_scratch(rows->n);
   if (rows->owner && !memory_claim(rows->owner, rows->reserved, MEMORY_REQUIRED))
@@ -1653,13 +1703,13 @@ static void rows_end(Rows *rows) {
 
 static void read_rows(void *ctx) {
   Rows *r = ctx;
-  for (int e = 0; e < 2; e++) engram_read(e, r->rows, r->n), dispatch_group_leave(r->read[e]);
+  for (int e = 0; e < 2; e++) engram_read(e, r->rows, r->n, r->codes[e], r->scales[e]), dispatch_group_leave(r->read[e]);
 }
 
-// Everything of layer l before its routed experts: the router signals the
-// returned value, then the shared expert runs while the CPU routes.
-static uint64_t layer_front(const Batch *b, int l) {
-  gpu_begin();
+// Everything of layer l before its routed experts, into the open command
+// buffer: the router signals the returned value, then the shared expert runs
+// while the CPU routes.
+static uint64_t front_encode(const Batch *b, int l) {
   if (l == 0) embed_encode(b->m, b->row);  // the rows embed_read read
   if (l == 1 || l == 14) {
     engram(b, l);
@@ -1675,8 +1725,24 @@ static uint64_t layer_front(const Batch *b, int l) {
   ffn_front(b, l);
   uint64_t v = gpu_signal();
   shared_expert(b->m, &L[l]);
+  return v;
+}
+
+static uint64_t layer_front(const Batch *b, int l) {
+  gpu_begin();
+  uint64_t v = front_encode(b, l);
   gpu_commit();
   return v;
+}
+
+// Layer l's front, encoded now into a command buffer that joins the queue
+// when gpu_submit_detached commits it; *signal: as front_encode returns.
+static void *front_ahead(const Batch *b, int l, uint64_t *signal) {
+  void *c = gpu_open_detached();
+  gpu_encode(c);
+  *signal = front_encode(b, l);
+  gpu_close();
+  return c;
 }
 
 // m rows at positions pos..: one token, or a token and its drafts.
@@ -1705,16 +1771,14 @@ static void step_rows(const int *tokens, int m, int pos) {
   phase_s[0] += now() - ts;
   Batch b = {m, pos, 0};
   int ahead = opt.dump_fd < 0 && !gpu_profiling();
-  // Pre-encode the next front while the current front runs. The ordinary
-  // path reserves two earlier queue positions for experts. Completion
-  // groups defer front submission until all expert groups are queued.
+  // The next layer's front is encoded while the current front runs, and
+  // joins the queue right after this layer's experts: no gap between them.
   uint64_t sig = layer_front(&b, 0), next = 0;
   ts = now();
   cache_adapt(experts_store);  // no slot is in use between tokens; layer 0's front uses none
   phase_s[5] += now() - ts;
   for (int l = 0; l < LAYERS; l++) {
-    void *experts = gpu_open(), *rest = ahead ? gpu_open() : 0;  // rest: see routed_rows
-    if (ahead && l + 1 < LAYERS) next = layer_front(&b, l + 1);
+    void *front = ahead && l + 1 < LAYERS ? front_ahead(&b, l + 1, &next) : 0;
     double t0 = now();
     if (full_ahead(m)) {  // the residual's predictions, signaled before the attention
       int keep[FEW * KEEP], first[FEW * AHEAD], nk = 0, nf = 0;
@@ -1726,7 +1790,8 @@ static void step_rows(const int *tokens, int m, int pos) {
       }
       read_residual_ahead(l, keep, nk, first, nf, INFLIGHT * m);
     }
-    gpu_wait_signal(sig);
+    gpu_wait_signal(sig);  // with it, the experts of the layer before have run
+    held_release();
     phase_s[1] += now() - t0;
     t0 = now();
     if (opt.routes_fd >= 0 && (write(opt.routes_fd, RT.ptr, TOPK * 4) < 0 ||
@@ -1734,19 +1799,18 @@ static void step_rows(const int *tokens, int m, int pos) {
                                write(opt.routes_fd, PT.ptr, PREDICT * 4) < 0 ||
                                write(opt.routes_fd, GL.ptr, EXPERTS * 4) < 0))
       die("routes: write failed");
-    gpu_encode(experts);
-    int split = routed_rows(&b, l, AHEAD, INFLIGHT, opt.deepseek.substitute > 0, rest);
+    routed_rows(&b, l, AHEAD, INFLIGHT, opt.deepseek.substitute > 0, ahead);
     if (l == LAYERS - 1) {
       hc_pre_norm(m, &HS, 0, &MF, 0, &final_norm);
       head_out(m, &logits);
     }
-    if (l == 0 || l == 13) {
+    gpu_commit();
+    if (l == 0 || l == 13) {  // the next front reads the table's rows
       double tw = now();
-      dispatch_group_wait(rr.read[l == 13], DISPATCH_TIME_FOREVER);
+      pass_wait_group(rr.read[l == 13]);
       phase_s[0] += now() - tw;
     }
-    gpu_commit();
-    if (rest && !split) gpu_submit(rest);  // empty
+    if (front) gpu_submit_detached(front);
     phase_s[4] += now() - t0;
     // Labels and source records are CPU-owned. Both expert buffers are now
     // committed, so independent, already-used heads can learn behind GPU work.
@@ -1764,6 +1828,7 @@ static void step_rows(const int *tokens, int m, int pos) {
   }
   double ta = now();
   gpu_sync();
+  held_release();
   phase_s[1] += now() - ta;
   for (int e = 0; e < 2; e++) dispatch_release(rr.read[e]);
   rows_end(&rr);
@@ -2009,7 +2074,7 @@ static int prefill(const int *tokens, int n, int pos0) {
   for (int l = 0; l < LAYERS && !stopped; l++) {
     if (prefill_prune_active && l > 20) plan = decoder_plan(pos0, n, l);
     cache_pass(experts_store, l);
-    if (l == 1 || l == 14) dispatch_group_wait(rr.read[l == 14], DISPATCH_TIME_FOREVER);
+    if (l == 1 || l == 14) pass_wait_group(rr.read[l == 14]);
     int begin = 0, next_rows = n;
     if (ced_compact) {
       int first = decoder_begin(n, pos0);
@@ -2049,12 +2114,12 @@ static int prefill(const int *tokens, int n, int pos0) {
       if (first_batch) cache_adapt_pass(experts_store, l);  // layer l - 1's experts may still be in use
       first_batch = 0;
       gpu_sync();
+      held_release();  // the batch before has run
       prefix_after(&b, l);
 #ifdef MYDS4_CED_CHECK
       ced_check_routes(l, pos0 + s, b.m, (const int *)RT.ptr);
 #endif
 
-      gpu_begin();
       int ahead = opt.deepseek.substitute > 0 ? SUB_KEEP : next_rows > BULK_ROWS ? EXPERTS : 8;
       if (prefill_prune_active && !next_rows) ahead = 0;
       routed_batch(&b, l, ahead, 2 * EXPERTS, opt.deepseek.substitute > 0);
@@ -2074,6 +2139,7 @@ static int prefill(const int *tokens, int n, int pos0) {
     gpu_commit();
   }
   gpu_sync();
+  held_release();
   if (all_logits && !stopped) {  // every row's logits, for checks
     for (int r = 0; r < n; r++) {
       gpu_begin();
@@ -2087,7 +2153,7 @@ static int prefill(const int *tokens, int n, int pos0) {
   }
   // A stopped prefill may end before layers 1 and 14 waited for the rows:
   // the reader uses rr and rows until it leaves both groups.
-  for (int e = 0; e < 2; e++) dispatch_group_wait(rr.read[e], DISPATCH_TIME_FOREVER), dispatch_release(rr.read[e]);
+  for (int e = 0; e < 2; e++) pass_wait_group(rr.read[e]), dispatch_release(rr.read[e]);
   rows_end(&rr);
   memory_host_free(rows);
   memset(IMG.ptr, 0, (size_t)n);  // decoding's rows are text
@@ -2133,7 +2199,7 @@ static int prepare_rows(int rows, int prompt) {
   for (;;) {
     int request_rows = candidate > small ? candidate : small;
     int layer_rows = request_rows < MB ? request_rows : MB;
-    uint64_t workspace = fixed + request_plan(request_rows, 0) + work_plan(layer_rows, 0);
+    uint64_t workspace = fixed + request_plan(request_rows, 0) + work_bytes(layer_rows);
     uint64_t host = row_scratch(candidate) + (uint64_t)candidate * 2 * ENGRAM_ROWS * 8 + (uint64_t)layer_rows * 64;
     cache_working_rows(experts_store, candidate);
     uint64_t required = weights_required(core_weights) + workspace + host + cache_required(experts_store, opt.draft ? CACHE_LAYERS : LAYERS);
@@ -2316,7 +2382,7 @@ int deepseek_image(Media *im) {
   uint64_t temporary = (size_t)L * DIM * 2;
   for (size_t i = 0; i < sizeof sizes / sizeof *sizes; i++) temporary += gpu_allocation_size(sizes[i]);
   MemorySlot *entries[] = {work, weights};
-  uint64_t bytes[] = {work->payload - old_layer + work_plan(MB, 0) + temporary, weights_required(vision_weights)};
+  uint64_t bytes[] = {work->payload - old_layer + work_bytes(MB) + temporary, weights_required(vision_weights)};
   if (!memory_admit(entries, bytes, 2, MEMORY_REQUIRED)) return 0;
   memory_pin(weights, 1);
   work_capacity(MB);
@@ -2610,6 +2676,8 @@ static void bench_experts(int r) {
   int idx[TOPK] = {0, 1, 2, 3, 4, 5};
   float wts[TOPK] = {0.1f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f};
   memcpy(RT.ptr, idx, sizeof idx), memcpy(RT.ptr + 32, wts, sizeof wts);
+  gpu_commit();  // routed_rows opens its own command buffer, which the benchmark commits
+  held_release();
   routed_rows(&(Batch){1, 0, 0}, r % 8, AHEAD, INFLIGHT, 0, 0);
 }
 
@@ -3037,7 +3105,7 @@ static const float *runahead_rows(State **states, const int *tokens, const int *
     memcpy(job->state->history, history, sizeof history);
     // These small reads finish before switching EC/ES to another job.
     // Expert reads from preceding jobs remain in flight meanwhile.
-    engram_read(0, rows, 1), engram_read(1, rows, 1);
+    engram_read(0, rows, 1, (uint8_t *)EC[0].ptr, (uint8_t *)ES[0].ptr), engram_read(1, rows, 1, (uint8_t *)EC[1].ptr, (uint8_t *)ES[1].ptr);
     embed_read(tokens + r, 1, 0, job->pos);
     gpu_wait_signal(layer_front(&(Batch){1, job->pos, 0}, 0));
     run_issue(job);
@@ -3224,7 +3292,7 @@ static const float *pipeline_rows(State **states, const int *tokens, const int *
     memcpy(history, job->state->history, sizeof history);
     engram_hash(tokens[r], job->pos, rows[0]);
     memcpy(job->state->history, history, sizeof history);
-    engram_read(0, rows, 1), engram_read(1, rows, 1);
+    engram_read(0, rows, 1, (uint8_t *)EC[0].ptr, (uint8_t *)ES[0].ptr), engram_read(1, rows, 1, (uint8_t *)EC[1].ptr, (uint8_t *)ES[1].ptr);
     embed_read(tokens + r, 1, 0, job->pos);
     pipe_front(job, live);
   }
@@ -3687,6 +3755,74 @@ static void ds_chat(char *text, size_t cap, const char *prompt, int images, int 
              "the value, the more thorough the reasoning)\n\n<｜User｜>%s%s<｜Assistant｜><think>",
              think, user, prompt);
   else snprintf(text, cap, "<｜begin▁of▁sentence｜><｜User｜>%s%s<｜Assistant｜></think>", user, prompt);
+}
+
+// ---- passes (src/engine/pass.h) ----
+
+// What belongs to one pass: its flags and positions, the state it works on,
+// and the buffers that live across its waits.
+#define V(x) {&(x), sizeof(x)}
+static const PassVariable pass_own[] = {
+    V(verifying),     V(prompt_pass), V(prefill_prune_active), V(prefill_prune_end), V(ced_first),  V(ced_active),
+    V(ced_compact),   V(forward_info), V(bounded),             V(bounded_first),     V(bounded_keep), V(request_rows),
+    V(pass_work_rows), V(active),     V(prefix_capture),       V(history),           V(row_state),  V(row_pos),
+    V(nrows),         V(replay_first), V(replaying),           V(verify_history),    V(all_logits), V(nimgs),
+    V(imgs),          V(held),        V(prefill_n),            V(prefill_layer),     V(HS),         V(MF),
+    V(SEL),           V(CAND),        V(IMG),                  V(EC),                V(ES),         V(H1),
+    V(XQ),            V(SHO),         V(RT),                   V(GL),                V(GP),         V(PR),
+    V(PC),            V(ETAB),        V(PARTS),                V(logits),            V(EROW),       V(TILES),
+    V(PTOK),          V(PW),          V(TP),
+};
+#undef V
+
+static void rebind(void) {
+  if (active) bind(active);
+}
+
+Pass *deepseek_pass_new(void (*body)(void *), void *argument) {
+  enum { OWN = sizeof pass_own / sizeof *pass_own };
+  static PassVariable all[OWN + 8];
+  static int count;
+  if (!count) {
+    int n;
+    const PassVariable *gpu = gpu_pass_variables(&n);
+    memcpy(all, pass_own, sizeof pass_own);
+    memcpy(all + OWN, gpu, (size_t)n * sizeof *gpu);
+    count = OWN + n;
+  }
+  Pass *pass = pass_new(body, argument, 64u << 20);
+  pass_variables(pass, all, count);
+  pass_on_resume(pass, rebind);
+  return pass;
+}
+
+static Buf *const pass_fixed_buffers[] = {&PC, &ETAB, &PARTS, &logits};
+static Buf *const pass_request_buffers[] = {&HS, &MF, &SEL, &CAND, &IMG, &EC[0], &EC[1], &ES[0], &ES[1]};
+
+// Inside a new pass, before its work: it owns its signals and buffers. The
+// buffers that grow with the rows start empty, and the capacity code
+// allocates this pass's own; those of a fixed size get copies of their size.
+void deepseek_pass_begin(void) {
+  gpu_pass_begin();
+  active = &parked;
+  memset(history, 0, sizeof history);
+  held.n = 0, nrows = 0, request_rows = 0, pass_work_rows = 0;
+  for (size_t i = 0; i < sizeof pass_request_buffers / sizeof *pass_request_buffers; i++) *pass_request_buffers[i] = (Buf){0};
+  for (size_t i = 0; i < sizeof pass_work_buffers / sizeof *pass_work_buffers; i++) *pass_work_buffers[i] = (Buf){0};
+  for (size_t i = 0; i < sizeof pass_fixed_buffers / sizeof *pass_fixed_buffers; i++) {
+    size_t size = pass_fixed_buffers[i]->size;
+    *pass_fixed_buffers[i] = zeros(size);
+  }
+}
+
+// Inside the pass, after its work has been waited for: frees what it owned.
+void deepseek_pass_end(void) {
+  gpu_sync();
+  held_release();
+  for (size_t i = 0; i < sizeof pass_request_buffers / sizeof *pass_request_buffers; i++) gpu_free_later(pass_request_buffers[i]);
+  for (size_t i = 0; i < sizeof pass_work_buffers / sizeof *pass_work_buffers; i++) gpu_free_later(pass_work_buffers[i]);
+  for (size_t i = 0; i < sizeof pass_fixed_buffers / sizeof *pass_fixed_buffers; i++) gpu_free_later(pass_fixed_buffers[i]);
+  gpu_pass_end();
 }
 
 static const char *const ds_types[] = {"deepseek_v41", 0};

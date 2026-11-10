@@ -9,6 +9,7 @@
 
 #include "myds4.h"
 #include "memory.h"
+#include "pass.h"
 
 typedef struct { unsigned long w, h, d; } Size3;
 extern id MTLCreateSystemDefaultDevice(void);
@@ -110,8 +111,14 @@ void gpu_keep_clock(double seconds) {
   spin((uint32_t)(seconds / spin_s));
 }
 
+// A pass yields with no command buffer being encoded: others encode in turn.
+static void closed_for_yield(void) {
+  if (enc) die("a pass yields with a command buffer being encoded");
+}
+
 void gpu_init(const char *source, size_t len) {
   memory_collect_with(collect);
+  pass_before_yield = closed_for_yield;
   pool = objc_autoreleasePoolPush();
   dev = MTLCreateSystemDefaultDevice();
   if (!dev) die("no Metal device");
@@ -388,9 +395,9 @@ uint64_t gpu_working_set(void) {
 
 // Command buffers run in the order they are opened (enqueued), whatever the
 // order in which they are encoded and committed. `reserved` counts those
-// opened and not committed yet: while there are any, a buffer committed after
-// them runs only once they are committed, so the thread that will commit
-// them must not wait for it.
+// being encoded and not committed yet, detached ones included: a buffer
+// committed after one in the queue runs only once that one is committed, so
+// the thread that will commit it must not wait for the later buffer.
 static int reserved;
 
 void *gpu_open(void) {
@@ -429,8 +436,15 @@ void gpu_barrier_on(const Buf *const *buffers, int count) {
   MSG(void (*)(id, SEL, const id *, unsigned long), enc, S("memoryBarrierWithResources:count:"), resources, (unsigned long)count);
 }
 
-// A command buffer that joins the queue only when gpu_submit commits it, so
-// that buffers committed after its opening may run before it.
+// A command buffer that joins the queue only when gpu_submit_detached commits
+// it, so that buffers committed after its opening may run before it. It stays
+// retained until then, across any drain of the autorelease pool.
+void *gpu_open_detached(void) {
+  id c = MSG(id (*)(id, SEL), queue, S("commandBufferWithUnretainedReferences"));
+  MSG(id (*)(id, SEL), c, S("retain"));
+  reserved++;
+  return c;
+}
 
 // Ends the encoding of the current command buffer without committing it.
 void *gpu_close(void) {
@@ -454,6 +468,11 @@ static void committed(id c) {
 void gpu_submit(void *c) {
   MSG(void (*)(id, SEL), (id)c, S("commit"));
   committed(c);
+}
+
+void gpu_submit_detached(void *c) {
+  gpu_submit(c);
+  MSG(void (*)(id, SEL), (id)c, S("release"));
 }
 
 void gpu_kern(int k) {
@@ -600,14 +619,47 @@ static void unsignaled(uint64_t v) {
   die("GPU: value %llu not signaled in 60 s", (unsigned long long)v);
 }
 
+// What a pass waits for runs outside it, where `event` is not the pass's: the
+// wait carries its event.
+typedef struct { id event; uint64_t value; } SignalWait;
+
+static int signal_ready(void *context) {
+  SignalWait *w = context;
+  return MSG(uint64_t (*)(id, SEL), w->event, S("signaledValue")) >= w->value;
+}
+
+static void signal_block(void *context) {
+  SignalWait *w = context;
+  if (!MSG(BOOL (*)(id, SEL, uint64_t, uint64_t), w->event, S("waitUntilSignaledValue:timeoutMS:"), w->value, 60000ull))
+    unsignaled(w->value);
+}
+
 void gpu_wait_signal(uint64_t v) {
-  if (!MSG(BOOL (*)(id, SEL, uint64_t, uint64_t), event, S("waitUntilSignaledValue:timeoutMS:"), v, 60000ull))
-    unsignaled(v);
+  SignalWait wait = {event, v};
+  if (pass_current()) pass_wait(&(PassWait){signal_ready, signal_block, &wait});
+  else signal_block(&wait);
 }
 
 uint64_t gpu_signal_value(void) {
   return MSG(uint64_t (*)(id, SEL), event, S("signaledValue"));
 }
+
+// Each pass numbers its signals on its own event: its command buffers may be
+// committed after a buffer another pass encoded later, and one event's values
+// fire in queue order.
+static const PassVariable signal_variables[] = {{&event, sizeof event}, {&signaled, sizeof signaled}};
+
+const PassVariable *gpu_pass_variables(int *count) {
+  *count = (int)(sizeof signal_variables / sizeof *signal_variables);
+  return signal_variables;
+}
+
+void gpu_pass_begin(void) {
+  event = MSG(id (*)(id, SEL), dev, S("newSharedEvent"));
+  signaled = 0;
+}
+
+void gpu_pass_end(void) { MSG(void (*)(id, SEL), event, S("release")); }
 
 static int by_start(const void *a, const void *b) {
   double x = ((const double *)a)[0], y = ((const double *)b)[0];
@@ -682,8 +734,16 @@ void gpu_reap(void) {
   account(n);
 }
 
+static int sync_ready(void *context) { return !last || MSG(long (*)(id, SEL), last, S("status")) >= 4; }
+static void sync_block(void *context) { gpu_sync(); }
+
 // Waits for the last committed command buffer; with it, all opened before.
 void gpu_sync(void) {
+  if (pass_current()) {
+    pass_wait(&(PassWait){sync_ready, sync_block, NULL});
+    gpu_reap();
+    return;
+  }
   if (!last) { accounted_end = 0; return; }
   MSG(void (*)(id, SEL), last, S("waitUntilCompleted"));
   for (int i = 0; i < ndone; i++) MSG(void (*)(id, SEL), done[i], S("waitUntilCompleted"));

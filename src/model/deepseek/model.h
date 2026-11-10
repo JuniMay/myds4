@@ -110,6 +110,12 @@ State *deepseek_state_new(void);    // zeroed; the first takes over the state de
 void deepseek_state_free(State *s);  // not the one in use
 size_t deepseek_state_bytes(const State *s, int positions);  // s (null: a new state) holding that many
 void deepseek_state_use(State *s);
+// A pass of this model (src/engine/pass.h): what it runs, and, inside it,
+// the start and end of its work on buffers of its own.
+struct Pass;
+struct Pass *deepseek_pass_new(void (*body)(void *), void *argument);
+void deepseek_pass_begin(void);
+void deepseek_pass_end(void);
 // The rows of the state in use that later positions overwrite, saved in the
 // state and restored (a rewind point, for the CLI's checks); a restored state
 // continues at the saved position or up to deepseek_rewind() positions before it.
