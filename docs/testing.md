@@ -53,6 +53,9 @@ takes its space back from idle experts, and expert slots charged before
 their reads write them are not room. It also checks that 20 passes of small
 workspace buffers at the reserve take back no expert, and that memory
 messages reach the engine's log hook only for take-backs of 1 GiB or more.
+With the available memory at the reserve, expert slots within the memory a
+model reserved for a pass's fewest slots are admitted, and slots beyond it
+are refused.
 Its simulated kernel counts memory as used once it is written, as macOS
 does.
 `build/tests/cache-memory` checks the cache's resizing under controlled

@@ -198,6 +198,28 @@ static Entry *grown_slot(MemoryAccount *account, uint64_t bytes) {
   return e;
 }
 
+// Before a pass, a model reserves its expert store's fewest slots
+// (memory_minimum with cache_required's bytes), and the store's slot limit
+// rises to them. The slots within that reservation are then admitted even
+// with the available memory at the reserve, so the store can fill them;
+// slots beyond it are refused there. A model with an 8 GiB backbone, with
+// 6 GiB available (the 4 GiB reserve and 2 GiB), reserves 2 GiB of 64 MiB
+// slots.
+static int reserved_slots_are_admitted_at_the_reserve(void) {
+  memory_configure(110, 4);
+  MemoryAccount *flash = calloc(1, sizeof *flash);
+  memory_account_init(flash, "Flash-Next");
+  entry(flash, NULL, 8 * GB);
+  others_growth = 100 * GB - 8 * GB - 6 * GB;
+  if (!memory_minimum(flash, 10 * GB)) return 0;
+  int within = 0, beyond = 0;
+  for (int i = 0; i < 32; i++) within += grown_slot(flash, 64ull << 20) != NULL;
+  for (int i = 0; i < 4; i++) beyond += grown_slot(flash, 64ull << 20) != NULL;
+  fprintf(stderr, "  at the reserve: %d of 32 slots within a reserved 2 GiB admitted (all), %d of 4 beyond it (none)\n",
+          within, beyond);
+  return within == 32 && beyond == 0;
+}
+
 // A pass takes small host buffers in the model's workspace and frees them
 // (a token's embedding and Engram rows), and the cache grows by a slot when
 // an expert misses. Once the cache has filled the room above the reserve,
@@ -276,6 +298,7 @@ int main(void) {
   run_case("the file cache the kernel keeps is not room for model memory", the_kept_file_cache_is_not_room);
   run_case("charged slots that their reads have not written yet are not room", slots_not_yet_written_are_not_room);
   run_case("a pass's small buffers do not take an expert back on every pass", small_buffers_do_not_take_experts_back_each_pass);
+  run_case("slots within a pass's reservation are admitted at the reserve", reserved_slots_are_admitted_at_the_reserve);
   run_case("memory messages go to the engine's log, and only large take-backs", memory_messages_go_to_the_log);
   fprintf(stderr, "memory budget: %d/%d CPU checks passed\n", checks - failures, checks);
   return failures != 0;
