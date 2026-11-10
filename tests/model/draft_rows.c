@@ -19,7 +19,7 @@ int main(int argc, char **argv) {
   tk = tok_open(argv[1], deepseek_ops.media_token);
   const char *prompt = "Write a short story about a lighthouse keeper who discovers a message in a bottle.";
   int tokens[256], n = tok_encode(tk, prompt, tokens, 256);
-  memory_configure(model_memory_gib, 8, model_reserve_gib);
+  memory_configure(model_memory_gib, model_reserve_gib);
   deepseek_load(argv[1], &o);
   State *st[2] = {deepseek_state_new(), deepseek_state_new()};
   int len[2] = {n, n - 3}, next[2];

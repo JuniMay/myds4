@@ -16,7 +16,7 @@ static double run(int kernel, int split, int threads, int rows, int cols,
   return (gpu_busy - before) * 1e6 / repetitions;
 }
 int main(void) {
-  memory_configure(1, 1, 10); gpu_start(); linear_init();
+  memory_configure(1, 10); gpu_start(); linear_init();
   const char *formats[] = {"nvfp4", "fp8", "bf16", "mxfp8"};
   static char names[4][2][32];
   int widths[] = {1, 4, 48, 320, 512}, inputs[] = {320, 2560, 10240, 32768};

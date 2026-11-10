@@ -11,7 +11,7 @@
 int main(int argc, char **argv) {
   if (argc != 3)
     die("usage: nemotron-model TARGET DFLASH2");
-  memory_configure(28, 4, 10);
+  memory_configure(28, 10);
   Options options = {.ctx = 4096,
                      .dump_fd = -1,
                      .routes_fd = -1,

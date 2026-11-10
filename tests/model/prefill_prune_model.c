@@ -52,7 +52,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < n; i++) tokens[i] = pattern[i % pn];
   }
   if (prefix < 1 || prefix >= n || n + 8 > o.ctx) die("invalid prefix or input length");
-  memory_configure(model_memory_gib, 8, model_reserve_gib);
+  memory_configure(model_memory_gib, model_reserve_gib);
   deepseek_load(argv[1], &o);
   prefill_chunk = 16384;
   opt.deepseek.prefill_prune = 0;

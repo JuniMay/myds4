@@ -1,6 +1,7 @@
 // Compare MXFP4 prefill activation staging with the scalar expert kernel.
 // One synthetic expert; no checkpoint or SSD reads.
 #include "myds4.h"
+#include "../../src/model/deepseek/model.h"
 #include "../reference/activations.h"
 #include <math.h>
 #include <stdlib.h>

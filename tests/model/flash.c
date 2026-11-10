@@ -13,7 +13,7 @@
 int main(int argc, char **argv) {
   if (argc < 2 || argc > 3)
     die("usage: flash-model CHECKPOINT [--long]");
-  memory_configure(32, 8, 10);
+  memory_configure(32, 10);
   Options options = {.ctx = 4096, .dump_fd = -1, .routes_fd = -1, .quiet = 1};
   Model *model = model_open(argv[1], &options);
   CHECK(model != NULL);

@@ -35,7 +35,7 @@ int main(int argc, char **argv) {
   int length = tok_encode(tk, " Review the queue, keep duplicate jobs, and preserve cancellation order.\n", seed, 128);
   if (!length) die("empty fixture prompt");
   for (int i = 0; i < n; i++) tokens[i] = seed[i % length];
-  memory_configure(model_memory_gib, 8, model_reserve_gib);
+  memory_configure(model_memory_gib, model_reserve_gib);
   deepseek_load(argv[1], &o);
   int rows[VERIFY_DRAFTS + 2];
   rows[0] = sample_argmax(deepseek_forward(tokens, n, 0), VOCAB);

@@ -49,8 +49,14 @@ server-check: build/libmyds4.a
 # Fast tests never acquire model weights or run GPU kernels.
 CPU_CHECKS = activation-format-check context-lookup-check workspace-check state-fork-check verification-schedule-check sampling-check shutdown-check cache-ready-check draft-cache-check prefetch-metrics-check prefetch-queue-check prefetch-admission-check prefetch-demote-check prefetch-refine-race-check cache-policy-check memory-available-check cache-memory-check memory-budget-check weights-stop-check weights-read-check
 EXTRA_CPU = memory metadata qwen-state-accounting attention-candidate prefill-prune cache-hold cache-progress cache-mapping predictor-learning predictor-state predictor-numerics
+# These need the GPU or model weights to run. make test only builds them, so
+# that a changed engine interface cannot leave one unbuildable.
+BUILD_ONLY = $(addprefix build/tests/,nemotron experts routing vision residency mxfp4-activation gpu-wait gpu-clock \
+  pass-eviction gguf-decode moe-tasks memory-model qwen-mtp flash-model speech-model nemotron-model prefill-prune-model \
+  draft-rows prefix-fork verification-model ced dspark-state prefill-state runahead-model) \
+  build/benchmarks/decode build/benchmarks/products
 
-test: $(CPU_CHECKS) $(addprefix build/tests/,$(EXTRA_CPU)) build/myds4-server
+test: $(CPU_CHECKS) $(addprefix build/tests/,$(EXTRA_CPU)) $(BUILD_ONLY) build/myds4-server
 	@set -e; for test in $(EXTRA_CPU); do ./build/tests/$$test; done
 	env -u MYDS4_QWEN -u MYDS4_FLASH -u MYDS4_NEMOTRON -u MYDS4_DFLASH -u MYDS4_CHECKPOINT -u MYDS4_EXPERTS $(MAKE) server-check
 

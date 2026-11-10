@@ -27,7 +27,7 @@ int main(int argc, char **argv) {
   o.deepseek.pipeline = pipeline;
   alarm(600);
   tk = tok_open(argv[1], deepseek_ops.media_token);
-  memory_configure(model_memory_gib, 8, model_reserve_gib);
+  memory_configure(model_memory_gib, model_reserve_gib);
   deepseek_load(argv[1], &o);
   enum { STEPS = 4 };
   State *states[FEW];

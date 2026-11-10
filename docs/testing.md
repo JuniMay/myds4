@@ -9,8 +9,10 @@ make test
 ```
 
 This builds and runs the maintained CPU checks and the Rust server tests.
-It clears model-path environment variables for the Rust tests so a normal
-CPU run does not load large checkpoints. Generated check executables live
+It also builds the GPU checks, the model checks and the benchmarks without
+running them, so that a changed engine interface cannot leave one of them
+unbuildable. It clears model-path environment variables for the Rust tests
+so a normal CPU run does not load large checkpoints. Generated check executables live
 under `build/tests/`; application binaries remain directly under `build/`.
 
 Tests are grouped by role:

@@ -15,7 +15,7 @@ int main(int argc, char **argv) {
   double model_reserve_gib = 4;
   Options o = {.ctx = 2048, .draft = 1, .deepseek.draft_cache = 32,
                .deepseek.experts = argc == 3 ? argv[2] : NULL, .dump_fd = -1, .routes_fd = -1, .quiet = 1};
-  memory_configure(model_memory_gib, 8, model_reserve_gib);
+  memory_configure(model_memory_gib, model_reserve_gib);
   deepseek_load(argv[1], &o);
   const float *lg = deepseek_forward(tokens, n, 0);
   int rows[BLOCK + 1];

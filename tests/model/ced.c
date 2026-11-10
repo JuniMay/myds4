@@ -14,7 +14,7 @@ static uint16_t *reference_global[LAYERS][2];
 
 static void benchmark(int *tokens, int generate, int keep) {
   ced_check_first = keep > 0 && prompt_n > keep ? prompt_n - keep : 0;
-  CacheStats c0 = cache_stats;
+  CacheStats c0 = *expert_stats();
   double g0 = gpu_busy, t0 = now();
   const float *lg = deepseek_forward(tokens, prompt_n, 0);
   unsigned char prefill_digest[CC_SHA256_DIGEST_LENGTH];
@@ -24,8 +24,8 @@ static void benchmark(int *tokens, int generate, int keep) {
 #pragma clang diagnostic pop
   double t1 = now(), g1 = gpu_busy;
   DeepSeekForwardInfo plan = deepseek_forward_info();
-  CacheStats c1 = cache_stats;
-  uint64_t rows0 = decode_rows, slots0 = cache_bytes(), minimum = slots0, maximum = slots0;
+  CacheStats c1 = *expert_stats();
+  uint64_t rows0 = decode_rows, slots0 = cache_bytes(experts_store), minimum = slots0, maximum = slots0;
   Sampler sampler = {.temp = 1, .top_p = 1};
   sampler_seed(&sampler, 12345);
   int current = sample_token(lg, VOCAB, &sampler), eos = tok_find(tk, "<｜end▁of▁sentence｜>");
@@ -46,12 +46,12 @@ static void benchmark(int *tokens, int generate, int keep) {
     }
     for (int r = 0; r <= a; r++) tokens[pos + r] = rows[r];
     gen += a + 1, pos += a + 1, current = next;
-    uint64_t bytes = cache_bytes();
+    uint64_t bytes = cache_bytes(experts_store);
     if (bytes < minimum) minimum = bytes;
     if (bytes > maximum) maximum = bytes;
   }
   double t2 = now(), g2 = gpu_busy;
-  CacheStats c2 = cache_stats;
+  CacheStats c2 = *expert_stats();
   unsigned char digest[CC_SHA256_DIGEST_LENGTH];
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -78,7 +78,7 @@ static void benchmark(int *tokens, int generate, int keep) {
   printf("\",\"proposal_policy\":\"%s\",\"decode_remaps\":%llu}}\n",
          opt.draft ? "dspark" : "none", (unsigned long long)(c2.remaps - c1.remaps));
   fflush(stdout);
-  cache_metrics_report(stderr);
+  deepseek_metrics_report(stderr);
 }
 
 static void ced_check_routes(int layer, int row, int rows, const int *routes) {
@@ -257,7 +257,7 @@ int main(int argc, char **argv) {
   Options o = {.ctx = 32768, .deepseek.experts = experts,
                .draft = dspark_depth, .deepseek.draft_cache = dspark_depth ? 32 : 0,
                .dump_fd = -1, .routes_fd = -1, .quiet = 1, .deepseek.ced = runtime_ced};
-  memory_configure(model_memory_gib, 8, model_reserve_gib);
+  memory_configure(model_memory_gib, model_reserve_gib);
   deepseek_load(argv[1], &o);
   if (bench_tokens >= 0) {
     benchmark(tokens, bench_tokens, keep_setting);

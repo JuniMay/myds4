@@ -747,7 +747,7 @@ int main(int argc, char **argv) {
   tk = tok_open(argv[1], deepseek_ops.media_token);
   int count, *tokens = read_text(text, rendered, &count);
   if (limit > 0 && count > limit) count = limit;
-  memory_configure(model_memory_gib, 8, model_reserve_gib);
+  memory_configure(model_memory_gib, model_reserve_gib);
   deepseek_load(argv[1], &o);
   return mode == 1 ? measure(tokens, count, rendered) : fork_test(tokens, count, randoms);
 }

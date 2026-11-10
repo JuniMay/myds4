@@ -14,7 +14,7 @@ int main(int argc, char **argv) {
   double model_memory_gib = 20;
   double model_reserve_gib = 4;
   Options o = {.ctx = 2048, .deepseek.experts = argc == 3 ? argv[2] : NULL, .dump_fd = -1, .routes_fd = -1, .quiet = 1};
-  memory_configure(model_memory_gib, 8, model_reserve_gib);
+  memory_configure(model_memory_gib, model_reserve_gib);
   deepseek_load(argv[1], &o);
   deepseek_forward(tokens, 256, 0);
   const uint16_t *all = (const uint16_t *)WIN.ptr;
