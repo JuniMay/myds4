@@ -98,6 +98,18 @@ compressed scales and the 16 KiB-aligned reads stay in the slot, and the
 largest exception lists (up to 112 KB, against 3.9 KB on average) set the
 size of every slot.
 
+While decoding, Flash-Next reads each layer's experts one layer ahead. A
+layer that reads its experts (one that does not run through its table)
+synchronizes with the GPU to read its routing. Before that point, the GPU
+also applies the next layer's router to this layer's input. After the
+layer holds its own experts, the store's background readers start reading
+the next layer's predicted experts that are not in memory. The readers wait
+while a layer's own misses are being read. The next layer's routing then
+demotes the read-aheads it did not choose, so that they are evicted first.
+A wrong prediction costs a read, never a result. A pass whose rows choose
+at least as many experts as a layer has (a prompt of 52 rows or more)
+needs nearly every expert and reads nothing ahead.
+
 When every expert of a layer is resident, GPU routing feeds the expert batch
 planner directly. With a store, resident means in a slot, read, mapped for
 the GPU and committed to the residency set. The engine rebuilds the layer's

@@ -76,6 +76,7 @@ static struct {
   Buf tokens, images, sequences, ple_states, x, normalized, mixed, mix_up, mix_down, injection, result;
   Buf xb, quantized, qkv, convolved, z, a, b, decay, beta, gdn, gated, qg, k, v, q, kr, attention_out;
   Buf index_qk, shared, shared_gate, routing, selected, coefficients, gathered, gate, up, intermediate, logits;
+  Buf predicted, predicted_coefficients;  // the next layer's predicted experts (read_ahead)
   ExpertWork routed;
   Buf resident_table, resident_counts;
   Buf ngram, ple_key, ple_query, ple_value, ple_gated, ple_normalized, attention_ids, part, ml;
@@ -439,6 +440,8 @@ static uint64_t workspace(int n, int allocate) {
   B(routing, r * f.experts);
   B(selected, (size_t)f.layers * n * f.chosen * 4);  // every layer's, kept for the pass (experts_selection)
   B(coefficients, r * f.chosen);
+  B(predicted, r * f.chosen);
+  B(predicted_coefficients, r * f.chosen);
   B(gathered, r * h);
   B(gate, r * f.inter);
   B(up, r * f.inter);
@@ -494,6 +497,8 @@ static uint64_t workspace_bytes(void) {
                     &f.routing,
                     &f.selected,
                     &f.coefficients,
+                    &f.predicted,
+                    &f.predicted_coefficients,
                     &f.gathered,
                     &f.gate,
                     &f.up,
@@ -1070,6 +1075,21 @@ static void routed_sum(int n) {
   gpu_bytes(3, dims, sizeof dims);
   gpu_go((dims[0] * dims[1] + 255) / 256, 1, 1, 256, 1, 1);
 }
+// Starts reading a layer's predicted experts (f.predicted, of n rows) in the
+// store's background readers while the current layer's expert work and the
+// next layer's attention run. A wrong prediction costs a read, never a
+// result. The current layer's experts are held by then, so these reads
+// cannot take their slots.
+static void read_ahead(int layer, int n) {
+  int ids[f.experts], count = 0;
+  uint8_t seen[f.experts];
+  memset(seen, 0, sizeof seen);
+  const uint32_t *predicted = (const uint32_t *)f.predicted.ptr;
+  for (int i = 0; i < n * f.chosen; i++)
+    if (predicted[i] < (uint32_t)f.experts && !seen[predicted[i]])
+      seen[predicted[i]] = 1, ids[count++] = (int)predicted[i];
+  cache_prefetch_from(f.store, layer, ids, count, 2 * f.experts, PF_OTHER);
+}
 static int routed(FlashLayer *y, int n) {
   size_t offset = (size_t)y->number * f.experts * sizeof(ExpertGroup);
   uint64_t generation;
@@ -1096,10 +1116,26 @@ static int routed(FlashLayer *y, int n) {
     routed_sum(n);
     return 2;
   }
+  // The next layer's router on this layer's input predicts its experts
+  // (read_ahead), read at the synchronization this layer makes anyway. Rows
+  // that choose as many experts as a layer has need nearly all of them.
+  int next = y->number + 1 < f.layers && n * f.chosen < f.experts ? y->number + 1 : -1;
+  if (next >= 0) {
+    product(&f.layer[next].router, &f.mixed, 0, &f.routing, n, 0, 1);
+    gpu_kern(f.route);
+    gpu_buf(0, &f.routing, 0);
+    gpu_buf(1, &f.predicted, 0);
+    gpu_buf(2, &f.predicted_coefficients, 0);
+    gpu_bytes(3, p, sizeof p);
+    gpu_go(n, 1, 1, 512, 1, 1);
+  }
   gpu_commit();
   gpu_sync();
   experts_acquire(&f.routed, y->experts, y->number, (const uint32_t *)selected.ptr,
                   (const float *)f.coefficients.ptr, n, 1, cache_counters(f.store));
+  cache_demote(f.store, y->number);  // its read-aheads that it did not choose go first
+  if (next >= 0)
+    read_ahead(next, n);
   gpu_begin();
   experts_encode(&f.routed, y->experts, &f.mixed);
   for (int i = 0; i < f.routed.active; i++) {

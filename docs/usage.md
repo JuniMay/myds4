@@ -64,7 +64,8 @@ architecture. Its routed experts are read into its expert store's slots as
 passes need them, as DeepSeek's are. The store stays within the global
 `memory` budget, keeps the experts used most, and gives slots back when
 other programs need the memory. Each slot takes about 3.1 MB: an expert's
-weights, its compressed scales as read, and the scales decoded.
+weights, its compressed scales as read, and the scales decoded. While
+decoding, it reads each layer's predicted experts one layer ahead.
 
 Nemotron 3.5 Transcribe uses checkpoint type `nemo_speechlm`. Its main model
 and speech encoder load on demand. Its routed experts are read into the

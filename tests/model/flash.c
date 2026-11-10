@@ -45,7 +45,10 @@ int main(int argc, char **argv) {
   size_t used = 0;
   float *expected = xmalloc((size_t)ops->vocab() * 4);
   int rows = 0, ready = 0;
+  uint64_t guessed = 0;
+  int bounded = 0;  // rows that evicted: their count is bounded, not exact
   ops->counters(&counters);
+  uint64_t tables = counters.table_layers;
   for (int i = 0; i < 16 && !ops->stop(token); i++) {
     int length;
     const char *piece = tok_piece(tokenizer, token, &length);
@@ -53,21 +56,33 @@ int main(int argc, char **argv) {
     memcpy(output + used, piece, length);
     used += length;
     int position = count + i;
+    CacheStats before = counters.cache;
     double began = now();
     logits = ops->rows(&state, &token, &position, 1);
     int touched = touched_experts(began, &ready);
-    if (touched != counters.experts_per_row)
-      die("Flash-Next check: decoded row %d marked %d experts used, not its %d", i, touched, counters.experts_per_row);
+    // A read-ahead marks its expert used when its read starts; the row's own
+    // read-aheads that its next layer did not choose add to its experts.
+    // When the row evicts, a later miss may take such a read-ahead's slot,
+    // which then counts once for both: the count lies between the two.
+    ops->counters(&counters);
+    int chosen = counters.experts_per_row, evicted = counters.cache.evictions != before.evictions;
+    int unchosen = (int)((counters.cache.prefetches - before.prefetches) -
+                         (counters.cache.prefetch_hits - before.prefetch_hits));
+    if (evicted ? touched < chosen || touched > chosen + unchosen : touched != chosen + unchosen)
+      die("Flash-Next check: decoded row %d marked %d experts used, not its %d and %s %d read ahead unchosen", i,
+          touched, chosen, evicted ? "at most" : "exactly", unchosen);
+    guessed += unchosen;
+    bounded += evicted;
     rows++;
     if (!i)
       memcpy(expected, logits, (size_t)ops->vocab() * 4);
     token = sample_argmax(logits, ops->vocab());
   }
-  uint64_t tables = counters.table_layers;
   ops->counters(&counters);
-  printf("each of %d decoded rows marked exactly its %d chosen experts used (%d experts in memory, %llu layer passes "
-         "through tables)\n",
-         rows, counters.experts_per_row, ready, (unsigned long long)(counters.table_layers - tables));
+  printf("each of %d decoded rows marked its %d chosen experts used, and its read-aheads (%llu unchosen in all; "
+         "%d rows evicted, bounded; %d experts in memory, %llu layer passes through tables)\n",
+         rows, counters.experts_per_row, (unsigned long long)guessed, bounded, ready,
+         (unsigned long long)(counters.table_layers - tables));
   for (size_t i = 0; i < used; i++)
     output[i] = (char)tolower((unsigned char)output[i]);
   static const char *colors[] = {"red",    "blue",  "green", "yellow", "orange",

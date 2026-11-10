@@ -161,7 +161,11 @@ a short shape report.
 `build/tests/flash-model CHECKPOINT --long` checks a color response, complete
 logits after state restoration, and state forks beyond the sparse indexer's
 2,048-token selection budget. Each decoded row must mark exactly its chosen
-experts used. The program prints hashes of its logits, so that two builds
+experts used, plus the experts it read ahead that the next layer did not
+choose (the store's read-ahead and read-ahead hit counts give that number).
+When the row evicts, a later miss may take such a read-ahead's slot, which
+then counts once for both; the count must then lie between the chosen
+experts and the two together. The program prints hashes of its logits, so that two builds
 can be compared, and the experts read and evicted. Within its default
 32 GiB no layer holds all of its 512 experts, so its rows do not reach the
 table path. `--memory GIB` sets a lower limit, under which experts are
