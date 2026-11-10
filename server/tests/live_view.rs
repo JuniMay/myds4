@@ -3,7 +3,10 @@
 //! terminal would. While a request decodes, the test presses the tabs' keys,
 //! scrolls a node's text with the wheel and clicks a tab, and checks what each
 //! tab draws: the expert map's request, the KV tree and a node's text, the
-//! last minute, log and memory tiles; then q, and the server's exit.
+//! last minute, log and memory tiles; then q, and the server's exit. The
+//! engine's own lines, such as the model's load, belong in the log: nothing
+//! else reaches the terminal while the view is up, and on every tab the title
+//! and the tabs stay on the top rows.
 //!
 //! It runs only when MYDS4_CHECKPOINT (the checkpoint directory) and
 //! MYDS4_EXPERTS (a GGUF file) are set; MYDS4_SERVER picks the server
@@ -184,6 +187,21 @@ fn the_live_view_draws_every_tab_with_a_model() {
     drop(master);
     let _ = pump.join();
     let all = since(0);
+    // What reached the terminal while the view was up. The view moves the
+    // cursor to each cell it draws: a line break there came from elsewhere.
+    let view = all
+        .split_once("\x1b[?1049h")
+        .map(|(_, rest)| rest.rsplit_once("\x1b[?1049l").map_or(rest, |(v, _)| v))
+        .unwrap_or("");
+    let stray: Vec<&str> = view
+        .split_inclusive(['\n', '\r'])
+        .filter(|s| s.ends_with(['\n', '\r']))
+        .take(5)
+        .map(|s| s.char_indices().rev().nth(99).map_or(s, |(i, _)| &s[i..]))
+        .collect();
+    for s in &stray {
+        println!("written beside the view: {s:?}");
+    }
     println!(
         "answer: {}",
         answer
@@ -235,7 +253,25 @@ fn the_live_view_draws_every_tab_with_a_model() {
             "a click chose the last minute",
             tabs["minute"].contains("phase") && tabs["minute"].contains("tokens/s"),
         ),
+        (
+            "nothing but the view wrote to the terminal while it was up",
+            !view.is_empty() && stray.is_empty(),
+        ),
+        (
+            "the title and the tabs on the top rows of every tab",
+            tabs.values().all(|t| {
+                let mut lines = t.lines();
+                lines
+                    .next()
+                    .is_some_and(|l| l.contains(&format!("127.0.0.1:{port}")))
+                    && lines.next().is_some_and(|l| l.contains("1 Overview"))
+            }),
+        ),
         ("the log", tabs["log"].contains("req 1:")),
+        (
+            "the engine's line about the model's load in the log",
+            tabs["log"].contains("dense weights"),
+        ),
         (
             "the shared memory budget and tile",
             tabs["memory"].contains("Shared KV budget") && tabs["memory"].contains("GiB tracked"),
@@ -254,13 +290,25 @@ fn the_live_view_draws_every_tab_with_a_model() {
     assert!(failed.is_empty(), "not drawn or not done: {failed:?}");
 }
 
-/// What a terminal of cols x rows cells shows after `out`: the text written
-/// where the cursor moves put it. Enough of a terminal for the view: cursor
-/// moves, clears and wide characters; colors and modes are passed over.
+/// What a terminal of cols x rows cells shows after `out`, as a terminal in
+/// raw mode draws it: cursor moves, clears, wide characters and the
+/// alternate screen; a line feed on the bottom row, or text past the last
+/// column there, moves the whole screen up a row. Colors and other modes are
+/// passed over.
 fn screen(out: &str, cols: usize, rows: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthChar;
-    let mut grid = vec![vec![' '; cols]; rows];
-    let (mut r, mut c) = (0usize, 0usize);
+    let blank = || vec![vec![' '; cols]; rows];
+    // the screen shown and the other one (normal or alternate)
+    let (mut grid, mut other, mut alternate) = (blank(), blank(), false);
+    let (mut r, mut c, mut saved) = (0usize, 0usize, (0usize, 0usize));
+    let feed = |grid: &mut Vec<Vec<char>>, r: &mut usize| {
+        if *r + 1 < rows {
+            *r += 1;
+        } else {
+            grid.remove(0);
+            grid.push(vec![' '; cols]);
+        }
+    };
     let mut it = out.chars().peekable();
     while let Some(ch) = it.next() {
         match ch {
@@ -275,13 +323,24 @@ fn screen(out: &str, cols: usize, rows: usize) -> Vec<String> {
                         params.push(d);
                     }
                     let n: Vec<usize> = params.split(';').map(|x| x.parse().unwrap_or(0)).collect();
-                    match fin {
-                        'H' | 'f' => {
-                            r = n.first().copied().unwrap_or(1).max(1) - 1;
-                            c = n.get(1).copied().unwrap_or(1).max(1) - 1;
+                    match (fin, params.as_str()) {
+                        ('H' | 'f', _) => {
+                            r = (n.first().copied().unwrap_or(1).max(1) - 1).min(rows - 1);
+                            c = (n.get(1).copied().unwrap_or(1).max(1) - 1).min(cols - 1);
                         }
-                        'J' if params == "2" => grid = vec![vec![' '; cols]; rows],
-                        'K' if r < rows => grid[r][c.min(cols)..].fill(' '),
+                        ('J', "2") => grid = blank(),
+                        ('K', "" | "0") => grid[r][c.min(cols)..].fill(' '),
+                        ('h', "?1049") if !alternate => {
+                            alternate = true;
+                            saved = (r, c);
+                            std::mem::swap(&mut grid, &mut other);
+                            grid = blank();
+                        }
+                        ('l', "?1049") if alternate => {
+                            alternate = false;
+                            std::mem::swap(&mut grid, &mut other);
+                            (r, c) = saved;
+                        }
                         _ => {}
                     }
                 }
@@ -295,14 +354,19 @@ fn screen(out: &str, cols: usize, rows: usize) -> Vec<String> {
                 _ => {}
             },
             '\r' => c = 0,
-            '\n' => r += 1,
+            '\n' => feed(&mut grid, &mut r),
             ch if !ch.is_control() => {
                 let w = ch.width().unwrap_or(0);
-                if r < rows && c < cols {
-                    grid[r][c] = ch;
-                    if w == 2 && c + 1 < cols {
-                        grid[r][c + 1] = '\0';
-                    }
+                if w == 0 {
+                    continue;
+                }
+                if c + w > cols {
+                    c = 0;
+                    feed(&mut grid, &mut r);
+                }
+                grid[r][c] = ch;
+                if w == 2 {
+                    grid[r][c + 1] = '\0';
                 }
                 c += w;
             }

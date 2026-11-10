@@ -147,6 +147,15 @@ should use GGUF experts. Run the selected Rust integration target with
 one server process. The lifecycle checks verify metadata-only startup,
 loading the requested model, and service errors for unavailable weights.
 
+The `live_view` target needs `MYDS4_CHECKPOINT` and `MYDS4_EXPERTS`. It runs
+the terminal interface in a 160 × 46 pseudo-terminal while a request
+decodes, selects each tab by key, wheel and click, and checks what each tab
+draws and the server's exit. Nothing but the interface may write to the
+terminal while it is up: the engine's lines, such as a model's load, must
+reach the Log tab instead, and the title and tabs must stay on the top rows.
+Its terminal emulator scrolls, as a terminal does, when a line ends on the
+bottom row.
+
 Set `MYDS4_FLASH` for Flash-Next's image and conversation-reuse check.
 Set `MYDS4_NEMOTRON` and `MYDS4_DFLASH` for Transcribe's shared-memory
 lifecycle check. The audio reuse test also reads a JSON chat request from

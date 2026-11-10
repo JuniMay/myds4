@@ -312,6 +312,11 @@ Arrow keys, Page Up/Down and the mouse navigate the selected panel.
 `q` or Ctrl-C shuts down the server and restores the terminal. Use
 `--no-tui` for ordinary logs.
 
+While the interface is up, only it draws on the terminal. Everything else
+the server writes to stderr, such as the engine's lines about a model's
+load, appears in the Log tab with its time. On exit the normal screen shows
+the last 30 log lines.
+
 ## CLI and diagnostics
 
 `build/myds4 -m DIR` handles a single request. Give `-p TEXT`, `-f FILE`,

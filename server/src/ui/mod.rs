@@ -1,4 +1,4 @@
-//! The live view (--tui): the terminal's alternate screen on stderr, from the
+//! The live view (--tui): the alternate screen of stderr's terminal, from the
 //! worker's snapshot ([`crate::worker::view`]) twice a second, in six tabs:
 //!
 //! 1. Overview: the requests and their decoding speed, the throughput over
@@ -20,15 +20,20 @@
 //! lines. The q key, or Ctrl-C, stops the server as SIGINT does.
 //!
 //! The engine's log reaches the view through [`on_log`]; lines logged while
-//! the view is not on the screen go to stderr as well. [`leave`] restores the
-//! terminal on every way out: the normal end, the engine's fatal errors
+//! the view is not on the screen go to stderr as well. While the view is up,
+//! stderr is a pipe ([`capture`]): what anything else writes there, such as
+//! the engine's lines about a model's load, reaches the log with its time, and
+//! the view alone writes to the terminal. [`leave`] restores the terminal and
+//! stderr on every way out: the normal end, the engine's fatal errors
 //! ([`on_die`]), this program's own and a panic.
 
 use std::collections::VecDeque;
 use std::ffi::{CStr, c_char};
-use std::io::{self, Stderr, Write};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Write};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -343,9 +348,26 @@ static ON: AtomicBool = AtomicBool::new(false); // the alternate screen is up
 static RAW: AtomicBool = AtomicBool::new(false); // the terminal is in raw mode for the keys
 static MOUSE: AtomicBool = AtomicBool::new(false); // the terminal reports the mouse to the view
 static DRAW: Mutex<()> = Mutex::new(()); // held while a frame is written
+static CAPTURE: Mutex<Option<Capture>> = Mutex::new(None); // while stderr is the pipe
+
+/// Stderr as a pipe into the log: the terminal it was, to give it back, and
+/// the end of the thread that reads the pipe.
+struct Capture {
+    terminal: OwnedFd,
+    done: mpsc::Receiver<()>,
+}
 
 fn ring() -> MutexGuard<'static, Ring> {
     RING_LINES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A line into the log; the oldest goes when the ring is full.
+fn keep(r: &mut Ring, line: String) {
+    r.logged += 1;
+    if r.lines.len() == RING {
+        r.lines.pop_front();
+    }
+    r.lines.push_back(line);
 }
 
 /// The engine's log lines (with their time), from the thread that logs.
@@ -359,11 +381,76 @@ pub extern "C" fn on_log(line: *const c_char) {
         eprintln!("{line}");
         r.printed = r.logged + 1;
     }
-    r.logged += 1;
-    if r.lines.len() == RING {
-        r.lines.pop_front();
+    keep(&mut r, line);
+}
+
+fn capture_state() -> MutexGuard<'static, Option<Capture>> {
+    CAPTURE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Points stderr at a pipe whose lines [`collect`] puts in the log, and
+/// returns the terminal stderr was, for the view to draw on. Without a pipe,
+/// stderr stays as it is and the result is None.
+fn capture() -> Option<File> {
+    let terminal = io::stderr().as_fd().try_clone_to_owned().ok()?;
+    let view = File::from(terminal.try_clone().ok()?);
+    let mut ends = [0; 2];
+    // Safety: pipe fills both descriptors when it succeeds.
+    if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
+        return None;
     }
-    r.lines.push_back(line);
+    // Safety: both descriptors are new and owned here.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+    for end in [&read, &write] {
+        // Safety: a descriptor owned here; a program this one starts gets neither end.
+        unsafe { libc::fcntl(end.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    let (finished, done) = mpsc::channel();
+    thread::Builder::new()
+        .name("stderr".into())
+        .spawn(move || {
+            collect(File::from(read));
+            let _ = finished.send(());
+        })
+        .ok()?;
+    // Safety: descriptor 2 becomes the pipe's writing end, which then stays
+    // open through it alone.
+    if unsafe { libc::dup2(write.as_raw_fd(), 2) } < 0 {
+        return None;
+    }
+    *capture_state() = Some(Capture { terminal, done });
+    Some(view)
+}
+
+/// Gives stderr its terminal back, once what was written to the pipe is in
+/// the log. Any thread may call it, any number of times.
+fn release() {
+    let Some(c) = capture_state().take() else {
+        return;
+    };
+    // Safety: descriptor 2 becomes the terminal again. The pipe's writing end
+    // closes with it, so the reader comes to the end of what was written.
+    unsafe { libc::dup2(c.terminal.as_raw_fd(), 2) };
+    let _ = c.done.recv_timeout(Duration::from_millis(500));
+}
+
+/// Each line from the pipe into the log, with its time. Of a line that
+/// carriage returns rewrite, the last version, as a terminal shows it.
+fn collect(pipe: File) {
+    let mut lines = BufReader::new(pipe);
+    let mut line = Vec::new();
+    while matches!(lines.read_until(b'\n', &mut line), Ok(n) if n > 0) {
+        let text = String::from_utf8_lossy(&line);
+        let shown = text
+            .trim_end_matches(['\n', '\r'])
+            .rsplit('\r')
+            .next()
+            .unwrap_or("");
+        if !shown.trim().is_empty() {
+            engine::log(shown);
+        }
+        line.clear();
+    }
 }
 
 /// Before the engine's fatal error message: the normal screen comes back.
@@ -371,8 +458,9 @@ pub extern "C" fn on_die() {
     leave();
 }
 
-/// The normal screen, the terminal's settings and the log lines it has not
-/// shown yet. Any thread may call it, any number of times.
+/// Stderr on its terminal again, the normal screen, the terminal's settings
+/// and the log lines it has not shown yet. Any thread may call it, any number
+/// of times.
 pub fn leave() {
     // A frame being written finishes first; a thread that fails while it
     // writes one (a panic) holds the lock, so the wait is bounded.
@@ -390,13 +478,15 @@ pub fn leave() {
             Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(5)),
         }
     }
+    // before the log's lock: the pipe's last lines go through it
+    release();
     let mut r = ring();
     if !ON.swap(false, Ordering::AcqRel) {
         return;
     }
     let mut err = io::stderr();
     if MOUSE.swap(false, Ordering::AcqRel) {
-        let _ = mouse_reports(false);
+        let _ = mouse_reports(&mut err, false);
     }
     if RAW.swap(false, Ordering::AcqRel) {
         let _ = terminal::disable_raw_mode();
@@ -416,14 +506,13 @@ pub fn leave() {
 /// Asks the terminal to report the mouse's clicks and wheel (mode 1000) in
 /// the SGR form (1006), or to stop. The view uses no moves, which crossterm's
 /// EnableMouseCapture also asks for (1002, 1003).
-fn mouse_reports(on: bool) -> io::Result<()> {
-    let mut err = io::stderr();
-    err.write_all(if on {
+fn mouse_reports(terminal: &mut impl Write, on: bool) -> io::Result<()> {
+    terminal.write_all(if on {
         b"\x1b[?1000h\x1b[?1006h"
     } else {
         b"\x1b[?1006l\x1b[?1000l"
     })?;
-    err.flush()
+    terminal.flush()
 }
 
 fn dim() -> Style {
@@ -927,7 +1016,7 @@ pub fn start(title: String, colors: Colors) -> Option<View> {
         let _r = ring();
         ON.store(true, Ordering::Release);
     }
-    if keys && mouse_reports(true).is_ok() {
+    if keys && mouse_reports(&mut err, true).is_ok() {
         MOUSE.store(true, Ordering::Release);
     }
     let hook = std::panic::take_hook();
@@ -935,12 +1024,11 @@ pub fn start(title: String, colors: Colors) -> Option<View> {
         leave();
         hook(info)
     }));
-    let mut screen = match Terminal::new(CrosstermBackend::new(io::stderr())) {
-        Ok(t) => t,
-        Err(_) => {
-            leave();
-            return None;
-        }
+    // from here the view alone writes to the terminal
+    let Some(mut screen) = capture().and_then(|t| Terminal::new(CrosstermBackend::new(t)).ok())
+    else {
+        leave();
+        return None;
     };
     let stop = Arc::new(AtomicBool::new(false));
     let done = stop.clone();
@@ -962,12 +1050,7 @@ impl View {
     }
 }
 
-fn run(
-    screen: &mut Terminal<CrosstermBackend<Stderr>>,
-    title: &str,
-    keys: bool,
-    stop: &AtomicBool,
-) {
+fn run(screen: &mut Terminal<CrosstermBackend<File>>, title: &str, keys: bool, stop: &AtomicBool) {
     let started = Instant::now();
     let mut history = History::default();
     let mut ui = Ui {
@@ -1018,7 +1101,7 @@ fn run(
                 crate::worker::request_stop();
             }
             Asked::Mouse(on) => {
-                if mouse_reports(on).is_ok() {
+                if mouse_reports(screen.backend_mut(), on).is_ok() {
                     MOUSE.store(on, Ordering::Release);
                 }
                 redraw = true;
