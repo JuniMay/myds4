@@ -171,6 +171,10 @@ then allocates past a 64 MiB limit so that an idle expert goes back. The
 eviction must not wait for the GPU; a wait that never ends fails the check
 by its 20-second alarm.
 
+`build/tests/gpu-steps` needs no model. A buffer that queued work uses must
+stay allocated and charged until that work has finished (`gpu_free_later`,
+`gpu_reap`), and one that no work uses must be freed at once.
+
 `build/tests/experts` needs no model. It checks that the grouped NVFP4
 expert kernels give each product, BF16 boundary and ordered mixture of
 separate kernels, for SwiGLU and squared ReLU and for 1 to 32 rows, through

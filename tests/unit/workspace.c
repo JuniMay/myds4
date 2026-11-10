@@ -30,7 +30,22 @@ static void fixture_free(Buf *b) {
   *b = (Buf){0};
 }
 
-static void fixture_sync(void) { pending = 0; }
+// As gpu_free_later: a buffer stays until the submitted work has finished.
+static Buf later[256];
+static int nlater;
+
+static void fixture_free_later(Buf *b) {
+  if (!b->obj) return;
+  if (!pending) { fixture_free(b); return; }
+  if (nlater == 256) die("too many deferred frees");
+  later[nlater++] = *b;
+  *b = (Buf){0};
+}
+
+static void fixture_sync(void) {
+  pending = 0;
+  while (nlater) fixture_free(&later[--nlater]);
+}
 typedef struct ExpertStore ExpertStore;
 static void fixture_adapt(ExpertStore *store) { cache_clock_advances++, cache_maintenance++; }
 static void fixture_idle(ExpertStore *store) { cache_maintenance++; }
@@ -38,6 +53,7 @@ static void fixture_idle(ExpertStore *store) { cache_maintenance++; }
 #define gpu_alloc fixture_alloc
 #define gpu_alloc_kv fixture_alloc
 #define gpu_free fixture_free
+#define gpu_free_later fixture_free_later
 #define gpu_sync fixture_sync
 #define cache_adapt fixture_adapt
 #define cache_idle fixture_idle
@@ -62,12 +78,13 @@ int main(void) {
   memset(HS.ptr, 0x19, HS.size);
   pending = 1;
   request_capacity(1);
+  expect("submitted work keeps the prompt buffers until it finishes", nlater > 0 && !unsafe_frees);
+  fixture_sync();
   size_t decode_bytes = live_bytes;
   // a verify pass's rows (the token and the rewind margin's), or batched rows
   size_t small = replay_margin() + 1 > BATCH_ROWS ? replay_margin() + 1 : BATCH_ROWS;
   expect("decoding retains only the small-batch row capacity", request_rows == (int)small);
   expect("prompt allocation is released", decode_bytes < prompt_bytes);
-  expect("submitted work completes before prompt buffers are freed", !pending && !unsafe_frees);
   expect("residual storage fits every verification row", HS.size == small * HC * DIM * STREAM_BYTES);
   expect("candidate masks retain only the rows being served", CAND.size == small * cand_words * sizeof(uint32_t));
   expect("query workspace releases unused prompt rows", Q.size == small * HEADS * HEAD_DIM * sizeof(float));
@@ -80,7 +97,8 @@ int main(void) {
   pending = 1;
   request_capacity(32);
   expect("a later prompt grows the workspace", request_rows >= 32 && HS.size >= 32u * HC * DIM * STREAM_BYTES);
-  expect("growth also waits before freeing buffers", !pending && !unsafe_frees);
+  expect("growth also keeps the old buffers until the work finishes", nlater > 0 && !unsafe_frees);
+  fixture_sync();
   request_capacity(1);
   expect("later decoding releases prompt storage again", live_bytes == decode_bytes);
   opt.lookup = VERIFY_DRAFTS;

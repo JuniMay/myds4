@@ -18,7 +18,13 @@ extern void objc_autoreleasePoolPop(void *);
 #define S(name) sel_registerName(name)
 #define MSG(type, ...) ((type)objc_msgSend)(__VA_ARGS__)
 
-static id dev, queue, event, cb, enc, last, pipes[512], done[4096];
+static id dev, queue, event, cb, enc, last, pipes[512];
+// Command buffers committed and not yet accounted for (gpu_reap, gpu_sync),
+// oldest first; each is retained until then, so that the autorelease pool
+// can be drained while they run.
+static id *done;
+static int done_cap;
+static uint64_t ncommitted, naccounted;  // command buffers committed, and accounted for
 enum { RESIDENT_SETS = 32 };
 static struct { id object; uint64_t bytes; } resident[RESIDENT_SETS];
 static uint32_t resident_count, resident_dirty;
@@ -433,11 +439,21 @@ void *gpu_close(void) {
   return cb;
 }
 
-void gpu_submit(void *c) {
-  MSG(void (*)(id, SEL), (id)c, S("commit"));
-  if (ndone < 4096) done[ndone++] = c;
+static void committed(id c) {
+  if (ndone == done_cap) {
+    done_cap = done_cap ? 2 * done_cap : 256;
+    done = realloc(done, (size_t)done_cap * sizeof *done);
+    if (!done) die("out of memory");
+  }
+  done[ndone++] = MSG(id (*)(id, SEL), c, S("retain"));
+  ncommitted++;
   last = c;
   reserved--;
+}
+
+void gpu_submit(void *c) {
+  MSG(void (*)(id, SEL), (id)c, S("commit"));
+  committed(c);
 }
 
 void gpu_kern(int k) {
@@ -569,10 +585,8 @@ uint64_t gpu_signal(void) {
 void gpu_commit(void) {
   MSG(void (*)(id, SEL), enc, S("endEncoding"));
   MSG(void (*)(id, SEL), cb, S("commit"));
-  if (ndone < 4096) done[ndone++] = cb;
-  last = cb;
+  committed(cb);
   enc = 0;
-  reserved--;
 }
 
 // The GPU signals the shared event's values in order, each after the command
@@ -600,30 +614,81 @@ static int by_start(const void *a, const void *b) {
   return (x > y) - (x < y);
 }
 
-// Waits for the last committed command buffer; with it, all opened before.
-// gpu_busy grows by the union of their execution intervals; gpu_gap by the
-// time between them, and gpu_gaps by the gaps longer than 100 us.
-void gpu_sync(void) {
-  if (!last) return;
-  MSG(void (*)(id, SEL), last, S("waitUntilCompleted"));
-  static double iv[4096][2];
-  for (int i = 0; i < ndone; i++) {
+typedef struct { Buf b; uint64_t after; } Deferred;  // freed once `after` command buffers are accounted for
+static Deferred *deferred;
+static int ndeferred, deferred_cap;
+
+static void free_deferred(void) {
+  int kept = 0;
+  for (int i = 0; i < ndeferred; i++) {
+    if (deferred[i].after > naccounted) deferred[kept++] = deferred[i];
+    else gpu_free(&deferred[i].b);
+  }
+  ndeferred = kept;
+}
+
+// As gpu_free, for a buffer that work committed or still being encoded may
+// use: it stays allocated and charged until that work has finished.
+void gpu_free_later(Buf *b) {
+  uint64_t after = ncommitted + (uint64_t)reserved;
+  if (!b->obj || after <= naccounted) { gpu_free(b); return; }
+  if (ndeferred == deferred_cap) {
+    deferred_cap = deferred_cap ? 2 * deferred_cap : 64;
+    deferred = realloc(deferred, (size_t)deferred_cap * sizeof *deferred);
+    if (!deferred) die("out of memory");
+  }
+  deferred[ndeferred++] = (Deferred){*b, after};
+  memset(b, 0, sizeof *b);
+}
+
+// The first `count` buffers of `done`, all finished: their errors and their
+// time. gpu_busy grows by the union of their execution intervals; gpu_gap by
+// the time between them, and gpu_gaps by the gaps longer than 100 us.
+static double accounted_end;
+
+static void account(int count) {
+  if (!count) return;
+  double (*iv)[2] = xmalloc((size_t)count * sizeof *iv);
+  for (int i = 0; i < count; i++) {
     id c = done[i];
-    MSG(void (*)(id, SEL), c, S("waitUntilCompleted"));
     if (MSG(long (*)(id, SEL), c, S("status")) == 5)  // MTLCommandBufferStatusError
       die("GPU: %s", describe(MSG(id (*)(id, SEL), c, S("error"))));
     iv[i][0] = MSG(double (*)(id, SEL), c, S("GPUStartTime"));
     iv[i][1] = MSG(double (*)(id, SEL), c, S("GPUEndTime"));
+    if (c == last) last = 0;
+    MSG(void (*)(id, SEL), c, S("release"));
   }
-  qsort(iv, ndone, sizeof iv[0], by_start);
-  double end = 0;
-  for (int i = 0; i < ndone; i++) {
+  qsort(iv, (size_t)count, sizeof iv[0], by_start);
+  double end = accounted_end;
+  for (int i = 0; i < count; i++) {
     double a = iv[i][0] > end ? iv[i][0] : end;
     if (end && iv[i][0] > end) gpu_gap += iv[i][0] - end, gpu_gaps += iv[i][0] - end > 100e-6;
     if (iv[i][1] > a) gpu_busy += iv[i][1] - a;
     if (iv[i][1] > end) end = iv[i][1];
   }
-  ndone = 0;
+  accounted_end = end;
+  free(iv);
+  ndone -= count;
+  memmove(done, done + count, (size_t)ndone * sizeof *done);
+  naccounted += (uint64_t)count;
+  free_deferred();
+}
+
+// Accounts for the command buffers that have finished, oldest first, without
+// waiting for the others.
+void gpu_reap(void) {
+  int n = 0;
+  while (n < ndone && MSG(long (*)(id, SEL), done[n], S("status")) >= 4) n++;  // completed, or error
+  account(n);
+}
+
+// Waits for the last committed command buffer; with it, all opened before.
+void gpu_sync(void) {
+  if (!last) { accounted_end = 0; return; }
+  MSG(void (*)(id, SEL), last, S("waitUntilCompleted"));
+  for (int i = 0; i < ndone; i++) MSG(void (*)(id, SEL), done[i], S("waitUntilCompleted"));
+  account(ndone);
+  accounted_end = 0;
   last = 0;
   if (profile == 2) stage_collect();
   objc_autoreleasePoolPop(pool);
@@ -645,15 +710,13 @@ void gpu_drain(void) {
 
 // Residency updates can retain released buffers in the autorelease pool.
 // Drain it once after an eviction batch, before admitting replacement data.
-// In the middle of a pass, with command buffers reserved and not committed
-// (see gpu_open), waiting for the GPU would never end: the pass's own
-// gpu_sync drains the pool then.
+// Command buffers that are still running are retained (see `done`), so this
+// need not wait for them. While a command buffer is being encoded its objects
+// are in the pool: the pass's own gpu_sync drains it then.
 static void collect(void) {
   gpu_residency_commit();
   if (reserved) return;
-  if (last) gpu_sync();
-  else {
-    objc_autoreleasePoolPop(pool);
-    pool = objc_autoreleasePoolPush();
-  }
+  gpu_reap();
+  objc_autoreleasePoolPop(pool);
+  pool = objc_autoreleasePoolPush();
 }

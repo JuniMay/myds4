@@ -361,8 +361,7 @@ static void work_capacity(int rows) {
   if (rows < small) rows = small;
   if (rows <= work_rows && !(rows == small && work_rows > small)) return;
   int resize_cache = work_rows != 0;
-  gpu_sync();
-  for (size_t i = 0; i < sizeof work_buffers / sizeof *work_buffers; i++) gpu_free(work_buffers[i]);
+  for (size_t i = 0; i < sizeof work_buffers / sizeof *work_buffers; i++) gpu_free_later(work_buffers[i]);
   work_plan(rows, 1);
   work_rows = rows;
   if (resize_cache) cache_idle(experts_store); // capacity maintenance does not represent another token or pass
@@ -424,10 +423,9 @@ static void request_capacity(int rows) {
   int small = replay_margin() + 1 > BATCH_ROWS ? replay_margin() + 1 : BATCH_ROWS;
   if (rows <= small) rows = small;
   if (rows <= request_rows && !(rows == small && request_rows > small)) return;
-  gpu_sync();
-  gpu_free(&HS), gpu_free(&MF), gpu_free(&SEL);
-  gpu_free(&CAND); gpu_free(&IMG);
-  for (int e = 0; e < 2; e++) { gpu_free(&EC[e]); gpu_free(&ES[e]); }
+  gpu_free_later(&HS), gpu_free_later(&MF), gpu_free_later(&SEL);
+  gpu_free_later(&CAND), gpu_free_later(&IMG);
+  for (int e = 0; e < 2; e++) gpu_free_later(&EC[e]), gpu_free_later(&ES[e]);
   request_plan(rows, 1);
   request_rows = rows;
 }

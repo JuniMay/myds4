@@ -102,6 +102,7 @@ Buf gpu_try_new(size_t size, int admission); // empty when the model-memory pool
 Buf gpu_alloc_kv(size_t size); // charged only to the separate KV pool
 size_t gpu_allocation_size(size_t size);
 void gpu_free(Buf *b);
+void gpu_free_later(Buf *b);  // gpu_free once the work committed or being encoded so far has finished
 // Allocation membership in the main queue's bounded residency sets. Changes
 // apply at gpu_residency_commit; gpu_alloc commits its own allocation.
 void gpu_resident(const Buf *b, int on);
@@ -134,6 +135,7 @@ void gpu_commit(void);
 void gpu_wait_signal(uint64_t v);
 uint64_t gpu_signal_value(void);  // latest completed signal, without waiting
 void gpu_sync(void);
+void gpu_reap(void);  // accounts for the command buffers that have finished, without waiting
 void gpu_drain(void); // complete both the compute and clock-keeping queues
 int gpu_threads(int k);  // max threads per threadgroup of a kernel
 int gpu_profiling(void);       // MYDS4_PROFILE set: dispatches run one at a time, timed

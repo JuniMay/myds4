@@ -51,7 +51,7 @@ CPU_CHECKS = activation-format-check state-file-check context-lookup-check works
 EXTRA_CPU = memory metadata qwen-state-accounting attention-candidate prefill-prune cache-hold cache-progress cache-mapping predictor-learning predictor-state predictor-numerics
 # These need the GPU or model weights to run. make test only builds them, so
 # that a changed engine interface cannot leave one unbuildable.
-BUILD_ONLY = $(addprefix build/tests/,nemotron experts routing vision residency mxfp4-activation gpu-wait gpu-clock \
+BUILD_ONLY = $(addprefix build/tests/,nemotron experts routing vision residency mxfp4-activation gpu-wait gpu-steps gpu-clock \
   pass-eviction gguf-decode moe-tasks memory-model qwen-mtp flash-model speech-model nemotron-model prefill-prune-model \
   draft-rows prefix-fork verification-model ced dspark-state prefill-state runahead-model state-file-model) \
   build/benchmarks/decode build/benchmarks/products build/benchmarks/steps build/benchmarks/pass-binding
@@ -306,6 +306,10 @@ build/tests/residency: tests/gpu/residency.c src/engine/gpu.c src/engine/util.c 
 build/tests/mxfp4-activation: tests/gpu/mxfp4_activation.c tests/reference/activations.h src/engine/gpu.c src/engine/util.c src/engine/myds4.h $(KERNELS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/gpu/mxfp4_activation.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)
+
+build/tests/gpu-steps: tests/gpu/gpu_steps.c build/libmyds4.a $(MODEL_HEADERS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -o $@ tests/gpu/gpu_steps.c build/libmyds4.a $(LDLIBS)
 
 build/tests/gpu-wait: tests/gpu/gpu_wait.c src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS)
 	@mkdir -p $(dir $@)
