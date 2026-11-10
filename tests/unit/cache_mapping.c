@@ -5,6 +5,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 static int added, removed;
 static Buf fixture_new(size_t bytes) {  // filled with 0xaa, so that a read of zeros shows
   void *p = malloc(bytes);
@@ -168,6 +169,40 @@ int main(void) {
   cache_unhold(st, 0, pair, 2);
   close(zero);
   for (int i = 0; i < 2; i++) fixture_free(&read_slots[i].b);
+
+  // A pass's fewest slots (cache_working_rows) are room the model reserved
+  // before the pass, so the slot limit rises to them. A store whose limit
+  // was set for one row (4 slots) holds a whole layer of 8 experts in a
+  // prompt pass of 4 rows (16 slots); without the room, no slot of the
+  // layer may go and the process ends. In a child, which such an end fails.
+  pid_t child = fork();
+  if (!child) {
+    static FileSpan wide_span[2][8][1];  // empty spans: their reads finish at once
+    static int wide_spans[2] = {1, 1};
+    st = cache_create(&(ExpertLayout){.layers = 2, .scored_layers = 2, .experts = 8, .chosen = 2, .parts = 1,
+                                      .span = &wide_span[0][0][0], .spans = wide_spans});
+    cache_retention(st, 0, 0);
+    static Slot wide[16];
+    static double wide_scores[16];
+    static int wide_frees[16];
+    for (int i = 0; i < 16; i++) wide_scores[i] = INFINITY, wide_frees[i] = 15 - i;
+    st->slots = wide, st->score = wide_scores, st->free_list = wide_frees;
+    st->max_slots = st->nfree = 16, st->SLOT_SIZE = 64;
+    st->head = st->tail = st->pass_layer = st->serving = -1;
+    memset(st->where, 0xff, WHERE_BYTES);
+    cache_working_rows(st, 1);
+    st->cap = st->mcap = st->minimum_slots;  // as cache_init sets them for one row, with little memory free
+    cache_working_rows(st, 4);
+    int layer[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    cache_pass(st, 0);
+    cache_hold(st, 0, layer, 8);
+    cache_wait(st, 0, layer, 8);
+    int held = st->nslots == 8;
+    for (int e = 0; e < 8; e++) held &= WHERE(0, e) >= 0;
+    _exit(held ? 0 : 1);
+  }
+  int status = 0;
+  CHECK(child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
   fprintf(stderr, "cache mapping: %d/%d CPU checks passed\n", checks - failures, checks);
   return failures != 0;
 }

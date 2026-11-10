@@ -686,6 +686,13 @@ void cache_active(ExpertStore *st, int active) { st->cache_busy = !!active; }
 void cache_working_rows(ExpertStore *st, int rows) {
   int experts = rows * st->chosen < st->experts ? rows * st->chosen : st->experts;
   st->minimum_slots = 2 * experts;
+  // The model reserves these slots' memory before such a pass (cache_required),
+  // so limits that cache_init or a resize set for fewer rows rise to them.
+  if (st->max_slots) {
+    int fewest = st->minimum_slots < st->max_slots ? st->minimum_slots : st->max_slots;
+    if (st->cap < fewest) st->cap = fewest;
+    if (st->mcap < fewest) st->mcap = fewest;
+  }
 }
 
 static int pool_can_evict(void *context) {

@@ -74,7 +74,10 @@ On a store whose layout has a transform (as Flash-Next's compressed scales
 do), it checks that the transform runs once per expert, only after every
 piece of the expert has been read and before the expert counts as read; that
 it sees the read bytes at the spans' offsets; and that its bytes at the
-slot's end fit in the slot's size.
+slot's end fit in the slot's size. A store whose slot limit was set for one
+row must hold a whole layer once a wider pass asks for its fewest slots
+(`cache_working_rows`); the check runs that pass in a child process, which
+ends with a message when the store cannot.
 `build/tests/weights-read` checks that a model's weights are read in
 16 KiB-aligned spans into aligned memory, so that a load does not fill the
 file cache, and that each tensor's bytes arrive intact.

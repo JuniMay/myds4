@@ -56,6 +56,9 @@ void cache_retention(ExpertStore *st, int half_life, int read_cost);
 // it and grows only while 4 GiB more than it is available.
 void cache_memory(ExpertStore *st, MemorySlot *backbone);
 void cache_active(ExpertStore *st, int active);
+// The fewest slots a pass of `rows` rows needs: two layers' selections
+// (cache_required gives their bytes, which the model reserves). The slot and
+// mapping limits rise to them.
 void cache_working_rows(ExpertStore *st, int rows);
 uint64_t cache_required(ExpertStore *st, int layers);
 void cache_init(ExpertStore *st, uint64_t budget, int layers);
