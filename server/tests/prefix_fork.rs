@@ -1,5 +1,6 @@
 //! The KV prefix cache through HTTP: the fork test's server
-//! part, and the cache's budget (--kv-cache). Forks of
+//! part, the cache's budget (--kv-cache), and a session kept while its idle
+//! model unloads (--idle-unload). Forks of
 //! a conversation reuse its history up to where they part from it, also while
 //! the conversation is still decoding. The cache resumes each fork the
 //! cheaper way: a replay at the shared prefix, or a snapshot before it that
@@ -933,4 +934,76 @@ fn quitting_stops_a_long_prefill() {
         "the server exited {took:.1} s after SIGTERM, during a {n}-token prefill"
     );
     assert_eq!(code, 503, "the stopped request's answer");
+}
+
+/// A model that goes its idle_unload time without requests gives back its
+/// weights and experts: its status reads unloaded, the memory it held is back
+/// in the engine's count and in the process's footprint, and its session
+/// stays. It stays unloaded while the server keeps calling its idle hook (35
+/// s: past DeepSeek's 32 calm calls, after which its cache raises its cap).
+/// The same request then loads it again and continues that session with the
+/// same greedy reply.
+#[test]
+fn an_idle_model_unloads_and_its_next_request_loads_it_again() {
+    let Some(s) = setup() else {
+        eprintln!("skipped: set MYDS4_CHECKPOINT and MYDS4_EXPERTS");
+        return;
+    };
+    let _one = one_model();
+    let server = Server::start(&s, &["--idle-unload", "3"]);
+    let footprint = |v: &Value| v["memory"]["footprint_gib"].as_f64().unwrap_or(f64::MAX);
+    let ask = request(&short_prompt(), 16);
+    let first = content(&server.chat(&ask));
+    let replied = Instant::now();
+    let (_, before) = server.status();
+    assert_eq!(before["loaded"], json!(true), "{before}");
+    let bytes = |v: &Value| v["model_memory_budget"]["allocated"].as_u64().unwrap_or(0);
+    let held = bytes(&before);
+    // the server looks once a second: unloaded a little after the 3 s
+    let mut after = before.clone();
+    while after["loaded"] != json!(false) && replied.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(250));
+        after = server.status().1;
+    }
+    let took = replied.elapsed().as_secs_f64();
+    let back = held.saturating_sub(bytes(&after));
+    // then it stays unloaded, and freed pages reach the counters
+    let unloaded = Instant::now();
+    let mut stayed = after["loaded"] == json!(false);
+    while stayed && unloaded.elapsed() < Duration::from_secs(35) {
+        std::thread::sleep(Duration::from_secs(1));
+        after = server.status().1;
+        stayed = after["loaded"] == json!(false);
+    }
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    println!(
+        "unloaded {took:.1} s after the reply: {:.2} of {:.2} GiB of model memory back; \
+         the process's footprint {:.1} GiB loaded, {:.1} after 35 s unloaded; sessions {}",
+        gib(back),
+        gib(held),
+        footprint(&before),
+        footprint(&after),
+        after["sessions"]
+    );
+    assert!(
+        took >= 2.5,
+        "unloaded {took:.1} s after the reply, before 3 s"
+    );
+    assert!(stayed, "it did not stay unloaded: {after}");
+    assert!(back * 10 >= held * 9, "{back} of {held} bytes back");
+    // the pages go back to the system too, not only the engine's count; the
+    // session, the workspace and the compiled kernels stay
+    assert!(
+        footprint(&after) <= footprint(&before) / 10.0,
+        "the footprint fell from {:.1} to only {:.1} GiB",
+        footprint(&before),
+        footprint(&after)
+    );
+    assert!(
+        after["sessions"].as_array().is_some_and(|l| !l.is_empty()),
+        "the session stays: {after}"
+    );
+    let again = server.chat(&ask);
+    assert_eq!(content(&again), first, "the reply after the reload");
+    assert_eq!(server.status().1["loaded"], json!(true));
 }

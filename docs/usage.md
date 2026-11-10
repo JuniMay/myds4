@@ -23,6 +23,7 @@ The root contains server settings and a nonempty `models` list:
 | `memory` | Optional upper limit of model memory in GiB: all loaded weights, experts, vision and model workspaces; KV is separate. Default 0: no limit; the memory that other programs leave decides (see [Memory](#memory)). |
 | `reserve` | Memory kept available to other programs, in GiB; default 10, range 2–1024. |
 | `kv_cache` | One budget for all models' attention states and snapshots, in GiB; default 8. Experts use the part that KV does not occupy. |
+| `idle_unload` | Seconds a model may go without requests before its weights and experts unload; default 600, range 0–1,000,000, 0 never. A model's own `idle_unload` overrides it (see [Memory](#memory)). |
 | `models` | Each model's checkpoint and inference settings. |
 
 Explicit server flags override file settings regardless of argument order.
@@ -48,6 +49,7 @@ of each architecture per process.
 | `draft` | Speculative proposals: DeepSeek DSpark 0–5; Qwen3.8-27B chained MTP 0–5; Nemotron DFlash2 0–15. Flash-Next requires 0. |
 | `draft_model` | For Nemotron with `draft` enabled, the separate DFlash2 checkpoint directory. |
 | `lookup` | `off` or 1–15 context-copy proposals, limited by the model's verification capacity. |
+| `idle_unload` | Seconds this model may go without requests before its weights and experts unload, 0 never; default: the server-wide `idle_unload`. |
 
 Qwen's generation configuration supplies sampling defaults when the entry
 omits them. Set temperature and top-p explicitly to 1 when that is the
@@ -129,6 +131,14 @@ The rules below keep the server from causing that pressure (see
   swapping it gives back a sixteenth of its slots at a time. Once a second,
   the server also takes back idle model memory, then idle KV, until the
   available memory is back at `reserve`.
+- **An idle model unloads.** A model that has gone `idle_unload` seconds
+  (default 600) without requests, with none waiting, gives back its expert
+  cache and its weights; the log names it and the memory given back. Its
+  KV states stay, and its next request loads it again: the weights are read
+  from the SSD while every model's requests wait. When every model has gone
+  its time, all their weights are back with other programs; their KV stays
+  within `kv_cache`. A yield's interval has its own limits, so nothing
+  unloads for idleness while it lasts.
 - **KV comes first, within `kv_cache`.** The experts may use the space that
   KV does not occupy. When KV grows, idle experts give that space back
   before it is allocated. Experts never take the space that KV occupies.

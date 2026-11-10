@@ -39,7 +39,9 @@ build/tests/tokenizer-reference /path/to/transcribe tests/fixtures/tokenizer_nem
 `build/tests/memory` checks the shared budget, unequal entry sizes, active
 pins, expert-before-backbone eviction and separate KV storage.
 It also checks reclaiming idle entries for the shared RAM reserve without
-discarding pinned weights or inflating recorded peak memory.
+discarding pinned weights or inflating recorded peak memory, and unloading
+one model's idle entries: experts before the backbone they depend on, with
+pinned entries and other models' entries kept.
 `build/tests/memory-budget` runs the engine's memory code on a simulated
 Mac (128 GiB installed, other programs holding 28 GiB): model memory stays
 within the installed memory less the reserve less other programs, never
@@ -177,7 +179,12 @@ load a model while a development wrapper holds its own lock.
 The `prefix_fork` target needs `MYDS4_CHECKPOINT`; `MYDS4_EXPERTS` is
 optional there. Besides prefix reuse and the KV budget, it sends SIGTERM
 5 s into a DeepSeek prefill of about 15,000 tokens and requires the server
-to exit within 5 s and to answer that request with 503.
+to exit within 5 s and to answer that request with 503. With
+`--idle-unload 3`, it requires the model to read unloaded at least 2.5 s
+after a reply, with at least 90% of its model memory given back, the
+process's footprint down by at least 90%, and its session kept. The model
+must stay unloaded for 35 s while the server keeps calling its idle hook;
+the same request must then load it again and give the same greedy reply.
 
 Model checks cover prefix forks, draft rollback, batched rows, compressed
 history, dependency pruning and concurrent execution. Build the relevant

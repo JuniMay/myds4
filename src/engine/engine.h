@@ -109,6 +109,10 @@ void myds4_finish(myds4_model *m);
 // other programs if they need it. The model's expert cache slots after it (0
 // without one).
 int myds4_idle(myds4_model *m);
+// While the model runs no request: every idle part of its memory goes back,
+// its expert cache before its weights. Its KV states stay, and the next
+// myds4_load reads the weights again. Returns the bytes given back.
+uint64_t myds4_unload(myds4_model *m);
 uint64_t myds4_reclaim(uint64_t bytes);
 // Process controls run on the engine thread, between completed model calls.
 typedef struct {

@@ -350,6 +350,10 @@ void myds4_refresh_stats(void) {
 }
 
 uint64_t myds4_reclaim(uint64_t bytes) { return memory_reclaim(bytes); }
+uint64_t myds4_unload(myds4_model *m) {
+  memory_scope(&m->m->work);
+  return memory_unload(&m->m->memory);
+}
 myds4_memory_info myds4_memory(void) {
   MemoryUsage usage = memory_usage();
   return (myds4_memory_info){usage.limit, usage.allocated, usage.kv};

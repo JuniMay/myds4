@@ -205,6 +205,7 @@ unsafe extern "C" {
     fn myds4_active(m: *mut RawModel, active: c_int);
     fn myds4_finish(m: *mut RawModel);
     fn myds4_idle(m: *mut RawModel) -> c_int;
+    fn myds4_unload(m: *mut RawModel) -> u64;
     fn myds4_reclaim(bytes: u64) -> u64;
     fn myds4_memory() -> MemoryInfo;
     fn myds4_memory_limit(bytes: u64);
@@ -702,6 +703,13 @@ impl Model {
     /// they need it; its expert cache's slots after it.
     pub fn idle(&self) -> i32 {
         unsafe { myds4_idle(self.raw) }
+    }
+
+    /// While the model runs no request: its expert cache and weights go back
+    /// to the system, its KV states stay, and the next load reads them again.
+    /// The bytes given back.
+    pub fn unload(&self) -> u64 {
+        unsafe { myds4_unload(self.raw) }
     }
 
     /// Rows of different states one decoding pass takes; the drafts per pass

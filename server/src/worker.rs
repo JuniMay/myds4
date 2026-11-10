@@ -160,6 +160,8 @@ pub struct Served {
     pub engine: engine::Options,
     /// Requests running together at most (at most the model's rows per pass).
     pub batch: usize,
+    /// Seconds without requests before its weights and experts unload; 0 never.
+    pub idle_unload: f64,
 }
 
 #[derive(Default)]
@@ -732,6 +734,8 @@ struct Slot {
     shown: usize,
     /// The experts a decoded row holds: the live view's routed rows.
     per_row: usize,
+    /// When the model last had a request, for its idle unload.
+    used: Instant,
 }
 
 // One KV budget and one LRU clock across models. Prefix matching is
@@ -882,6 +886,7 @@ impl Worker {
                     think_end: model.tokenizer().special("</think>"),
                     shown: 0,
                     per_row: model.stats().experts_per_row.max(0) as usize,
+                    used: Instant::now(),
                     model,
                     served,
                 }
@@ -897,9 +902,47 @@ impl Worker {
         }
     }
 
+    /// A model that has gone its idle_unload seconds without requests, with
+    /// none waiting, gives back its expert cache and weights; its KV stays,
+    /// and its next request loads it again. Not while a yield holds memory.
+    fn unload_idle(&mut self) {
+        let waiting: Vec<bool> = {
+            let q = lock(&self.s.queue);
+            if q.control.phase != Phase::Running {
+                return;
+            }
+            q.jobs.iter().map(|j| !j.is_empty()).collect()
+        };
+        let mut drained = false;
+        for slot in &self.slots {
+            let after = slot.served.idle_unload;
+            if after <= 0.0
+                || !slot.gens.is_empty()
+                || waiting.get(slot.index).copied().unwrap_or(false)
+                || slot.used.elapsed().as_secs_f64() < after
+                || !slot.model.loaded()
+            {
+                continue;
+            }
+            if !drained {
+                engine::drain(); // nothing in flight still reads what goes
+                drained = true;
+            }
+            let freed = slot.model.unload();
+            if freed > 0 {
+                engine::log(&format!(
+                    "{}: unloaded after {after:.0} s without requests; {:.1} GiB back",
+                    slot.served.id,
+                    freed as f64 / GIB
+                ));
+            }
+        }
+    }
+
     /// Apply one RAM reserve between engine calls, including while only a
     /// dense model is active. Release expert slots first, then idle KV.
     fn maintain(&mut self) {
+        self.unload_idle();
         engine::refresh_stats();
         let mut released = 0;
         for slot in &self.slots {
@@ -1110,6 +1153,9 @@ impl Worker {
             }
             for (x, admit) in self.slots.iter_mut().zip(admitted) {
                 x.step(&s, admit, &mut self.memory);
+                if !x.gens.is_empty() {
+                    x.used = Instant::now();
+                }
                 x.model.active(!x.gens.is_empty());
             }
             if self.published.elapsed() >= Duration::from_millis(250) {
@@ -1194,6 +1240,7 @@ impl Slot {
                         continue;
                     }
                     lock(&s.models[self.index].status).load_error = None;
+                    self.used = Instant::now();
                     self.per_row = self.model.stats().experts_per_row.max(0) as usize;
                     engine::log(&format!(
                         "{}: loaded; shares the {:.1} GiB KV budget",

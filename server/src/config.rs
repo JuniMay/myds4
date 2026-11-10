@@ -26,6 +26,9 @@ pub struct ModelConfig {
     pub seed: Option<u64>,
     /// Thinking effort 1-100, 0 off; None: the format's default.
     pub think: Option<u32>,
+    /// Seconds without requests before its weights and experts unload, 0
+    /// never; None: the server-wide setting.
+    pub idle_unload: Option<f64>,
 }
 
 impl ModelConfig {
@@ -43,6 +46,7 @@ impl ModelConfig {
             top_k: None,
             seed: None,
             think: None,
+            idle_unload: None,
         }
     }
 
@@ -137,6 +141,7 @@ impl ModelConfig {
                         .ok_or("think takes 0 (off) or 1 to 100")? as u32,
                 )
             }
+            "idle_unload" => self.idle_unload = Some(idle_seconds(v)?),
             _ => return Err(format!("no option {name}")),
         }
         Ok(())
@@ -205,12 +210,22 @@ impl Server {
     }
 }
 
-/// Global model-memory and KV budgets, plus the process-wide reserve.
+/// Seconds without requests before a model unloads: 0 (never) to 1,000,000.
+fn idle_seconds(v: &Value) -> Result<f64, String> {
+    v.as_f64()
+        .filter(|n| (0.0..=1e6).contains(n))
+        .ok_or("idle_unload takes 0 (never) to 1000000 seconds".into())
+}
+
+/// Global model-memory and KV budgets, the process-wide reserve, and the
+/// seconds a model may go without requests before it unloads.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Budgets {
     pub memory_gb: f64,
     pub reserve_gb: f64,
     pub kv_gb: f64,
+    /// 0: never; a model's own idle_unload setting overrides it.
+    pub idle_unload_s: f64,
 }
 
 impl Default for Budgets {
@@ -219,12 +234,17 @@ impl Default for Budgets {
             memory_gb: 0.0,
             reserve_gb: 10.0,
             kv_gb: 8.0,
+            idle_unload_s: 600.0,
         }
     }
 }
 
 impl Budgets {
     pub fn set(&mut self, name: &str, value: &Value) -> Result<(), String> {
+        if name == "idle_unload" {
+            self.idle_unload_s = idle_seconds(value)?;
+            return Ok(());
+        }
         let n = value
             .as_f64()
             .filter(|n| n.is_finite())
@@ -278,6 +298,7 @@ pub fn parse(root: &Value) -> Result<Config, String> {
             "memory",
             "reserve",
             "kv_cache",
+            "idle_unload",
             "port",
             "host",
             "api_key_file",
@@ -289,7 +310,7 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         return Err(format!("no server setting {k}"));
     }
     let mut budgets = Budgets::default();
-    for name in ["memory", "reserve", "kv_cache"] {
+    for name in ["memory", "reserve", "kv_cache", "idle_unload"] {
         if let Some(value) = obj.get(name) {
             budgets.set(name, value)?;
         }
@@ -331,6 +352,26 @@ pub fn parse(root: &Value) -> Result<Config, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn idle_unload_is_server_wide_and_a_model_can_set_its_own() {
+        let c = parse(&json!({"idle_unload": 120, "models": [
+            {"model": "/models/deepseek"}, {"model": "/models/qwen", "idle_unload": 0}
+        ]}))
+        .unwrap();
+        assert_eq!(c.budgets.idle_unload_s, 120.0);
+        assert_eq!(
+            (c.models[0].idle_unload, c.models[1].idle_unload),
+            (None, Some(0.0))
+        );
+        // ten minutes when nothing sets it
+        let c = parse(&json!({"models": [{"model": "/models/deepseek"}]})).unwrap();
+        assert_eq!(c.budgets.idle_unload_s, 600.0);
+        for bad in [json!(-1), json!(2e6), json!("soon")] {
+            assert!(parse(&json!({"idle_unload": bad, "models": [{"model": "/m"}]})).is_err());
+            assert!(parse(&json!({"models": [{"model": "/m", "idle_unload": bad}]})).is_err());
+        }
+    }
 
     #[test]
     fn model_memory_is_global_and_separate_from_kv() {

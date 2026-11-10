@@ -161,6 +161,23 @@ static void ram_reserve_reclaims_idle_entries(void) {
   CHECK(memory_reclaim(1) == 0);
 }
 
+static void unloading_takes_back_one_accounts_idle_entries(void) {
+  memory_init(100);
+  MemoryAccount moe, other;
+  memory_account_init(&moe, "MoE"), memory_account_init(&other, "other");
+  Entry core, a, b, held, kept;
+  entry(&core, &moe, NULL, 20, 1);
+  entry(&a, &moe, &core, 8, 2);
+  entry(&b, &moe, &core, 12, 3);
+  entry(&held, &moe, NULL, 5, 4); memory_pin(&held.slot, 1);
+  entry(&kept, &other, NULL, 30, 5);
+  CHECK(memory_unload(&moe) == 40);
+  CHECK(a.evicted == 1 && b.evicted == 1 && core.evicted == 1);
+  CHECK(order_count == 3 && order[2] == 1);  // the weights after the experts on them
+  CHECK(held.evicted == 0 && kept.evicted == 0 && memory_usage().allocated == 35);
+  CHECK(memory_unload(&moe) == 0);
+}
+
 static void temporary_limits_survive_new_accounts(void) {
   memory_init(100);
   MemoryAccount first, second;
@@ -182,7 +199,8 @@ int main(void) {
     pinned_entries_and_kv_are_separate, active_minimum_cannot_overcommit,
     speculative_reads_do_not_evict_weights, combined_admission_refuses_without_partial_eviction,
     cached_bytes_can_fund_a_promised_workspace, host_and_gpu_payloads_share_the_budget,
-    ram_reserve_reclaims_idle_entries, temporary_limits_survive_new_accounts};
+    ram_reserve_reclaims_idle_entries, unloading_takes_back_one_accounts_idle_entries,
+    temporary_limits_survive_new_accounts};
   int failed = 0;
   for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
     pid_t child = fork();

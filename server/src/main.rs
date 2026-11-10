@@ -47,6 +47,8 @@ const USAGE: &str = "usage: myds4-server [--config FILE | -m MODEL [model option
                   that other programs leave, less --reserve, decides)
   --reserve GB    memory kept available to other programs, 2-1024 GiB (default 10)
   --kv-cache GB   total KV states and snapshots across all models, GiB (default 8)
+  --idle-unload S seconds a model may go without requests before its weights and experts unload (its KV
+                  stays; the next request loads it again), 0 never (default 600; a model's own setting wins)
   --tui           a live view in the terminal (requests, speed, experts, memory, the KV cache) instead of the
                   log on stderr; q stops the server, n shows the next model, and the last log lines print on exit
   --no-tui        use the log even when the configuration enables the live view
@@ -130,7 +132,7 @@ fn parse(args: &[String]) -> Args {
                         one = Some(ModelConfig::new(v));
                     }
                     "--config" => file = Some(v.into()),
-                    "--memory" | "--reserve" | "--kv-cache" => {
+                    "--memory" | "--reserve" | "--kv-cache" | "--idle-unload" => {
                         let name = flag[2..].replace('-', "_");
                         let value = serde_json::from_str::<Value>(v).unwrap_or(Value::Null);
                         budgets.push((name, value));
@@ -286,6 +288,8 @@ fn command_line_server_settings_override_the_file_in_either_order() {
             "12",
             "--kv-cache",
             "16",
+            "--idle-unload",
+            "30",
         ]
         .map(String::from)
         .into();
@@ -307,7 +311,14 @@ fn command_line_server_settings_override_the_file_in_either_order() {
             (a.server.tui, a.server.tui_theme),
             (false, ui::Colors::Light)
         );
-        assert_eq!((a.budgets.reserve_gb, a.budgets.kv_gb), (12.0, 16.0));
+        assert_eq!(
+            (
+                a.budgets.reserve_gb,
+                a.budgets.kv_gb,
+                a.budgets.idle_unload_s
+            ),
+            (12.0, 16.0, 30.0)
+        );
     }
 }
 
@@ -709,6 +720,7 @@ fn main() {
             id,
             engine: e,
             batch: m.batch,
+            idle_unload: m.idle_unload.unwrap_or(a.budgets.idle_unload_s),
         });
         families.push(family);
     }

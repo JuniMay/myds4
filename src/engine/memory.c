@@ -233,6 +233,23 @@ uint64_t memory_reclaim(uint64_t bytes) {
   return freed;
 }
 
+uint64_t memory_unload(MemoryAccount *account) {
+  uint64_t before = usage.allocated;
+  // Each pass releases the account's idle leaves; an entry whose dependents
+  // went in one pass is a leaf in the next.
+  for (int again = 1; again;) {
+    again = 0;
+    for (MemorySlot *s = entries; s; s = s->next)
+      if (s->account == account && !has_children(s) && evictable(s, NULL, 0, MEMORY_REQUIRED)) {
+        release_entry(s);
+        again = 1;
+      }
+  }
+  uint64_t freed = before - usage.allocated;
+  if (freed && collect_released) collect_released();
+  return freed;
+}
+
 // What an addition needs back past the limit (UINT64_MAX: more than can come back).
 static uint64_t over_limit(uint64_t extra) {
   if (fits(extra)) return 0;

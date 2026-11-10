@@ -129,6 +129,13 @@ under memory pressure. The engine never causes that pressure itself:
 - weights are read without filling the file cache.
 
 The once-a-second maintenance gives memory back when other programs grow.
+It also unloads a model that has gone its `idle_unload` time without
+requests, with none waiting: after the GPU queues and expert reads drain,
+`myds4_unload` releases every idle entry of that model's memory account,
+each before the entries it depends on, so the expert cache goes before the
+weights. The account's workspace and the model's KV states stay; the next
+request's load reads the weights again. While a yield holds the memory,
+nothing unloads for idleness.
 
 The engine allocates selected missing experts and their decoding scratch
 space before starting up to eight read workers. Workers read checkpoint
