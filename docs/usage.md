@@ -303,10 +303,22 @@ lock. The server does not acquire or inspect that lock.
 
 ## Terminal interface
 
-`n` selects the next model. Keys 1–6 select Overview, KV cache, Experts,
-Last minute, Log and Memory. The Memory tab shows all models' tracked
-weights, experts and allocated KV, with the shared budgets shown once.
-Process footprint also includes runtime allocations outside the tiles.
+Keys 1–6 select Overview, KV cache, Experts, Last minute, Log and Memory.
+With several models, the Overview, KV cache, Experts and Last minute tabs
+show one model at a time, and `n` selects the next. The KV cache tab lists
+every model with its sessions and their KV at its top; a click there shows
+that model's sessions. The Log and Memory tabs cover every model.
+
+The Memory tab draws the Mac's installed memory as a treemap: each
+rectangle's area follows its bytes, and a character cell counts as twice
+as tall as wide. Each model in memory is a rectangle under its name, split
+into its weights, experts, workspace and allocated KV. Beside the models
+are the server's other memory, other programs (the system's memory among
+them), the file cache and free memory, with the `reserve` share of free
+memory marked. A part too small to show its size is named on its model's
+first row when it fits there, else below the map. Above the map are the
+models' memory and its current limit, how many models are in memory, the
+shared KV budget, the reserve, and the available memory.
 
 Arrow keys, Page Up/Down and the mouse navigate the selected panel.
 `q` or Ctrl-C shuts down the server and restores the terminal. Use

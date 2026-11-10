@@ -6,14 +6,17 @@
 //!    decoded token (with what substitution adds), memory on the GPU, in RAM
 //!    and on the SSD, and the latest log lines.
 //! 2. KV cache: the KV prefix cache's tree of states along the token
-//!    positions, and the text of the node chosen with the keys or a click.
+//!    positions, and the text of the node chosen with the keys or a click;
+//!    with several models, every model's sessions above it.
 //! 3. Experts: a decoding request's experts in every layer for its last
 //!    sampled tokens, and where each one was.
 //! 4. Last minute: the phase, the tokens/s, the SSD's reads, the hit rate and
 //!    each request, one column per snapshot.
 //! 5. Log: the latest log lines.
-//! 6. Memory: every model's allocation tiles, the process total, and the
-//!    shared KV budget and reserve.
+//! 6. Memory: the Mac's memory as a treemap, each model with its weights,
+//!    experts, workspace and KV beside the server's other memory, other
+//!    programs, the file cache and free memory; the models' limit, the shared
+//!    KV budget and the reserve.
 //!
 //! What the tabs draw of the last minute stays in the view's memory; nothing
 //! is written to files. On exit the normal screen comes back with the last log
@@ -138,7 +141,9 @@ struct ModelMemory {
     workspace: u64,
     kv: u64,
     kv_committed: u64,
-    tracked: u64,
+    /// The model's sessions in the shared KV cache.
+    #[serde(default)]
+    sessions: u64,
 }
 
 #[derive(Deserialize, Default)]
@@ -749,17 +754,17 @@ fn draw_screen(
     title: &str,
     log: &[String],
 ) {
-    // with several models, the model shown and how to show the next
+    // with several models, the model shown (the key bar has the next)
     let shown;
     let title = if s.models > 1 {
-        shown = format!("{title} · showing {} (n: next)", s.model);
+        shown = format!("{title} · showing {}", s.model);
         shown.as_str()
     } else {
         title
     };
     ui.hits.clear();
     let area = buf.area;
-    let inner = frame::draw(buf, area, title, state(s, h), ui);
+    let inner = frame::draw(buf, area, title, state(s, h), s.models, ui);
     if inner.height == 0 {
         // too small for the chrome: the title alone
         buf.set_line(
@@ -849,6 +854,16 @@ fn take_text(ui: &mut Ui, a: crate::worker::NodeText) -> bool {
     }
 }
 
+/// Model `i` in the same tab: its own requests, tree and counters.
+fn show_model(ui: &mut Ui, i: usize) {
+    *ui = Ui {
+        model: i,
+        tab: ui.tab,
+        mouse: ui.mouse,
+        ..Ui::default()
+    };
+}
+
 fn handle(ev: &Event, ui: &mut Ui, s: &Snapshot, h: &History) -> Asked {
     match ev {
         Event::Key(k) if quits(k) => Asked::Quit,
@@ -866,6 +881,10 @@ fn handle(ev: &Event, ui: &mut Ui, s: &Snapshot, h: &History) -> Asked {
                 Some(Target::Request(n)) => {
                     ui.request = Some(n);
                     Asked::Redraw
+                }
+                Some(Target::Model(i)) if i < s.models && i != ui.model => {
+                    show_model(ui, i);
+                    Asked::Model
                 }
                 _ => Asked::Nothing,
             },
@@ -907,13 +926,7 @@ fn key(code: KeyCode, ui: &mut Ui, s: &Snapshot, h: &History) -> Asked {
             return Asked::Mouse(ui.mouse);
         }
         KeyCode::Char('n' | 'N') if s.models > 1 => {
-            // the next model: its own requests, tree and counters
-            *ui = Ui {
-                model: (ui.model + 1) % s.models,
-                tab: ui.tab,
-                mouse: ui.mouse,
-                ..Ui::default()
-            };
+            show_model(ui, (ui.model + 1) % s.models);
             return Asked::Model;
         }
         KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down if ui.tab == Tab::Kv => {
@@ -1302,8 +1315,9 @@ mod tests {
         assert!(mac.contains("file cache 36.0"), "{mac}");
     }
 
-    #[test]
-    fn memory_tiles_show_both_models_and_one_shared_budget() {
+    /// Two models in the memory of a Mac of 128 GiB: DeepSeek's weights,
+    /// experts and KV, Qwen's weights and KV, and the server's other memory.
+    fn two_models() -> Snapshot {
         let mut s = snapshot();
         s.model = "DeepSeek".into();
         s.models = 2;
@@ -1324,7 +1338,7 @@ mod tests {
                 experts: 56 * gib,
                 kv: gib,
                 kv_committed: gib,
-                tracked: 65 * gib,
+                sessions: 2,
             },
             ModelMemory {
                 workspace: 0,
@@ -1333,9 +1347,15 @@ mod tests {
                 experts: 0,
                 kv: 2 * gib,
                 kv_committed: 2 * gib,
-                tracked: 22 * gib,
+                sessions: 1,
             },
         ];
+        s
+    }
+
+    #[test]
+    fn the_memory_map_shows_every_model_its_parts_and_the_rest() {
+        let s = two_models();
         for (w, h) in [(160, 30), (80, 30), (40, 32), (12, 4)] {
             let mut b = Buffer::empty(ratatui::layout::Rect::new(0, 0, w, h));
             let mut ui = Ui {
@@ -1345,17 +1365,21 @@ mod tests {
             draw_screen(&mut b, &s, &History::default(), &mut ui, "myds4", &[]);
             if w >= 80 {
                 let screen = all(&b);
+                // each model under its name, with its parts inside it
                 assert!(
-                    screen.contains("DeepSeek") && screen.contains("Qwen"),
+                    screen.contains("DeepSeek 65.0 GiB") && screen.contains("Qwen 22.0 GiB"),
                     "{screen}"
                 );
-                assert!(screen.contains("3.00 / 12.00 GiB"), "{screen}");
-                assert_eq!(screen.matches("Shared KV budget").count(), 1);
-                assert!(
-                    screen.contains("65.00 GiB tracked") && screen.contains("22.00 GiB tracked"),
-                    "{screen}"
-                );
-                if std::env::var_os("MYDS4_PRINT_MEMORY_VIEW").is_some() && w == 160 {
+                assert!(screen.contains("experts 56.0 GiB"), "{screen}");
+                // the rest of the Mac's memory beside them, by its sizes:
+                // other programs and the file cache
+                if w == 160 {
+                    for size in [" 12.0 GiB", " 19.0 GiB"] {
+                        assert!(screen.contains(size), "{size}: {screen}");
+                    }
+                }
+                assert_eq!(screen.matches("3.00 / 12.00 GiB, shared").count(), 1);
+                if std::env::var_os("MYDS4_PRINT_MEMORY_VIEW").is_some() {
                     eprintln!("{screen}");
                 }
             }
@@ -1363,6 +1387,115 @@ mod tests {
         let mut ui = Ui::default();
         key(KeyCode::Char('6'), &mut ui, &s, &History::default());
         assert_eq!(ui.tab, Tab::Memory);
+    }
+
+    /// The four models of this server's configuration, with their real ids
+    /// (17 to 44 columns); the last is not loaded.
+    fn four_models() -> Snapshot {
+        let mut s = two_models();
+        let gib = 1024u64.pow(3);
+        s.models = 4;
+        s.model = "deepseek-v4.1-flash".into();
+        s.reserve_gib = 5.0;
+        s.memory.footprint = 75 * gib;
+        s.memory.free = 25 * gib;
+        s.memory.file = 12 * gib;
+        let m = |model: &str, weights, experts, kv, sessions| ModelMemory {
+            model: model.into(),
+            weights,
+            experts,
+            workspace: if weights > 0 { gib / 10 } else { 0 },
+            kv,
+            kv_committed: kv,
+            sessions,
+        };
+        s.model_memory = vec![
+            m(
+                "deepseek-v4.1-flash",
+                7 * gib + gib / 5,
+                40 * gib,
+                gib / 16,
+                3,
+            ),
+            m("qwen3.8-27b-nvfp4", 15 * gib, 0, gib / 2, 1),
+            m("qwen3.8-flash-next-fp4-local", 4 * gib, 6 * gib, gib / 5, 2),
+            m("nvidia-nemotron-3.5-transcribe-30b-a4b-nvfp4", 0, 0, 0, 0),
+        ];
+        s
+    }
+
+    #[test]
+    fn four_long_model_ids_keep_their_sizes_and_sessions() {
+        let s = four_models();
+        let ids: Vec<&str> = s.model_memory.iter().map(|m| m.model.as_str()).collect();
+        for w in [160, 120] {
+            let mut ui = Ui {
+                tab: Tab::Memory,
+                ..Ui::default()
+            };
+            let mut b = Buffer::empty(Rect::new(0, 0, w, 40));
+            draw_screen(&mut b, &s, &History::default(), &mut ui, "myds4", &[]);
+            let screen = all(&b);
+            // A long name gives way to its model's size; the parts too small
+            // for their sizes follow on the model's first row. The reserve's
+            // share of free memory is marked.
+            for size in ["47.4 GiB", "15.6 GiB", "10.3 GiB", "KV 0.06 GiB", "5.0 GiB"] {
+                assert!(screen.contains(size), "{w} columns, {size}: {screen}");
+            }
+            assert!(screen.contains("3 of 4 in memory"), "{screen}");
+            // every model's sessions in the KV tab's rows of models
+            ui.tab = Tab::Kv;
+            let mut b = Buffer::empty(Rect::new(0, 0, w, 40));
+            draw_screen(&mut b, &s, &History::default(), &mut ui, "myds4", &[]);
+            let screen = all(&b);
+            let rows: String = screen.lines().skip(3).take(3).collect();
+            for id in &ids {
+                assert!(
+                    rows.contains(&format!("{id}  ")),
+                    "{w} columns, {id}: {screen}"
+                );
+            }
+            assert!(rows.contains("3 sessions · 0.06 GiB"), "{screen}");
+            if std::env::var_os("MYDS4_PRINT_MEMORY_VIEW").is_some() {
+                eprintln!("{screen}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_kv_tab_lists_every_models_sessions_and_a_click_shows_another() {
+        let s = two_models();
+        let mut ui = Ui {
+            tab: Tab::Kv,
+            ..Ui::default()
+        };
+        let mut b = Buffer::empty(Rect::new(0, 0, 160, 46));
+        let title = "myds4 · 127.0.0.1:8008 · 2 models";
+        draw_screen(&mut b, &s, &History::default(), &mut ui, title, &[]);
+        let screen = all(&b);
+        let lines: Vec<&str> = screen.lines().collect();
+        assert!(lines[0].contains("2 models · showing DeepSeek"), "{screen}");
+        // the tab's first row: every model with its sessions and KV
+        assert!(
+            lines[3].contains("DeepSeek  2 sessions · 1.00 GiB")
+                && lines[3].contains("Qwen  1 session · 2.00 GiB"),
+            "{screen}"
+        );
+        assert!(screen.contains("n next model"), "{screen}");
+        // a click on Qwen shows Qwen's sessions in the same tab
+        let hit = *ui
+            .hits
+            .iter()
+            .find(|h| h.target == Target::Model(1))
+            .expect("Qwen's place in the row");
+        let ev = Event::Mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.x0,
+            row: hit.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(handle(&ev, &mut ui, &s, &History::default()), Asked::Model);
+        assert_eq!((ui.model, ui.tab), (1, Tab::Kv));
     }
 
     #[test]

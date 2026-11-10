@@ -154,7 +154,8 @@ draws and the server's exit. Nothing but the interface may write to the
 terminal while it is up: the engine's lines, such as a model's load, must
 reach the Log tab instead, and the title and tabs must stay on the top rows.
 Its terminal emulator scrolls, as a terminal does, when a line ends on the
-bottom row.
+bottom row. It prints every tab's screen when a check fails, or when
+`MYDS4_PRINT_TABS` is set.
 
 Set `MYDS4_FLASH` for Flash-Next's image and conversation-reuse check.
 Set `MYDS4_NEMOTRON` and `MYDS4_DFLASH` for Transcribe's shared-memory

@@ -3,7 +3,7 @@
 //! terminal would. While a request decodes, the test presses the tabs' keys,
 //! scrolls a node's text with the wheel and clicks a tab, and checks what each
 //! tab draws: the expert map's request, the KV tree and a node's text, the
-//! last minute, log and memory tiles; then q, and the server's exit. The
+//! last minute, log and memory map; then q, and the server's exit. The
 //! engine's own lines, such as the model's load, belong in the log: nothing
 //! else reaches the terminal while the view is up, and on every tab the title
 //! and the tabs stay on the top rows.
@@ -11,6 +11,7 @@
 //! It runs only when MYDS4_CHECKPOINT (the checkpoint directory) and
 //! MYDS4_EXPERTS (a GGUF file) are set; MYDS4_SERVER picks the server
 //! (default build/myds4-server). It loads the model once (one model process).
+//! It prints every screen when a check fails, or when MYDS4_PRINT_TABS is set.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -273,8 +274,17 @@ fn the_live_view_draws_every_tab_with_a_model() {
             tabs["log"].contains("dense weights"),
         ),
         (
-            "the shared memory budget and tile",
-            tabs["memory"].contains("Shared KV budget") && tabs["memory"].contains("GiB tracked"),
+            "the memory map: the model's rectangle under its name and size, its experts",
+            {
+                // below the tab's two header rows and a blank one
+                let map: Vec<&str> = tabs["memory"].lines().skip(6).collect();
+                map.iter()
+                    .any(|l| l.starts_with(" deepseek-v4.1-flash ") && l.contains(" GiB"))
+                    && map
+                        .iter()
+                        .any(|l| l.contains(" experts ") && l.contains(" GiB"))
+                    && tabs["memory"].contains("GiB, shared")
+            },
         ),
         ("the server's exit status 0", status.success()),
     ];
@@ -282,7 +292,8 @@ fn the_live_view_draws_every_tab_with_a_model() {
     for (name, ok) in &checks {
         println!("{} {name}", if *ok { "ok  " } else { "FAIL" });
     }
-    if !failed.is_empty() {
+    // every screen when a check fails, or when MYDS4_PRINT_TABS asks for them
+    if !failed.is_empty() || std::env::var_os("MYDS4_PRINT_TABS").is_some() {
         for (name, _, _) in steps {
             println!("--- the screen after {name}'s keys:\n{}", tabs[name]);
         }

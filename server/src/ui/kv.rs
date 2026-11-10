@@ -7,9 +7,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::frame::{Hit, NodeKey, Target, Ui, label, strong, text};
+use super::frame::{Hit, NodeKey, Target, Ui, label, strong, tab_row, text};
 use super::theme::{Rgb, c, get, mix};
-use super::{Node, Snapshot, color, count, duration, pct};
+use super::{GIB, Node, Snapshot, color, count, duration, pct};
 
 /// A node's place in the drawing.
 pub struct Place {
@@ -210,7 +210,58 @@ fn request_of(s: &Snapshot, session: u64) -> Option<u64> {
         .map(|r| r.number)
 }
 
+/// With several models, every model's sessions in rows at the top, the model
+/// shown on the accent; a click on another shows it. Returns the rows used.
+fn models(buf: &mut Buffer, area: Rect, s: &Snapshot, ui: &mut Ui) -> u16 {
+    if s.models < 2 {
+        return 0;
+    }
+    let mut rows: Vec<Vec<(Line<'static>, Target, bool)>> = vec![Vec::new()];
+    let mut x = area.x + 1;
+    for (i, m) in s.model_memory.iter().enumerate() {
+        let sessions = match m.sessions {
+            0 => "no sessions".to_string(),
+            1 => "1 session".to_string(),
+            n => format!("{n} sessions"),
+        };
+        let line = Line::from(vec![
+            strong(format!(" {}", m.model)),
+            label(format!(
+                "  {sessions} · {:.2} GiB ",
+                m.kv_committed as f64 / GIB
+            )),
+        ]);
+        let w = line.width() as u16 + 2;
+        if x + w > area.right() && rows.last().is_some_and(|r| !r.is_empty()) {
+            rows.push(Vec::new());
+            x = area.x + 1;
+        }
+        x += w;
+        if let Some(row) = rows.last_mut() {
+            row.push((line, Target::Model(i), i == ui.model));
+        }
+    }
+    let used = (rows.len() as u16).min(area.height / 2);
+    for (r, row) in rows.into_iter().take(used as usize).enumerate() {
+        tab_row(
+            buf,
+            area.x + 1,
+            area.y + r as u16,
+            area.right(),
+            row,
+            &mut ui.hits,
+        );
+    }
+    used
+}
+
 pub fn draw(buf: &mut Buffer, area: Rect, s: &Snapshot, ui: &mut Ui) {
+    let used = models(buf, area, s, ui);
+    let area = Rect {
+        y: area.y + used,
+        height: area.height - used,
+        ..area
+    };
     let t = get();
     let k = &s.kinds;
     let tot = &s.totals;

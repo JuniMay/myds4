@@ -784,14 +784,11 @@ fn main() {
             format,
         });
     }
-    let title = format!(
-        "myds4 · {host}:{port} · {}",
-        served_models
-            .iter()
-            .map(|m| m.id.as_str())
-            .collect::<Vec<_>>()
-            .join(" · ")
-    );
+    // the view names the model it shows; with several, the KV tab lists them
+    let title = match served_models.as_slice() {
+        [one] => format!("myds4 · {host}:{port} · {}", one.id),
+        all => format!("myds4 · {host}:{port} · {} models", all.len()),
+    };
     let live = if tui {
         ui::start(title, a.server.tui_theme)
     } else {

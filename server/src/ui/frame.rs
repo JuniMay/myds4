@@ -36,6 +36,8 @@ pub enum Target {
     Node(usize),
     /// A request of the expert map.
     Request(u64),
+    /// A model in the KV tab's row of models: its index among the worker's.
+    Model(usize),
 }
 
 /// A place a click acts on: columns x0..x1 of row y.
@@ -139,8 +141,16 @@ pub fn strong(s: impl Into<String>) -> Span<'static> {
     Span::styled(s.into(), Style::new().add_modifier(Modifier::BOLD))
 }
 
-/// Draws the chrome; returns the area left for the tab.
-pub fn draw(buf: &mut Buffer, area: Rect, title: &str, state: Line<'static>, ui: &mut Ui) -> Rect {
+/// Draws the chrome for a server of `models` models; returns the area left
+/// for the tab.
+pub fn draw(
+    buf: &mut Buffer,
+    area: Rect,
+    title: &str,
+    state: Line<'static>,
+    models: usize,
+    ui: &mut Ui,
+) -> Rect {
     if area.height < 5 || area.width < 20 {
         return Rect { height: 0, ..area };
     }
@@ -186,7 +196,7 @@ pub fn draw(buf: &mut Buffer, area: Rect, title: &str, state: Line<'static>, ui:
     buf.set_string(area.x, area.y + 2, "─".repeat(w as usize), color(t.rule));
     // the keys
     let mut spans = vec![text(" ")];
-    for (k, what) in keys(ui) {
+    for (k, what) in keys(ui, models) {
         spans.extend([strong(k), text(" "), label(what), text("   ")]);
     }
     buf.set_line(
@@ -243,7 +253,7 @@ pub fn tab_row(
     }
 }
 
-fn keys(ui: &Ui) -> Vec<(&'static str, &'static str)> {
+fn keys(ui: &Ui, models: usize) -> Vec<(&'static str, &'static str)> {
     let mut k = vec![("1–6", "tabs")];
     match ui.tab {
         Tab::Kv if ui.text.is_some() => k.extend([
@@ -256,6 +266,9 @@ fn keys(ui: &Ui) -> Vec<(&'static str, &'static str)> {
         Tab::Experts => k.extend([("[ ] or click", "request")]),
         Tab::Log => k.extend([("↑↓ PgUp PgDn", "scroll"), ("Home End", "oldest, newest")]),
         _ => {}
+    }
+    if models > 1 {
+        k.push(("n", "next model"));
     }
     k.push((
         "m",

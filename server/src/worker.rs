@@ -518,6 +518,7 @@ fn memory_models(s: &Shared) -> Vec<Value> {
             let c = st.engine;
             json!({"model": m.served.id, "weights": c.dense_bytes, "experts": c.cache_bytes,
                "workspace": c.model_workspace, "kv": st.kv_allocated, "kv_committed": st.kv_bytes,
+               "sessions": st.states.len(),
                "tracked": c.dense_bytes + c.cache_bytes + c.model_workspace + st.kv_allocated})
         })
         .collect()
