@@ -1158,6 +1158,8 @@ static int routed(FlashLayer *y, int n) {
     feed_forward(y->experts + e, &f.gathered, &out, count, 1);
   }
   routed_sum(n);
+  gpu_commit();  // the GPU starts the experts while the next layer's work is encoded
+  gpu_begin();
   return 1;
 }
 static void add_stats(CacheStats *to, CacheStats before, CacheStats after) {

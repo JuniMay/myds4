@@ -108,7 +108,9 @@ while a layer's own misses are being read. The next layer's routing then
 demotes the read-aheads it did not choose, so that they are evicted first.
 A wrong prediction costs a read, never a result. A pass whose rows choose
 at least as many experts as a layer has (a prompt of 52 rows or more)
-needs nearly every expert and reads nothing ahead.
+needs nearly every expert and reads nothing ahead. Once a layer's expert
+work is encoded, Flash-Next commits it, so that the GPU runs it while the
+CPU encodes the next layer's work.
 
 Every family with routed experts records, for each row of its latest
 decoding pass, the experts chosen in each layer with routed experts and
