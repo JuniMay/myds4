@@ -25,11 +25,11 @@ int main(void) {
   int checks = 0, failures = 0;
 #define CHECK(x) do { checks++; if (!(x)) failures++, fprintf(stderr, "FAIL: %s\n", #x); } while (0)
   Slot a = {0}, b = {0};
-  Slot *slots[] = {&a, &b};
+  Slot *pair[] = {&a, &b};
   for (int i = 0; i < 2; i++) {
-    slots[i]->loading = dispatch_group_create();
-    dispatch_group_enter(slots[i]->loading);
-    atomic_store(&slots[i]->unfinished, 1);
+    pair[i]->loading = dispatch_group_create();
+    dispatch_group_enter(pair[i]->loading);
+    atomic_store(&pair[i]->unfinished, 1);
   }
   uint64_t epoch = cache_read_epoch();
   pthread_t thread;

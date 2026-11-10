@@ -17,12 +17,12 @@ static void check_prefetch(const char *state, int has_group, int pending) {
   const int layer = 0, expert = 7;
   Slot slot = {.layer = layer, .expert = expert, .prev = -1, .next = -1, .prefetched = 1, .mapped = 1, .npiece = 1};
   double slot_score = 0;
-  slots = &slot;
-  score = &slot_score;
-  head = tail = 0;
-  token = 1;
-  memset(where, 0xff, sizeof where);
-  where[layer][expert] = 0;
+  st->slots = &slot;
+  st->score = &slot_score;
+  st->head = st->tail = 0;
+  st->token = 1;
+  memset(st->where, 0xff, sizeof st->where);
+  st->where[layer][expert] = 0;
   memset(&cache_stats, 0, sizeof cache_stats);
   // The read was claimed already. cache_request must not launch any I/O.
   atomic_store(&slot.taken[0], 1);
@@ -54,8 +54,8 @@ static void check_prefetch(const char *state, int has_group, int pending) {
   expect(state, "missing expert has no slot", cache_slot(layer, expert + 1), 0);
   expect(state, "missing expert is not ready", cache_ready(layer, expert + 1), 0);
   expect(state, "missing expert classification", cache_where(layer, expert + 1), 0);
-  slots = NULL;
-  score = NULL;
+  st->slots = NULL;
+  st->score = NULL;
 }
 
 int main(void) {

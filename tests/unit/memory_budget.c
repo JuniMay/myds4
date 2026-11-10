@@ -210,16 +210,16 @@ static int small_buffers_do_not_take_experts_back_each_pass(void) {
   memory_slot_init(work, deepseek, NULL, "model workspace", NULL, NULL);
   work->automatic = 1;
   enum { MOST = 2048 };
-  Entry **slots = calloc(MOST, sizeof *slots);
+  Entry **grown = calloc(MOST, sizeof *grown);
   int n = 0, taken = 0;
-  while (n < MOST && (slots[n] = grown_slot(deepseek, 64ull << 20))) n++;
+  while (n < MOST && (grown[n] = grown_slot(deepseek, 64ull << 20))) n++;
   for (int pass = 0; pass < 20; pass++) {
     MemorySlot *before = memory_scope(work);
     memory_host_free(memory_host_alloc(64, 0));
     memory_scope(before);
-    if (n < MOST && (slots[n] = grown_slot(deepseek, 64ull << 20))) n++;
+    if (n < MOST && (grown[n] = grown_slot(deepseek, 64ull << 20))) n++;
   }
-  for (int i = 0; i < n; i++) taken += slots[i]->evicted;
+  for (int i = 0; i < n; i++) taken += grown[i]->evicted;
   fprintf(stderr, "  20 passes with small buffers at the reserve: %d expert slots taken back (at most 1)\n", taken);
   return taken <= 1;
 }

@@ -58,24 +58,24 @@ static void child_case(int kind) {
   vm_fixture.free_count = (1ull << 30) / vm_page_size;
   vm_fixture.external_page_count = (20ull << 30) / vm_page_size;
   vm_fixture.speculative_count = 0;
-  nslots = cap = max_slots - 256;
-  if (kind == 7) nslots = 0;
-  if (kind == 8) nslots = cap = 2 * EXPERTS;
+  st->nslots = st->cap = st->max_slots - 256;
+  if (kind == 7) st->nslots = 0;
+  if (kind == 8) st->nslots = st->cap = 2 * EXPERTS;
   if (kind == 9 || kind == 10) vm_fixture.external_page_count = (8ull << 30) / vm_page_size;  // within the kept share
   if (kind == 10) vm_fixture.free_count = (15ull << 28) / vm_page_size;  // 3.75 GiB: 0.25 GiB short of the reserve
-  int before = cap;
+  int before = st->cap;
   if (kind == 2) pressure_fixture = 2;
   resize(-1);
   if (kind == 10) {  // the slots that restore the reserve, not a sixteenth of the cache
-    int expected = before - (int)(((4ull << 30) - (15ull << 28)) / SLOT_SIZE) - 1;
+    int expected = before - (int)(((4ull << 30) - (15ull << 28)) / st->SLOT_SIZE) - 1;
     fprintf(stderr, "cache reproduction %d: 0.25 GiB short of the reserve, no pressure: limit %d -> %d (expected %d)\n",
-            kind, before, cap, expected);
-    _exit(cap == expected ? 0 : 1);
+            kind, before, st->cap, expected);
+    _exit(st->cap == expected ? 0 : 1);
   }
-  if (kind == 0) _exit(cap == before ? 0 : 1);
+  if (kind == 0) _exit(st->cap == before ? 0 : 1);
   if (kind == 1) {
     for (int i = 0; i < 32; i++) resize(-1);
-    _exit(cap > before && cap <= max_slots ? 0 : 1);
+    _exit(st->cap > before && st->cap <= st->max_slots ? 0 : 1);
   }
   if (kind == 3) vm_fixture.compressions++, compressed_fixture = 128ull << 20;
   if (kind == 4) vm_fixture.swapouts++;
@@ -86,26 +86,26 @@ static void child_case(int kind) {
       vm_fixture.compressions++, compressed_fixture += 128ull << 20;
       resize(-1);
     }
-    _exit(cap > before && cap <= max_slots ? 0 : 1);
+    _exit(st->cap > before && st->cap <= st->max_slots ? 0 : 1);
   }
   if (kind >= 3) resize(-1);
   if (kind == 6 || kind == 7) {
     fprintf(stderr, "cache reproduction %d: limit %d -> %d, allocated %d, swapouts %llu, wakeups %llu\n",
-            kind, before, cap, nslots, (unsigned long long)vm_fixture.swapouts, (unsigned long long)wakeups_fixture);
-    _exit(cap == before ? 0 : 1);
+            kind, before, st->cap, st->nslots, (unsigned long long)vm_fixture.swapouts, (unsigned long long)wakeups_fixture);
+    _exit(st->cap == before ? 0 : 1);
   }
   if (kind == 8) {
     for (int i = 0; i < 32; i++) resize(-1);
-    fprintf(stderr, "cache reproduction %d: limit %d -> %d after 32 calm calls, allocated %d\n", kind, before, cap, nslots);
-    _exit(cap > before && cap <= max_slots ? 0 : 1);
+    fprintf(stderr, "cache reproduction %d: limit %d -> %d after 32 calm calls, allocated %d\n", kind, before, st->cap, st->nslots);
+    _exit(st->cap > before && st->cap <= st->max_slots ? 0 : 1);
   }
-  if (kind == 3) _exit(cap == before ? 0 : 1);
+  if (kind == 3) _exit(st->cap == before ? 0 : 1);
   if (kind == 9) {
     fprintf(stderr, "cache reproduction %d: 1 GiB free and 8 GiB of file cache within a 10 GiB kept share: limit %d -> %d\n",
-            kind, before, cap);
-    _exit(cap < before ? 0 : 1);
+            kind, before, st->cap);
+    _exit(st->cap < before ? 0 : 1);
   }
-  _exit(cap < before ? 0 : 1);
+  _exit(st->cap < before ? 0 : 1);
 }
 // macOS counts a slot's pages as in use only once a read writes them, so the
 // cache reports the charged bytes no completed load has written
@@ -115,8 +115,8 @@ static void reads(Slot *s, int from, int to) {  // a reader completes pieces fro
 }
 static void unwritten_checks(void) {
   for (int e = 0; e < EXPERTS; e++) expert_span[1][e][0].len = EXPERT_W / 2;
-  Slot *s = &slots[0];
-  uint64_t whole = gpu_allocation_size(SLOT_SIZE);
+  Slot *s = &st->slots[0];
+  uint64_t whole = gpu_allocation_size(st->SLOT_SIZE);
   s->b = (Buf){.obj = s, .ptr = malloc(whole), .allocated = whole};  // a new buffer, never touched
   s->layer = 1, s->expert = 0;
   start(0, 0);
@@ -165,8 +165,8 @@ int main(void) {
   cache_reserve(4);
   cache_init(NULL, 56ull << 30, LAYERS);
   expect("initial capacity uses file cache beyond the kept share to fit the requested 56 GiB",
-         cap == (int)((56ull << 30) / SLOT_SIZE));
-  expect("initial capacity respects the configured upper bound", cap <= max_slots);
+         st->cap == (int)((56ull << 30) / st->SLOT_SIZE));
+  expect("initial capacity respects the configured upper bound", st->cap <= st->max_slots);
   const char *names[] = {"low free pages with file cache beyond the kept share do not shrink",
                          "calm growth uses file cache beyond the kept share",
                          "actual memory pressure still shrinks", "compression alone does not shrink", "new swapping still shrinks",
@@ -182,7 +182,7 @@ int main(void) {
     expect(names[kind], WIFEXITED(status) && WEXITSTATUS(status) == 0);
   }
   unwritten_checks();
-  free(slots), free(score), free(free_list);
+  free(st->slots), free(st->score), free(st->free_list);
   printf("cache memory policy: %d/%d CPU checks passed\n", checks - failures, checks);
   return failures != 0;
 }

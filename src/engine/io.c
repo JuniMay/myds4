@@ -42,7 +42,6 @@
 #define PIECE (2ull << 20)
 #define GiB (1024.0 * 1024 * 1024)
 #define REGION(len) (((len) + 3 * SECTOR - 1) / SECTOR * SECTOR)  // a span's aligned cover, at most
-static uint64_t SLOT_SIZE;  // the largest expert in use
 
 typedef struct { int fd; uint64_t off, len; uint8_t *dst; } Piece;
 
@@ -268,21 +267,10 @@ typedef struct {
   MemorySlot memory;
 } Slot;
 
-static uint64_t token;
-
 FileSpan expert_span[CACHE_LAYERS][EXPERTS][3];
 int expert_spans[CACHE_LAYERS];
 CacheStats cache_stats;
-static Slot *slots;
-static int pass_layer = -1;
-static MemorySlot *cache_backbone;
-static int cache_busy = 1;
-static int minimum_slots = 2 * EXPERTS;
-static double last_pool_growth;
-static int16_t where[CACHE_LAYERS][EXPERTS];
-static int nslots, cap, max_slots, *free_list, nfree, npinned;
-static int nmapped, mcap;  // slots mapped for the GPU, and how many may be
-static uint64_t reserve, pinned_bytes;
+static uint64_t reserve;  // every store keeps it available to other programs
 
 // This program's memory is what other programs leave, less the reserve kept
 // available to them: model memory and KV follow the available memory
@@ -297,9 +285,6 @@ void memory_configure(double model_gib, double reserve_gib) {
 }
 
 void cache_reserve(double gib) { reserve = (uint64_t)((gib > 0 ? gib : CACHE_RESERVE_DEFAULT) * GiB); }
-static int draft_capacity = DRAFT_EXPERTS;
-static uint64_t draft_clock, draft_touch_clock;
-static uint64_t draft_age[DRAFTS * DRAFT_EXPERTS];  // recency within the separate pools
 
 // Observation metadata is separate from the eviction policy's prefetched flag.
 // The model thread owns it until a read group finishes; readers update only
@@ -321,44 +306,101 @@ typedef struct {
   _Atomic uint64_t prefetch_read_bytes, demand_read_bytes;
   _Atomic uint64_t io_pieces[3], queue_ns[3], service_ns[3]; // demand, background, promoted
 } PrefetchStats;
-static int pf_enabled, pf_active, pf_phase, pf_rows, pf_issuer = PF_OTHER;
-static uint64_t pf_pass;
-static PrefetchLoad *pf_loads;
-static PrefetchStats pf_stats[PF_PHASES];
-static uint8_t pf_ghost[LAYERS][EXPERTS];
+// An expert cache's state: its slots, eviction order, readers and memory
+// policy. This file holds one store.
+#define READERS 4
+#define QUEUE (1u << 14)
+typedef struct ExpertStore {
+  uint64_t SLOT_SIZE;  // the largest expert in use
+  uint64_t token;
+  Slot *slots;
+  int pass_layer;
+  MemorySlot *cache_backbone;
+  int cache_busy;
+  int minimum_slots;
+  double last_pool_growth;
+  int16_t where[CACHE_LAYERS][EXPERTS];
+  int nslots, cap, max_slots, *free_list, nfree, npinned;
+  int nmapped, mcap;  // slots mapped for the GPU, and how many may be
+  uint64_t pinned_bytes;
+  int draft_capacity;
+  uint64_t draft_clock, draft_touch_clock;
+  uint64_t draft_age[DRAFTS * DRAFT_EXPERTS];  // recency within the separate pools
+  int pf_enabled, pf_active, pf_phase, pf_rows, pf_issuer;
+  uint64_t pf_pass;
+  PrefetchLoad *pf_loads;
+  PrefetchStats pf_stats[PF_PHASES];
+  uint8_t pf_ghost[LAYERS][EXPERTS];
+  // the eviction order (see the scores below)
+  int head, tail;
+  double weight;  // the current token's
+  double escore[CACHE_LAYERS * EXPERTS];  // per expert
+  double dscore[CACHE_LAYERS * EXPERTS];  // per expert: the part of escore that decoding's requests gave
+  double *score;  // per slot: its expert's score; INFINITY for a free slot, -INFINITY for an empty one
+  int retention_half_life, retention_read_cost;
+  double retention_growth;
+  double reload_cost[LAYERS * EXPERTS];
+  uint64_t pinned_slot_size;
+  int layout_ready;
+  // the readers' queue (see the prefetch reads below)
+  uint32_t queue[QUEUE], qhead, qtail;  // entries: slot << 4 | piece
+  pthread_mutex_t qlock;
+  pthread_cond_t qcond;
+  _Atomic int demand, prefetching;  // demand pieces, and prefetched slots, in flight
+  pthread_mutex_t progress_lock;
+  pthread_cond_t progress_cond;
+  _Atomic int progress_enabled;
+  uint64_t progress_epoch;
+  int serving;  // the layer cache_request makes resident: its experts used this token stay
+  unsigned held_references;
+  // resize's readings and clocks
+  uint64_t swapouts;
+  int calm, init;
+  double gave;  // when slots were last given back: their memory shows as free only later
+  double bad;   // last swap-out while the cache could release memory
+  int calm_map;
+  double unmapped;  // when the GPU's excess was last unmapped: the driver shows it about a second later
+} ExpertStore;
+static ExpertStore the_store = {
+    .pass_layer = -1, .cache_busy = 1, .minimum_slots = 2 * EXPERTS, .draft_capacity = DRAFT_EXPERTS,
+    .pf_issuer = PF_OTHER, .head = -1, .tail = -1, .weight = 1, .retention_half_life = CACHE_HALF_LIFE_DEFAULT,
+    .qlock = PTHREAD_MUTEX_INITIALIZER, .qcond = PTHREAD_COND_INITIALIZER,
+    .progress_lock = PTHREAD_MUTEX_INITIALIZER, .progress_cond = PTHREAD_COND_INITIALIZER,
+    .serving = -1, .bad = -1e9};
+static ExpertStore *const st = &the_store;
 static int slot_reading(int i);
 static uint64_t metrics_ns(void) { return (uint64_t)(now() * 1e9); }
 
 void cache_metrics_begin(int phase, int rows) {
-  if (!pf_enabled) return;
-  if (phase < 0 || phase >= PF_PHASES || rows < 1 || pf_pass == UINT64_MAX) die("invalid prefetch metric pass");
-  pf_phase = phase, pf_rows = rows, pf_active = 1, pf_pass++;
-  pf_stats[phase].passes++, pf_stats[phase].rows += rows;
+  if (!st->pf_enabled) return;
+  if (phase < 0 || phase >= PF_PHASES || rows < 1 || st->pf_pass == UINT64_MAX) die("invalid prefetch metric pass");
+  st->pf_phase = phase, st->pf_rows = rows, st->pf_active = 1, st->pf_pass++;
+  st->pf_stats[phase].passes++, st->pf_stats[phase].rows += rows;
 }
 
-void cache_metrics_end(void) { pf_active = 0; }
+void cache_metrics_end(void) { st->pf_active = 0; }
 
 void cache_observe_snapshot(int layer, CacheObservation *o) {
-  o->active = pf_enabled && pf_active && layer >= 0 && layer < LAYERS;
+  o->active = st->pf_enabled && st->pf_active && layer >= 0 && layer < LAYERS;
   if (!o->active) return;
-  o->layer = layer, o->phase = pf_phase, o->pass = pf_pass;
+  o->layer = layer, o->phase = st->pf_phase, o->pass = st->pf_pass;
   for (int e = 0; e < EXPERTS; e++) {
-    int i = where[layer][e];
+    int i = st->where[layer][e];
     o->state[e] = PF_ABSENT, o->first[e] = 0, o->completed[e] = 0;
-    o->ghost[e] = pf_ghost[layer][e];
+    o->ghost[e] = st->pf_ghost[layer][e];
     if (i < 0) continue;
-    PrefetchLoad *m = &pf_loads[i];
+    PrefetchLoad *m = &st->pf_loads[i];
     int pending = slot_reading(i);
     o->first[e] = m->tracked && m->origin_prefetch && !m->used;
     o->completed[e] = atomic_load_explicit(&m->completed, memory_order_relaxed);
     o->state[e] = pending ? (m->origin_prefetch ? PF_PENDING_PREFETCH : PF_PENDING_DEMAND)
-                         : o->first[e] && m->target_pass == pf_pass ? PF_FRESH_READY : PF_EXISTING_READY;
+                         : o->first[e] && m->target_pass == st->pf_pass ? PF_FRESH_READY : PF_EXISTING_READY;
   }
 }
 
 void cache_observe_routes(const CacheObservation *o, const int *ids, int rows, int stride, int served) {
   if (!o->active) return;
-  if (served < 0 || served > 1 || o->pass != pf_pass) die("invalid prefetch observation");
+  if (served < 0 || served > 1 || o->pass != st->pf_pass) die("invalid prefetch observation");
   uint8_t used[EXPERTS] = {0};
   for (int r = 0; r < rows; r++)
     for (int k = 0; k < TOPK; k++) {
@@ -366,20 +408,20 @@ void cache_observe_routes(const CacheObservation *o, const int *ids, int rows, i
       if (e < 0 || e >= EXPERTS) die("invalid expert in prefetch observation");
       used[e] = 1;
     }
-  PrefetchStats *s = &pf_stats[o->phase];
+  PrefetchStats *s = &st->pf_stats[o->phase];
   s->batches[served]++;
   for (int e = 0; e < EXPERTS; e++) {
     if (!used[e]) continue;
-    int state = o->state[e], i = where[o->layer][e];
+    int state = o->state[e], i = st->where[o->layer][e];
     s->states[served][state]++;
     for (int k = 0; k < expert_spans[o->layer]; k++) s->payload[served][state] += expert_span[o->layer][e][k].len;
     if (o->ghost[e]) {
       s->rerequests[served]++;
       s->absent_after_eviction[served] += state == PF_ABSENT;
-      if (served) pf_ghost[o->layer][e] = 0;
+      if (served) st->pf_ghost[o->layer][e] = 0;
     }
-    if (!served || !o->first[e] || i < 0 || pf_loads[i].used) continue;
-    PrefetchLoad *m = &pf_loads[i];
+    if (!served || !o->first[e] || i < 0 || st->pf_loads[i].used) continue;
+    PrefetchLoad *m = &st->pf_loads[i];
     m->used = 1;
     s->first_uses++;
     s->used_by_issuer[m->issuer]++;
@@ -400,27 +442,27 @@ void cache_observe_routes(const CacheObservation *o, const int *ids, int rows, i
 }
 
 static void metrics_start(int i, int urgent) {
-  if (!pf_enabled) return;
-  PrefetchLoad *m = &pf_loads[i];
-  m->target_pass = pf_pass, m->used = 0, m->origin_prefetch = !urgent;
-  m->phase = pf_phase, m->issuer = pf_issuer;
-  m->tracked = pf_active && slots[i].layer < LAYERS;
+  if (!st->pf_enabled) return;
+  PrefetchLoad *m = &st->pf_loads[i];
+  m->target_pass = st->pf_pass, m->used = 0, m->origin_prefetch = !urgent;
+  m->phase = st->pf_phase, m->issuer = st->pf_issuer;
+  m->tracked = st->pf_active && st->slots[i].layer < LAYERS;
   m->requested = 0;
   m->queued_ns = metrics_ns();
   atomic_store_explicit(&m->completed, 0, memory_order_relaxed);
   atomic_store_explicit(&m->first_io_ns, 0, memory_order_relaxed);
-  for (int k = 0; k < slots[i].npiece; k++) m->requested += slots[i].piece[k].len;
-  if (m->tracked && !urgent) pf_stats[m->phase].admissions[m->issuer]++;
+  for (int k = 0; k < st->slots[i].npiece; k++) m->requested += st->slots[i].piece[k].len;
+  if (m->tracked && !urgent) st->pf_stats[m->phase].admissions[m->issuer]++;
 }
 
 static uint64_t metrics_io_begin(Slot *slot, int urgent_worker) {
-  if (!pf_enabled) return 0;
-  PrefetchLoad *m = &pf_loads[slot - slots];
+  if (!st->pf_enabled) return 0;
+  PrefetchLoad *m = &st->pf_loads[slot - st->slots];
   if (!m->tracked) return 0;
   uint64_t began = metrics_ns(), zero = 0;
   atomic_compare_exchange_strong_explicit(&m->first_io_ns, &zero, began, memory_order_release, memory_order_relaxed);
   int kind = !m->origin_prefetch ? 0 : urgent_worker ? 2 : 1;
-  PrefetchStats *s = &pf_stats[m->phase];
+  PrefetchStats *s = &st->pf_stats[m->phase];
   atomic_fetch_add_explicit(&s->io_pieces[kind], 1, memory_order_relaxed);
   atomic_fetch_add_explicit(&s->queue_ns[kind], began - m->queued_ns, memory_order_relaxed);
   return began;
@@ -428,17 +470,17 @@ static uint64_t metrics_io_begin(Slot *slot, int urgent_worker) {
 
 static void metrics_io_end(Slot *slot, int urgent_worker, uint64_t began) {
   if (!began) return;
-  PrefetchLoad *m = &pf_loads[slot - slots];
+  PrefetchLoad *m = &st->pf_loads[slot - st->slots];
   int kind = !m->origin_prefetch ? 0 : urgent_worker ? 2 : 1;
-  atomic_fetch_add_explicit(&pf_stats[m->phase].service_ns[kind], metrics_ns() - began, memory_order_relaxed);
+  atomic_fetch_add_explicit(&st->pf_stats[m->phase].service_ns[kind], metrics_ns() - began, memory_order_relaxed);
 }
 
 static void metrics_piece_done(Slot *slot, uint64_t bytes) {
-  if (!pf_enabled) return;
-  PrefetchLoad *m = &pf_loads[slot - slots];
+  if (!st->pf_enabled) return;
+  PrefetchLoad *m = &st->pf_loads[slot - st->slots];
   atomic_fetch_add_explicit(&m->completed, bytes, memory_order_relaxed);
   if (m->tracked) {
-    PrefetchStats *s = &pf_stats[m->phase];
+    PrefetchStats *s = &st->pf_stats[m->phase];
     atomic_fetch_add_explicit(m->origin_prefetch ? &s->prefetch_read_bytes : &s->demand_read_bytes,
                               bytes, memory_order_relaxed);
   }
@@ -447,15 +489,15 @@ static void metrics_piece_done(Slot *slot, uint64_t bytes) {
 // Called only after cancel/finish joins all old readers, before reusing or
 // releasing the slot. Ghosts record observed rerequests, not baseline misses.
 static void metrics_retire(int i, int by_prefetch) {
-  if (!pf_enabled || slots[i].layer >= LAYERS || slots[i].expert < 0) return;
-  PrefetchLoad *m = &pf_loads[i];
-  if (by_prefetch && pf_active) {
-    pf_stats[pf_phase].prefetch_evictions++;
-    pf_ghost[slots[i].layer][slots[i].expert] = 1;
+  if (!st->pf_enabled || st->slots[i].layer >= LAYERS || st->slots[i].expert < 0) return;
+  PrefetchLoad *m = &st->pf_loads[i];
+  if (by_prefetch && st->pf_active) {
+    st->pf_stats[st->pf_phase].prefetch_evictions++;
+    st->pf_ghost[st->slots[i].layer][st->slots[i].expert] = 1;
   }
   if (m->tracked && m->origin_prefetch && !m->used) {
     uint64_t done = atomic_load_explicit(&m->completed, memory_order_relaxed);
-    PrefetchStats *s = &pf_stats[m->phase];
+    PrefetchStats *s = &st->pf_stats[m->phase];
     s->unused_removed++;
     s->unused_removed_bytes += done;
     s->unused_cancelled_bytes += m->requested > done ? m->requested - done : 0;
@@ -463,16 +505,16 @@ static void metrics_retire(int i, int by_prefetch) {
   m->tracked = 0;
 }
 
-void cache_draft_limit(int slots) {
-  if (slots && (slots < DRAFT_CACHE_MIN || slots > DRAFT_EXPERTS))
+void cache_draft_limit(int per_stage) {
+  if (per_stage && (per_stage < DRAFT_CACHE_MIN || per_stage > DRAFT_EXPERTS))
     die("draft cache needs %d to %d slots per stage", DRAFT_CACHE_MIN, DRAFT_EXPERTS);
-  draft_capacity = slots ? slots : DRAFT_EXPERTS;
+  st->draft_capacity = per_stage ? per_stage : DRAFT_EXPERTS;
 }
 
-int cache_draft_capacity(void) { return draft_capacity; }
+int cache_draft_capacity(void) { return st->draft_capacity; }
 
 static int draft_pool_count(int layers) {
-  return layers > LAYERS ? (layers - LAYERS) * draft_capacity : 0;
+  return layers > LAYERS ? (layers - LAYERS) * st->draft_capacity : 0;
 }
 // The driver counts a slot taken out of the residency set for about a second
 // more; the mapped slots leave this much room for those.
@@ -485,29 +527,21 @@ static int draft_pool_count(int layers) {
 // Optional read-cost weighting affects that priority, not the score history.
 // A recency list (head = most recently used) orders the slots for giving
 // slots back.
-static int head = -1, tail = -1;
-static double weight = 1;  // the current token's
-static double escore[CACHE_LAYERS * EXPERTS];  // per expert
-static double dscore[CACHE_LAYERS * EXPERTS];  // per expert: the part of escore that decoding's requests gave
-static double *score;  // per slot: its expert's score; INFINITY for a free slot, -INFINITY for an empty one
-static int retention_half_life = CACHE_HALF_LIFE_DEFAULT, retention_read_cost;
-static double retention_growth;
-static double reload_cost[LAYERS * EXPERTS];
 
 void cache_retention(int half_life, int read_cost) {
-  if (slots) die("cache retention must be set before cache_init");
+  if (st->slots) die("cache retention must be set before cache_init");
   if (half_life < 0 || half_life > CACHE_HALF_LIFE_MAX || (read_cost != 0 && read_cost != 1))
     die("invalid cache retention policy");
-  retention_half_life = half_life ? half_life : CACHE_HALF_LIFE_DEFAULT;
-  retention_read_cost = read_cost;
+  st->retention_half_life = half_life ? half_life : CACHE_HALF_LIFE_DEFAULT;
+  st->retention_read_cost = read_cost;
   // Keep the original constant expression for the default; cache other
   // ratios once instead of evaluating exp2 at every forward pass.
-  retention_growth = retention_half_life == CACHE_HALF_LIFE_DEFAULT ? exp2(1.0 / CACHE_HALF_LIFE_DEFAULT)
-                                                                  : exp2(1.0 / retention_half_life);
+  st->retention_growth = st->retention_half_life == CACHE_HALF_LIFE_DEFAULT ? exp2(1.0 / CACHE_HALF_LIFE_DEFAULT)
+                                                                  : exp2(1.0 / st->retention_half_life);
 }
 
 static void prepare_reload_cost(int layers) {
-  if (!retention_read_cost) return;
+  if (!st->retention_read_cost) return;
   for (int l = 0; l < layers && l < LAYERS; l++)
     for (int e = 0; e < EXPERTS; e++) {
       uint64_t bytes = 0;
@@ -516,85 +550,85 @@ static void prepare_reload_cost(int layers) {
         uint64_t a = p->off & ~(SECTOR - 1), end = (p->off + p->len + SECTOR - 1) & ~(SECTOR - 1);
         bytes += end - a;
       }
-      if (!bytes || bytes > SLOT_SIZE) die("expert read footprint does not fit its cache slot");
-      reload_cost[l * EXPERTS + e] = (double)bytes / SLOT_SIZE;
+      if (!bytes || bytes > st->SLOT_SIZE) die("expert read footprint does not fit its cache slot");
+      st->reload_cost[l * EXPERTS + e] = (double)bytes / st->SLOT_SIZE;
     }
 }
 
 static double eviction_priority(int i) {
-  if (!retention_read_cost || !isfinite(score[i]) || slots[i].expert < 0 ||
-      slots[i].layer < 0 || slots[i].layer >= LAYERS) return score[i];
-  return score[i] * reload_cost[slots[i].layer * EXPERTS + slots[i].expert];
+  if (!st->retention_read_cost || !isfinite(st->score[i]) || st->slots[i].expert < 0 ||
+      st->slots[i].layer < 0 || st->slots[i].layer >= LAYERS) return st->score[i];
+  return st->score[i] * st->reload_cost[st->slots[i].layer * EXPERTS + st->slots[i].expert];
 }
 
 static void advance_score_clock(void) {
-  token++;
-  if ((weight *= retention_growth) > 0x1p500) {  // rescale raw history and resident scores together
-    for (int k = 0; k < CACHE_LAYERS * EXPERTS; k++) escore[k] /= weight, dscore[k] /= weight;
-    for (int i = 0; i < max_slots + npinned; i++) score[i] /= weight;
-    weight = 1;
+  st->token++;
+  if ((st->weight *= st->retention_growth) > 0x1p500) {  // rescale raw history and resident scores together
+    for (int k = 0; k < CACHE_LAYERS * EXPERTS; k++) st->escore[k] /= st->weight, st->dscore[k] /= st->weight;
+    for (int i = 0; i < st->max_slots + st->npinned; i++) st->score[i] /= st->weight;
+    st->weight = 1;
   }
 }
 
 static void unlink_slot(int i) {
-  Slot *s = &slots[i];
-  if (s->prev >= 0) slots[s->prev].next = s->next; else head = s->next;
-  if (s->next >= 0) slots[s->next].prev = s->prev; else tail = s->prev;
+  Slot *s = &st->slots[i];
+  if (s->prev >= 0) st->slots[s->prev].next = s->next; else st->head = s->next;
+  if (s->next >= 0) st->slots[s->next].prev = s->prev; else st->tail = s->prev;
 }
 
 static void push_back(int i) {
-  slots[i].next = -1;
-  slots[i].prev = tail;
-  if (tail >= 0) slots[tail].next = i;
-  tail = i;
-  if (head < 0) head = i;
+  st->slots[i].next = -1;
+  st->slots[i].prev = st->tail;
+  if (st->tail >= 0) st->slots[st->tail].next = i;
+  st->tail = i;
+  if (st->head < 0) st->head = i;
 }
 
 static void push_front(int i) {
-  slots[i].prev = -1;
-  slots[i].next = head;
-  if (head >= 0) slots[head].prev = i;
-  head = i;
-  if (tail < 0) tail = i;
+  st->slots[i].prev = -1;
+  st->slots[i].next = st->head;
+  if (st->head >= 0) st->slots[st->head].prev = i;
+  st->head = i;
+  if (st->tail < 0) st->tail = i;
 }
 
 static void cancel(int i), start_readers(void), start(int i, int urgent), finish(int i), map_slot(int i);
 
 static void release(int i) {
-  if (slots[i].holds) die("cannot release an expert held by a runahead job");
+  if (st->slots[i].holds) die("cannot release an expert held by a runahead job");
   cancel(i);
   metrics_retire(i, 0);
   unlink_slot(i);
-  if (slots[i].expert >= 0) where[slots[i].layer][slots[i].expert] = -1;
-  if (slots[i].mapped) nmapped--, slots[i].mapped = 0;
-  gpu_free(&slots[i].b);
-  score[i] = INFINITY;
-  free_list[nfree++] = i;
-  nslots--;
+  if (st->slots[i].expert >= 0) st->where[st->slots[i].layer][st->slots[i].expert] = -1;
+  if (st->slots[i].mapped) st->nmapped--, st->slots[i].mapped = 0;
+  gpu_free(&st->slots[i].b);
+  st->score[i] = INFINITY;
+  st->free_list[st->nfree++] = i;
+  st->nslots--;
   cache_stats.evictions++;
 }
 
-void cache_memory(MemorySlot *backbone) { cache_backbone = backbone; }
-void cache_active(int active) { cache_busy = !!active; }
+void cache_memory(MemorySlot *backbone) { st->cache_backbone = backbone; }
+void cache_active(int active) { st->cache_busy = !!active; }
 void cache_working_rows(int rows) {
   int experts = rows * TOPK < EXPERTS ? rows * TOPK : EXPERTS;
-  minimum_slots = 2 * experts;
+  st->minimum_slots = 2 * experts;
 }
 
 static int pool_can_evict(void *context) {
   Slot *slot = context;
   if (!slot->b.obj || slot->holds) return 0;
-  if (!cache_busy) return 1;
-  if (slot->pinned || slot->used == token) return 0;
-  return pass_layer < 0 || slot->layer < pass_layer - 1;
+  if (!st->cache_busy) return 1;
+  if (slot->pinned || slot->used == st->token) return 0;
+  return st->pass_layer < 0 || slot->layer < st->pass_layer - 1;
 }
 
 static void pool_evict(void *context) {
   Slot *slot = context;
-  int index = (int)(slot - slots);
+  int index = (int)(slot - st->slots);
   if (slot->pinned) {
     cancel(index);
-    if (slot->expert >= 0) where[slot->layer][slot->expert] = -1;
+    if (slot->expert >= 0) st->where[slot->layer][slot->expert] = -1;
     slot->expert = -1;
     gpu_free(&slot->b);
   } else release(index);
@@ -603,8 +637,8 @@ static void pool_evict(void *context) {
 }
 
 static Buf pool_buffer(int index, size_t bytes, int mapped) {
-  if (!cache_backbone) return mapped ? gpu_alloc(bytes) : gpu_new(bytes);
-  MemorySlot *previous = memory_scope(&slots[index].memory);
+  if (!st->cache_backbone) return mapped ? gpu_alloc(bytes) : gpu_new(bytes);
+  MemorySlot *previous = memory_scope(&st->slots[index].memory);
   // Slot growth borrows free budget. Reuse the native victim if it cannot
   // grow; a routing prediction never evicts another model's weight group.
   Buf buffer = gpu_try_new(bytes, MEMORY_SPECULATIVE);
@@ -613,10 +647,8 @@ static Buf pool_buffer(int index, size_t bytes, int mapped) {
   return buffer;
 }
 
-static uint64_t pinned_slot_size;
-static int layout_ready;
 uint64_t cache_required(TensorIndex *index, int layers) {
-  if (!layout_ready) {
+  if (!st->layout_ready) {
   for (int l = 0; l < CACHE_LAYERS; l++)
     for (int e = 0; !expert_spans[l] && e < (l < LAYERS ? EXPERTS : DRAFT_EXPERTS); e++) {
       Tensor w = l < LAYERS ? st_get(index, "layers.%d.ffn.experts.%d.w1.weight", l, e)
@@ -633,104 +665,104 @@ uint64_t cache_required(TensorIndex *index, int layers) {
     for (int k = 0; k < expert_spans[l]; k++)
       size += REGION(expert_span[l][0][k].len), pieces += (REGION(expert_span[l][0][k].len) + PIECE - 1) / PIECE;
     if (pieces > 16) die("layer %d's experts take %llu reads of %llu MiB, more than a slot tracks", l, pieces, PIECE >> 20);
-    uint64_t *at = l < LAYERS ? &SLOT_SIZE : &pin_size;
+    uint64_t *at = l < LAYERS ? &st->SLOT_SIZE : &pin_size;
     if (size > *at) *at = size;
   }
   prepare_reload_cost(layers);
-  npinned = draft_pool_count(layers);
-  pinned_bytes = npinned * pin_size;
-    pinned_slot_size = pin_size;
-    layout_ready = 1;
+  st->npinned = draft_pool_count(layers);
+  st->pinned_bytes = st->npinned * pin_size;
+    st->pinned_slot_size = pin_size;
+    st->layout_ready = 1;
   }
-  return minimum_slots * gpu_allocation_size(SLOT_SIZE) + npinned * gpu_allocation_size(pinned_slot_size);
+  return st->minimum_slots * gpu_allocation_size(st->SLOT_SIZE) + st->npinned * gpu_allocation_size(st->pinned_slot_size);
 }
 
 void cache_init(TensorIndex *index, uint64_t budget, int layers) {
-  if (!retention_growth) cache_retention(0, 0);
+  if (!st->retention_growth) cache_retention(0, 0);
   const char *observe = getenv("MYDS4_PREFETCH_METRICS");
-  pf_enabled = observe && *observe && strcmp(observe, "0");
+  st->pf_enabled = observe && *observe && strcmp(observe, "0");
   cache_required(index, layers);
-  memset(where, 0xff, sizeof where);
-  draft_clock = draft_touch_clock = 0;
-  memset(draft_age, 0, sizeof draft_age);
-  uint64_t pin_size = pinned_slot_size;
+  memset(st->where, 0xff, sizeof st->where);
+  st->draft_clock = st->draft_touch_clock = 0;
+  memset(st->draft_age, 0, sizeof st->draft_age);
+  uint64_t pin_size = st->pinned_slot_size;
   uint64_t free = mem_free(), avail = mem_available(), gpu_limit = gpu_working_set(), limit = gpu_limit;
   if (!reserve) cache_reserve(0);
   int fixed = budget > 0;
   if (!budget) budget = avail > reserve ? avail - reserve : 0;
-  if (cache_backbone && memory_usage().limit < limit) limit = memory_usage().limit;
+  if (st->cache_backbone && memory_usage().limit < limit) limit = memory_usage().limit;
   if (budget > limit) budget = limit;
-  budget = budget > pinned_bytes ? budget - pinned_bytes : 0;
+  budget = budget > st->pinned_bytes ? budget - st->pinned_bytes : 0;
   // the cache may grow up to max_slots when memory becomes free; a given budget is a fixed bound
-  max_slots = (int)((fixed ? budget : limit) / SLOT_SIZE);
-  if (max_slots > LAYERS * EXPERTS) max_slots = LAYERS * EXPERTS;
-  if (max_slots < minimum_slots) max_slots = minimum_slots;
-  if (budget < minimum_slots * SLOT_SIZE)
-    die("an expert cache of %.1f GiB is too small: a prompt needs %.1f GiB", budget / GiB, (double)minimum_slots * SLOT_SIZE / GiB);
+  st->max_slots = (int)((fixed ? budget : limit) / st->SLOT_SIZE);
+  if (st->max_slots > LAYERS * EXPERTS) st->max_slots = LAYERS * EXPERTS;
+  if (st->max_slots < st->minimum_slots) st->max_slots = st->minimum_slots;
+  if (budget < st->minimum_slots * st->SLOT_SIZE)
+    die("an expert cache of %.1f GiB is too small: a prompt needs %.1f GiB", budget / GiB, (double)st->minimum_slots * st->SLOT_SIZE / GiB);
   // File-cache reclamation is handled by macOS as slots are populated.
-  uint64_t within = avail > reserve + pinned_bytes ? avail - reserve - pinned_bytes : 0;
-  cap = (int)((budget < within ? budget : within) / SLOT_SIZE);
-  if (cap > max_slots) cap = max_slots;
-  if (cap < minimum_slots) cap = minimum_slots;
+  uint64_t within = avail > reserve + st->pinned_bytes ? avail - reserve - st->pinned_bytes : 0;
+  st->cap = (int)((budget < within ? budget : within) / st->SLOT_SIZE);
+  if (st->cap > st->max_slots) st->cap = st->max_slots;
+  if (st->cap < st->minimum_slots) st->cap = st->minimum_slots;
   // The mapped slots stay within Metal's recommendation, beside weights that
   // count as resident only once the GPU uses them.
-  int64_t room = mem_gpu_room() - (int64_t)pinned_bytes - (int64_t)mem_footprint() - MAP_SLACK;
-  mcap = room > minimum_slots * (int64_t)SLOT_SIZE ? (int)(room / (int64_t)SLOT_SIZE) : minimum_slots;
-  if (mcap > max_slots) mcap = max_slots;
-  slots = xmalloc((max_slots + npinned) * sizeof *slots);
-  if (cache_backbone) for (int i = 0; i < max_slots + npinned; i++) {
-    memory_slot_init(&slots[i].memory, cache_backbone->account, cache_backbone,
-                     "routed expert", pool_evict, &slots[i]);
-    slots[i].memory.can_evict = pool_can_evict;
-    slots[i].memory.automatic = 1;
+  int64_t room = mem_gpu_room() - (int64_t)st->pinned_bytes - (int64_t)mem_footprint() - MAP_SLACK;
+  st->mcap = room > st->minimum_slots * (int64_t)st->SLOT_SIZE ? (int)(room / (int64_t)st->SLOT_SIZE) : st->minimum_slots;
+  if (st->mcap > st->max_slots) st->mcap = st->max_slots;
+  st->slots = xmalloc((st->max_slots + st->npinned) * sizeof *st->slots);
+  if (st->cache_backbone) for (int i = 0; i < st->max_slots + st->npinned; i++) {
+    memory_slot_init(&st->slots[i].memory, st->cache_backbone->account, st->cache_backbone,
+                     "routed expert", pool_evict, &st->slots[i]);
+    st->slots[i].memory.can_evict = pool_can_evict;
+    st->slots[i].memory.automatic = 1;
   }
-  if (pf_enabled) {
-    pf_loads = xmalloc((max_slots + npinned) * sizeof *pf_loads);
-    memset(pf_loads, 0, (max_slots + npinned) * sizeof *pf_loads);
+  if (st->pf_enabled) {
+    st->pf_loads = xmalloc((st->max_slots + st->npinned) * sizeof *st->pf_loads);
+    memset(st->pf_loads, 0, (st->max_slots + st->npinned) * sizeof *st->pf_loads);
   }
-  score = xmalloc((max_slots + npinned) * sizeof *score);
-  for (int i = 0; i < max_slots + npinned; i++) score[i] = INFINITY;
+  st->score = xmalloc((st->max_slots + st->npinned) * sizeof *st->score);
+  for (int i = 0; i < st->max_slots + st->npinned; i++) st->score[i] = INFINITY;
   start_readers();
-  free_list = xmalloc(max_slots * sizeof *free_list);
-  for (int i = max_slots - 1; i >= 0; i--) free_list[nfree++] = i;
-  for (int i = max_slots; i < max_slots + npinned; i++) {  // separate, MXFP4-sized draft pools
-    Slot *s = &slots[i];
+  st->free_list = xmalloc(st->max_slots * sizeof *st->free_list);
+  for (int i = st->max_slots - 1; i >= 0; i--) st->free_list[st->nfree++] = i;
+  for (int i = st->max_slots; i < st->max_slots + st->npinned; i++) {  // separate, MXFP4-sized draft pools
+    Slot *s = &st->slots[i];
     s->b = pool_buffer(i, pin_size, 1), s->written = 0;
     if (!s->b.obj) die("reserved draft expert memory is unavailable");
-    s->layer = LAYERS + (i - max_slots) / draft_capacity;
-    s->expert = draft_capacity == DRAFT_EXPERTS ? (i - max_slots) % draft_capacity : -1;
+    s->layer = LAYERS + (i - st->max_slots) / st->draft_capacity;
+    s->expert = st->draft_capacity == DRAFT_EXPERTS ? (i - st->max_slots) % st->draft_capacity : -1;
     s->pinned = 1;
     if (s->expert >= 0) {
-      where[s->layer][s->expert] = i;
+      st->where[s->layer][s->expert] = i;
       start(i, 1);
     }
   }
-  for (int i = max_slots; i < max_slots + npinned; i++) finish(i);
+  for (int i = st->max_slots; i < st->max_slots + st->npinned; i++) finish(i);
   int64_t gpu_room = mem_gpu_room();
   fprintf(stderr, "expert cache: slot ceiling %d (%.1f GiB) within the shared model budget, up to %d mapped for the GPU, %.1f GiB free and %.1f GiB "
           "of reclaimable file cache, %.1f GiB kept for other programs, GPU resident memory %.1f GiB",
-          cap, cap * (double)SLOT_SIZE / GiB, mcap, free / GiB, (avail > free ? avail - free : 0) / GiB, reserve / GiB,
+          st->cap, st->cap * (double)st->SLOT_SIZE / GiB, st->mcap, free / GiB, (avail > free ? avail - free : 0) / GiB, reserve / GiB,
           mem_gpu() / GiB);
   if (gpu_room < INT64_MAX) fprintf(stderr, " (%.1f GiB below the residency target)", gpu_room / GiB);
   fprintf(stderr, ", GPU working set %.1f GiB\n", gpu_limit / GiB);
   fprintf(stderr, "cache policy: half-life %d forward passes, read-cost weighting %s\n",
-          retention_half_life, retention_read_cost ? "on" : "off");
-  if (npinned) {
-    if (draft_capacity == DRAFT_EXPERTS)
-      fprintf(stderr, "the DSpark stages' %d experts: %.1f GiB, resident\n", npinned, pinned_bytes / GiB);
+          st->retention_half_life, st->retention_read_cost ? "on" : "off");
+  if (st->npinned) {
+    if (st->draft_capacity == DRAFT_EXPERTS)
+      fprintf(stderr, "the DSpark stages' %d experts: %.1f GiB, resident\n", st->npinned, st->pinned_bytes / GiB);
     else
       fprintf(stderr, "DSpark cache: %d slots per stage, %.1f GiB reserved, native experts read on demand\n",
-              draft_capacity, pinned_bytes / GiB);
+              st->draft_capacity, st->pinned_bytes / GiB);
   }
 }
 
 const Buf *cache_get(int layer, int expert, uint32_t at[3], int *fresh) {
-  int i = where[layer][expert];
+  int i = st->where[layer][expert];
   if (i < 0) return 0;
-  if (!slots[i].pinned) map_slot(i);
-  *fresh = slots[i].fresh;
-  memcpy(at, slots[i].at, sizeof slots[i].at);
-  return &slots[i].b;
+  if (!st->slots[i].pinned) map_slot(i);
+  *fresh = st->slots[i].fresh;
+  memcpy(at, st->slots[i].at, sizeof st->slots[i].at);
+  return &st->slots[i].b;
 }
 
 // Prefetch reads: a prefetch's pieces wait in a queue for READERS threads,
@@ -739,22 +771,12 @@ const Buf *cache_get(int layer, int expert, uint32_t at[3], int *fresh) {
 // expert still being prefetched claims the pieces no reader has started.
 // The threads and the demand reads run above the utility QoS class, whose
 // disk reads macOS throttles.
-#define READERS 4
-#define QUEUE (1u << 14)
-static uint32_t queue[QUEUE], qhead, qtail;  // entries: slot << 4 | piece
-static pthread_mutex_t qlock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t qcond = PTHREAD_COND_INITIALIZER;
-static _Atomic int demand, prefetching;  // demand pieces, and prefetched slots, in flight
-static pthread_mutex_t progress_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t progress_cond = PTHREAD_COND_INITIALIZER;
-static _Atomic int progress_enabled;
-static uint64_t progress_epoch;
 
 uint64_t cache_read_epoch(void) {
-  atomic_store(&progress_enabled, 1);
-  pthread_mutex_lock(&progress_lock);
-  uint64_t value = progress_epoch;
-  pthread_mutex_unlock(&progress_lock);
+  atomic_store(&st->progress_enabled, 1);
+  pthread_mutex_lock(&st->progress_lock);
+  uint64_t value = st->progress_epoch;
+  pthread_mutex_unlock(&st->progress_lock);
   return value;
 }
 
@@ -763,9 +785,9 @@ void cache_wait_progress(uint64_t epoch) {
   clock_gettime(CLOCK_REALTIME, &until);
   until.tv_nsec += 20000000;
   if (until.tv_nsec >= 1000000000) until.tv_sec++, until.tv_nsec -= 1000000000;
-  pthread_mutex_lock(&progress_lock);
-  if (progress_epoch == epoch) pthread_cond_timedwait(&progress_cond, &progress_lock, &until);
-  pthread_mutex_unlock(&progress_lock);
+  pthread_mutex_lock(&st->progress_lock);
+  if (st->progress_epoch == epoch) pthread_cond_timedwait(&st->progress_cond, &st->progress_lock, &until);
+  pthread_mutex_unlock(&st->progress_lock);
 }
 
 // `read`: a reader wrote the piece; 0 when it is dropped unread.
@@ -775,30 +797,30 @@ static void piece_finished(Slot *s, int piece, int read) {
   // this to a dispatch notification can block a newer forecast after data is ready.
   int last_piece = atomic_fetch_sub_explicit(&s->unfinished, 1, memory_order_acq_rel) == 1;
   if (last_piece) {
-    if (s->background_load) atomic_fetch_sub_explicit(&prefetching, 1, memory_order_relaxed);
+    if (s->background_load) atomic_fetch_sub_explicit(&st->prefetching, 1, memory_order_relaxed);
   }
   dispatch_group_leave(s->loading);
   // Publish after leaving the group. Every piece signals: the reader that
   // decrements unfinished last need not leave the dispatch group last.
-  if (atomic_load(&progress_enabled)) {
-    pthread_mutex_lock(&progress_lock);
-    progress_epoch++;
-    pthread_cond_broadcast(&progress_cond);
-    pthread_mutex_unlock(&progress_lock);
+  if (atomic_load(&st->progress_enabled)) {
+    pthread_mutex_lock(&st->progress_lock);
+    st->progress_epoch++;
+    pthread_cond_broadcast(&st->progress_cond);
+    pthread_mutex_unlock(&st->progress_lock);
   }
 }
 
 static void *reader(void *arg) {
   for (;;) {
-    pthread_mutex_lock(&qlock);
-    while (qhead == qtail || demand) pthread_cond_wait(&qcond, &qlock);
-    if (qtail - qhead == QUEUE) pthread_cond_broadcast(&qcond);  // room for start()
-    uint32_t q = queue[qhead++ % QUEUE];
+    pthread_mutex_lock(&st->qlock);
+    while (st->qhead == st->qtail || st->demand) pthread_cond_wait(&st->qcond, &st->qlock);
+    if (st->qtail - st->qhead == QUEUE) pthread_cond_broadcast(&st->qcond);  // room for start()
+    uint32_t q = st->queue[st->qhead++ % QUEUE];
     // Cancellation examines taken under this lock. Announce ownership
     // before a popped piece can become invisible to the queue scan.
-    int owned = !atomic_exchange(&slots[q >> 4].taken[q & 15], 1);
-    pthread_mutex_unlock(&qlock);
-    Slot *s = &slots[q >> 4];
+    int owned = !atomic_exchange(&st->slots[q >> 4].taken[q & 15], 1);
+    pthread_mutex_unlock(&st->qlock);
+    Slot *s = &st->slots[q >> 4];
     if (owned) {
       uint64_t began = metrics_io_begin(s, 0);
       read_piece(&s->piece[q & 15], 0);
@@ -822,14 +844,14 @@ static void start_readers(void) {
 
 static void read_demand(void *ctx) {
   uint32_t q = (uint32_t)(uintptr_t)ctx;
-  Slot *s = &slots[q >> 4];
+  Slot *s = &st->slots[q >> 4];
   uint64_t began = metrics_io_begin(s, 1);
   read_piece(&s->piece[q & 15], 0);
   metrics_io_end(s, 1, began);
   __atomic_fetch_add(&cache_stats.bytes, s->piece[q & 15].len, __ATOMIC_RELAXED);
   metrics_piece_done(s, s->piece[q & 15].len);
   piece_finished(s, q & 15, 1);
-  if (--demand == 0) pthread_mutex_lock(&qlock), pthread_cond_broadcast(&qcond), pthread_mutex_unlock(&qlock);
+  if (--st->demand == 0) pthread_mutex_lock(&st->qlock), pthread_cond_broadcast(&st->qcond), pthread_mutex_unlock(&st->qlock);
 }
 
 
@@ -839,11 +861,11 @@ static void submit_demand(uint32_t q) {
 
 // Promotes slot i's pieces that no reader has started to the urgent path.
 static void claim(int i) {
-  for (int k = 0; k < slots[i].npiece; k++)
-    if (!atomic_exchange(&slots[i].taken[k], 1)) {
+  for (int k = 0; k < st->slots[i].npiece; k++)
+    if (!atomic_exchange(&st->slots[i].taken[k], 1)) {
       // demand counts both queued and active pieces. Background readers
       // therefore stay suppressed even before a bounded worker starts.
-      demand++, submit_demand((uint32_t)(i << 4 | k));
+      st->demand++, submit_demand((uint32_t)(i << 4 | k));
     }
 }
 
@@ -851,31 +873,31 @@ static void claim(int i) {
 // helpers may query it while that thread waits for them; they must not
 // release it. Reader threads only complete the group's pending work.
 static int slot_reading(int i) {
-  dispatch_group_t g = slots[i].loading;
+  dispatch_group_t g = st->slots[i].loading;
   return g && dispatch_group_wait(g, DISPATCH_TIME_NOW) != 0;
 }
 
 static void finish(int i) {
-  if (!slots[i].loading) return;
-  dispatch_group_wait(slots[i].loading, DISPATCH_TIME_FOREVER);
-  dispatch_release(slots[i].loading);
-  slots[i].loading = 0;
+  if (!st->slots[i].loading) return;
+  dispatch_group_wait(st->slots[i].loading, DISPATCH_TIME_FOREVER);
+  dispatch_release(st->slots[i].loading);
+  st->slots[i].loading = 0;
   // A load that dropped a piece adds nothing: its pages may be partly written.
-  if (atomic_load_explicit(&slots[i].read, memory_order_acquire) == slots[i].npiece &&
-      slots[i].extent > slots[i].written)
-    slots[i].written = slots[i].extent;
+  if (atomic_load_explicit(&st->slots[i].read, memory_order_acquire) == st->slots[i].npiece &&
+      st->slots[i].extent > st->slots[i].written)
+    st->slots[i].written = st->slots[i].extent;
 }
 
 void cache_drain(void) {
-  if (!slots) return;
-  for (int i = 0; i < max_slots + npinned; i++) finish(i);
+  if (!st->slots) return;
+  for (int i = 0; i < st->max_slots + st->npinned; i++) finish(i);
 }
 
 // Slot i is reused: its pieces no reader has started are not read.
 static void cancel(int i) {
-  if (!slots[i].loading) return;
-  for (int k = 0; k < slots[i].npiece; k++)
-    if (!atomic_exchange(&slots[i].taken[k], 1)) piece_finished(&slots[i], k, 0);
+  if (!st->slots[i].loading) return;
+  for (int k = 0; k < st->slots[i].npiece; k++)
+    if (!atomic_exchange(&st->slots[i].taken[k], 1)) piece_finished(&st->slots[i], k, 0);
   finish(i);
 }
 
@@ -885,8 +907,8 @@ static void cancel(int i) {
 // A load whose pieces were all read counts before the model thread reaps it.
 static uint64_t cache_unwritten(void) {
   uint64_t bytes = 0;
-  for (int i = 0; slots && i < max_slots + npinned; i++) {
-    const Slot *s = &slots[i];
+  for (int i = 0; st->slots && i < st->max_slots + st->npinned; i++) {
+    const Slot *s = &st->slots[i];
     if (!s->b.obj) continue;
     uint64_t written = s->written;
     if (s->loading && atomic_load_explicit(&s->read, memory_order_acquire) == s->npiece && s->extent > written)
@@ -898,7 +920,7 @@ static uint64_t cache_unwritten(void) {
 
 // The layer a prompt pass is at (-1: decoding). The pass still needs the
 // experts of this layer and the next; it is done with earlier layers.
-void cache_pass(int layer) { pass_layer = layer; }
+void cache_pass(int layer) { st->pass_layer = layer; }
 
 // A slot for (layer, e), resident and non-volatile: a free one, or a victim.
 // When decoding, the victim has the lowest priority (eviction_priority), so
@@ -913,29 +935,26 @@ void cache_pass(int layer) { pass_layer = layer; }
 // last layers and rows, which decoding needs first, stay longest. A
 // prefetch that finds none is skipped (-1) rather than evicting experts in
 // use.
-static int serving = -1;  // the layer cache_request makes resident: its experts used this token stay
-
-static unsigned held_references;
 
 // What a prompt pass evicts by: how much decoding used slot i's expert (its
 // part of the score, read-cost weighted as eviction_priority weights it); an
 // empty slot first.
 static double decoding_priority(int i) {
-  if (!isfinite(score[i]) || slots[i].expert < 0 || slots[i].layer < 0 || slots[i].layer >= CACHE_LAYERS)
-    return score[i];
-  double d = dscore[slots[i].layer * EXPERTS + slots[i].expert];
-  if (!retention_read_cost || slots[i].layer >= LAYERS) return d;
-  return d * reload_cost[slots[i].layer * EXPERTS + slots[i].expert];
+  if (!isfinite(st->score[i]) || st->slots[i].expert < 0 || st->slots[i].layer < 0 || st->slots[i].layer >= CACHE_LAYERS)
+    return st->score[i];
+  double d = st->dscore[st->slots[i].layer * EXPERTS + st->slots[i].expert];
+  if (!st->retention_read_cost || st->slots[i].layer >= LAYERS) return d;
+  return d * st->reload_cost[st->slots[i].layer * EXPERTS + st->slots[i].expert];
 }
 
 static int victim(void) {
   int best = -1;
   double lowest = INFINITY;
-  if (pass_layer < 0) {
-    for (int j = 0; j < max_slots; j++)
-      if (score[j] < INFINITY && !slots[j].prefetched &&
-          !slots[j].holds &&
-          !(slots[j].expert >= 0 && slots[j].layer == serving && slots[j].used == token)) {
+  if (st->pass_layer < 0) {
+    for (int j = 0; j < st->max_slots; j++)
+      if (st->score[j] < INFINITY && !st->slots[j].prefetched &&
+          !st->slots[j].holds &&
+          !(st->slots[j].expert >= 0 && st->slots[j].layer == st->serving && st->slots[j].used == st->token)) {
         double priority = eviction_priority(j);
         if (priority < lowest) best = j, lowest = priority;
       }
@@ -943,10 +962,10 @@ static int victim(void) {
   }
   // From the least recently used on, so that the oldest of equals goes.
   for (int later = 0; later < 2 && best < 0; later++)
-    for (int j = tail; j >= 0; j = slots[j].prev) {
-      int l = slots[j].layer;
-      if (later ? l <= pass_layer + 1 : l >= pass_layer) continue;
-      if (score[j] == INFINITY || slots[j].holds) continue;
+    for (int j = st->tail; j >= 0; j = st->slots[j].prev) {
+      int l = st->slots[j].layer;
+      if (later ? l <= st->pass_layer + 1 : l >= st->pass_layer) continue;
+      if (st->score[j] == INFINITY || st->slots[j].holds) continue;
       double priority = decoding_priority(j);
       if (best < 0 || priority < lowest) best = j, lowest = priority;
     }
@@ -957,28 +976,28 @@ static int victim(void) {
 // Maps slot i for the GPU; until the set is committed (between tokens) the
 // GPU reaches it through gpu_use (fresh).
 static void map_slot(int i) {
-  if (slots[i].mapped) return;
-  gpu_resident(&slots[i].b, 1);
-  slots[i].mapped = 1, slots[i].fresh = 1;
-  nmapped++;
-  if (slots[i].mapped_once) cache_stats.remaps++;
-  slots[i].mapped_once = 1;
+  if (st->slots[i].mapped) return;
+  gpu_resident(&st->slots[i].b, 1);
+  st->slots[i].mapped = 1, st->slots[i].fresh = 1;
+  st->nmapped++;
+  if (st->slots[i].mapped_once) cache_stats.remaps++;
+  st->slots[i].mapped_once = 1;
 }
 
 static int take(int layer, int e, int optional) {
   int i = -1;
-  int reuse = nslots >= cap || !nfree;
+  int reuse = st->nslots >= st->cap || !st->nfree;
   Buf buffer = {0};
   if (!reuse) {
-    i = free_list[nfree - 1];
-    buffer = pool_buffer(i, SLOT_SIZE, 0);
+    i = st->free_list[st->nfree - 1];
+    buffer = pool_buffer(i, st->SLOT_SIZE, 0);
     if (!buffer.obj) reuse = 1;
   }
   if (reuse) {
     i = victim();
     if (i < 0) {
       if (optional) return -1;
-      die("the expert cache (%d slots) cannot hold the experts of two layers", nslots);
+      die("the expert cache (%d slots) cannot hold the experts of two layers", st->nslots);
     }
     // Routing can demote a prefetch while its read is still running. Do not
     // stall the model for optional work or evict a higher-scoring resident.
@@ -986,26 +1005,26 @@ static int take(int layer, int e, int optional) {
     cancel(i);
     metrics_retire(i, optional);
     unlink_slot(i);
-    if (slots[i].expert >= 0) where[slots[i].layer][slots[i].expert] = -1;
+    if (st->slots[i].expert >= 0) st->where[st->slots[i].layer][st->slots[i].expert] = -1;
     cache_stats.evictions++;
-    if (slots[i].mapped) {
-      gpu_resident(&slots[i].b, 0);
-      slots[i].mapped = slots[i].fresh = 0;
-      nmapped--;
+    if (st->slots[i].mapped) {
+      gpu_resident(&st->slots[i].b, 0);
+      st->slots[i].mapped = st->slots[i].fresh = 0;
+      st->nmapped--;
     }
   } else {
-    i = free_list[--nfree];
-    slots[i].b = buffer, slots[i].written = 0;
+    i = st->free_list[--st->nfree];
+    st->slots[i].b = buffer, st->slots[i].written = 0;
     // CPU reads fill the buffer. cache_get maps it when GPU work uses it;
     // a forecast that is never selected does not occupy GPU residency.
-    slots[i].mapped = slots[i].fresh = slots[i].mapped_once = 0;
-    nslots++;
+    st->slots[i].mapped = st->slots[i].fresh = st->slots[i].mapped_once = 0;
+    st->nslots++;
   }
-  if (cache_backbone) memory_touch(&slots[i].memory);
-  slots[i].prefetched = 0;
-  slots[i].layer = layer, slots[i].expert = e;
-  where[layer][e] = i;
-  score[i] = escore[layer * EXPERTS + e];
+  if (st->cache_backbone) memory_touch(&st->slots[i].memory);
+  st->slots[i].prefetched = 0;
+  st->slots[i].layer = layer, st->slots[i].expert = e;
+  st->where[layer][e] = i;
+  st->score[i] = st->escore[layer * EXPERTS + e];
   push_front(i);
   return i;
 }
@@ -1014,7 +1033,7 @@ static int take(int layer, int e, int optional) {
 // A forecast (urgent 0) goes to the background queue and counts as a
 // prefetch in the metrics; a demand (urgent 1) is claimed at once.
 static void start(int i, int urgent) {
-  Slot *s = &slots[i];
+  Slot *s = &st->slots[i];
   int n = 0;
   uint64_t region = 0;
   for (int k = 0; k < expert_spans[s->layer]; k++) {
@@ -1034,19 +1053,19 @@ static void start(int i, int urgent) {
   // A stale queue entry may claim a newly reused slot as soon as taken is
   // reset. Publish all group entries and the admission before that reset.
   for (int k = 0; k < n; k++) dispatch_group_enter(s->loading);
-  if (!urgent) atomic_fetch_add_explicit(&prefetching, 1, memory_order_relaxed);
+  if (!urgent) atomic_fetch_add_explicit(&st->prefetching, 1, memory_order_relaxed);
   for (int k = 0; k < n; k++) atomic_store_explicit(&s->taken[k], 0, memory_order_release);
   if (urgent) {
     claim(i);
     return;
   }
-  pthread_mutex_lock(&qlock);
+  pthread_mutex_lock(&st->qlock);
   for (int k = 0; k < n; k++) {
-    while (qtail - qhead == QUEUE) pthread_cond_wait(&qcond, &qlock);
-    queue[qtail++ % QUEUE] = i << 4 | k;
+    while (st->qtail - st->qhead == QUEUE) pthread_cond_wait(&st->qcond, &st->qlock);
+    st->queue[st->qtail++ % QUEUE] = i << 4 | k;
   }
-  pthread_cond_broadcast(&qcond);
-  pthread_mutex_unlock(&qlock);
+  pthread_cond_broadcast(&st->qcond);
+  pthread_mutex_unlock(&st->qlock);
 }
 
 // Makes a layer's selected experts resident: starts reading the missing
@@ -1056,21 +1075,21 @@ static void start(int i, int urgent) {
 // than the backbone's GGUF slots. The caller must have finished prior GPU
 // use of this stage's pool; draft_stage already synchronizes before loading.
 static int draft_victim(int layer, uint64_t stamp) {
-  int first = max_slots + (layer - LAYERS) * draft_capacity, best = -1;
-  if (layer < LAYERS || layer >= CACHE_LAYERS || first + draft_capacity > max_slots + npinned)
+  int first = st->max_slots + (layer - LAYERS) * st->draft_capacity, best = -1;
+  if (layer < LAYERS || layer >= CACHE_LAYERS || first + st->draft_capacity > st->max_slots + st->npinned)
     die("draft cache layer %d has no pool", layer);
-  int end = first + draft_capacity;
+  int end = first + st->draft_capacity;
   for (int i = first; i < end; i++) {
-    Slot *s = &slots[i];
+    Slot *s = &st->slots[i];
     if ((s->expert >= 0 && s->used == stamp) || slot_reading(i)) continue;
     if (s->expert < 0) return i;
-    if (best < 0 || draft_age[i - max_slots] < draft_age[best - max_slots]) best = i;
+    if (best < 0 || st->draft_age[i - st->max_slots] < st->draft_age[best - st->max_slots]) best = i;
   }
   return best;
 }
 
 static int draft_request(int layer, const int *experts, int n) {
-  if (layer < LAYERS || layer >= CACHE_LAYERS || (layer - LAYERS + 1) * draft_capacity > npinned || n < 0)
+  if (layer < LAYERS || layer >= CACHE_LAYERS || (layer - LAYERS + 1) * st->draft_capacity > st->npinned || n < 0)
     die("invalid bounded draft cache request for layer %d", layer);
   char wanted[DRAFT_EXPERTS] = {0};
   int unique = 0, reading = 0;
@@ -1079,15 +1098,15 @@ static int draft_request(int layer, const int *experts, int n) {
     if (e < 0 || e >= DRAFT_EXPERTS) die("draft expert %d is outside its stage", e);
     if (!wanted[e]) wanted[e] = 1, unique++;
   }
-  if (unique > draft_capacity)
-    die("draft stage needs %d experts together, but its cache holds %d", unique, draft_capacity);
-  if (draft_clock == UINT64_MAX || (uint64_t)n > UINT64_MAX - draft_touch_clock)
+  if (unique > st->draft_capacity)
+    die("draft stage needs %d experts together, but its cache holds %d", unique, st->draft_capacity);
+  if (st->draft_clock == UINT64_MAX || (uint64_t)n > UINT64_MAX - st->draft_touch_clock)
     die("draft cache request counter exhausted");
-  uint64_t stamp = ++draft_clock;
+  uint64_t stamp = ++st->draft_clock;
   for (int e = 0; e < DRAFT_EXPERTS; e++)
-    if (wanted[e] && where[layer][e] >= 0) slots[where[layer][e]].used = stamp;
+    if (wanted[e] && st->where[layer][e] >= 0) st->slots[st->where[layer][e]].used = stamp;
   for (int k = 0; k < n; k++) {
-    int e = experts[k], i = where[layer][e];
+    int e = experts[k], i = st->where[layer][e];
     if (i >= 0) {
       if (slot_reading(i)) claim(i);
       cache_stats.hits++;
@@ -1095,43 +1114,43 @@ static int draft_request(int layer, const int *experts, int n) {
       i = draft_victim(layer, stamp);
       if (i < 0) die("draft stage %d has no reusable slot: its slots are needed or still being read", layer - LAYERS);
       finish(i);  // reap a completed handle before assigning a new expert
-      Slot *s = &slots[i];
-      if (s->expert >= 0) where[s->layer][s->expert] = -1, cache_stats.evictions++;
+      Slot *s = &st->slots[i];
+      if (s->expert >= 0) st->where[s->layer][s->expert] = -1, cache_stats.evictions++;
       if (!s->b.obj) {
-        s->b = pool_buffer(i, pinned_slot_size, 1), s->written = 0;
+        s->b = pool_buffer(i, st->pinned_slot_size, 1), s->written = 0;
         if (!s->b.obj) die("reserved draft expert memory is unavailable");
       }
       s->layer = layer, s->expert = e;
       s->prefetched = 0;
-      where[layer][e] = i;
+      st->where[layer][e] = i;
       cache_stats.misses++;
       start(i, 1);  // draft misses always use the demand-priority path
     }
-    slots[i].used = stamp;
-    if (cache_backbone) memory_touch(&slots[i].memory);
-    draft_age[i - max_slots] = ++draft_touch_clock;
-    score[i] = escore[layer * EXPERTS + e] += weight;
-    dscore[layer * EXPERTS + e] += weight;  // drafts run only while decoding
+    st->slots[i].used = stamp;
+    if (st->cache_backbone) memory_touch(&st->slots[i].memory);
+    st->draft_age[i - st->max_slots] = ++st->draft_touch_clock;
+    st->score[i] = st->escore[layer * EXPERTS + e] += st->weight;
+    st->dscore[layer * EXPERTS + e] += st->weight;  // drafts run only while decoding
     reading += slot_reading(i);
   }
   return reading;
 }
 
 int cache_request(int layer, const int *experts, int n) {
-  if (layer >= LAYERS && draft_capacity < DRAFT_EXPERTS) return draft_request(layer, experts, n);
+  if (layer >= LAYERS && st->draft_capacity < DRAFT_EXPERTS) return draft_request(layer, experts, n);
   int reading = 0;
-  serving = layer;
+  st->serving = layer;
   for (int k = 0; k < n; k++)  // the resident ones first, so that the others' slots are not theirs
-    if (where[layer][experts[k]] >= 0) slots[where[layer][experts[k]]].used = token;
+    if (st->where[layer][experts[k]] >= 0) st->slots[st->where[layer][experts[k]]].used = st->token;
   for (int k = 0; k < n; k++) {
-    int e = experts[k], i = where[layer][e], pending;
+    int e = experts[k], i = st->where[layer][e], pending;
     if (i >= 0) {
-      if (!slots[i].pinned) unlink_slot(i), push_front(i);
+      if (!st->slots[i].pinned) unlink_slot(i), push_front(i);
       pending = slot_reading(i);
       // A forecast can outlive its predicted pass and lose its protection.
       // Any later demand must promote its queued pieces, protected or not.
       if (pending) claim(i);
-      if (slots[i].prefetched) {
+      if (st->slots[i].prefetched) {
         cache_stats.prefetch_hits++;
         if (pending) cache_stats.late++;
       } else {
@@ -1145,26 +1164,26 @@ int cache_request(int layer, const int *experts, int n) {
     }
     // A request outside an observed pass is still a use: keep it out of
     // first-use rewards and later unused-byte totals.
-    if (pf_enabled && !pf_active && layer < LAYERS) {
-      PrefetchLoad *m = &pf_loads[i];
+    if (st->pf_enabled && !st->pf_active && layer < LAYERS) {
+      PrefetchLoad *m = &st->pf_loads[i];
       if (m->tracked && m->origin_prefetch && !m->used) {
         m->used = 1;
-        pf_stats[m->phase].unobserved_first_uses++;
+        st->pf_stats[m->phase].unobserved_first_uses++;
       }
     }
-    slots[i].prefetched = 0;
-    slots[i].used = token;
-    if (cache_backbone) memory_touch(&slots[i].memory);
-    double *history = &escore[layer * EXPERTS + e];
-    *history += weight;
-    score[i] = *history;
-    if (pass_layer < 0) dscore[layer * EXPERTS + e] += weight;
+    st->slots[i].prefetched = 0;
+    st->slots[i].used = st->token;
+    if (st->cache_backbone) memory_touch(&st->slots[i].memory);
+    double *history = &st->escore[layer * EXPERTS + e];
+    *history += st->weight;
+    st->score[i] = *history;
+    if (st->pass_layer < 0) st->dscore[layer * EXPERTS + e] += st->weight;
     reading += pending;
   }
   return reading;
 }
 
-int cache_slot(int layer, int e) { return where[layer][e] >= 0; }
+int cache_slot(int layer, int e) { return st->where[layer][e] >= 0; }
 
 int cache_hold(int layer, const int *experts, int n) {
   if (layer < 0 || layer >= LAYERS || n < 1 || n > TOPK) die("invalid runahead expert set");
@@ -1174,41 +1193,41 @@ int cache_hold(int layer, const int *experts, int n) {
   for (int k = 0; k < n; k++) {
     int e = experts[k];
     if (e < 0 || e >= EXPERTS) die("invalid runahead expert");
-    int i = where[layer][e];
+    int i = st->where[layer][e];
     resident[k] = i >= 0;
-    if (i >= 0) slots[i].holds++;
+    if (i >= 0) st->slots[i].holds++;
   }
   int pending = cache_request(layer, experts, n);
-  for (int k = 0; k < n; k++) if (!resident[k]) slots[where[layer][experts[k]]].holds++;
-  held_references += n;
+  for (int k = 0; k < n; k++) if (!resident[k]) st->slots[st->where[layer][experts[k]]].holds++;
+  st->held_references += n;
   return pending;
 }
 
 void cache_unhold(int layer, const int *experts, int n) {
   for (int k = 0; k < n; k++) {
-    int i = where[layer][experts[k]];
-    if (i < 0 || !slots[i].holds) die("runahead expert lost its reservation");
-    slots[i].holds--;
+    int i = st->where[layer][experts[k]];
+    if (i < 0 || !st->slots[i].holds) die("runahead expert lost its reservation");
+    st->slots[i].holds--;
   }
-  if (held_references < (unsigned)n) die("invalid runahead reference count");
-  held_references -= n;
+  if (st->held_references < (unsigned)n) die("invalid runahead reference count");
+  st->held_references -= n;
 }
 
 
 int cache_ready(int layer, int e) {
-  int i = where[layer][e];
+  int i = st->where[layer][e];
   return i >= 0 && !slot_reading(i);
 }
 
 
 int cache_where(int layer, int e) {  // as cache_request will count it
-  int i = where[layer][e];
-  return i < 0 ? 0 : !slots[i].prefetched ? 1 : slot_reading(i) ? 3 : 2;
+  int i = st->where[layer][e];
+  return i < 0 ? 0 : !st->slots[i].prefetched ? 1 : slot_reading(i) ? 3 : 2;
 }
 
 void cache_wait(int layer, const int *experts, int n) {
   double t = now();
-  for (int k = 0; k < n; k++) finish(where[layer][experts[k]]);
+  for (int k = 0; k < n; k++) finish(st->where[layer][experts[k]]);
   cache_stats.read_s += now() - t;
 }
 
@@ -1222,83 +1241,83 @@ void cache_load(int layer, const int *experts, int n) {
 // Starts reading the predicted experts (in rank order)
 // that are not resident, while fewer than `inflight` prefetches are reading.
 void cache_prefetch(int layer, const int *experts, int n, int inflight) {
-  if (layer >= LAYERS && draft_capacity < DRAFT_EXPERTS) return;  // bounded draft pools are demand-only
-  for (int k = 0; k < n && prefetching < inflight; k++) {
+  if (layer >= LAYERS && st->draft_capacity < DRAFT_EXPERTS) return;  // bounded draft pools are demand-only
+  for (int k = 0; k < n && st->prefetching < inflight; k++) {
     int e = experts[k];
-    if (where[layer][e] >= 0) continue;
+    if (st->where[layer][e] >= 0) continue;
     int i = take(layer, e, 1);
     if (i < 0) return;
-    slots[i].prefetched = 1;
-    slots[i].used = token;
-    if (cache_backbone) memory_touch(&slots[i].memory);
+    st->slots[i].prefetched = 1;
+    st->slots[i].used = st->token;
+    if (st->cache_backbone) memory_touch(&st->slots[i].memory);
     start(i, 0);
     cache_stats.prefetches++;
   }
 }
 
 void cache_prefetch_from(int layer, const int *experts, int n, int inflight, int issuer) {
-  int before = pf_issuer;
+  int before = st->pf_issuer;
   if (issuer < 0 || issuer >= PF_ISSUERS) die("invalid prefetch issuer");
-  pf_issuer = issuer;
+  st->pf_issuer = issuer;
   cache_prefetch(layer, experts, n, inflight);
-  pf_issuer = before;
+  st->pf_issuer = before;
 }
 
 
 // The model thread cancels only pieces that no reader owns. Check and
 // claim under the reader's lock so optional cancellation never waits for I/O.
 static int discard_unstarted(int layer, const int *keep, int n) {
-  if (!atomic_load(&prefetching)) return 0;
+  if (!atomic_load(&st->prefetching)) return 0;
   int retired[EXPERTS], nc = 0;
   // Only the model thread changes slot metadata. Readers can change taken,
   // so this scan is a filter; ownership is rechecked under qlock below.
   for (int e = 0; e < EXPERTS; e++) {
-    int i = where[layer][e];
-    if (i < 0 || !slots[i].prefetched || !slots[i].loading || !slots[i].npiece) continue;
+    int i = st->where[layer][e];
+    if (i < 0 || !st->slots[i].prefetched || !st->slots[i].loading || !st->slots[i].npiece) continue;
     int k = 0;
     while (k < n && keep[k] != e) k++;
     if (k < n) continue;
-    if (slots[i].holds) continue;
+    if (st->slots[i].holds) continue;
     int started = 0;
-    for (int p = 0; p < slots[i].npiece; p++) started |= atomic_load(&slots[i].taken[p]);
+    for (int p = 0; p < st->slots[i].npiece; p++) started |= atomic_load(&st->slots[i].taken[p]);
     if (!started) retired[nc++] = i;
   }
   if (!nc) return 0;
   unsigned char discard[EXPERTS] = {0};
   int nr = 0;
-  pthread_mutex_lock(&qlock);
+  pthread_mutex_lock(&st->qlock);
   for (int k = 0; k < nc; k++) {
     int i = retired[k], started = 0;
-    for (int p = 0; p < slots[i].npiece; p++) started |= atomic_load(&slots[i].taken[p]);
+    for (int p = 0; p < st->slots[i].npiece; p++) started |= atomic_load(&st->slots[i].taken[p]);
     if (started) continue;
     // Reader claims use qlock too. The model thread is the only demand
     // claimant, so every piece is now owned by this cancellation.
-    for (int p = 0; p < slots[i].npiece; p++) atomic_store(&slots[i].taken[p], 1);
-    discard[slots[i].expert] = 1, retired[nr++] = i;
+    for (int p = 0; p < st->slots[i].npiece; p++) atomic_store(&st->slots[i].taken[p], 1);
+    discard[st->slots[i].expert] = 1, retired[nr++] = i;
   }
   if (nr) {
-    uint32_t end = qtail, write = qhead;
-    for (uint32_t read = qhead; read != end; read++) {
-      uint32_t q = queue[read % QUEUE];
-      Slot *s = &slots[q >> 4];
+    uint32_t end = st->qtail, write = st->qhead;
+    for (uint32_t read = st->qhead; read != end; read++) {
+      uint32_t q = st->queue[read % QUEUE];
+      Slot *s = &st->slots[q >> 4];
       if (s->layer == layer && s->expert >= 0 && discard[s->expert]) continue;
-      queue[write++ % QUEUE] = q;
+      st->queue[write++ % QUEUE] = q;
     }
-    qtail = write;
-    pthread_cond_broadcast(&qcond);
+    st->qtail = write;
+    pthread_cond_broadcast(&st->qcond);
   }
-  pthread_mutex_unlock(&qlock);
+  pthread_mutex_unlock(&st->qlock);
   // All old queue references are gone, and no reader owns a retired piece.
   // Complete the groups before making these buffers available for reuse.
   for (int k = 0; k < nr; k++) {
-    int i = retired[k], expert = slots[i].expert;
-    for (int p = 0; p < slots[i].npiece; p++) piece_finished(&slots[i], p, 0);
+    int i = retired[k], expert = st->slots[i].expert;
+    for (int p = 0; p < st->slots[i].npiece; p++) piece_finished(&st->slots[i], p, 0);
     finish(i);
     metrics_retire(i, 0);
-    where[layer][expert] = -1;
-    slots[i].expert = -1, slots[i].prefetched = 0;
-    slots[i].used = token - 1; // an empty slot is not part of the selected union
-    score[i] = -INFINITY;
+    st->where[layer][expert] = -1;
+    st->slots[i].expert = -1, st->slots[i].prefetched = 0;
+    st->slots[i].used = st->token - 1; // an empty slot is not part of the selected union
+    st->score[i] = -INFINITY;
     unlink_slot(i), push_back(i);
     cache_stats.cancelled++;
   }
@@ -1309,8 +1328,8 @@ static int discard_unstarted(int layer, const int *keep, int n) {
 // select may be evicted again, by the score earlier selections gave them.
 void cache_demote(int layer) {
   for (int e = 0; e < EXPERTS; e++) {
-    int i = where[layer][e];
-    if (i >= 0) slots[i].prefetched = 0;
+    int i = st->where[layer][e];
+    if (i >= 0) st->slots[i].prefetched = 0;
   }
 }
 
@@ -1331,91 +1350,85 @@ void cache_refine(int layer, const int *keep, int n) {
 // headroom after 32 calm calls; for five minutes after swap-driven
 // reclamation it uses only free pages.
 static void resize(int below) {
-  static uint64_t swapouts;
-  static int calm, init;
-  static double gave;  // when slots were last given back: their memory shows as free only later
-  static double bad = -1e9;  // last swap-out while the cache could release memory
   vm_statistics64_data_t s = vm();
-  uint64_t free = (uint64_t)s.free_count * vm_page_size, avail = avail_of(s), slot = SLOT_SIZE, margin = 4 * (uint64_t)GiB;
-  if (!init) swapouts = s.swapouts, init = 1;
+  uint64_t free = (uint64_t)s.free_count * vm_page_size, avail = avail_of(s), slot = st->SLOT_SIZE, margin = 4 * (uint64_t)GiB;
+  if (!st->init) st->swapouts = s.swapouts, st->init = 1;
   int64_t room = mem_gpu_room();
-  uint64_t swap_delta = s.swapouts > swapouts ? s.swapouts - swapouts : 0;
-  int level = mem_pressure(), swapped = swap_delta && nslots > minimum_slots;
+  uint64_t swap_delta = s.swapouts > st->swapouts ? s.swapouts - st->swapouts : 0;
+  int level = mem_pressure(), swapped = swap_delta && st->nslots > st->minimum_slots;
   int low = level >= 2 || swapped || avail < reserve;
-  static int calm_map;
-  static double unmapped;  // when the GPU's excess was last unmapped: the driver shows it about a second later
-  if (swapped) bad = now();
-  swapouts = s.swapouts;
-  int old_cap = cap, old_mcap = mcap;
-  uint64_t headroom = now() - bad > 300 ? avail : free;
-  if (low && (level >= 4 || swapped || now() - gave > 1)) {
+  if (swapped) st->bad = now();
+  st->swapouts = s.swapouts;
+  int old_cap = st->cap, old_mcap = st->mcap;
+  uint64_t headroom = now() - st->bad > 300 ? avail : free;
+  if (low && (level >= 4 || swapped || now() - st->gave > 1)) {
     uint64_t to = avail;
-    int64_t give = level >= 4 ? nslots / 4 : level >= 2 || swapped ? nslots / 16 + 1 : 0;
+    int64_t give = level >= 4 ? st->nslots / 4 : level >= 2 || swapped ? st->nslots / 16 + 1 : 0;
     if (to < reserve && (int64_t)((reserve - to) / slot) + 1 > give) give = (reserve - to) / slot + 1;
-    cap = nslots - (int)give > minimum_slots ? nslots - (int)give : minimum_slots;
-    calm = 0, gave = now();
-  } else if (!low && ++calm >= 32 && cap < max_slots && headroom > reserve + margin) {
-    cap += (int)((headroom - reserve - margin) / slot / 4) + 1;
-    if (cap > max_slots) cap = max_slots;
-    calm = 0;
+    st->cap = st->nslots - (int)give > st->minimum_slots ? st->nslots - (int)give : st->minimum_slots;
+    st->calm = 0, st->gave = now();
+  } else if (!low && ++st->calm >= 32 && st->cap < st->max_slots && headroom > reserve + margin) {
+    st->cap += (int)((headroom - reserve - margin) / slot / 4) + 1;
+    if (st->cap > st->max_slots) st->cap = st->max_slots;
+    st->calm = 0;
   }
-  if (room < 0 && now() - unmapped > 1) {  // past the GPU's limit: map fewer, exactly the excess fewer
-    mcap = nmapped - (int)(-room / (int64_t)slot) - 1 > minimum_slots ? nmapped - (int)(-room / (int64_t)slot) - 1 : minimum_slots;
-    calm_map = 0, unmapped = now();
-  } else if (room >= 0 && ++calm_map >= 32 && mcap < max_slots && room > MAP_SLACK + (int64_t)GiB) {
-    mcap += (int)((room - MAP_SLACK - (int64_t)GiB) / (int64_t)slot / 4) + 1;
-    if (mcap > max_slots) mcap = max_slots;
-    calm_map = 0;
+  if (room < 0 && now() - st->unmapped > 1) {  // past the GPU's limit: map fewer, exactly the excess fewer
+    st->mcap = st->nmapped - (int)(-room / (int64_t)slot) - 1 > st->minimum_slots ? st->nmapped - (int)(-room / (int64_t)slot) - 1 : st->minimum_slots;
+    st->calm_map = 0, st->unmapped = now();
+  } else if (room >= 0 && ++st->calm_map >= 32 && st->mcap < st->max_slots && room > MAP_SLACK + (int64_t)GiB) {
+    st->mcap += (int)((room - MAP_SLACK - (int64_t)GiB) / (int64_t)slot / 4) + 1;
+    if (st->mcap > st->max_slots) st->mcap = st->max_slots;
+    st->calm_map = 0;
   }
-  for (int i = tail; nslots > cap && i >= 0;) {
-    int prev = slots[i].prev;
-    if (slots[i].layer < below) release(i), cache_stats.given_back++;
+  for (int i = st->tail; st->nslots > st->cap && i >= 0;) {
+    int prev = st->slots[i].prev;
+    if (st->slots[i].layer < below) release(i), cache_stats.given_back++;
     i = prev;
   }
-  while (nmapped > mcap) {  // the mapped slots with the lowest scores that nothing of this pass still needs
+  while (st->nmapped > st->mcap) {  // the mapped slots with the lowest scores that nothing of this pass still needs
     int best = -1;
-    for (int j = 0; j < max_slots; j++)
-      if (slots[j].b.obj && slots[j].mapped && slots[j].layer < below &&
-          !slots[j].loading && !slots[j].prefetched && (best < 0 || score[j] < score[best]))
+    for (int j = 0; j < st->max_slots; j++)
+      if (st->slots[j].b.obj && st->slots[j].mapped && st->slots[j].layer < below &&
+          !st->slots[j].loading && !st->slots[j].prefetched && (best < 0 || st->score[j] < st->score[best]))
         best = j;
     if (best < 0) break;
-    gpu_resident(&slots[best].b, 0);
-    slots[best].mapped = 0, slots[best].fresh = 0;
-    nmapped--;
+    gpu_resident(&st->slots[best].b, 0);
+    st->slots[best].mapped = 0, st->slots[best].fresh = 0;
+    st->nmapped--;
   }
   gpu_residency_commit();
   static int trace = -1;
   if (trace < 0) trace = getenv("MYDS4_CACHE_TRACE") != NULL;
-  if (trace && (cap != old_cap || mcap != old_mcap))
+  if (trace && (st->cap != old_cap || st->mcap != old_mcap))
     fprintf(stderr, "cache resize: limit %d -> %d, allocated %d, map limit %d -> %d, mapped %d, "
                     "maximum %d, pressure %d, swap-outs +%llu, available %.2f GiB, free %.2f GiB, "
                     "slots not yet written %.2f GiB, GPU room %.2f GiB, growth uses %s\n",
-            old_cap, cap, nslots, old_mcap, mcap, nmapped, max_slots, level, (unsigned long long)swap_delta,
+            old_cap, st->cap, st->nslots, old_mcap, st->mcap, st->nmapped, st->max_slots, level, (unsigned long long)swap_delta,
             avail / GiB, free / GiB, cache_unwritten() / GiB, room / GiB,
-            now() - bad > 300 ? "available memory" : "free pages");
+            now() - st->bad > 300 ? "available memory" : "free pages");
 }
 
 // Between tokens (pass < 0) no GPU work references a slot, so any slot can be
 // released. Within a prompt pass at layer `pass` the GPU may still use the
 // slots of the layer before, so only those of earlier layers are released.
 void cache_adapt_pass(int pass) {
-  if (held_references) die("cannot resize the cache during a runahead job");
+  if (st->held_references) die("cannot resize the cache during a runahead job");
   if (pass < 0) {
     advance_score_clock();
   }
-  if (cache_backbone && pass < 0 && now() - last_pool_growth >= 1.0 &&
-      memory_room(cache_backbone->account) < 4 * SLOT_SIZE) {
+  if (st->cache_backbone && pass < 0 && now() - st->last_pool_growth >= 1.0 &&
+      memory_room(st->cache_backbone->account) < 4 * st->SLOT_SIZE) {
     MemorySlot growth;
-    memory_slot_init(&growth, cache_backbone->account, NULL, "cache growth", NULL, NULL);
+    memory_slot_init(&growth, st->cache_backbone->account, NULL, "cache growth", NULL, NULL);
     MemorySlot *wanted[] = {&growth};
-    uint64_t bytes = 4 * SLOT_SIZE;
+    uint64_t bytes = 4 * st->SLOT_SIZE;
     memory_admit(wanted, &bytes, 1, MEMORY_CACHE);
     memory_slot_remove(&growth);
-    last_pool_growth = now();
+    st->last_pool_growth = now();
   }
   resize(pass < 0 ? CACHE_LAYERS : pass - 1);
   if (pass < 0)
-    for (int i = head; i >= 0; i = slots[i].next) slots[i].fresh = 0;
+    for (int i = st->head; i >= 0; i = st->slots[i].next) st->slots[i].fresh = 0;
 }
 
 void cache_adapt(void) { cache_adapt_pass(-1); }
@@ -1425,12 +1438,12 @@ void cache_adapt(void) { cache_adapt_pass(-1); }
 // memory and leaves them as they are otherwise.
 void cache_idle(void) { resize(CACHE_LAYERS); }
 
-uint64_t cache_bytes(void) { return (uint64_t)nslots * SLOT_SIZE + pinned_bytes; }
-int cache_slots(void) { return nslots; }
-int cache_mapped(void) { return nmapped; }
-int cache_cap(void) { return cap; }
-int cache_max(void) { return max_slots; }
-uint64_t cache_slot_bytes(void) { return SLOT_SIZE; }
+uint64_t cache_bytes(void) { return (uint64_t)st->nslots * st->SLOT_SIZE + st->pinned_bytes; }
+int cache_slots(void) { return st->nslots; }
+int cache_mapped(void) { return st->nmapped; }
+int cache_cap(void) { return st->cap; }
+int cache_max(void) { return st->max_slots; }
+uint64_t cache_slot_bytes(void) { return st->SLOT_SIZE; }
 
 static void metric_array(FILE *out, const char *const *names, const uint64_t *values, int n) {
   fputc('{', out);
@@ -1439,23 +1452,23 @@ static void metric_array(FILE *out, const char *const *names, const uint64_t *va
 }
 
 void cache_metrics_report(FILE *out) {
-  if (!pf_enabled) return;
+  if (!st->pf_enabled) return;
   const char *const phase[] = {"prefill", "decode"};
   const char *const state[] = {"existing_ready", "fresh_timely_prefetch", "pending_prefetch", "pending_demand", "absent"};
   const char *const issuer[] = {"pc", "h1", "h2", "prefill_bulk", "other"};
   uint64_t unused_live[PF_PHASES] = {0}, unread_live[PF_PHASES] = {0};
   for (int l = 0; l < LAYERS; l++)
     for (int e = 0; e < EXPERTS; e++) {
-      int i = where[l][e];
+      int i = st->where[l][e];
       if (i < 0) continue;
-      PrefetchLoad *m = &pf_loads[i];
+      PrefetchLoad *m = &st->pf_loads[i];
       if (!m->tracked || !m->origin_prefetch) continue;
       uint64_t done = atomic_load_explicit(&m->completed, memory_order_relaxed);
       if (!m->used) unused_live[m->phase] += done;
       unread_live[m->phase] += m->requested > done ? m->requested - done : 0;
     }
   for (int p = 0; p < PF_PHASES; p++) {
-    PrefetchStats *s = &pf_stats[p];
+    PrefetchStats *s = &st->pf_stats[p];
     fprintf(out, "{\"prefetch_metrics\":{\"version\":1,\"phase\":\"%s\",\"passes\":%llu,\"rows\":%llu,", phase[p],
             (unsigned long long)s->passes, (unsigned long long)s->rows);
     for (int v = 0; v < 2; v++) {
@@ -1519,7 +1532,7 @@ uint64_t cache_uncached_bytes(int *experts) {
   int n = 0;
   for (int l = 0; l < LAYERS; l++)
     for (int e = 0; e < EXPERTS; e++)
-      if (where[l][e] < 0) {
+      if (st->where[l][e] < 0) {
         n++;
         for (int k = 0; k < expert_spans[l]; k++) b += expert_span[l][e][k].len;
       }
