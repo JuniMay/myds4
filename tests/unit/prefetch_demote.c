@@ -13,6 +13,7 @@
 static dispatch_queue_t deferred;
 #define dispatch_get_global_queue(qos, flags) deferred
 #include "../../src/engine/io.c"
+#include "cache_layout.h"
 #undef dispatch_get_global_queue
 
 enum { NSLOT = 7, LAYER = 3, BUFSIZE = 131072, QMAX = 32 };
@@ -51,8 +52,8 @@ static int same_queue(const uint32_t *expected, int count) {
 
 static void setup(int fd, int prefill) {
   memset(fixture, 0, sizeof fixture);
-  memset(st->where, 0xff, sizeof st->where);
-  memset(st->escore, 0, sizeof st->escore);
+  memset(st->where, 0xff, WHERE_BYTES);
+  memset(st->escore, 0, SCORE_BYTES);
   memset(&cache_stats, 0, sizeof cache_stats);
   st->slots = fixture, st->score = priorities;
   st->max_slots = st->cap = st->nslots = NSLOT, st->nfree = st->npinned = 0;
@@ -73,7 +74,7 @@ static void setup(int fd, int prefill) {
     memset(s->b.ptr, 0xa5, BUFSIZE);
     s->mapped = 1, s->layer = layers[i], s->expert = experts[i], s->prefetched = 1, s->used = st->token;
     s->prev = i == NSLOT - 1 ? -1 : i + 1, s->next = i ? i - 1 : -1;
-    st->where[s->layer][s->expert] = i;
+    WHERE(s->layer, s->expert) = i;
     priorities[i] = st->escore[s->layer * EXPERTS + s->expert] = 10 + i;
     for (int k = 0; k < 2; k++)
       expert_span[s->layer][s->expert][k] = (FileSpan){fd, (uint64_t)k * 32768, 16384};
@@ -122,6 +123,7 @@ static void teardown(void) {
 }
 
 int main(void) {
+  deepseek_cache_layout();
   alarm(20);
   int fd = open("/dev/zero", O_RDONLY);
   if (fd < 0) return 1;
@@ -132,11 +134,11 @@ int main(void) {
     int count = snapshot(before), admissions = atomic_load(&st->prefetching);
     uint64_t bytes = cache_stats.bytes, cancelled = cache_stats.cancelled;
     cache_demote(LAYER);
-    expect("demotion keeps the selected pending expert", st->where[LAYER][0] == 0 && fixture[0].loading);
-    expect("demotion keeps unused reads queued, no longer protected", st->where[LAYER][1] == 1 && st->where[LAYER][4] == 6 &&
+    expect("demotion keeps the selected pending expert", WHERE(LAYER, 0) == 0 && fixture[0].loading);
+    expect("demotion keeps unused reads queued, no longer protected", WHERE(LAYER, 1) == 1 && WHERE(LAYER, 4) == 6 &&
            fixture[1].loading && fixture[6].loading && !fixture[1].prefetched && !fixture[6].prefetched);
-    expect("other layers remain forecast entries", st->where[LAYER + 1][0] == 3 && fixture[3].prefetched &&
-           st->where[LAYER - 1][0] == 4 && fixture[4].prefetched);
+    expect("other layers remain forecast entries", WHERE(LAYER + 1, 0) == 3 && fixture[3].prefetched &&
+           WHERE(LAYER - 1, 0) == 4 && fixture[4].prefetched);
     expect("demotion performs no I/O and changes no queue", cache_stats.bytes == bytes && same_queue(before, count) &&
            atomic_load(&st->prefetching) == admissions && cache_stats.cancelled == cancelled);
     teardown();
@@ -155,51 +157,51 @@ int main(void) {
     uint64_t bytes = cache_stats.bytes, cancelled = cache_stats.cancelled;
     uint8_t *selected_buffer = fixture[0].b.ptr, *partial_buffer = fixture[2].b.ptr, *reuse_buffer = fixture[1].b.ptr;
     cache_refine(LAYER, newer, 3);
-    expect("selected pending expert stays protected", st->where[LAYER][0] == 0 && fixture[0].b.ptr == selected_buffer &&
+    expect("selected pending expert stays protected", WHERE(LAYER, 0) == 0 && fixture[0].b.ptr == selected_buffer &&
            fixture[0].loading && !fixture[0].prefetched && atomic_load(&fixture[0].unfinished) == 2);
-    expect("partially started forecast can still finish", st->where[LAYER][2] == 2 && fixture[2].b.ptr == partial_buffer &&
+    expect("partially started forecast can still finish", WHERE(LAYER, 2) == 2 && fixture[2].b.ptr == partial_buffer &&
            fixture[2].loading && atomic_load(&fixture[2].unfinished) == 2 &&
            atomic_load(&fixture[2].taken[0]) == 1 && atomic_load(&fixture[2].taken[1]) == 0);
-    expect("already ready expert remains cached", st->where[LAYER][3] == 5 && !slot_reading(5));
-    expect("other layers remain forecast entries", st->where[LAYER + 1][0] == 3 && fixture[3].prefetched &&
-           st->where[LAYER - 1][0] == 4 && fixture[4].prefetched);
+    expect("already ready expert remains cached", WHERE(LAYER, 3) == 5 && !slot_reading(5));
+    expect("other layers remain forecast entries", WHERE(LAYER + 1, 0) == 3 && fixture[3].prefetched &&
+           WHERE(LAYER - 1, 0) == 4 && fixture[4].prefetched);
     expect("refinement performs no I/O", cache_stats.bytes == bytes);
     expect("remaining queue keeps FIFO order across wrap", same_queue(expected, kept));
     expect("only canceled admissions are released", atomic_load(&st->prefetching) == admissions - 2);
     expect("cancellations counted once", cache_stats.cancelled == cancelled + 2);
-    expect("wholly unstarted excluded entries are empty", st->where[LAYER][1] == -1 && st->where[LAYER][4] == -1 &&
+    expect("wholly unstarted excluded entries are empty", WHERE(LAYER, 1) == -1 && WHERE(LAYER, 4) == -1 &&
            fixture[1].expert == -1 && fixture[6].expert == -1 && !slot_reading(1) && !slot_reading(6));
     cache_refine(LAYER, newer, 3);
     expect("repeated refinement is idempotent", same_queue(expected, kept) && cache_stats.cancelled == cancelled + 2);
     int incoming = 0;
     cache_prefetch(LAYER + 2, &incoming, 1, 100);
-    expect("empty slot can be reused without allocation", st->where[LAYER + 2][0] == 1 && fixture[1].b.ptr == reuse_buffer);
+    expect("empty slot can be reused without allocation", WHERE(LAYER + 2, 0) == 1 && fixture[1].b.ptr == reuse_buffer);
     expected[kept++] = 0x10, expected[kept++] = 0x11;
     expect("reused slot has only its new queue references", same_queue(expected, kept));
-    expect("reuse does not displace selected or partial data", st->where[LAYER][0] == 0 && st->where[LAYER][2] == 2);
+    expect("reuse does not displace selected or partial data", WHERE(LAYER, 0) == 0 && WHERE(LAYER, 2) == 2);
   }
   teardown();
 
   setup(fd, 0);
   int keep = 1;
   cache_refine(LAYER, &keep, 1);
-  expect("refinement retains a kept unstarted forecast", st->where[LAYER][1] == 1 && fixture[1].loading &&
+  expect("refinement retains a kept unstarted forecast", WHERE(LAYER, 1) == 1 && fixture[1].loading &&
          fixture[1].prefetched && !atomic_load(&fixture[1].taken[0]) && !atomic_load(&fixture[1].taken[1]));
-  expect("refinement cancels an excluded unstarted forecast", st->where[LAYER][4] == -1 &&
+  expect("refinement cancels an excluded unstarted forecast", WHERE(LAYER, 4) == -1 &&
          fixture[6].expert == -1 && !slot_reading(6));
-  expect("refinement preserves selected and partially started reads", st->where[LAYER][0] == 0 &&
-         st->where[LAYER][2] == 2 && atomic_load(&fixture[2].taken[0]) && !atomic_load(&fixture[2].taken[1]));
+  expect("refinement preserves selected and partially started reads", WHERE(LAYER, 0) == 0 &&
+         WHERE(LAYER, 2) == 2 && atomic_load(&fixture[2].taken[0]) && !atomic_load(&fixture[2].taken[1]));
   teardown();
 
   setup(fd, 0);
   fixture[1].holds = 1;
   fixture[5].prefetched = 1;
   cache_refine(LAYER, newer, 3);
-  expect("held forecast keeps its pending buffer", st->where[LAYER][1] == 1 && fixture[1].holds == 1 &&
+  expect("held forecast keeps its pending buffer", WHERE(LAYER, 1) == 1 && fixture[1].holds == 1 &&
          fixture[1].loading && !atomic_load(&fixture[1].taken[0]) && !atomic_load(&fixture[1].taken[1]));
-  expect("held forecast does not protect an unrelated unused entry", st->where[LAYER][4] == -1 &&
+  expect("held forecast does not protect an unrelated unused entry", WHERE(LAYER, 4) == -1 &&
          fixture[6].expert == -1 && !slot_reading(6));
-  expect("completed forecast remains available", st->where[LAYER][3] == 5 && !slot_reading(5));
+  expect("completed forecast remains available", WHERE(LAYER, 3) == 5 && !slot_reading(5));
   teardown();
   dispatch_release(deferred);
   close(fd);

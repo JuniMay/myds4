@@ -1,6 +1,7 @@
 // In-memory checks of optional attribution; no model, expert files or GPU work.
 #include "../../src/model/deepseek/model.h"
 #include "../../src/engine/io.c"
+#include "cache_layout.h"
 
 static int checks, failures;
 static Slot fixture[8];
@@ -18,7 +19,7 @@ static void load(int i, int layer, int expert, int prefetch, int issuer, uint64_
   Slot *s = &fixture[i];
   s->layer = layer, s->expert = expert, s->mapped = 1, s->prefetched = prefetch;
   s->npiece = 1, s->piece[0].len = 100, s->taken[0] = 1;
-  st->where[layer][expert] = i;
+  WHERE(layer, expert) = i;
   st->pf_issuer = issuer;
   metrics_start(i, !prefetch);
   s->loading = dispatch_group_create();
@@ -30,7 +31,8 @@ static void load(int i, int layer, int expert, int prefetch, int issuer, uint64_
 }
 
 int main(void) {
-  memset(st->where, 0xff, sizeof st->where);
+  deepseek_cache_layout();
+  memset(st->where, 0xff, WHERE_BYTES);
   st->slots = fixture, st->score = fixture_scores, st->pf_loads = metadata, st->max_slots = 8, st->nslots = 8;
   st->pf_enabled = 1;
   expert_spans[4] = 1;
@@ -90,7 +92,7 @@ int main(void) {
 
   Slot *s = &st->slots[7];
   s->layer = 4, s->expert = 7, s->npiece = 2, s->piece[0].len = 30, s->piece[1].len = 70;
-  st->where[4][7] = 7, s->taken[0] = 1, s->taken[1] = 0;
+  WHERE(4, 7) = 7, s->taken[0] = 1, s->taken[1] = 0;
   st->pf_issuer = PF_H1;
   metrics_start(7, 0);
   s->loading = dispatch_group_create();
@@ -102,13 +104,13 @@ int main(void) {
   expect("partial unused read bytes retired", d->unused_removed_bytes, 30);
   expect("unread cancelled bytes are separate", d->unused_cancelled_bytes, 70);
   expect("observed prefetch eviction counted", d->prefetch_evictions, 1);
-  st->where[4][7] = -1, s->expert = -1;
+  WHERE(4, 7) = -1, s->expert = -1;
   int rerequest[6] = {0, 1, 2, 3, 4, 7};
   cache_observe_snapshot(4, &snapshot);
   cache_observe_routes(&snapshot, rerequest, 1, 6, 0);
-  expect("exact rerequest leaves ghost intact", st->pf_ghost[4][7], 1);
+  expect("exact rerequest leaves ghost intact", GHOST(4, 7), 1);
   cache_observe_routes(&snapshot, rerequest, 1, 6, 1);
-  expect("served rerequest clears ghost", st->pf_ghost[4][7], 0);
+  expect("served rerequest clears ghost", GHOST(4, 7), 0);
   expect("observed absent rerequest counted", d->absent_after_eviction[1], 1);
   cache_observe_snapshot(LAYERS, &snapshot);
   expect("draft route observations excluded", snapshot.active, 0);
@@ -127,7 +129,7 @@ int main(void) {
   expect("unobserved request gets no timely reward", d->timely_first[PF_PC], 0);
   expect("unobserved consumption is reported separately", d->unobserved_first_uses, 1);
   finish(7);
-  st->where[4][7] = -1;
+  WHERE(4, 7) = -1;
   cache_metrics_begin(PF_DECODE, 1);
   load(7, 4, 8, 1, PF_H2, 0, 1);
   uint64_t before_started = d->unstarted_at_use[PF_H2];

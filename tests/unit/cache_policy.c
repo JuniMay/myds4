@@ -2,6 +2,7 @@
 #include "../../src/model/deepseek/model.h"
 #include <sys/wait.h>
 #include "../../src/engine/io.c"
+#include "cache_layout.h"
 
 static Slot fixture[3];
 static double fixture_score[3];
@@ -22,9 +23,9 @@ static void setup(int half_life, int cost) {
   st->slots = NULL;
   cache_retention(half_life, cost);
   memset(fixture, 0, sizeof fixture);
-  memset(st->where, 0xff, sizeof st->where);
-  memset(st->escore, 0, sizeof st->escore);
-  memset(st->dscore, 0, sizeof st->dscore);
+  memset(st->where, 0xff, WHERE_BYTES);
+  memset(st->escore, 0, SCORE_BYTES);
+  memset(st->dscore, 0, SCORE_BYTES);
   memset(expert_spans, 0, sizeof expert_spans);
   memset(&cache_stats, 0, sizeof cache_stats);
   st->slots = fixture, st->score = fixture_score;
@@ -36,7 +37,7 @@ static void setup(int half_life, int cost) {
     st->slots[i].layer = 0, st->slots[i].expert = i, st->slots[i].mapped = 1;
     st->slots[i].prev = i == 2 ? -1 : i + 1;
     st->slots[i].next = i == 0 ? -1 : i - 1;
-    st->where[0][i] = i;
+    WHERE(0, i) = i;
     st->score[i] = st->escore[i] = i + 1;
     st->reload_cost[i] = 1;
   }
@@ -91,13 +92,13 @@ static void busy_victim(int optional, int prefill) {
           prefill ? "prefill" : "decode", optional ? "prefetch" : "demand", got, elapsed * 1000);
   if (optional) {
     expect("prefetch declines a victim still being read", got == -1);
-    expect("declined prefetch preserves all residents", st->where[0][0] == 0 && st->where[0][1] == 1 &&
-           st->where[0][2] == 2 && st->where[2][0] == -1 && cache_stats.evictions == 0);
+    expect("declined prefetch preserves all residents", WHERE(0, 0) == 0 && WHERE(0, 1) == 1 &&
+           WHERE(0, 2) == 2 && WHERE(2, 0) == -1 && cache_stats.evictions == 0);
     finish(0);
     expect("prefetch can use the same victim once its read ends", take(2, 0, 1) == 0);
   } else {
     expect("demand still waits for and reuses the cheapest victim", got == 0 && !st->slots[0].loading &&
-           st->where[0][0] == -1 && st->where[2][0] == 0 && cache_stats.evictions == 1);
+           WHERE(0, 0) == -1 && WHERE(2, 0) == 0 && cache_stats.evictions == 1);
   }
 }
 
@@ -105,11 +106,11 @@ static void busy_victim(int optional, int prefill) {
 // Its canceled slot must remain reusable when actual routing advances to 1.
 static void refined_empty_setup(void) {
   setup(10, 0);
-  memset(st->where, 0xff, sizeof st->where);
+  memset(st->where, 0xff, WHERE_BYTES);
   st->slots[0].layer = 1, st->slots[0].expert = 0;
   st->slots[1].layer = 0, st->slots[1].expert = 1;
   st->slots[2].layer = 1, st->slots[2].expert = 2;
-  st->where[1][0] = 0, st->where[0][1] = 1, st->where[1][2] = 2;
+  WHERE(1, 0) = 0, WHERE(0, 1) = 1, WHERE(1, 2) = 2;
   st->score[0] = st->escore[EXPERTS] = 1;
   st->score[2] = st->escore[EXPERTS + 2] = 3;
   st->slots[0].prefetched = 1, st->slots[0].used = st->token;
@@ -122,21 +123,21 @@ static void refined_empty_setup(void) {
   st->serving = 0;
   int keep = 2;
   cache_refine(1, &keep, 1);
-  expect("refinement leaves an empty completed slot", st->where[1][0] == -1 && st->slots[0].expert == -1 &&
+  expect("refinement leaves an empty completed slot", WHERE(1, 0) == -1 && st->slots[0].expert == -1 &&
          st->score[0] == -INFINITY && !st->slots[0].loading && !atomic_load(&st->prefetching));
   // This is the next operation in read_ahead/read_residual_ahead. Already
   // resident candidates do not consume the slot before actual routing.
   cache_prefetch(1, &keep, 1, 6);
-  expect("resident forecast leaves the refined slot available", st->slots[0].expert == -1 && st->where[1][2] == 2);
+  expect("resident forecast leaves the refined slot available", st->slots[0].expert == -1 && WHERE(1, 2) == 2);
 }
 
 static void refined_empty_reuse(void) {
   refined_empty_setup();
   int routed[] = {2, 3};
   cache_request(1, routed, 2);
-  expect("actual routing reuses its layer's refined empty slot", st->where[1][3] == 0);
-  expect("refined empty reuse preserves another layer's ready expert", st->where[0][1] == 1);
-  expect("refined empty reuse preserves the selected resident", st->where[1][2] == 2 && st->slots[2].used == st->token);
+  expect("actual routing reuses its layer's refined empty slot", WHERE(1, 3) == 0);
+  expect("refined empty reuse preserves another layer's ready expert", WHERE(0, 1) == 1);
+  expect("refined empty reuse preserves the selected resident", WHERE(1, 2) == 2 && st->slots[2].used == st->token);
   expect("refinement regression performs no I/O", cache_stats.bytes == 0);
 
   refined_empty_setup();
@@ -149,6 +150,7 @@ static void refined_empty_reuse(void) {
 }
 
 int main(void) {
+  deepseek_cache_layout();
   alarm(20);
   setup(0, 0);
   expect("zero selects default half-life", st->retention_half_life == 50);
@@ -250,21 +252,21 @@ int main(void) {
 
   setup(10, 1);
   st->max_slots = st->cap = st->nslots = 2, st->head = 1, st->tail = 0;
-  st->where[0][2] = -1, st->escore[2] = 0;
+  WHERE(0, 2) = -1, st->escore[2] = 0;
   st->slots[1].prev = -1;
   st->score[0] = st->escore[0] = 2, st->score[1] = st->escore[1] = 5;
   st->reload_cost[0] = .25, st->reload_cost[1] = .5, st->reload_cost[2] = .25;
   int incoming = 2;
   cache_load(0, &incoming, 1);
-  expect("eviction preserves absent expert history", st->where[0][0] == -1 && st->escore[0] == 2);
-  expect("new request adds raw unweighted count", st->escore[2] == 1 && st->score[st->where[0][2]] == 1);
+  expect("eviction preserves absent expert history", WHERE(0, 0) == -1 && st->escore[0] == 2);
+  expect("new request adds raw unweighted count", st->escore[2] == 1 && st->score[WHERE(0, 2)] == 1);
   advance_score_clock();
   double before = st->weight;
   incoming = 0;
   cache_load(0, &incoming, 1);
   expect("reentry restores prior history before increment", near(st->escore[0], 2 + before));
-  expect("resident score keeps raw reentry history", st->score[st->where[0][0]] == st->escore[0]);
-  expect("weighted reentry priority uses static cost", near(eviction_priority(st->where[0][0]), st->escore[0] * .25));
+  expect("resident score keeps raw reentry history", st->score[WHERE(0, 0)] == st->escore[0]);
+  expect("weighted reentry priority uses static cost", near(eviction_priority(WHERE(0, 0)), st->escore[0] * .25));
   expect("empty-span fixture performs no file reads", cache_stats.bytes == 0);
 
   st->weight = 0x1p500;
@@ -274,7 +276,7 @@ int main(void) {
   expect("overflow guard resets global weight", st->weight == 1);
   expect("overflow guard rescales resident history", near(st->escore[0], old / scale));
   expect("overflow guard rescales ghost history", near(st->escore[3], 7 / scale));
-  expect("resident and historical scores stay consistent", st->score[st->where[0][0]] == st->escore[0]);
+  expect("resident and historical scores stay consistent", st->score[WHERE(0, 0)] == st->escore[0]);
   busy_victim(1, 0);
   busy_victim(1, 1);
   busy_victim(0, 0);

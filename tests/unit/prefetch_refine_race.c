@@ -23,6 +23,7 @@ static void watched_leave(dispatch_group_t group);
 #define dispatch_group_wait(group, timeout) watched_wait(group, timeout)
 #define dispatch_group_leave(group) watched_leave(group)
 #include "../../src/engine/io.c"
+#include "cache_layout.h"
 #undef pthread_mutex_lock
 #undef atomic_exchange
 #undef pread
@@ -118,6 +119,7 @@ static void *refine_thread(void *unused) {
 }
 
 int main(void) {
+  deepseek_cache_layout();
   alarm(10); // only a deadlock backstop; assertions do not depend on elapsed time
   int fd = open("/dev/zero", O_RDONLY);
   if (fd < 0) return 1;
@@ -125,7 +127,7 @@ int main(void) {
   st->max_slots = st->cap = st->nslots = 2, st->nfree = st->npinned = 0;
   st->head = 1, st->tail = 0, st->token = 10, st->weight = 1;
   st->pass_layer = st->serving = -1;
-  memset(st->where, 0xff, sizeof st->where);
+  memset(st->where, 0xff, WHERE_BYTES);
   expert_spans[0] = 1;
   for (int i = 0; i < 2; i++) {
     Slot *s = &fixture[i];
@@ -133,7 +135,7 @@ int main(void) {
     memset(s->b.ptr, 0xa5, s->b.size);
     s->layer = 0, s->expert = i, s->mapped = 1, s->prefetched = 1, s->used = st->token;
     s->prev = i ? -1 : 1, s->next = i ? 0 : -1;
-    st->where[0][i] = i, priorities[i] = st->escore[i] = i + 1;
+    WHERE(0, i) = i, priorities[i] = st->escore[i] = i + 1;
     expert_span[0][i][0] = (FileSpan){fd, 0, 16384};
     start(i, 0);
   }
@@ -150,9 +152,9 @@ int main(void) {
   expect("reader won ownership during refinement", injection && reader_in_io && atomic_load(&fixture[0].taken[0]));
   expect("refinement returns before the reader is released", returned);
   expect("refinement does not wait on the unfinished reader", !waited);
-  expect("started data remains cached while I/O is held", returned && st->where[0][0] == 0 &&
+  expect("started data remains cached while I/O is held", returned && WHERE(0, 0) == 0 &&
          fixture[0].loading == watched_group && atomic_load(&fixture[0].unfinished) == 1);
-  expect("wholly unstarted obsolete entry still cancels", returned && st->where[0][1] == -1 &&
+  expect("wholly unstarted obsolete entry still cancels", returned && WHERE(0, 1) == -1 &&
          fixture[1].expert == -1 && !slot_reading(1));
 
   pthread_mutex_lock(&control);
@@ -162,7 +164,7 @@ int main(void) {
   pthread_mutex_unlock(&control);
   pthread_join(reading, NULL);
   pthread_join(refining, NULL);
-  expect("reader completion preserves the started expert", st->where[0][0] == 0 && cache_ready(0, 0));
+  expect("reader completion preserves the started expert", WHERE(0, 0) == 0 && cache_ready(0, 0));
   expect("only the started piece was read", cache_stats.bytes == 16384);
   expect("all read admissions finish", !atomic_load(&st->prefetching) && !atomic_load(&st->demand));
   for (int i = 0; i < 2; i++) cancel(i), free(fixture[i].b.ptr);

@@ -45,6 +45,7 @@ static int fixture_sysctl(const char *name, void *out, size_t *n, void *in, size
 #define host_statistics64 fixture_host
 #define sysctlbyname fixture_sysctl
 #include "../../src/engine/io.c"
+#include "cache_layout.h"
 #undef host_statistics64
 #undef sysctlbyname
 
@@ -265,6 +266,7 @@ static void run_case(const char *name, int (*check)(void)) {
 }
 
 int main(void) {
+  deepseek_cache_layout();
   run_case("with your budgets and no KV, model memory stays within 128 - 4 - 28 GiB", your_budgets_with_kv_empty);
   run_case("model memory never takes the space that KV occupies", your_budgets_with_kv_in_use);
   run_case("with the defaults, model memory stays within 128 - 10 - 28 GiB", the_defaults);

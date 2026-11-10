@@ -236,6 +236,11 @@ static struct {
   int up, down, up_m, down_m;
 } gk[LAYERS];
 static uint32_t expert_quant[LAYERS][3]; // 0 is native MXFP4; otherwise the GGUF type
+// The routed experts' bytes in the files, which the expert store reads
+// (deepseek_cache_layout): the GGUF rows (gguf_experts), else the MXFP4
+// codes and scales (deepseek_mxfp4_spans).
+FileSpan expert_span[CACHE_LAYERS][EXPERTS][3];
+int expert_spans[CACHE_LAYERS];
 static Buf head_q6;  // the GGUF file's output head in Q6_K, if it has one: used instead of the checkpoint's
 static int K_gg_head1, K_gg_head6;
 // A prompt batch's pairs' rows of XQ and MH, in pair order. Native MXFP4
@@ -606,11 +611,13 @@ static void prepare_weights(const char *dir, const Options *options) {
   for (int i = 0; i < 3; i++)
     if (st_has(checkpoint, "%s", markers[i])) load(&image_markers[i], st_get(checkpoint, "%s", markers[i]));
   if (opt.deepseek.experts) gguf_experts(opt.deepseek.experts);
+  deepseek_mxfp4_spans(checkpoint);
+  deepseek_cache_layout();
   cache_retention(opt.deepseek.cache_half_life, opt.deepseek.cache_read_cost);
   cache_draft_limit(opt.deepseek.draft_cache);
   cand_words = (opt.ctx / 8 + 31) / 32 + 1;
   cache_working_rows(1);
-  cache_required(checkpoint, opt.draft ? CACHE_LAYERS : LAYERS);
+  cache_required(opt.draft ? CACHE_LAYERS : LAYERS);
 }
 
 int deepseek_load(const char *dir, const Options *options) {
@@ -623,7 +630,7 @@ int deepseek_load(const char *dir, const Options *options) {
   cache_working_rows(1);
   uint64_t workspace = model_buffers_ready ? work->payload - resizable_bytes() + work_plan(small, 0) + request_plan(small, 0)
                                           : fixed_plan(0) + work_plan(small, 0) + request_plan(small, 0);
-  uint64_t minimum = weights_required(core_weights) + workspace + cache_required(checkpoint, opt.draft ? CACHE_LAYERS : LAYERS);
+  uint64_t minimum = weights_required(core_weights) + workspace + cache_required(opt.draft ? CACHE_LAYERS : LAYERS);
   if (!memory_minimum(core->account, minimum)) { memory_pin(core, 0); return 0; }
   if (model_buffers_ready) request_capacity(1);
   if (!weights_load(core_weights)) { memory_pin(core, 0); return 0; }
@@ -666,7 +673,7 @@ int deepseek_load(const char *dir, const Options *options) {
       fprintf(stderr, "%s online predictor state: %s\n", loaded ? "loaded" : "new", opt.deepseek.predictor_state);
     }
   }
-    cache_init(checkpoint, 0, opt.draft ? CACHE_LAYERS : LAYERS);
+    cache_init(0, opt.draft ? CACHE_LAYERS : LAYERS);
     base_state();
     model_buffers_ready = 1;
   }
@@ -2113,7 +2120,7 @@ static int prepare_rows(int rows, int prompt) {
     uint64_t workspace = fixed + request_plan(request_rows, 0) + work_plan(layer_rows, 0);
     uint64_t host = row_scratch(candidate) + (uint64_t)candidate * 2 * ENGRAM_ROWS * 8 + (uint64_t)layer_rows * 64;
     cache_working_rows(candidate);
-    uint64_t required = weights_required(core_weights) + workspace + host + cache_required(checkpoint, opt.draft ? CACHE_LAYERS : LAYERS);
+    uint64_t required = weights_required(core_weights) + workspace + host + cache_required(opt.draft ? CACHE_LAYERS : LAYERS);
     MemoryAdmission mode = candidate > 1 && prompt ? MEMORY_WORKSPACE : MEMORY_REQUIRED;
     if (memory_minimum_mode(work->account, required, mode)) {
       previous_rows = prompt ? 0 : rows;

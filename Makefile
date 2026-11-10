@@ -3,7 +3,7 @@ CC = clang
 CFLAGS = -std=c23 -O2 -Wall -Wextra -Wno-unused-parameter -Isrc/engine $(shell pkg-config --cflags yyjson libjpeg)
 LDLIBS = -framework Metal -framework Foundation -framework IOKit -framework ImageIO -framework CoreGraphics -framework AudioToolbox -framework Accelerate -lobjc -licucore \
          $(shell pkg-config --libs yyjson libjpeg)
-MODEL_HEADERS = src/model/experts.h src/model/nemotron/dflash.h src/model/nemotron/audio.h src/model/linear.h src/engine/memory.h src/model/weights.h src/model/deepseek/model.h src/engine/myds4.h src/model/model.h src/model/qwen/model.h src/model/qwen/vision.h src/model/deepseek/engram.h src/model/deepseek/learning.h src/model/draft.h src/model/deepseek/prefill.h src/model/deepseek/expert_tasks.h
+MODEL_HEADERS = src/engine/expert_store.h src/model/experts.h src/model/nemotron/dflash.h src/model/nemotron/audio.h src/model/linear.h src/engine/memory.h src/model/weights.h src/model/deepseek/model.h src/engine/myds4.h src/model/model.h src/model/qwen/model.h src/model/qwen/vision.h src/model/deepseek/engram.h src/model/deepseek/learning.h src/model/draft.h src/model/deepseek/prefill.h src/model/deepseek/expert_tasks.h
 KERNELS = src/kernels/formats.metal src/kernels/kernels.metal src/kernels/gguf_grids.metal src/kernels/gguf.metal \
           src/kernels/vision.metal src/kernels/qwen_vision.metal src/kernels/rows.metal src/kernels/products.metal src/kernels/experts.metal src/kernels/deltanet.metal src/kernels/gqa.metal src/kernels/flash.metal src/kernels/nemotron.metal src/kernels/speech.metal src/kernels/dflash.metal src/kernels/expert_tasks.metal
 
@@ -180,89 +180,89 @@ shutdown-check: build/tests/shutdown
 	./build/tests/shutdown
 
 # CPU-only cache checks; the fixture creates no model buffers or read files.
-build/tests/cache-ready: tests/unit/cache_ready.c src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/myds4.h
+build/tests/cache-ready: tests/unit/cache_ready.c src/engine/io.c src/engine/expert_store.h tests/unit/cache_layout.h src/engine/gpu.c src/engine/util.c src/engine/myds4.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/unit/cache_ready.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)
 
 cache-ready-check: build/tests/cache-ready
 	./build/tests/cache-ready
 
-build/tests/cache-mapping: tests/unit/cache_mapping.c src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/myds4.h
+build/tests/cache-mapping: tests/unit/cache_mapping.c src/engine/io.c src/engine/expert_store.h tests/unit/cache_layout.h src/engine/gpu.c src/engine/util.c src/engine/myds4.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/unit/cache_mapping.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)
 
-build/tests/cache-progress: tests/unit/cache_progress.c src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/myds4.h
+build/tests/cache-progress: tests/unit/cache_progress.c src/engine/io.c src/engine/expert_store.h tests/unit/cache_layout.h src/engine/gpu.c src/engine/util.c src/engine/myds4.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/unit/cache_progress.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)
 
-build/tests/cache-hold: tests/unit/cache_hold.c src/engine/io.c src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS)
+build/tests/cache-hold: tests/unit/cache_hold.c src/engine/io.c src/engine/expert_store.h tests/unit/cache_layout.h src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/unit/cache_hold.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)
 
-build/tests/draft-cache: tests/unit/draft_cache.c src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/myds4.h
+build/tests/draft-cache: tests/unit/draft_cache.c src/engine/io.c src/engine/expert_store.h tests/unit/cache_layout.h src/engine/gpu.c src/engine/util.c src/engine/myds4.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/unit/draft_cache.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)
 
 draft-cache-check: build/tests/draft-cache
 	./build/tests/draft-cache
 
-build/tests/prefetch-metrics: tests/unit/prefetch_metrics.c src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/myds4.h
+build/tests/prefetch-metrics: tests/unit/prefetch_metrics.c src/engine/io.c src/engine/expert_store.h tests/unit/cache_layout.h src/engine/gpu.c src/engine/util.c src/engine/myds4.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/unit/prefetch_metrics.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)
 
 prefetch-metrics-check: build/tests/prefetch-metrics
 	./build/tests/prefetch-metrics
 
-build/tests/prefetch-queue: tests/unit/prefetch_queue.c src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/myds4.h
+build/tests/prefetch-queue: tests/unit/prefetch_queue.c src/engine/io.c src/engine/expert_store.h tests/unit/cache_layout.h src/engine/gpu.c src/engine/util.c src/engine/myds4.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/unit/prefetch_queue.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)
 
 prefetch-queue-check: build/tests/prefetch-queue
 	./build/tests/prefetch-queue
 
-build/tests/prefetch-admission: tests/unit/prefetch_admission.c src/engine/io.c src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS)
+build/tests/prefetch-admission: tests/unit/prefetch_admission.c src/engine/io.c src/engine/expert_store.h tests/unit/cache_layout.h src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS)
 	@mkdir -p $(dir $@)
 	$(CC) $(filter-out -O2,$(CFLAGS)) -O0 -o $@ tests/unit/prefetch_admission.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)
 
 prefetch-admission-check: build/tests/prefetch-admission
 	./build/tests/prefetch-admission
 
-build/tests/prefetch-demote: tests/unit/prefetch_demote.c src/engine/io.c src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS)
+build/tests/prefetch-demote: tests/unit/prefetch_demote.c src/engine/io.c src/engine/expert_store.h tests/unit/cache_layout.h src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS)
 	@mkdir -p $(dir $@)
 	$(CC) $(filter-out -O2,$(CFLAGS)) -O0 -o $@ tests/unit/prefetch_demote.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)
 
 prefetch-demote-check: build/tests/prefetch-demote
 	./build/tests/prefetch-demote
 
-build/tests/prefetch-refine-race: tests/unit/prefetch_refine_race.c src/engine/io.c src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS)
+build/tests/prefetch-refine-race: tests/unit/prefetch_refine_race.c src/engine/io.c src/engine/expert_store.h tests/unit/cache_layout.h src/engine/gpu.c src/engine/util.c $(MODEL_HEADERS)
 	@mkdir -p $(dir $@)
 	$(CC) $(filter-out -O2,$(CFLAGS)) -O0 -o $@ tests/unit/prefetch_refine_race.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)
 
 prefetch-refine-race-check: build/tests/prefetch-refine-race
 	./build/tests/prefetch-refine-race
 
-build/tests/cache-policy: tests/unit/cache_policy.c src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/myds4.h
+build/tests/cache-policy: tests/unit/cache_policy.c src/engine/io.c src/engine/expert_store.h tests/unit/cache_layout.h src/engine/gpu.c src/engine/util.c src/engine/myds4.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/unit/cache_policy.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)
 
 cache-policy-check: build/tests/cache-policy
 	./build/tests/cache-policy
 
-build/tests/memory-available: tests/unit/memory_available.c src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/myds4.h
+build/tests/memory-available: tests/unit/memory_available.c src/engine/io.c src/engine/expert_store.h tests/unit/cache_layout.h src/engine/gpu.c src/engine/util.c src/engine/myds4.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/unit/memory_available.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)
 
 memory-available-check: build/tests/memory-available
 	./build/tests/memory-available
 
-build/tests/cache-memory: tests/unit/cache_memory.c src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/myds4.h
+build/tests/cache-memory: tests/unit/cache_memory.c src/engine/io.c src/engine/expert_store.h tests/unit/cache_layout.h src/engine/gpu.c src/engine/util.c src/engine/myds4.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/unit/cache_memory.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)
 
 cache-memory-check: build/tests/cache-memory
 	./build/tests/cache-memory
 
-build/tests/memory-budget: tests/unit/memory_budget.c src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/memory.c src/engine/myds4.h
+build/tests/memory-budget: tests/unit/memory_budget.c src/engine/io.c src/engine/expert_store.h tests/unit/cache_layout.h src/engine/gpu.c src/engine/util.c src/engine/memory.c src/engine/myds4.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/unit/memory_budget.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)
 
@@ -368,7 +368,7 @@ build/benchmarks/products: benchmarks/products.c build/libmyds4.a $(MODEL_HEADER
 
 # Ready MXFP4 stages from different layers in one experimental dispatch.
 # Reads 24 experts, no complete model; does not measure decoder throughput.
-build/tests/moe-tasks: tests/gpu/expert_tasks.c src/model/deepseek/expert_tasks.h src/kernels/expert_tasks.metal src/kernels/formats.metal src/kernels/kernels.metal src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/myds4.h
+build/tests/moe-tasks: tests/gpu/expert_tasks.c src/model/deepseek/expert_tasks.h src/kernels/expert_tasks.metal src/kernels/formats.metal src/kernels/kernels.metal src/engine/io.c src/engine/expert_store.h tests/unit/cache_layout.h src/engine/gpu.c src/engine/util.c src/engine/myds4.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/gpu/expert_tasks.c src/engine/io.c src/engine/gpu.c src/engine/util.c src/engine/memory.c $(LDLIBS)
 

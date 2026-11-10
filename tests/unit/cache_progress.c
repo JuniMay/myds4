@@ -13,6 +13,7 @@ static int fixture_wait(pthread_cond_t *cond, pthread_mutex_t *lock, const struc
 }
 #define pthread_cond_timedwait fixture_wait
 #include "../../src/engine/io.c"
+#include "cache_layout.h"
 #undef pthread_cond_timedwait
 static void *waiter(void *context) {
   uint64_t epoch = *(uint64_t *)context;
@@ -21,6 +22,7 @@ static void *waiter(void *context) {
   return NULL;
 }
 int main(void) {
+  deepseek_cache_layout();
   alarm(5);
   int checks = 0, failures = 0;
 #define CHECK(x) do { checks++; if (!(x)) failures++, fprintf(stderr, "FAIL: %s\n", #x); } while (0)

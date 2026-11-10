@@ -42,6 +42,7 @@ static int fixture_thread(pthread_t *thread, const pthread_attr_t *a, void *(*f)
 #define gpu_residency_commit fixture_residency
 #define pthread_create fixture_thread
 #include "../../src/engine/io.c"
+#include "cache_layout.h"
 #undef host_statistics64
 #undef task_info
 #undef sysctlbyname
@@ -144,6 +145,7 @@ static void unwritten_checks(void) {
 }
 
 int main(void) {
+  deepseek_cache_layout();
   alarm(10);
   working_set_fixture = 0;
   expect("an unopened Metal device supplies no residency target", mem_gpu_limit() == INT64_MAX);
@@ -163,7 +165,7 @@ int main(void) {
     }
   }
   cache_reserve(4);
-  cache_init(NULL, 56ull << 30, LAYERS);
+  cache_init(56ull << 30, LAYERS);
   expect("initial capacity uses file cache beyond the kept share to fit the requested 56 GiB",
          st->cap == (int)((56ull << 30) / st->SLOT_SIZE));
   expect("initial capacity respects the configured upper bound", st->cap <= st->max_slots);

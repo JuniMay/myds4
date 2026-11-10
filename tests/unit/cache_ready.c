@@ -3,6 +3,7 @@
 // represent completed reads whose dispatch group has not yet been released.
 #include "../../src/model/deepseek/model.h"
 #include "../../src/engine/io.c"
+#include "cache_layout.h"
 
 static int checks, failures;
 
@@ -21,8 +22,8 @@ static void check_prefetch(const char *state, int has_group, int pending) {
   st->score = &slot_score;
   st->head = st->tail = 0;
   st->token = 1;
-  memset(st->where, 0xff, sizeof st->where);
-  st->where[layer][expert] = 0;
+  memset(st->where, 0xff, WHERE_BYTES);
+  WHERE(layer, expert) = 0;
   memset(&cache_stats, 0, sizeof cache_stats);
   // The read was claimed already. cache_request must not launch any I/O.
   atomic_store(&slot.taken[0], 1);
@@ -59,6 +60,7 @@ static void check_prefetch(const char *state, int has_group, int pending) {
 }
 
 int main(void) {
+  deepseek_cache_layout();
   check_prefetch("completed group", 1, 0);
   check_prefetch("pending group", 1, 1);
   check_prefetch("released group", 0, 0);

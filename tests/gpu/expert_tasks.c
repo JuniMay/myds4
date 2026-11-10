@@ -4,6 +4,7 @@
 #include "../../src/model/deepseek/model.h"
 #include "myds4.h"
 #include "../../src/model/deepseek/expert_tasks.h"
+#include "../unit/cache_layout.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -84,7 +85,9 @@ int main(int argc, char **argv) {
   TensorIndex *index = st_open(argv[1]);
   // Only 24 experts are allocated and read, about 453 MB. The cache limit
   // reserves metadata, not buffers for unused slots.
-  cache_reserve(16), cache_init(index, 16ull << 30, LAYERS);
+  deepseek_mxfp4_spans(index);
+  deepseek_cache_layout();
+  cache_reserve(16), cache_init(16ull << 30, LAYERS);
   const int layers[JOBS] = {3, 11, 23, 37};
   tasks = zeros(JOBS * sizeof(MoeTask)), dummy = zeros(16);
   for (int i = 0; i < JOBS; i++) {

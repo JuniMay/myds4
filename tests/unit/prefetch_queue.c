@@ -8,6 +8,7 @@
 static dispatch_queue_t deferred;
 #define dispatch_get_global_queue(qos, flags) deferred
 #include "../../src/engine/io.c"
+#include "cache_layout.h"
 #undef dispatch_get_global_queue
 
 static int checks, failures;
@@ -31,8 +32,8 @@ static void setup(int fd) {
   fixture.prev = fixture.next = -1;
   st->slots = &fixture, st->score = &fixture_score;
   st->head = st->tail = 0, st->weight = 1;
-  memset(st->where, 0xff, sizeof st->where);
-  st->where[0][0] = 0;
+  memset(st->where, 0xff, WHERE_BYTES);
+  WHERE(0, 0) = 0;
   expert_spans[0] = 1;
   expert_span[0][0][0] = (FileSpan){fd, 0, 16384};
   st->qhead = st->qtail = 0;
@@ -52,6 +53,7 @@ static void teardown(void) {
 }
 
 int main(void) {
+  deepseek_cache_layout();
   alarm(20);
   int fd = open("/dev/zero", O_RDONLY);
   if (fd < 0) return 1;

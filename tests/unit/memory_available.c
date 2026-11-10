@@ -21,6 +21,7 @@ static int fixture_sysctl(const char *name, void *old, size_t *length, void *val
 
 #define sysctlbyname fixture_sysctl
 #include "../../src/engine/io.c"
+#include "cache_layout.h"
 #undef sysctlbyname
 
 static int checks, failures;
@@ -32,6 +33,7 @@ static void expect(const char *name, uint64_t actual, uint64_t wanted) {
 }
 
 int main(void) {
+  deepseek_cache_layout();
   vm_statistics64_data_t pages = {.free_count = 100, .external_page_count = 500, .speculative_count = 20};
   query_failed = 1;
   expect("an unreadable share counts only the free pages", avail_of(pages), 100 * vm_page_size);

@@ -11,11 +11,13 @@
 static dispatch_queue_t deferred;
 #define dispatch_get_global_queue(qos, flags) deferred
 #include "../../src/engine/io.c"
+#include "cache_layout.h"
 #undef dispatch_get_global_queue
 
 static void nothing(void *unused) {}
 
 int main(void) {
+  deepseek_cache_layout();
   alarm(20);
   enum { CURRENT = 6, COUNT = CURRENT + 1 };
   Slot fixture[COUNT] = {0};
@@ -30,7 +32,7 @@ int main(void) {
   st->max_slots = st->cap = st->nslots = COUNT, st->nfree = st->npinned = 0;
   st->head = COUNT - 1, st->tail = 0, st->token = 10, st->weight = 1;
   st->pass_layer = st->serving = -1;
-  memset(st->where, 0xff, sizeof st->where);
+  memset(st->where, 0xff, WHERE_BYTES);
   expert_spans[0] = expert_spans[2] = 1;
   expert_span[2][future][0] = (FileSpan){fd, 0, 16384};
   for (int i = 0; i < COUNT; i++) {
@@ -42,7 +44,7 @@ int main(void) {
     fixture[i].next = i ? i - 1 : -1;
     priorities[i] = i < CURRENT ? 0 : -INFINITY;
     if (i == CURRENT) continue;
-    ids[i] = i, st->where[0][i] = i;
+    ids[i] = i, WHERE(0, i) = i;
     expert_span[0][i][0] = (FileSpan){fd, 0, 16384};
     fixture[i].prefetched = 1;
     start(i, 0);
@@ -54,21 +56,21 @@ int main(void) {
   CHECK(atomic_load(&st->prefetching) == CURRENT); // Promotion has not freed admissions.
   CHECK(cache_stats.prefetch_hits == CURRENT && cache_stats.late == CURRENT);
   cache_prefetch(2, &future, 1, CURRENT);
-  CHECK(st->where[2][future] == -1 && cache_stats.prefetches == 0);
+  CHECK(WHERE(2, future) == -1 && cache_stats.prefetches == 0);
 
   dispatch_resume(deferred);
   dispatch_sync_f(deferred, NULL, nothing);
   cache_wait(0, ids, CURRENT);
   CHECK(atomic_load(&st->prefetching) == 0 && atomic_load(&st->demand) == 0);
-  CHECK(st->where[2][future] == -1); // Free capacity does not retry the skipped forecast.
+  CHECK(WHERE(2, future) == -1); // Free capacity does not retry the skipped forecast.
   CHECK(cache_stats.bytes == (uint64_t)CURRENT * 16384);
 
   cache_prefetch(2, &future, 1, CURRENT); // Offer exactly the same candidate again.
-  CHECK(st->where[2][future] == CURRENT && atomic_load(&st->prefetching) == 1);
+  CHECK(WHERE(2, future) == CURRENT && atomic_load(&st->prefetching) == 1);
   CHECK(cache_stats.prefetches == 1);
   cache_prefetch(2, &future, 1, CURRENT);
   CHECK(cache_stats.prefetches == 1 && atomic_load(&st->prefetching) == 1);
-  for (int i = 0; i < CURRENT; i++) CHECK(st->where[0][i] == i && cache_ready(0, i));
+  for (int i = 0; i < CURRENT; i++) CHECK(WHERE(0, i) == i && cache_ready(0, i));
   cancel(CURRENT);
   CHECK(atomic_load(&st->prefetching) == 0 && !fixture[CURRENT].loading);
   for (int i = 0; i < COUNT; i++) free(fixture[i].b.ptr);

@@ -14,11 +14,13 @@ static void fixture_free(Buf *b) { free(b->ptr); *b = (Buf){0}; }
 #define gpu_resident fixture_resident
 #define gpu_free fixture_free
 #include "../../src/engine/io.c"
+#include "cache_layout.h"
 #undef gpu_new
 #undef gpu_resident
 #undef gpu_free
 
 int main(void) {
+  deepseek_cache_layout();
   Slot fixture[2] = {0};
   double priorities[2] = {INFINITY, INFINITY};
   int unused[2] = {1, 0}, failures = 0, checks = 0;
@@ -26,7 +28,7 @@ int main(void) {
   st->slots = fixture, st->score = priorities, st->free_list = unused;
   st->max_slots = st->cap = st->nfree = 2, st->SLOT_SIZE = 64;
   st->head = st->tail = st->pass_layer = st->serving = -1;
-  memset(st->where, 0xff, sizeof st->where);
+  memset(st->where, 0xff, WHERE_BYTES);
   int a = take(0, 0, 1), b = take(1, 0, 0);
   CHECK(st->nslots == 2 && st->nmapped == 0 && added == 0);
   CHECK(!st->slots[a].mapped && !st->slots[b].mapped);
@@ -48,7 +50,7 @@ int main(void) {
   CHECK(cache_get(2, 0, at, &fresh) == &st->slots[a].b);
   CHECK(st->nmapped == 1 && added == 2 && fresh);
   CHECK(cache_stats.remaps == 1);
-  CHECK(st->nslots == 2 && st->where[0][0] == -1 && st->where[2][0] == a);
+  CHECK(st->nslots == 2 && WHERE(0, 0) == -1 && WHERE(2, 0) == a);
   for (int i = 0; i < 2; i++) fixture_free(&fixture[i].b);
   fprintf(stderr, "cache mapping: %d/%d CPU checks passed\n", checks - failures, checks);
   return failures != 0;
