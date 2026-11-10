@@ -109,7 +109,7 @@ int main(void) {
   expect("no test bytes read", st->stats.bytes, 0);
   for (int e = 1; e <= 3; e++) {
     int at = WHERE(LAYERS, e), fresh;
-    uint32_t spans[3];
+    uint32_t spans[STORE_PARTS];
     const Buf *buffer = cache_get(st, LAYERS, e, spans, &fresh);
     expect("draft uses its own stage pool", at >= 2 && at < 18, 1);
     expect("draft buffer keeps larger format size", buffer->size, 8192);

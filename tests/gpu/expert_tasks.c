@@ -99,7 +99,7 @@ int main(int argc, char **argv) {
     cache_load(st, layers[i], ids, TOPK);
     Entry *entry = (Entry *)j->ex.ptr;
     for (int e = 0; e < TOPK; e++) {
-      uint32_t at[3]; int fresh;
+      uint32_t at[STORE_PARTS]; int fresh;
       const Buf *b = cache_get(st, layers[i], ids[e], at, &fresh);
       entry[e] = (Entry){{b->gpu + at[0], b->gpu + at[1], 0}, (float)(e + 1) / 32, 0};
     }

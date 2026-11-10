@@ -1044,7 +1044,7 @@ static int routed(FlashLayer *y, int n) {
   size_t offset = (size_t)y->number * f.experts * sizeof(ExpertGroup);
   int resident = y->presence.count == (unsigned)f.experts;
   if (resident && y->table_generation != y->presence.generation) {
-    y->table_valid = experts_table(&f.routed, y->experts, &f.resident_table, offset);
+    y->table_valid = experts_table(&f.routed, y->experts, y->number, &f.resident_table, offset);
     y->table_generation = y->presence.generation;
   }
   resident &= y->table_valid;
@@ -1067,7 +1067,7 @@ static int routed(FlashLayer *y, int n) {
   }
   gpu_commit();
   gpu_sync();
-  if (!experts_acquire(&f.routed, y->experts, (const uint32_t *)selected.ptr,
+  if (!experts_acquire(&f.routed, y->experts, y->number, (const uint32_t *)selected.ptr,
                        (const float *)f.coefficients.ptr, n, 1, &f.cache.stats))
     return 0;
   gpu_begin();
@@ -1183,7 +1183,7 @@ static const float *pass(const Row *rows, int n, int logits, int prompt) {
   for (int i = 0; i < resident_count; i++) {
     const FlashLayer *y = f.layer + resident_layers[i];
     Buf selected = experts_selection(&f.selected, y->number, n, f.chosen);
-    experts_mark_used(&f.routed, y->experts, (const uint32_t *)selected.ptr, n);
+    experts_mark_used(&f.routed, y->experts, y->number, (const uint32_t *)selected.ptr, n);
     uint32_t unique = ((uint32_t *)f.resident_counts.ptr)[resident_layers[i]];
     f.cache.stats.hits += unique;
     f.cache.stats.row_unique += unique;

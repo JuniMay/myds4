@@ -17,9 +17,11 @@ static uint64_t logits_hash(const void *data, size_t bytes) {
 // every expert it uses, and only those: a decoded row marks the experts each
 // layer chose for it. The memory pool lists its entries newest first, so an
 // entry made after the model's leads to all of them. Counts the routed
-// experts in memory, and those touched (marked used) at or after `since`.
+// experts in memory (entries holding memory: an expert's own weight group,
+// or a slot of the expert store), and those touched (marked used) at or
+// after `since`.
 static int touched_experts(double since, int *ready) {
-  static const char *const names[] = {"Flash-Next expert", "Nemotron expert", "routed expert"};
+  static const char *const names[] = {"Flash-Next expert", "routed expert"};
   static MemoryAccount account;
   if (!account.name)
     memory_account_init(&account, "recency probe");
@@ -29,7 +31,7 @@ static int touched_experts(double since, int *ready) {
   *ready = 0;
   for (const MemorySlot *s = probe.next; s; s = s->next)
     for (size_t i = 0; i < sizeof names / sizeof *names; i++)
-      if (!strcmp(s->name, names[i]) && memory_ready(s)) {
+      if (!strcmp(s->name, names[i]) && s->bytes) {
         ++*ready;
         touched += s->touched >= since;
       }

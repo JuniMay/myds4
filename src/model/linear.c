@@ -83,6 +83,24 @@ void linear_load(WeightSet *weights, Linear *m, TensorIndex *index, const char *
     die("%s: matrix columns must be a multiple of 64", stem);
 }
 
+void linear_describe(Linear *m, TensorIndex *index, const char *stem, Tensor *weight, Tensor *scales) {
+  Tensor w = st_get(index, "%s.weight", stem);
+  if (w.dtype != 'u' || w.ndim != 2 || w.shape[0] < 1 || w.shape[1] < 1 || !st_has(index, "%s.weight_scale", stem))
+    die("%s: the expert store reads NVFP4 matrices with stored scales", stem);
+  *m = (Linear){.rows = (int)w.shape[0], .cols = (int)w.shape[1] * 2, .kind = 'n', .scale = 1, .input_scale = 1};
+  Tensor s = st_get(index, "%s.weight_scale", stem);
+  if (s.size != (size_t)m->rows * m->cols / 16)
+    die("%s: NVFP4 scale dimensions differ", stem);
+  if (m->cols % 64)
+    die("%s: matrix columns must be a multiple of 64", stem);
+  if (st_has(index, "%s.weight_scale_2", stem))
+    m->scale = scalar(st_get(index, "%s.weight_scale_2", stem));
+  if (st_has(index, "%s.input_scale", stem))
+    m->input_scale = scalar(st_get(index, "%s.input_scale", stem));
+  *weight = w;
+  *scales = s;
+}
+
 void linear_product(const Linear *m, const Buf *x, size_t xo, const Buf *y, size_t yo, int rows, int prompt,
                     const Buf *bf16, int staged, int rounded) {
   int format = m->kind == 'n' ? 0 : m->kind == '8' ? 1 : m->kind == 'b' ? 2 : 3;

@@ -14,7 +14,7 @@ typedef struct ExpertStore ExpertStore;
 // one after the other.
 typedef struct { int fd; uint64_t off, len; } FileSpan;
 
-enum { STORE_EXPERTS_MAX = 512, STORE_PARTS = 3 };
+enum { STORE_EXPERTS_MAX = 512, STORE_PARTS = 8 };
 
 // The layout, given before cache_init. Layers [0, scored_layers) share one
 // pool of slots, evicted by score; each later layer (a stage) has a pool of
@@ -66,15 +66,27 @@ void cache_load(ExpertStore *st, int layer, const int *experts, int n);  // fini
 // Starts reading the experts into memory. Returns how many had pending reads
 // when each was checked; prefetch lateness uses that same completion check.
 int cache_request(ExpertStore *st, int layer, const int *experts, int n);
+// Counts the experts as used, as cache_request does, without reading any:
+// for experts a pass reached through a table of their addresses. Experts
+// that left their slots meanwhile are skipped.
+void cache_use(ExpertStore *st, int layer, const int *experts, int n);
 void cache_wait(ExpertStore *st, int layer, const int *experts, int n);     // waits for their reads
 // Read the epoch before scanning pending requests, then wait only if no
 // piece completed since that scan. A completion for any layer wakes it.
 uint64_t cache_read_epoch(ExpertStore *st);
 void cache_wait_progress(ExpertStore *st, uint64_t epoch);
 int cache_slot(ExpertStore *st, int layer, int expert);   // it has a slot: resident, or being read
+// Requests up to a layer's experts (cache_request) and keeps them from
+// eviction until cache_unhold, after the GPU work that uses them completes.
 int cache_hold(ExpertStore *st, int layer, const int *experts, int n);
 void cache_unhold(ExpertStore *st, int layer, const int *experts, int n);
 int cache_ready(ExpertStore *st, int layer, int expert);  // resident and read
+// Whether the GPU can reach every expert of the layer through addresses
+// alone: each is read, its reads are reaped (cache_wait), and it is mapped
+// for the GPU in the committed residency set (not fresh). *generation
+// changes whenever an expert of the layer moves to or leaves a slot, so
+// that a table of the layer's addresses can be rebuilt then.
+int cache_layer_ready(ExpertStore *st, int layer, uint64_t *generation);
 int cache_where(ExpertStore *st, int layer, int expert);  // 0 only on the SSD, 1 in memory, 2 read ahead, 3 read ahead and still being read
 // Starts reading the n predicted experts that are not resident, in order,
 // while fewer than `inflight` prefetches are reading.

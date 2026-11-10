@@ -61,9 +61,14 @@ static void resident_check(const ModelOps *ops, uint64_t *hash) {
 }
 
 int main(int argc, char **argv) {
-  if (argc != 3)
-    die("usage: nemotron-model TARGET DFLASH2");
-  memory_configure(28, 10);
+  // --memory: a lower model-memory limit makes the checks evict and reuse expert memory; no
+  // layer then holds all of its experts, so the resident-layer check does not run.
+  double memory = 28;
+  if (argc == 5 && !strcmp(argv[3], "--memory") && atof(argv[4]) > 0)
+    memory = atof(argv[4]);
+  else if (argc != 3)
+    die("usage: nemotron-model TARGET DFLASH2 [--memory GIB]");
+  memory_configure(memory, 10);
   Options options = {.ctx = 4096,
                      .dump_fd = -1,
                      .routes_fd = -1,
@@ -135,9 +140,15 @@ int main(int argc, char **argv) {
   tok_close(tokenizer);
   free(expected);
   puts("Nemotron accepted-prefix checks passed");
-  uint64_t resident_hash;
-  resident_check(ops, &resident_hash);
-  printf("logits with every expert in memory %016llx\n", (unsigned long long)resident_hash);
-  puts("Nemotron experts used in resident layers count as used");
+  if (argc == 3) {
+    uint64_t resident_hash;
+    resident_check(ops, &resident_hash);
+    printf("logits with every expert in memory %016llx\n", (unsigned long long)resident_hash);
+    puts("Nemotron experts used in resident layers count as used");
+  }
+  ModelCounters counters;
+  ops->counters(&counters);
+  printf("within %.0f GiB: %llu experts read, %llu evicted\n", memory, (unsigned long long)counters.cache.misses,
+         (unsigned long long)counters.cache.evictions);
   return 0;
 }

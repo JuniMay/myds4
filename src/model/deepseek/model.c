@@ -1277,7 +1277,7 @@ static void fill_entries(int l, size_t eo, const int *experts, const float *weig
     }
   ExpertRef *ref = (ExpertRef *)(ETAB.ptr + eo);
   for (int k = 0; k < TOPK; k++) {
-    uint32_t at[3];
+    uint32_t at[STORE_PARTS];
     int fresh;
     const Buf *b = !ready || ready[idx[k]] == want ? cache_get(experts_store, l, idx[k], at, &fresh) : 0;
     ref[k] = b ? (ExpertRef){{b->gpu + at[0], b->gpu + at[1], b->gpu + at[2]}, wts[k], 0} : (ExpertRef){{0, 0, 0}, 0, 0};
@@ -1494,7 +1494,7 @@ static void routed_batch(const Batch *b, int l, int ahead, int inflight, int app
   int nt = 0, gg = gk[l].up != 0, per = gg ? 64 : 32;
   for (int i = 0; i < nn; i++) {
     int e = need[i], fresh;
-    uint32_t at[3];
+    uint32_t at[STORE_PARTS];
     const Buf *slot = cache_get(experts_store, l, e, at, &fresh);
     if (fresh) gpu_use(slot);
     for (int c = 0; c < count[e]; c += per)
@@ -2455,7 +2455,7 @@ static void draft_stage(int d, int pos) {
     size_t eo = (size_t)(LAYERS * FEW + d * BLOCK + r) * 256;
     ExpertRef *ref = (ExpertRef *)(ETAB.ptr + eo);
     for (int k = 0; k < DRAFT_TOPK; k++) {
-      uint32_t at[3];
+      uint32_t at[STORE_PARTS];
       int fresh;
       const Buf *b = cache_get(experts_store, LAYERS + d, idx[r][k], at, &fresh);
       ref[k] = (ExpertRef){{b->gpu + at[0], b->gpu + at[1], b->gpu + at[2]}, wts[r][k], 0};
@@ -3281,7 +3281,7 @@ static const float *pipeline_rows(State **states, const int *tokens, const int *
         // A first-use mapping might not be committed to the residency set
         // yet. This new encoder must declare the down stage's resources too.
         for (int k = 0; k < TOPK; k++) {
-          uint32_t at[3]; int fresh;
+          uint32_t at[STORE_PARTS]; int fresh;
           const Buf *b = cache_get(experts_store, job->layer, job->experts[k], at, &fresh);
           if (fresh) gpu_use(b);
         }

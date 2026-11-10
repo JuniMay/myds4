@@ -13,9 +13,19 @@
   } while (0)
 
 int main(int argc, char **argv) {
-  if (argc < 2 || argc > 3)
-    die("usage: flash-model CHECKPOINT [--long]");
-  memory_configure(32, 10);
+  // --memory: a lower model-memory limit makes the checks evict and reuse expert memory.
+  int long_check = 0;
+  double memory = 32;
+  for (int i = 2; i < argc; i++)
+    if (!strcmp(argv[i], "--long"))
+      long_check = 1;
+    else if (!strcmp(argv[i], "--memory") && i + 1 < argc && atof(argv[i + 1]) > 0)
+      memory = atof(argv[++i]);
+    else
+      argc = 0;
+  if (argc < 2)
+    die("usage: flash-model CHECKPOINT [--long] [--memory GIB]");
+  memory_configure(memory, 10);
   Options options = {.ctx = 4096, .dump_fd = -1, .routes_fd = -1, .quiet = 1};
   Model *model = model_open(argv[1], &options);
   CHECK(model != NULL);
@@ -78,7 +88,7 @@ int main(int argc, char **argv) {
   tok_close(tokenizer);
   free(expected);
   puts("Flash-Next colors and complete restored-state logits passed");
-  if (argc == 3 && !strcmp(argv[2], "--long")) {
+  if (long_check) {
     enum { N = 2071 };
     int *history = xmalloc(N * sizeof *history);
     int words[32],
@@ -108,5 +118,8 @@ int main(int argc, char **argv) {
     tok_close(tokenizer);
     puts("Flash-Next sparse selection, fork and restoration beyond 2048 positions passed");
   }
+  ops->counters(&counters);
+  printf("within %.0f GiB: %llu experts read, %llu evicted\n", memory, (unsigned long long)counters.cache.misses,
+         (unsigned long long)counters.cache.evictions);
   return 0;
 }

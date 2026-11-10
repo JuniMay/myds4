@@ -245,7 +245,7 @@ void mem_info(MemInfo *m) {
 
 typedef struct {
   Buf b;
-  uint32_t at[3];  // where the spans are in b
+  uint32_t at[STORE_PARTS];  // where the spans are in b
   int16_t layer, expert;
   int prev, next;  // links in the recency list, head = most recent
   int prefetched;  // loaded on a prediction, not yet requested
@@ -326,6 +326,11 @@ struct ExpertStore {
   int minimum_slots;
   double last_pool_growth;
   int16_t *where;  // [layers][experts]: an expert's slot (WHERE), -1: none
+  uint64_t *generation;  // [layers]: counts the changes of the layer's `where` (place, cache_layer_ready)
+  // cache_layer_ready's last finding of each layer: its generation then, and
+  // the unmappings (resize) by then. Until either changes the layer stays ready.
+  uint64_t *ready_generation, *ready_unmaps, unmaps;
+  int any_fresh;  // a slot may be fresh: cache_adapt clears them
   int nslots, cap, max_slots, *free_list, nfree, npinned;
   int nmapped, mcap;  // slots mapped for the GPU, and how many may be
   uint64_t pinned_bytes;
@@ -384,6 +389,13 @@ static double gave;  // when a store last gave slots back: their memory shows as
 #define SCORE_BYTES ((size_t)st->layers * st->experts * sizeof *st->escore)
 #define DRAFT_AGE_BYTES (((size_t)(st->layers - st->scored_layers) * st->stage_experts + 1) * sizeof *st->draft_age)
 
+// Puts expert e of the layer in slot i (-1: in none). A table of the layer's
+// addresses is then out of date (cache_layer_ready).
+static void place(ExpertStore *st, int layer, int e, int i) {
+  WHERE(layer, e) = i;
+  st->generation[layer]++;
+}
+
 ExpertStore *cache_create(const ExpertLayout *l) {
   if (l->experts < 1 || l->experts > STORE_EXPERTS_MAX || l->scored_layers < 1 || l->scored_layers > l->layers ||
       l->chosen < 1 || l->chosen > l->experts || l->stage_experts > l->experts || l->stage_min > l->stage_experts ||
@@ -403,6 +415,12 @@ ExpertStore *cache_create(const ExpertLayout *l) {
   size_t scored = (size_t)l->scored_layers * l->experts;
   st->where = xmalloc(WHERE_BYTES);
   memset(st->where, 0, WHERE_BYTES);
+  st->generation = xmalloc((size_t)l->layers * sizeof *st->generation);
+  memset(st->generation, 0, (size_t)l->layers * sizeof *st->generation);
+  st->ready_generation = xmalloc((size_t)l->layers * sizeof *st->ready_generation);
+  memset(st->ready_generation, 0xff, (size_t)l->layers * sizeof *st->ready_generation);  // never found ready
+  st->ready_unmaps = xmalloc((size_t)l->layers * sizeof *st->ready_unmaps);
+  memset(st->ready_unmaps, 0, (size_t)l->layers * sizeof *st->ready_unmaps);
   st->escore = xmalloc(SCORE_BYTES), st->dscore = xmalloc(SCORE_BYTES);
   memset(st->escore, 0, SCORE_BYTES), memset(st->dscore, 0, SCORE_BYTES);
   st->reload_cost = xmalloc(scored * sizeof *st->reload_cost);
@@ -650,7 +668,7 @@ static void release(ExpertStore *st, int i) {
   cancel(st, i);
   metrics_retire(st, i, 0);
   unlink_slot(st, i);
-  if (st->slots[i].expert >= 0) WHERE(st->slots[i].layer, st->slots[i].expert) = -1;
+  if (st->slots[i].expert >= 0) place(st, st->slots[i].layer, st->slots[i].expert, -1);
   if (st->slots[i].mapped) st->nmapped--, st->slots[i].mapped = 0;
   gpu_free(&st->slots[i].b);
   st->score[i] = INFINITY;
@@ -681,7 +699,7 @@ static void pool_evict(void *context) {
   int index = (int)(slot - st->slots);
   if (slot->pinned) {
     cancel(st, index);
-    if (slot->expert >= 0) WHERE(slot->layer, slot->expert) = -1;
+    if (slot->expert >= 0) place(st, slot->layer, slot->expert, -1);
     slot->expert = -1;
     gpu_free(&slot->b);
   } else release(st, index);
@@ -703,14 +721,15 @@ static Buf pool_buffer(ExpertStore *st, int index, size_t bytes, int mapped) {
 uint64_t cache_required(ExpertStore *st, int layers) {
   if (!st->layout_ready) {
   uint64_t pin_size = 0;  // the stages' slots
-  for (int l = 0; l < layers; l++) {
-    uint64_t size = 0, pieces = 0;
-    for (int k = 0; k < st->spans[l]; k++)
-      size += REGION(SPAN(l, 0, k).len), pieces += (REGION(SPAN(l, 0, k).len) + PIECE - 1) / PIECE;
-    if (pieces > 16) die("layer %d's experts take %llu reads of %llu MiB, more than a slot tracks", l, pieces, PIECE >> 20);
-    uint64_t *at = l < st->scored_layers ? &st->SLOT_SIZE : &pin_size;
-    if (size > *at) *at = size;
-  }
+  for (int l = 0; l < layers; l++)  // a slot holds the layer's largest expert
+    for (int e = 0; e < st->experts; e++) {
+      uint64_t size = 0, pieces = 0;
+      for (int k = 0; k < st->spans[l]; k++)
+        size += REGION(SPAN(l, e, k).len), pieces += (REGION(SPAN(l, e, k).len) + PIECE - 1) / PIECE;
+      if (pieces > 16) die("layer %d's experts take %llu reads of %llu MiB, more than a slot tracks", l, pieces, PIECE >> 20);
+      uint64_t *at = l < st->scored_layers ? &st->SLOT_SIZE : &pin_size;
+      if (size > *at) *at = size;
+    }
   prepare_reload_cost(st, layers);
   st->npinned = draft_pool_count(st, layers);
   st->pinned_bytes = st->npinned * pin_size;
@@ -777,7 +796,7 @@ void cache_init(ExpertStore *st, uint64_t budget, int layers) {
     s->expert = st->draft_capacity == st->stage_experts ? (i - st->max_slots) % st->draft_capacity : -1;
     s->pinned = 1;
     if (s->expert >= 0) {
-      WHERE(s->layer, s->expert) = i;
+      place(st, s->layer, s->expert, i);
       start(st, i, 1);
     }
   }
@@ -800,12 +819,12 @@ void cache_init(ExpertStore *st, uint64_t budget, int layers) {
   }
 }
 
-const Buf *cache_get(ExpertStore *st, int layer, int expert, uint32_t at[3], int *fresh) {
+const Buf *cache_get(ExpertStore *st, int layer, int expert, uint32_t at[STORE_PARTS], int *fresh) {
   int i = WHERE(layer, expert);
   if (i < 0) return 0;
   if (!st->slots[i].pinned) map_slot(st, i);
   *fresh = st->slots[i].fresh;
-  memcpy(at, st->slots[i].at, sizeof st->slots[i].at);
+  memcpy(at, st->slots[i].at, (size_t)st->parts * sizeof *at);  // the layout's spans
   return &st->slots[i].b;
 }
 
@@ -1033,7 +1052,7 @@ static int victim(ExpertStore *st) {
 static void map_slot(ExpertStore *st, int i) {
   if (st->slots[i].mapped) return;
   gpu_resident(&st->slots[i].b, 1);
-  st->slots[i].mapped = 1, st->slots[i].fresh = 1;
+  st->slots[i].mapped = 1, st->slots[i].fresh = 1, st->any_fresh = 1;
   st->nmapped++;
   if (st->slots[i].mapped_once) st->stats.remaps++;
   st->slots[i].mapped_once = 1;
@@ -1060,7 +1079,7 @@ static int take(ExpertStore *st, int layer, int e, int optional) {
     cancel(st, i);
     metrics_retire(st, i, optional);
     unlink_slot(st, i);
-    if (st->slots[i].expert >= 0) WHERE(st->slots[i].layer, st->slots[i].expert) = -1;
+    if (st->slots[i].expert >= 0) place(st, st->slots[i].layer, st->slots[i].expert, -1);
     st->stats.evictions++;
     if (st->slots[i].mapped) {
       gpu_resident(&st->slots[i].b, 0);
@@ -1078,7 +1097,7 @@ static int take(ExpertStore *st, int layer, int e, int optional) {
   if (st->cache_backbone) memory_touch(&st->slots[i].memory);
   st->slots[i].prefetched = 0;
   st->slots[i].layer = layer, st->slots[i].expert = e;
-  WHERE(layer, e) = i;
+  place(st, layer, e, i);
   st->score[i] = st->escore[layer * st->experts + e];
   push_front(st, i);
   return i;
@@ -1171,14 +1190,14 @@ static int draft_request(ExpertStore *st, int layer, const int *experts, int n) 
       if (i < 0) die("draft stage %d has no reusable slot: its slots are needed or still being read", layer - st->scored_layers);
       finish(st, i);  // reap a completed handle before assigning a new expert
       Slot *s = &st->slots[i];
-      if (s->expert >= 0) WHERE(s->layer, s->expert) = -1, st->stats.evictions++;
+      if (s->expert >= 0) place(st, s->layer, s->expert, -1), st->stats.evictions++;
       if (!s->b.obj) {
         s->b = pool_buffer(st, i, st->pinned_slot_size, 1), s->written = 0;
         if (!s->b.obj) die("reserved draft expert memory is unavailable");
       }
       s->layer = layer, s->expert = e;
       s->prefetched = 0;
-      WHERE(layer, e) = i;
+      place(st, layer, e, i);
       st->stats.misses++;
       start(st, i, 1);  // draft misses always use the demand-priority path
     }
@@ -1190,6 +1209,18 @@ static int draft_request(ExpertStore *st, int layer, const int *experts, int n) 
     reading += slot_reading(st, i);
   }
   return reading;
+}
+
+// Slot i's expert e of the layer is in use this token: eviction keeps it
+// longest, and its score grows.
+static void mark_used(ExpertStore *st, int layer, int e, int i) {
+  st->slots[i].prefetched = 0;
+  st->slots[i].used = st->token;
+  if (st->cache_backbone) memory_touch(&st->slots[i].memory);
+  double *history = &st->escore[layer * st->experts + e];
+  *history += st->weight;
+  st->score[i] = *history;
+  if (st->pass_layer < 0) st->dscore[layer * st->experts + e] += st->weight;
 }
 
 int cache_request(ExpertStore *st, int layer, const int *experts, int n) {
@@ -1227,22 +1258,27 @@ int cache_request(ExpertStore *st, int layer, const int *experts, int n) {
         st->pf_stats[m->phase].unobserved_first_uses++;
       }
     }
-    st->slots[i].prefetched = 0;
-    st->slots[i].used = st->token;
-    if (st->cache_backbone) memory_touch(&st->slots[i].memory);
-    double *history = &st->escore[layer * st->experts + e];
-    *history += st->weight;
-    st->score[i] = *history;
-    if (st->pass_layer < 0) st->dscore[layer * st->experts + e] += st->weight;
+    mark_used(st, layer, e, i);
     reading += pending;
   }
   return reading;
 }
 
+void cache_use(ExpertStore *st, int layer, const int *experts, int n) {
+  for (int k = 0; k < n; k++) {
+    int e = experts[k], i = WHERE(layer, e);
+    if (i < 0) continue;
+    if (!st->slots[i].pinned) unlink_slot(st, i), push_front(st, i);
+    if (st->slots[i].prefetched) st->stats.prefetch_hits++;
+    else st->stats.hits++;
+    mark_used(st, layer, e, i);
+  }
+}
+
 int cache_slot(ExpertStore *st, int layer, int e) { return WHERE(layer, e) >= 0; }
 
 int cache_hold(ExpertStore *st, int layer, const int *experts, int n) {
-  if (layer < 0 || layer >= st->scored_layers || n < 1 || n > st->chosen) die("invalid runahead expert set");
+  if (layer < 0 || layer >= st->scored_layers || n < 1 || n > st->experts) die("invalid expert set to hold");
   unsigned char resident[n];
   // Protect resident entries before allocating missing ones. Jobs share
   // the reservation and pending fetch when they need the same expert.
@@ -1273,6 +1309,19 @@ void cache_unhold(ExpertStore *st, int layer, const int *experts, int n) {
 int cache_ready(ExpertStore *st, int layer, int e) {
   int i = WHERE(layer, e);
   return i >= 0 && !slot_reading(st, i);
+}
+
+// A layer found ready stays ready until one of its experts moves (place) or
+// a slot is unmapped (resize): a slot is fresh or reading only after either.
+int cache_layer_ready(ExpertStore *st, int layer, uint64_t *generation) {
+  *generation = st->generation[layer];
+  if (st->ready_generation[layer] == *generation && st->ready_unmaps[layer] == st->unmaps) return 1;
+  for (int e = 0; e < st->experts; e++) {
+    int i = WHERE(layer, e);
+    if (i < 0 || st->slots[i].loading || !st->slots[i].mapped || st->slots[i].fresh) return 0;
+  }
+  st->ready_generation[layer] = *generation, st->ready_unmaps[layer] = st->unmaps;
+  return 1;
 }
 
 
@@ -1371,7 +1420,7 @@ static int discard_unstarted(ExpertStore *st, int layer, const int *keep, int n)
     for (int p = 0; p < st->slots[i].npiece; p++) piece_finished(st, &st->slots[i], p, 0);
     finish(st, i);
     metrics_retire(st, i, 0);
-    WHERE(layer, expert) = -1;
+    place(st, layer, expert, -1);
     st->slots[i].expert = -1, st->slots[i].prefetched = 0;
     st->slots[i].used = st->token - 1; // an empty slot is not part of the selected union
     st->score[i] = -INFINITY;
@@ -1451,7 +1500,7 @@ static void resize(ExpertStore *st, int below) {
     if (best < 0) break;
     gpu_resident(&st->slots[best].b, 0);
     st->slots[best].mapped = 0, st->slots[best].fresh = 0;
-    st->nmapped--;
+    st->nmapped--, st->unmaps++;
   }
   gpu_residency_commit();
   static int trace = -1;
@@ -1484,8 +1533,10 @@ void cache_adapt_pass(ExpertStore *st, int pass) {
     st->last_pool_growth = now();
   }
   resize(st, pass < 0 ? st->layers : pass - 1);
-  if (pass < 0)
+  if (pass < 0 && st->any_fresh) {  // resize committed the residency set
     for (int i = st->head; i >= 0; i = st->slots[i].next) st->slots[i].fresh = 0;
+    st->any_fresh = 0;
+  }
 }
 
 void cache_adapt(ExpertStore *st) { cache_adapt_pass(st, -1); }

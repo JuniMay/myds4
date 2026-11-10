@@ -5,7 +5,7 @@
 | Area | Responsibility |
 | --- | --- |
 | `src/engine/` | C interface, Metal commands, file access, tokenization, sampling and media decoding. |
-| `src/engine/expert_store.h`, `io.c` | The routed-expert store: slots read from the SSD, read-ahead and eviction by score, within the memory other programs leave. Each model with routed experts creates its own store from its layout (`cache_create`: its layers, their experts and each expert's file spans), and every call takes it. The stores share the reserve and the time of the last give-back, so that one shortfall goes back once. |
+| `src/engine/expert_store.h`, `io.c` | The routed-expert store: slots read from the SSD, read-ahead and eviction by score, within the memory other programs leave. Each model with routed experts creates its own store from its layout (`cache_create`: its layers, their experts and each expert's file spans, up to eight), and every call takes it. DeepSeek and Nemotron use it. The stores share the reserve and the time of the last give-back, so that one shortfall goes back once. |
 | `src/model/model.*` | Model registry and common execution interface. |
 | `src/model/weights.*`, `experts.*`, `linear.*` | Reloadable weights, routed-expert batches and matrix products. |
 | `src/model/deepseek/` | DeepSeek layers, experts, Engram, prefill planning and concurrent schedules. |
@@ -71,29 +71,43 @@ experts leave before routers, attention and shared weights.
 
 Routed experts share the process memory budget and dependency rules. Flash-Next
 and Nemotron also share the expert batch planner: it groups selected rows by
-expert, pins every selection before loading misses, records cache use, and
+expert, holds every selection before loading misses, records cache use, and
 retains the original expert order for each row's mixture. Their NVFP4 backend
 executes small groups together and batches larger prompt groups into 16-row
 matrix tiles. Quantized activations fit exactly in BF16; reductions retain
 FP32. Workspaces remain charged to the model-memory pool.
 
+Nemotron's routed experts live in its expert store, as DeepSeek's do. The
+model builds the store's layout from its checkpoint. Each expert's tensors
+that follow each other in a file share a span, when every expert of the
+layer lays them out alike; otherwise each tensor has its own span. Transcribe's
+experts take two spans: both weight matrices, then both scale matrices. A
+layer's matrices lie at the same places in each expert's slot. While the
+planner holds an expert, the expert's matrices are views of its slot.
+Flash-Next still keeps each routed expert as a weight group of its own; the
+shared loader packs that group's matrices and scales into one allocation.
+
 When every expert of a layer is resident, GPU routing feeds the expert batch
-planner directly. The engine records residency changes and rebuilds that
-layer's weight-address table after a reload. Each layer's selections stay in
-the pass's selection buffer until the pass completes. The engine then
-collects the cache-use counters and marks the experts that each such layer's
-rows chose as used, as it does for loaded selections, so that eviction keeps
-them. Layers with missing experts return their selections to the engine for
-loading.
+planner directly. With a store, resident means in a slot, read, mapped for
+the GPU and committed to the residency set. The engine rebuilds the layer's
+weight-address table after any of its experts moves. Each layer's selections
+stay in the pass's selection buffer until the pass completes. The engine
+then collects the cache-use counters and marks the experts that each such
+layer's rows chose as used, as it does for loaded selections, so that
+eviction keeps them. Layers with missing experts return their selections to
+the engine for loading.
 
 The expert batch stays in the current GPU command buffer with the following
-layer work. Selected weights remain pinned until the next CPU routing read
-or the end of the model pass. That synchronization completes the queued
-expert work before the engine releases its selection and loads another.
-Resident layers can run between these points without changing the held
-selection. Kernels and per-row summation order remain unchanged.
+layer work. Selected experts remain held until the next CPU routing read or
+the end of the model pass. That synchronization completes the queued expert
+work before the engine releases its selection and loads another. Resident
+layers can run between these points without changing the held selection.
+Kernels and per-row summation order remain unchanged. Nemotron's store
+advances its clock after every pass, prompt chunks included: the pass's GPU
+work has completed, so any slot that is not held may go back, and slots
+mapped during the pass join the residency set for the next one.
 
-The shared weight loader packs a cached expert's matrices and scales into
+The shared weight loader packs a weight group's matrices and scales into
 one Metal allocation with aligned views. Loading registers that allocation
 once; eviction releases and accounts for it once. Checkpoint bytes and
 scale decoding remain unchanged. Tensors that require a separate aligned
@@ -341,7 +355,9 @@ features. Image outputs are not bitwise equal to the CPU reference.
 The language backbone has 52 blocks: 23 Mamba2 blocks, 23 MoE blocks and
 six full-attention blocks. Its hidden width is 2,688. Each MoE block selects
 six of 128 experts and also runs a shared expert. Experts use two matrix
-products with a squared ReLU between them. The attention blocks have 32
+products with a squared ReLU between them. The expert store holds the 23 MoE
+blocks' 2,944 routed experts, 5.35 MiB each, read in four pieces from two
+spans. The attention blocks have 32
 query heads and two key/value heads, each with 128 values. They do not
 apply rotary positions; the Mamba blocks carry position-dependent history.
 

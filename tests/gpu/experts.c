@@ -79,8 +79,8 @@ static int held_selection(void) {
     }
     if (!weights_load(fake[e].weights)) return 0;
   }
-  experts_table(&w, fake, &table, 0);
-  if (!experts_acquire(&w, fake, (uint32_t *)selected.ptr, (float *)coefficients.ptr, 1, 0, &cache.stats))
+  experts_table(&w, fake, 0, &table, 0);
+  if (!experts_acquire(&w, fake, 0, (uint32_t *)selected.ptr, (float *)coefficients.ptr, 1, 0, &cache.stats))
     return 0;
   gpu_begin();
   experts_encode(&w, fake, &x); experts_sum(&w, &a);
@@ -93,7 +93,7 @@ static int held_selection(void) {
   gpu_sync();
   int equal = !memcmp(a.ptr, b.ptr, a.size);
   ((uint32_t *)selected.ptr)[0] = 2;
-  if (!experts_acquire(&w, fake, (uint32_t *)selected.ptr, (float *)coefficients.ptr, 1, 0, &cache.stats))
+  if (!experts_acquire(&w, fake, 0, (uint32_t *)selected.ptr, (float *)coefficients.ptr, 1, 0, &cache.stats))
     return 0;
   memory_reclaim(cache.bytes);
   int replaced = memory_ready(weights_slot(fake[0].weights)) && !memory_ready(weights_slot(fake[1].weights)) &&

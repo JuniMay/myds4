@@ -63,8 +63,11 @@ when the checkpoint contains the vision encoder. Set `draft: 0` and
 architecture. Its routed experts share the global `memory` budget.
 
 Nemotron 3.5 Transcribe uses checkpoint type `nemo_speechlm`. Its main model
-and speech encoder load on demand. The DFlash2 checkpoint is BF16 and loads
-only with `draft` enabled. Seven proposals are a useful starting point;
+and speech encoder load on demand. Its routed experts are read into the
+expert store's slots as passes need them, as DeepSeek's are. The store stays
+within the global `memory` budget, keeps the experts used most, and gives
+slots back when other programs need the memory. The DFlash2 checkpoint is
+BF16 and loads only with `draft` enabled. Seven proposals are a useful starting point;
 the best setting depends on acceptance and transcript length. Without
 explicit sampling settings, Transcribe uses temperature 0 and reasoning
 off. API requests can override those defaults.

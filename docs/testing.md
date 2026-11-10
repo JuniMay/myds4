@@ -63,6 +63,13 @@ shortfall back and the second gives nothing back until the memory readings
 can show it; the second store's unwritten slots count as in use too. It also checks which slot
 bytes count as not yet written: a slot whose read is under way, a load that
 dropped a piece, and the part of a slot beyond a smaller expert.
+`build/tests/cache-mapping` checks that CPU reads need no GPU residency and
+that only an encoded use maps an expert. On a store of two layers of four
+experts, it also checks when a layer can run through a table of its experts'
+addresses: only once a hold of the whole layer has been read, reaped,
+mapped and committed. It stops being ready when the residency limit unmaps
+a slot or one of its experts leaves its slot. Experts that a table used count
+as used without a read, and one that left its slot is skipped.
 `build/tests/weights-read` checks that a model's weights are read in
 16 KiB-aligned spans into aligned memory, so that a load does not fill the
 file cache, and that each tensor's bytes arrive intact.
@@ -89,7 +96,10 @@ used in the memory pool. The check then brings nearly every expert into
 memory with 1,500 varied tokens. The next row must mark its experts used
 too, and at least one layer must reach its experts through its table of
 resident experts. The program prints hashes of its logits, so that two
-builds can be compared. `tests/reference/nemotron.py`
+builds can be compared, and the experts read and evicted. With
+`--memory GIB` below its default 28, its experts are evicted and their
+slots reused; no layer then holds all of its experts, so the resident-layer
+check does not run. `tests/reference/nemotron.py`
 compares selected backbone blocks with the upstream CPU implementation.
 
 `build/tests/speech-model CHECKPOINT` reads bounded audio on stdin and
@@ -137,8 +147,10 @@ a short shape report.
 logits after state restoration, and state forks beyond the sparse indexer's
 2,048-token selection budget. Each decoded row must mark exactly its chosen
 experts used. The program prints hashes of its logits, so that two builds
-can be compared. Within its 32 GiB no layer holds all of its 512 experts,
-so its rows do not reach the table path. `tests/reference/flash.py --checkpoint DIR
+can be compared, and the experts read and evicted. Within its default
+32 GiB no layer holds all of its 512 experts, so its rows do not reach the
+table path. `--memory GIB` sets a lower limit, under which experts are
+evicted more often. `tests/reference/flash.py --checkpoint DIR
 --layer N` compares a requested text block with Transformers using the same
 input and only that block's selected experts.
 

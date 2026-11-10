@@ -11,7 +11,7 @@
 enum { NM_ROWS = 256, NM_BATCH = 8 };
 typedef struct {
   int kind, index, number, table_valid;
-  WeightPresence presence;
+  int moe;  // the expert store's layer (MoE blocks only)
   uint64_t table_generation;
   Buf norm, conv, conv_bias, decay, dt, skip, gate_norm, correction;
   Linear input, output, q, k, v, router;
@@ -43,8 +43,13 @@ static struct {
   TensorIndex *checkpoint;
   Layer *layer;
   WeightSet *core;
-  WeightCache cache;
-  uint64_t expert_bytes;
+  // The routed experts: the store reads each from two or four spans (spans,
+  // span) into a slot; places say where its matrices lie in the slot.
+  ExpertStore *store;
+  int moe_layers, store_ready;
+  FileSpan *span;  // [moe_layers][experts][STORE_PARTS]
+  int *spans;      // [moe_layers]
+  ExpertPlaces *places;
   Buf embedding, final_norm;
   Linear head;
   Buf tokens, embeddings, sequences, x, norm, quant, packed, projected_values, convolved, scan, gated;
@@ -74,17 +79,63 @@ static float number(const Json *j, const char *name, float fallback) {
 static void vector(Buf *out, const char *name, int exponential) {
   weights_vector(nm.core, out, st_get(nm.checkpoint, "%s", name), 0, exponential ? WEIGHT_EXP : 0);
 }
-static void expert(Expert *e, const char *prefix, WeightPresence *presence) {
-  int cache = presence != NULL;
+// The shared expert is part of the backbone.
+static void shared_expert(Expert *e, const char *prefix) {
   char name[256];
-  e->weights = cache ? weights_cached(nm.core, &nm.cache, "Nemotron expert") : nm.core;
-  if (cache) weights_track(e->weights, presence);
+  e->weights = nm.core;
   snprintf(name, sizeof name, "%s.up_proj", prefix);
   linear_load(e->weights, &e->up, nm.checkpoint, name);
   snprintf(name, sizeof name, "%s.down_proj", prefix);
   linear_load(e->weights, &e->down, nm.checkpoint, name);
-  if (cache && weights_required(e->weights) > nm.expert_bytes)
-    nm.expert_bytes = weights_required(e->weights);
+}
+// A routed expert's matrices, and its tensors: up's weights and scales, then
+// down's.
+static void routed_expert(Expert *e, const char *prefix, Tensor *tensors) {
+  char name[256];
+  *e = (Expert){0};
+  snprintf(name, sizeof name, "%s.up_proj", prefix);
+  linear_describe(&e->up, nm.checkpoint, name, &tensors[0], &tensors[1]);
+  snprintf(name, sizeof name, "%s.down_proj", prefix);
+  linear_describe(&e->down, nm.checkpoint, name, &tensors[2], &tensors[3]);
+}
+static int same_places(const ExpertPlaces *a, const ExpertPlaces *b) {
+  for (int k = 0; k < 3; k++)
+    if (a->weight[k].span != b->weight[k].span || a->weight[k].offset != b->weight[k].offset ||
+        a->scales[k].span != b->scales[k].span || a->scales[k].offset != b->scales[k].offset)
+      return 0;
+  return 1;
+}
+// The store's layout from the routed experts' tensors ([moe_layers][experts][4]).
+// A layer's experts share one placement of their matrices in a slot: the
+// tensors that follow each other in a file share a span when every expert of
+// the layer lays them out alike, and each tensor has its own span otherwise.
+static void store_layout(const Tensor *tensors) {
+  nm.span = xmalloc((size_t)nm.moe_layers * nm.experts * STORE_PARTS * sizeof *nm.span);
+  nm.spans = xmalloc((size_t)nm.moe_layers * sizeof *nm.spans);
+  nm.places = xmalloc((size_t)nm.moe_layers * sizeof *nm.places);
+  for (int m = 0; m < nm.moe_layers; m++)
+    for (int merge = 1; merge >= 0; merge--) {
+      int alike = 1;
+      for (int e = 0; e < nm.experts && alike; e++) {
+        size_t at = (size_t)m * nm.experts + e;
+        ExpertPart parts[4];
+        int n = experts_spans(tensors + at * 4, 4, merge, nm.span + at * STORE_PARTS, parts);
+        ExpertPlaces p = {.weight = {{0, 0}, parts[0], parts[2]}, .scales = {{0, 0}, parts[1], parts[3]}};
+        if (!e)
+          nm.spans[m] = n, nm.places[m] = p;
+        else
+          alike = n == nm.spans[m] && same_places(&p, &nm.places[m]);
+      }
+      if (alike)
+        break;
+      if (!merge)
+        die("Nemotron layer %d's experts have different tensors", m);
+    }
+  nm.store = cache_create(&(ExpertLayout){.layers = nm.moe_layers, .scored_layers = nm.moe_layers,
+                                          .experts = nm.experts, .chosen = nm.chosen, .parts = STORE_PARTS,
+                                          .span = nm.span, .spans = nm.spans});
+  cache_memory(nm.store, weights_slot(nm.core));
+  experts_store(&nm.routed, nm.store, nm.places);
 }
 static void prepare(const char *directory) {
   char path[4096], name[256];
@@ -146,6 +197,10 @@ static void prepare(const char *directory) {
   vector(&nm.final_norm, "backbone.norm_f.weight", 0);
   linear_load(nm.core, &nm.head, nm.checkpoint, "lm_head");
   nm.layer = xmalloc((size_t)nm.layers * sizeof *nm.layer);
+  int moe_layers = 0;
+  for (int l = 0; l < nm.layers; l++)
+    moe_layers += !strcmp(types->kid[l].s, "moe");
+  Tensor *tensors = xmalloc(((size_t)moe_layers * nm.experts * 4 + 1) * sizeof *tensors);
   for (int l = 0; l < nm.layers; l++) {
     Layer *y = nm.layer + l;
     y->number = l;
@@ -182,17 +237,20 @@ static void prepare(const char *directory) {
       MAT(router, "gate");
       VEC(correction, "gate.e_score_correction_bias", 0);
       snprintf(name, sizeof name, "backbone.layers.%d.mixer.shared_experts", l);
-      expert(&y->shared, name, 0);
+      shared_expert(&y->shared, name);
+      y->moe = nm.moe_layers++;
       y->experts = xmalloc((size_t)nm.experts * sizeof *y->experts);
       for (int e = 0; e < nm.experts; e++) {
         snprintf(name, sizeof name, "backbone.layers.%d.mixer.experts.%d", l, e);
-        expert(y->experts + e, name, &y->presence);
+        routed_expert(y->experts + e, name, tensors + ((size_t)y->moe * nm.experts + e) * 4);
       }
     } else
       die("unsupported Nemotron layer type: %s", type);
 #undef MAT
 #undef VEC
   }
+  store_layout(tensors);
+  free(tensors);
   snprintf(path, sizeof path, "%s/generation_config.json", directory);
   if (!access(path, R_OK)) {
     char *source = read_file(path, NULL);
@@ -307,7 +365,8 @@ static int prepare_rows(int rows, int positions) {
   if (blocks < 1)
     blocks = 1;
   for (;;) {
-    uint64_t experts = (uint64_t)(rows * nm.chosen < nm.experts ? rows * nm.chosen : nm.experts) * nm.expert_bytes;
+    cache_working_rows(nm.store, rows);  // the store's fewest slots: two layers' selections
+    uint64_t experts = cache_required(nm.store, nm.moe_layers);
     if (memory_minimum(weights_slot(nm.core)->account, weights_required(nm.core) + dflash_required(nm.draft) + fixed +
                                                            workspace(rows, blocks, 0) + experts)) {
       gpu_sync();
@@ -570,10 +629,11 @@ static void feed_forward(const Expert *e, const Buf *input, const Buf *output, i
 }
 static int routed(Layer *y, int rows) {
   size_t offset = (size_t)y->number * nm.experts * sizeof(ExpertGroup);
-  int resident = (nm.prompt_pass || rows <= 8) && y->presence.count == (unsigned)nm.experts;
-  if (resident && y->table_generation != y->presence.generation) {
-    y->table_valid = experts_table(&nm.routed, y->experts, &nm.resident_table, offset);
-    y->table_generation = y->presence.generation;
+  uint64_t generation;
+  int resident = (nm.prompt_pass || rows <= 8) && cache_layer_ready(nm.store, y->moe, &generation);
+  if (resident && y->table_generation != generation) {
+    y->table_valid = experts_table(&nm.routed, y->experts, y->moe, &nm.resident_table, offset);
+    y->table_generation = generation;
   }
   resident &= y->table_valid;
   Buf selected = experts_selection(&nm.selected, y->number, rows, nm.chosen);
@@ -600,8 +660,8 @@ static int routed(Layer *y, int rows) {
   }
   gpu_commit();
   gpu_sync();
-  if (!experts_acquire(&nm.routed, y->experts, (const uint32_t *)selected.ptr,
-                       (const float *)nm.coefficients.ptr, rows, nm.prompt_pass, &nm.cache.stats))
+  if (!experts_acquire(&nm.routed, y->experts, y->moe, (const uint32_t *)selected.ptr,
+                       (const float *)nm.coefficients.ptr, rows, nm.prompt_pass, cache_counters(nm.store)))
     return 0;
   gpu_begin();
   experts_encode(&nm.routed, y->experts, &nm.norm);
@@ -666,7 +726,7 @@ static const float *pass(const Row *rows, int count, int logits, int prompt) {
       seq[r].saved_conv = s->saved_conv[rows[r].save - 1].gpu;
   }
   double began = now(), gpu = gpu_busy;
-  CacheStats before = nm.cache.stats;
+  CacheStats *stats = cache_counters(nm.store), before = *stats;
   int resident_layers[nm.layers], resident_count = 0;
   gpu_begin();
   uint32_t hidden = (uint32_t)nm.hidden;
@@ -689,6 +749,8 @@ static const float *pass(const Row *rows, int count, int logits, int prompt) {
     else if (y->kind == 1)
       attention(y, count);
     else {
+      if (prompt)
+        cache_pass(nm.store, y->moe);  // a prompt's reads evict earlier layers' experts first
       int result = routed(y, count);
       if (!result) return NULL;
       if (result == 2) resident_layers[resident_count++] = l;
@@ -714,17 +776,20 @@ static const float *pass(const Row *rows, int count, int logits, int prompt) {
   }
   gpu_commit();
   gpu_sync();
-  for (int i = 0; i < resident_count; i++) {
+  if (prompt)
+    cache_pass(nm.store, -1);
+  for (int i = 0; i < resident_count; i++) {  // the store counts their experts as hits
     const Layer *y = nm.layer + resident_layers[i];
     Buf selected = experts_selection(&nm.selected, y->number, count, nm.chosen);
-    experts_mark_used(&nm.routed, y->experts, (const uint32_t *)selected.ptr, count);
-    uint32_t unique = ((uint32_t *)nm.resident_counts.ptr)[resident_layers[i]];
-    nm.cache.stats.hits += unique;
-    nm.cache.stats.row_unique += unique;
-    nm.cache.stats.row_own += (uint64_t)count * nm.chosen;
+    stats->row_unique += experts_mark_used(&nm.routed, y->experts, y->moe, (const uint32_t *)selected.ptr, count);
+    stats->row_own += (uint64_t)count * nm.chosen;
   }
   nm.counters.table_layers += resident_count;
   experts_release(&nm.routed);
+  // The pass's GPU work has completed and no expert is held: between passes
+  // the store may evict any slot, its new slots join the residency set (the
+  // next pass reaches them through tables), and the scores age once.
+  cache_adapt(nm.store);
   if (nm.dump_fd >= 0) {
     size_t bytes = (size_t)logits * nm.vocab * 4;
     if (write(nm.dump_fd, nm.logits.ptr, bytes) != (ssize_t)bytes)
@@ -734,12 +799,12 @@ static const float *pass(const Row *rows, int count, int logits, int prompt) {
     rows[i].state->pos++;
   if (prompt) {
     nm.counters.prefill_rows += count;
-    add_stats(&nm.counters.prefill, before, nm.cache.stats);
+    add_stats(&nm.counters.prefill, before, *stats);
   } else {
     nm.counters.decode_rows += count;
     nm.counters.decode_seconds += now() - began;
     nm.counters.decode_gpu_seconds += gpu_busy - gpu;
-    add_stats(&nm.counters.decode, before, nm.cache.stats);
+    add_stats(&nm.counters.decode, before, *stats);
   }
   nm.counters.prefill_layer = 0;
   return nm.last_logits = (const float *)nm.logits.ptr;
@@ -803,6 +868,10 @@ static int load(const char *directory, const Options *options) {
   memory_pin(weights_slot(nm.core), 1);
   dflash_active(nm.draft, 1);
   int ok = prepare_rows(1, 1) && weights_load(nm.core) && dflash_load(nm.draft);
+  if (ok && !nm.store_ready) {  // the store's slots and readers start once; a reload refills the slots
+    cache_init(nm.store, 0, nm.moe_layers);
+    nm.store_ready = 1;
+  }
   memory_pin(weights_slot(nm.core), 0);
   dflash_active(nm.draft, 0);
   return ok;
@@ -842,22 +911,31 @@ static int replay_start(int position) {
 }
 static void seek(ModelState *s, const int *tokens, int position) {
 }
+// Before the first load there is no store, or no slot in it.
 static int idle(void) {
-  return nm.cache.slots;
+  if (!nm.store_ready)
+    return 0;
+  cache_idle(nm.store);
+  return cache_slots(nm.store);
 }
-static uint64_t cache_bytes(void) {
-  return nm.cache.bytes;
+static uint64_t store_bytes(void) {
+  return nm.store_ready ? cache_bytes(nm.store) : 0;
 }
 static void counters(ModelCounters *out) {
   *out = nm.counters;
   out->layers = nm.layers;
   out->experts_per_row = (nm.layers - nm.recurrent - nm.attention) * nm.chosen;
   out->dense_bytes = weights_resident_bytes(nm.core) + speech_weight_bytes(nm.speech) + dflash_weight_bytes(nm.draft);
-  out->cache = nm.cache.stats;
-  out->cache_bytes = nm.cache.bytes;
-  out->cache_slots = out->mapped = out->cap = nm.cache.slots;
-  out->max_slots = out->experts = nm.cache.capacity;
-  out->slot_bytes = nm.cache.slots ? nm.cache.bytes / nm.cache.slots : nm.expert_bytes;
+  if (!nm.store)
+    return;
+  out->cache = *cache_counters(nm.store);
+  out->cache_bytes = store_bytes();
+  out->cache_slots = cache_slots(nm.store);
+  out->mapped = cache_mapped(nm.store);
+  out->cap = cache_cap(nm.store);
+  out->max_slots = cache_max(nm.store);
+  out->experts = nm.moe_layers * nm.experts;
+  out->slot_bytes = cache_slot_bytes(nm.store);
 }
 static void plan(ModelPlan *out) {
   *out = nm.plan;
@@ -880,6 +958,8 @@ static void media(const Media *input, int count) {
 static void active(int on) {
   speech_reside(nm.speech, on);
   dflash_active(nm.draft, on);
+  if (nm.store)
+    cache_active(nm.store, on);
 }
 static const double *draft(ModelState *state, int token, int position, int *tokens, int count, Sampler *sampler) {
   State *s = (State *)state;
@@ -919,7 +999,7 @@ const ModelOps nemotron_ops = {.family = "Nemotron 3.5 Transcribe",
                                .media = media,
                                .active = active,
                                .counters = counters,
-                               .cache_bytes = cache_bytes,
+                               .cache_bytes = store_bytes,
                                .plan = plan,
                                .vocab = vocab,
                                .max_rows = max_rows,
