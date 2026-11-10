@@ -107,7 +107,16 @@ static int ced_check_layer = 20, ced_check_compact;
 static void ced_check_routes(int layer, int row, int rows, const int *routes);
 #endif
 
-#define MB 2048     // rows of a prompt batch
+// Rows of a prompt batch. A batch groups its (row, expert) pairs by expert
+// into tiles, and each tile decodes its expert's weights once, so larger
+// batches fill tiles better. Batch boundaries change no result.
+#define MB 8192
+// Dependency-pruned prefill keeps or skips decoder rows in groups of this
+// many (prefill_prune_plan's block), independently of MB.
+#define PRUNE_ROWS 2048
+// A layer whose next layer takes more rows than this reads all of the next
+// layer's experts ahead: so many rows choose nearly every expert.
+#define BULK_ROWS 4096
 #define KERNEL_ROWS 6  // the most rows the one-row kernels' multi-row forms (products, the head) take at once
 #define TARGET 37   // the first of the layers whose attention input the draft reads
 // A layer's window keys are a ring of RING rows (row p % RING), and a KV
@@ -1960,7 +1969,7 @@ static int decoder_begin(int n, int pos) {
 static PrefillPrune decoder_plan(int pos, int count, int layer) {
   int remaining = LAYERS - 21;
   return prefill_prune_plan(pos, count, prefill_prune_end, prefix_capture.at,
-                           remaining, WINDOW, replay_margin(), MB);
+                           remaining, WINDOW, replay_margin(), PRUNE_ROWS);
 }
 
 // Runs the prompt's rows through every layer. Quitting stops it before its
@@ -2014,18 +2023,21 @@ static int prefill(const int *tokens, int n, int pos0) {
       next_rows = decoder_plan(pos0, n, l + 1).kept;
     }
     if (replaying && replay_first[l] - pos0 > begin) begin = replay_first[l] - pos0 < n ? replay_first[l] - pos0 : n;
-    int first_batch = 1;
-    for (int s = begin; s < n; s += MB) {
+    int first_batch = 1, batch_rows = 0;
+    for (int s = begin; s < n; s += batch_rows) {
       if (shutdown_requested()) {
         stopped = 1;
         break;
       }
+      int end = n;
       if (prefill_prune_active && l > 20) {
         if (s < plan.prefix_begin) s = plan.prefix_begin;
         if (s >= plan.prefix_end && s < plan.tail_begin) s = plan.tail_begin;
         if (s >= n) break;
+        if (s < plan.prefix_end) end = plan.prefix_end;  // a batch stays within a kept region
       }
-      Batch b = {n - s < MB ? n - s : MB, pos0 + s, s};
+      batch_rows = end - s < MB ? end - s : MB;
+      Batch b = {batch_rows, pos0 + s, s};
       if (l > 20) forward_info.decoder_row_layers += b.m;
       prefix_before(&b, l);
       gpu_begin();
@@ -2045,7 +2057,7 @@ static int prefill(const int *tokens, int n, int pos0) {
 #endif
 
       gpu_begin();
-      int ahead = opt.deepseek.substitute > 0 ? SUB_KEEP : next_rows > 2 * MB ? EXPERTS : 8;
+      int ahead = opt.deepseek.substitute > 0 ? SUB_KEEP : next_rows > BULK_ROWS ? EXPERTS : 8;
       if (prefill_prune_active && !next_rows) ahead = 0;
       routed_batch(&b, l, ahead, 2 * EXPERTS, opt.deepseek.substitute > 0);
       gpu_commit();

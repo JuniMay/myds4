@@ -251,11 +251,22 @@ pipeline keeps independent layer stages in flight and groups ready expert
 stages across layers. Both preserve each request's ordered reduction.
 There is still a token boundary before the next sampling step.
 
-Dependency-pruned prefill skips whole decoder batches outside the history
-needed by the final output and branch snapshots. It retains required
-encoder work and original batch boundaries. CED instead deliberately
-shortens decoder replay and is approximate. Either can change cache warmth
-and subsequent decoding speed even when prefill is faster.
+A prompt runs layer by layer over up to 16,384 rows, in batches of up to
+8,192 rows. Each batch groups its routed (row, expert) pairs by expert into
+tiles of up to 64 rows (32 for MXFP4), and each tile decodes its expert's
+weights once. Larger batches therefore fill the tiles better: on a
+5,772-token prompt the routed experts took about a quarter less GPU time
+with 8,192-row batches than with 2,048. A batch needs about 0.9 MB of
+workspace per row, about 7 GiB at 8,192 rows; prefill takes fewer rows when
+the model-memory budget is short. Batch boundaries change no result. When a
+layer's successor takes more than 4,096 rows, the layer reads all of the
+next layer's experts ahead, since that many rows choose nearly every expert.
+
+Dependency-pruned prefill skips decoder rows outside the history needed by
+the final output and branch snapshots, in groups of 2,048 rows, and a batch
+ends where a kept group ends. It retains required encoder work. CED instead
+deliberately shortens decoder replay and is approximate. Either can change
+cache warmth and subsequent decoding speed even when prefill is faster.
 
 ## Qwen3.8-27B
 

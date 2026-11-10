@@ -165,7 +165,7 @@ Quitting (Ctrl-C, SIGTERM, or `q` in the terminal interface) stops a model's
 load between weights; the load frees what it took, and requests waiting for
 it end as a shutdown. Weights that a pass loads (routed experts, vision
 weights) complete with their pass first. A DeepSeek prompt's prefill stops
-before its next batch of 2,048 rows, and its request ends as a shutdown;
+before its next batch of up to 8,192 rows, and its request ends as a shutdown;
 other models' prefills stop between the calls the server makes for them.
 
 Prefill uses chunks that fit available model workspace. A long prompt does
