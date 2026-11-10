@@ -24,7 +24,7 @@ static void check_prefetch(const char *state, int has_group, int pending) {
   st->token = 1;
   memset(st->where, 0xff, WHERE_BYTES);
   WHERE(layer, expert) = 0;
-  memset(&cache_stats, 0, sizeof cache_stats);
+  memset(&st->stats, 0, sizeof st->stats);
   // The read was claimed already. cache_request must not launch any I/O.
   atomic_store(&slot.taken[0], 1);
   if (has_group) {
@@ -34,33 +34,33 @@ static void check_prefetch(const char *state, int has_group, int pending) {
     expect(state, "group has pending work", dispatch_group_wait(slot.loading, DISPATCH_TIME_NOW) != 0, pending);
   }
 
-  expect(state, "selected expert has a slot", cache_slot(layer, expert), 1);
-  expect(state, "ready before request", cache_ready(layer, expert), !pending);
-  expect(state, "prefetch classification", cache_where(layer, expert), pending ? 3 : 2);
-  expect(state, "request's pending read count", cache_request(layer, &expert, 1), pending);
-  expect(state, "prefetch hits", cache_stats.prefetch_hits, 1);
-  expect(state, "late prefetch hits", cache_stats.late, pending);
-  expect(state, "demand misses", cache_stats.misses, 0);
-  expect(state, "bytes read", cache_stats.bytes, 0);
-  expect(state, "selected expert keeps its slot", cache_slot(layer, expert), 1);
+  expect(state, "selected expert has a slot", cache_slot(st, layer, expert), 1);
+  expect(state, "ready before request", cache_ready(st, layer, expert), !pending);
+  expect(state, "prefetch classification", cache_where(st, layer, expert), pending ? 3 : 2);
+  expect(state, "request's pending read count", cache_request(st, layer, &expert, 1), pending);
+  expect(state, "prefetch hits", st->stats.prefetch_hits, 1);
+  expect(state, "late prefetch hits", st->stats.late, pending);
+  expect(state, "demand misses", st->stats.misses, 0);
+  expect(state, "bytes read", st->stats.bytes, 0);
+  expect(state, "selected expert keeps its slot", cache_slot(st, layer, expert), 1);
 
   if (pending) {
     dispatch_group_leave(slot.loading);
-    expect(state, "ready after I/O completes", cache_ready(layer, expert), 1);
+    expect(state, "ready after I/O completes", cache_ready(st, layer, expert), 1);
   }
   // Reap the completed handle, as the normal consumer does. No wait can block.
-  cache_wait(layer, &expert, 1);
-  expect(state, "ready after consumer wait", cache_ready(layer, expert), 1);
+  cache_wait(st, layer, &expert, 1);
+  expect(state, "ready after consumer wait", cache_ready(st, layer, expert), 1);
   expect(state, "consumer releases group", slot.loading == NULL, 1);
-  expect(state, "missing expert has no slot", cache_slot(layer, expert + 1), 0);
-  expect(state, "missing expert is not ready", cache_ready(layer, expert + 1), 0);
-  expect(state, "missing expert classification", cache_where(layer, expert + 1), 0);
+  expect(state, "missing expert has no slot", cache_slot(st, layer, expert + 1), 0);
+  expect(state, "missing expert is not ready", cache_ready(st, layer, expert + 1), 0);
+  expect(state, "missing expert classification", cache_where(st, layer, expert + 1), 0);
   st->slots = NULL;
   st->score = NULL;
 }
 
 int main(void) {
-  deepseek_cache_layout();
+  st = deepseek_cache_create();
   check_prefetch("completed group", 1, 0);
   check_prefetch("pending group", 1, 1);
   check_prefetch("released group", 0, 0);

@@ -56,12 +56,15 @@ static inline void deepseek_mxfp4_spans(TensorIndex *index) {
       if (e == (l < LAYERS ? EXPERTS : DRAFT_EXPERTS) - 1) expert_spans[l] = 2;
     }
 }
-// The store's layout: the backbone's routed experts, then the DSpark stages'.
-static inline void deepseek_cache_layout(void) {
-  cache_layout(&(ExpertLayout){.layers = CACHE_LAYERS, .scored_layers = LAYERS, .experts = EXPERTS,
-                               .chosen = TOPK, .stage_experts = DRAFT_EXPERTS, .stage_min = DRAFT_CACHE_MIN,
-                               .parts = 3, .span = &expert_span[0][0][0], .spans = expert_spans});
+// DeepSeek's expert store: the backbone's routed experts, then the DSpark
+// stages'.
+static inline ExpertStore *deepseek_cache_create(void) {
+  return cache_create(&(ExpertLayout){.layers = CACHE_LAYERS, .scored_layers = LAYERS, .experts = EXPERTS,
+                                      .chosen = TOPK, .stage_experts = DRAFT_EXPERTS, .stage_min = DRAFT_CACHE_MIN,
+                                      .parts = 3, .span = &expert_span[0][0][0], .spans = expert_spans});
 }
+// With MYDS4_PREFETCH_METRICS: the expert store's read-ahead measurements.
+void deepseek_metrics_report(FILE *out);
 // A routed expert as the expert kernels read it: the GPU addresses of its
 // three matrices (null: no expert) and its routing weight.
 typedef struct { uint64_t p[3]; float weight, pad; } ExpertRef;

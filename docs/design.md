@@ -5,7 +5,7 @@
 | Area | Responsibility |
 | --- | --- |
 | `src/engine/` | C interface, Metal commands, file access, tokenization, sampling and media decoding. |
-| `src/engine/expert_store.h`, `io.c` | The routed-expert store: slots read from the SSD, read-ahead and eviction by score, within the memory other programs leave. The model gives its layout (`cache_layout`): its layers, their experts and each expert's file spans. |
+| `src/engine/expert_store.h`, `io.c` | The routed-expert store: slots read from the SSD, read-ahead and eviction by score, within the memory other programs leave. Each model with routed experts creates its own store from its layout (`cache_create`: its layers, their experts and each expert's file spans), and every call takes it. The stores share the reserve and the time of the last give-back, so that one shortfall goes back once. |
 | `src/model/model.*` | Model registry and common execution interface. |
 | `src/model/weights.*`, `experts.*`, `linear.*` | Reloadable weights, routed-expert batches and matrix products. |
 | `src/model/deepseek/` | DeepSeek layers, experts, Engram, prefill planning and concurrent schedules. |

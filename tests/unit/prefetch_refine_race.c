@@ -105,12 +105,12 @@ static void *reader_thread(void *unused) {
   int abort = reader_abort;
   pthread_mutex_unlock(&control);
   if (abort) return NULL;
-  return reader(NULL);
+  return reader(st);
 }
 
 static void *refine_thread(void *unused) {
   role = REFINER;
-  cache_refine(0, NULL, 0);
+  cache_refine(st, 0, NULL, 0);
   pthread_mutex_lock(&control);
   refine_done = 1;
   pthread_cond_broadcast(&changed);
@@ -119,7 +119,7 @@ static void *refine_thread(void *unused) {
 }
 
 int main(void) {
-  deepseek_cache_layout();
+  st = deepseek_cache_create();
   alarm(10); // only a deadlock backstop; assertions do not depend on elapsed time
   int fd = open("/dev/zero", O_RDONLY);
   if (fd < 0) return 1;
@@ -137,7 +137,7 @@ int main(void) {
     s->prev = i ? -1 : 1, s->next = i ? 0 : -1;
     WHERE(0, i) = i, priorities[i] = st->escore[i] = i + 1;
     expert_span[0][i][0] = (FileSpan){fd, 0, 16384};
-    start(i, 0);
+    start(st, i, 0);
   }
   watched_group = fixture[0].loading;
   armed = 1;
@@ -155,7 +155,7 @@ int main(void) {
   expect("started data remains cached while I/O is held", returned && WHERE(0, 0) == 0 &&
          fixture[0].loading == watched_group && atomic_load(&fixture[0].unfinished) == 1);
   expect("wholly unstarted obsolete entry still cancels", returned && WHERE(0, 1) == -1 &&
-         fixture[1].expert == -1 && !slot_reading(1));
+         fixture[1].expert == -1 && !slot_reading(st, 1));
 
   pthread_mutex_lock(&control);
   if (!reader_go) reader_abort = reader_go = 1; // report missing instrumentation without stranding the worker
@@ -164,10 +164,10 @@ int main(void) {
   pthread_mutex_unlock(&control);
   pthread_join(reading, NULL);
   pthread_join(refining, NULL);
-  expect("reader completion preserves the started expert", WHERE(0, 0) == 0 && cache_ready(0, 0));
-  expect("only the started piece was read", cache_stats.bytes == 16384);
+  expect("reader completion preserves the started expert", WHERE(0, 0) == 0 && cache_ready(st, 0, 0));
+  expect("only the started piece was read", st->stats.bytes == 16384);
   expect("all read admissions finish", !atomic_load(&st->prefetching) && !atomic_load(&st->demand));
-  for (int i = 0; i < 2; i++) cancel(i), free(fixture[i].b.ptr);
+  for (int i = 0; i < 2; i++) cancel(st, i), free(fixture[i].b.ptr);
   close(fd);
   st->slots = NULL, st->score = NULL;
   printf("refine ownership race: %d/%d CPU checks passed (reader injected at %s)\n",

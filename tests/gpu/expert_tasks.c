@@ -86,8 +86,8 @@ int main(int argc, char **argv) {
   // Only 24 experts are allocated and read, about 453 MB. The cache limit
   // reserves metadata, not buffers for unused slots.
   deepseek_mxfp4_spans(index);
-  deepseek_cache_layout();
-  cache_reserve(16), cache_init(16ull << 30, LAYERS);
+  st = deepseek_cache_create();
+  cache_reserve(16), cache_init(st, 16ull << 30, LAYERS);
   const int layers[JOBS] = {3, 11, 23, 37};
   tasks = zeros(JOBS * sizeof(MoeTask)), dummy = zeros(16);
   for (int i = 0; i < JOBS; i++) {
@@ -96,11 +96,11 @@ int main(int argc, char **argv) {
     j->shared = zeros(DIM * 4), j->mix = zeros(MIX * 4), j->res = zeros(HC * DIM * 2), j->out = zeros(HC * DIM * 2);
     int ids[TOPK];
     for (int e = 0; e < TOPK; e++) ids[e] = 17 * i + e;
-    cache_load(layers[i], ids, TOPK);
+    cache_load(st, layers[i], ids, TOPK);
     Entry *entry = (Entry *)j->ex.ptr;
     for (int e = 0; e < TOPK; e++) {
       uint32_t at[3]; int fresh;
-      const Buf *b = cache_get(layers[i], ids[e], at, &fresh);
+      const Buf *b = cache_get(st, layers[i], ids[e], at, &fresh);
       entry[e] = (Entry){{b->gpu + at[0], b->gpu + at[1], 0}, (float)(e + 1) / 32, 0};
     }
     for (int d = 0; d < DIM; d++) {

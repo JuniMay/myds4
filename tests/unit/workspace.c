@@ -31,8 +31,9 @@ static void fixture_free(Buf *b) {
 }
 
 static void fixture_sync(void) { pending = 0; }
-static void fixture_adapt(void) { cache_clock_advances++, cache_maintenance++; }
-static void fixture_idle(void) { cache_maintenance++; }
+typedef struct ExpertStore ExpertStore;
+static void fixture_adapt(ExpertStore *store) { cache_clock_advances++, cache_maintenance++; }
+static void fixture_idle(ExpertStore *store) { cache_maintenance++; }
 
 #define gpu_alloc fixture_alloc
 #define gpu_alloc_kv fixture_alloc

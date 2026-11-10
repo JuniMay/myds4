@@ -266,7 +266,7 @@ static void run_case(const char *name, int (*check)(void)) {
 }
 
 int main(void) {
-  deepseek_cache_layout();
+  st = deepseek_cache_create();
   run_case("with your budgets and no KV, model memory stays within 128 - 4 - 28 GiB", your_budgets_with_kv_empty);
   run_case("model memory never takes the space that KV occupies", your_budgets_with_kv_in_use);
   run_case("with the defaults, model memory stays within 128 - 10 - 28 GiB", the_defaults);

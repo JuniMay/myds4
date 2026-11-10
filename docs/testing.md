@@ -55,7 +55,10 @@ Its simulated kernel counts memory as used once it is written, as macOS
 does.
 `build/tests/cache-memory` checks the cache's resizing under controlled
 memory counters, including that a shortfall without memory pressure gives
-back only the slots that restore the reserve. It also checks which slot
+back only the slots that restore the reserve. With a second model's store
+beside the first and the same shortfall for both, the first gives the
+shortfall back and the second gives nothing back until the memory readings
+can show it; the second store's unwritten slots count as in use too. It also checks which slot
 bytes count as not yet written: a slot whose read is under way, a load that
 dropped a piece, and the part of a slot beyond a smaller expert.
 `build/tests/weights-read` checks that a model's weights are read in

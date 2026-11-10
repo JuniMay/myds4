@@ -19,15 +19,15 @@ static int near(double a, double b) { return fabs(a - b) <= 1e-12 * fmax(fabs(b)
 
 static void setup(int half_life, int cost) {
   if (st->slots)
-    for (int i = 0; i < st->max_slots; i++) finish(i);
+    for (int i = 0; i < st->max_slots; i++) finish(st, i);
   st->slots = NULL;
-  cache_retention(half_life, cost);
+  cache_retention(st, half_life, cost);
   memset(fixture, 0, sizeof fixture);
   memset(st->where, 0xff, WHERE_BYTES);
   memset(st->escore, 0, SCORE_BYTES);
   memset(st->dscore, 0, SCORE_BYTES);
   memset(expert_spans, 0, sizeof expert_spans);
-  memset(&cache_stats, 0, sizeof cache_stats);
+  memset(&st->stats, 0, sizeof st->stats);
   st->slots = fixture, st->score = fixture_score;
   st->max_slots = st->cap = st->nslots = 3, st->npinned = st->nfree = 0;
   st->head = 2, st->tail = 0, st->token = 10, st->weight = 1;
@@ -45,17 +45,17 @@ static void setup(int half_life, int cost) {
 
 static void bad_half(void) {
   st->slots = NULL;
-  cache_retention(-1, 0);
+  cache_retention(st, -1, 0);
 }
 static void bad_cost(void) {
   st->slots = NULL;
-  cache_retention(50, 2);
+  cache_retention(st, 50, 2);
 }
 static void too_large_half(void) {
   st->slots = NULL;
-  cache_retention(CACHE_HALF_LIFE_MAX + 1, 0);
+  cache_retention(st, CACHE_HALF_LIFE_MAX + 1, 0);
 }
-static void too_late(void) { cache_retention(10, 0); }
+static void too_late(void) { cache_retention(st, 10, 0); }
 
 static void rejected(const char *name, void (*operation)(void)) {
   pid_t pid = fork();
@@ -85,7 +85,7 @@ static void busy_victim(int optional, int prefill) {
   pthread_t reader;
   if (pthread_create(&reader, NULL, complete_read, st->slots[0].loading)) die("cannot start fixture reader");
   double began = now();
-  int got = take(2, 0, optional);
+  int got = take(st, 2, 0, optional);
   double elapsed = now() - began;
   pthread_join(reader, NULL);
   fprintf(stderr, "cache policy: %s %s with busy victim: slot %d, %.3f ms\n",
@@ -93,12 +93,12 @@ static void busy_victim(int optional, int prefill) {
   if (optional) {
     expect("prefetch declines a victim still being read", got == -1);
     expect("declined prefetch preserves all residents", WHERE(0, 0) == 0 && WHERE(0, 1) == 1 &&
-           WHERE(0, 2) == 2 && WHERE(2, 0) == -1 && cache_stats.evictions == 0);
-    finish(0);
-    expect("prefetch can use the same victim once its read ends", take(2, 0, 1) == 0);
+           WHERE(0, 2) == 2 && WHERE(2, 0) == -1 && st->stats.evictions == 0);
+    finish(st, 0);
+    expect("prefetch can use the same victim once its read ends", take(st, 2, 0, 1) == 0);
   } else {
     expect("demand still waits for and reuses the cheapest victim", got == 0 && !st->slots[0].loading &&
-           WHERE(0, 0) == -1 && WHERE(2, 0) == 0 && cache_stats.evictions == 1);
+           WHERE(0, 0) == -1 && WHERE(2, 0) == 0 && st->stats.evictions == 1);
   }
 }
 
@@ -122,40 +122,40 @@ static void refined_empty_setup(void) {
   dispatch_group_enter(st->slots[0].loading);
   st->serving = 0;
   int keep = 2;
-  cache_refine(1, &keep, 1);
+  cache_refine(st, 1, &keep, 1);
   expect("refinement leaves an empty completed slot", WHERE(1, 0) == -1 && st->slots[0].expert == -1 &&
          st->score[0] == -INFINITY && !st->slots[0].loading && !atomic_load(&st->prefetching));
   // This is the next operation in read_ahead/read_residual_ahead. Already
   // resident candidates do not consume the slot before actual routing.
-  cache_prefetch(1, &keep, 1, 6);
+  cache_prefetch(st, 1, &keep, 1, 6);
   expect("resident forecast leaves the refined slot available", st->slots[0].expert == -1 && WHERE(1, 2) == 2);
 }
 
 static void refined_empty_reuse(void) {
   refined_empty_setup();
   int routed[] = {2, 3};
-  cache_request(1, routed, 2);
+  cache_request(st, 1, routed, 2);
   expect("actual routing reuses its layer's refined empty slot", WHERE(1, 3) == 0);
   expect("refined empty reuse preserves another layer's ready expert", WHERE(0, 1) == 1);
   expect("refined empty reuse preserves the selected resident", WHERE(1, 2) == 2 && st->slots[2].used == st->token);
-  expect("refinement regression performs no I/O", cache_stats.bytes == 0);
+  expect("refinement regression performs no I/O", st->stats.bytes == 0);
 
   refined_empty_setup();
   st->serving = 1;
-  expect("the serving layer permits a refined empty slot", victim() == 0);
+  expect("the serving layer permits a refined empty slot", victim(st) == 0);
   st->slots[0].holds = 1;
-  expect("a reservation still excludes an otherwise empty slot", victim() == 1);
+  expect("a reservation still excludes an otherwise empty slot", victim(st) == 1);
   st->slots[0].holds = 0;
-  expect("releasing the reservation restores empty-slot eligibility", victim() == 0);
+  expect("releasing the reservation restores empty-slot eligibility", victim(st) == 0);
 }
 
 int main(void) {
-  deepseek_cache_layout();
+  st = deepseek_cache_create();
   alarm(20);
   setup(0, 0);
   expect("zero selects default half-life", st->retention_half_life == 50);
   expect("default ratio retains original constant", st->retention_growth == exp2(1.0 / 50));
-  for (int i = 0; i < 50; i++) advance_score_clock();
+  for (int i = 0; i < 50; i++) advance_score_clock(st);
   expect("default clock doubles weight over 50 advances", near(st->weight, 2));
   expect("clock counts forward advances", st->token == 60);
   expect("aging preserves raw history between rescalings", st->escore[0] == 1 && st->score[0] == 1);
@@ -165,29 +165,29 @@ int main(void) {
   rejected("live policy mutation rejected", too_late);
 
   setup(10, 0);
-  for (int i = 0; i < 10; i++) advance_score_clock();
+  for (int i = 0; i < 10; i++) advance_score_clock(st);
   expect("ten-pass clock doubles weight", near(st->weight, 2));
-  expect("unweighted priority is raw score", eviction_priority(1) == st->score[1]);
-  expect("default victim is lowest raw score", victim() == 0);
+  expect("unweighted priority is raw score", eviction_priority(st, 1) == st->score[1]);
+  expect("default victim is lowest raw score", victim(st) == 0);
   st->slots[0].prefetched = 1;
-  expect("prefetch protection unchanged", victim() == 1);
+  expect("prefetch protection unchanged", victim(st) == 1);
   st->serving = 0, st->slots[1].used = st->token;
-  expect("current union protection unchanged", victim() == 2);
+  expect("current union protection unchanged", victim(st) == 2);
   st->serving = -1, st->slots[0].prefetched = 0;
   st->score[0] = st->score[1] = 2, st->score[2] = 3;
-  expect("equal priorities retain physical-slot tie break", victim() == 0);
+  expect("equal priorities retain physical-slot tie break", victim(st) == 0);
   st->score[2] = -INFINITY, st->slots[2].expert = -1;
-  expect("empty slots still go first", victim() == 2);
+  expect("empty slots still go first", victim(st) == 2);
   st->score[2] = INFINITY, st->slots[2].layer = 32767, st->slots[2].expert = 32767;
-  expect("unallocated slots stay ineligible", victim() == 0);
+  expect("unallocated slots stay ineligible", victim(st) == 0);
 
   setup(10, 1);
   st->reload_cost[0] = 1, st->reload_cost[1] = .25, st->reload_cost[2] = 1;
-  expect("cost weighting retains expensive lower-frequency expert", victim() == 1);
+  expect("cost weighting retains expensive lower-frequency expert", victim(st) == 1);
   expect("priority multiplication leaves raw resident score", st->score[1] == 2);
   expect("priority multiplication leaves raw ghost history", st->escore[1] == 2);
   for (int i = 0; i < 3; i++) st->reload_cost[i] = .5;
-  expect("uniform read costs preserve victim", victim() == 0);
+  expect("uniform read costs preserve victim", victim(st) == 0);
 
   // A prompt pass keeps what decoding uses most: its victim is the slot of a
   // layer the pass is done with whose expert decoding used least, not the
@@ -198,11 +198,11 @@ int main(void) {
   st->score[0] = 9, st->score[1] = 2, st->score[2] = 1;
   st->dscore[0] = 9, st->dscore[EXPERTS + 1] = 2, st->dscore[3 * EXPERTS + 2] = 1;
   st->pass_layer = 2;
-  expect("prefill evicts the done layers' slot decoding used least", victim() == 1);
+  expect("prefill evicts the done layers' slot decoding used least", victim(st) == 1);
   st->pass_layer = 0;
-  expect("prefill fallback protects current and next layer", victim() == 2);
+  expect("prefill fallback protects current and next layer", victim(st) == 2);
   st->slots[2].layer = 1;
-  expect("prefill finds no victim in its current and next layers", victim() == -1);
+  expect("prefill finds no victim in its current and next layers", victim(st) == -1);
   st->pass_layer = -1;
 
   // A first prompt, with no decoding history: the prompt credits an expert
@@ -216,7 +216,7 @@ int main(void) {
   st->slots[0].layer = 0, st->slots[1].layer = 1, st->slots[2].layer = 3;
   st->score[0] = st->escore[0] = 4, st->score[1] = st->escore[EXPERTS + 1] = 1, st->score[2] = 1;
   st->pass_layer = 2;
-  expect("a first prompt's pass evicts the least recently used slot", victim() == 0);
+  expect("a first prompt's pass evicts the least recently used slot", victim(st) == 0);
   st->pass_layer = -1;
 
   // Between slots decoding used alike, recency decides, not the read cost.
@@ -226,7 +226,7 @@ int main(void) {
   expert_spans[0] = 1;
   expert_span[0][0][0].len = 200, expert_span[0][1][0].len = 100;
   st->pass_layer = 2;
-  expect("prefill breaks a decoding tie by recency", victim() == 0);
+  expect("prefill breaks a decoding tie by recency", victim(st) == 0);
   expert_spans[0] = 0, st->pass_layer = -1;
 
   // Decoding's use outranks recency: an older slot decoding used stays.
@@ -234,7 +234,7 @@ int main(void) {
   st->slots[0].layer = 0, st->slots[1].layer = 1, st->slots[2].layer = 3;
   st->dscore[0] = 3;
   st->pass_layer = 2;
-  expect("prefill keeps an older slot that decoding used", victim() == 1);
+  expect("prefill keeps an older slot that decoding used", victim(st) == 1);
   st->pass_layer = -1;
 
   setup(10, 1);
@@ -243,11 +243,11 @@ int main(void) {
     expert_span[0][e][0] = (FileSpan){.off = 1, .len = 16384};
     expert_span[0][e][1] = (FileSpan){.off = 32768, .len = 1};
   }
-  prepare_reload_cost(1);
+  prepare_reload_cost(st, 1);
   expect("cost uses aligned covers of all spans", st->reload_cost[0] == .75);
-  expect("uniform aligned costs preserve victim", victim() == 0);
+  expect("uniform aligned costs preserve victim", victim(st) == 0);
   expert_span[0][1][0] = (FileSpan){.off = 0, .len = 1};
-  prepare_reload_cost(1);
+  prepare_reload_cost(st, 1);
   expect("each expert gets its own read cost", st->reload_cost[1] == .5 && st->reload_cost[0] == .75);
 
   setup(10, 1);
@@ -257,22 +257,22 @@ int main(void) {
   st->score[0] = st->escore[0] = 2, st->score[1] = st->escore[1] = 5;
   st->reload_cost[0] = .25, st->reload_cost[1] = .5, st->reload_cost[2] = .25;
   int incoming = 2;
-  cache_load(0, &incoming, 1);
+  cache_load(st, 0, &incoming, 1);
   expect("eviction preserves absent expert history", WHERE(0, 0) == -1 && st->escore[0] == 2);
   expect("new request adds raw unweighted count", st->escore[2] == 1 && st->score[WHERE(0, 2)] == 1);
-  advance_score_clock();
+  advance_score_clock(st);
   double before = st->weight;
   incoming = 0;
-  cache_load(0, &incoming, 1);
+  cache_load(st, 0, &incoming, 1);
   expect("reentry restores prior history before increment", near(st->escore[0], 2 + before));
   expect("resident score keeps raw reentry history", st->score[WHERE(0, 0)] == st->escore[0]);
-  expect("weighted reentry priority uses static cost", near(eviction_priority(WHERE(0, 0)), st->escore[0] * .25));
-  expect("empty-span fixture performs no file reads", cache_stats.bytes == 0);
+  expect("weighted reentry priority uses static cost", near(eviction_priority(st, WHERE(0, 0)), st->escore[0] * .25));
+  expect("empty-span fixture performs no file reads", st->stats.bytes == 0);
 
   st->weight = 0x1p500;
   st->escore[3] = 7;
   double scale = st->weight * st->retention_growth, old = st->escore[0];
-  advance_score_clock();
+  advance_score_clock(st);
   expect("overflow guard resets global weight", st->weight == 1);
   expect("overflow guard rescales resident history", near(st->escore[0], old / scale));
   expect("overflow guard rescales ghost history", near(st->escore[3], 7 / scale));
@@ -281,7 +281,7 @@ int main(void) {
   busy_victim(1, 1);
   busy_victim(0, 0);
   refined_empty_reuse();
-  for (int i = 0; i < st->max_slots; i++) finish(i);
+  for (int i = 0; i < st->max_slots; i++) finish(st, i);
   fprintf(stderr, "cache policy: %d/%d checks passed\n", checks - failures, checks);
   return failures != 0;
 }

@@ -237,10 +237,15 @@ static struct {
 } gk[LAYERS];
 static uint32_t expert_quant[LAYERS][3]; // 0 is native MXFP4; otherwise the GGUF type
 // The routed experts' bytes in the files, which the expert store reads
-// (deepseek_cache_layout): the GGUF rows (gguf_experts), else the MXFP4
+// (deepseek_cache_create): the GGUF rows (gguf_experts), else the MXFP4
 // codes and scales (deepseek_mxfp4_spans).
 FileSpan expert_span[CACHE_LAYERS][EXPERTS][3];
 int expert_spans[CACHE_LAYERS];
+static ExpertStore *experts_store;  // the routed experts in memory
+static CacheStats *expert_stats(void) { return cache_counters(experts_store); }
+void deepseek_metrics_report(FILE *out) {
+  if (experts_store) cache_metrics_report(experts_store, out);
+}
 static Buf head_q6;  // the GGUF file's output head in Q6_K, if it has one: used instead of the checkpoint's
 static int K_gg_head1, K_gg_head6;
 // A prompt batch's pairs' rows of XQ and MH, in pair order. Native MXFP4
@@ -351,7 +356,7 @@ static void work_capacity(int rows) {
   for (size_t i = 0; i < sizeof work_buffers / sizeof *work_buffers; i++) gpu_free(work_buffers[i]);
   work_plan(rows, 1);
   work_rows = rows;
-  if (resize_cache) cache_idle(); // capacity maintenance does not represent another token or pass
+  if (resize_cache) cache_idle(experts_store); // capacity maintenance does not represent another token or pass
 }
 
 // RoPE angles: (cos, sin) for 32 frequencies per position; YaRN for the
@@ -559,7 +564,9 @@ static void prepare_weights(const char *dir, const Options *options) {
   if (!memory_current()) memory_scope(memory_shared());
   core_weights = weights_new(memory_current()->account, "DeepSeek dense backbone");
   weight_group = core_weights;
-  cache_memory(weights_slot(core_weights));
+  // the store reads the spans when it starts (cache_required), after they are set below
+  experts_store = deepseek_cache_create();
+  cache_memory(experts_store, weights_slot(core_weights));
   static const uint8_t ratios[LAYERS] = {0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
                                          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
   for (int l = 0; l < LAYERS; l++) {
@@ -612,12 +619,11 @@ static void prepare_weights(const char *dir, const Options *options) {
     if (st_has(checkpoint, "%s", markers[i])) load(&image_markers[i], st_get(checkpoint, "%s", markers[i]));
   if (opt.deepseek.experts) gguf_experts(opt.deepseek.experts);
   deepseek_mxfp4_spans(checkpoint);
-  deepseek_cache_layout();
-  cache_retention(opt.deepseek.cache_half_life, opt.deepseek.cache_read_cost);
-  cache_draft_limit(opt.deepseek.draft_cache);
+  cache_retention(experts_store, opt.deepseek.cache_half_life, opt.deepseek.cache_read_cost);
+  cache_draft_limit(experts_store, opt.deepseek.draft_cache);
   cand_words = (opt.ctx / 8 + 31) / 32 + 1;
-  cache_working_rows(1);
-  cache_required(opt.draft ? CACHE_LAYERS : LAYERS);
+  cache_working_rows(experts_store, 1);
+  cache_required(experts_store, opt.draft ? CACHE_LAYERS : LAYERS);
 }
 
 int deepseek_load(const char *dir, const Options *options) {
@@ -625,12 +631,12 @@ int deepseek_load(const char *dir, const Options *options) {
   if (!checkpoint) prepare_weights(dir, options);
   MemorySlot *core = weights_slot(core_weights), *work = memory_current();
   memory_pin(core, 1);
-  cache_active(1);
+  cache_active(experts_store, 1);
   int small = replay_margin() + 1 > BATCH_ROWS ? replay_margin() + 1 : BATCH_ROWS;
-  cache_working_rows(1);
+  cache_working_rows(experts_store, 1);
   uint64_t workspace = model_buffers_ready ? work->payload - resizable_bytes() + work_plan(small, 0) + request_plan(small, 0)
                                           : fixed_plan(0) + work_plan(small, 0) + request_plan(small, 0);
-  uint64_t minimum = weights_required(core_weights) + workspace + cache_required(opt.draft ? CACHE_LAYERS : LAYERS);
+  uint64_t minimum = weights_required(core_weights) + workspace + cache_required(experts_store, opt.draft ? CACHE_LAYERS : LAYERS);
   if (!memory_minimum(core->account, minimum)) { memory_pin(core, 0); return 0; }
   if (model_buffers_ready) request_capacity(1);
   if (!weights_load(core_weights)) { memory_pin(core, 0); return 0; }
@@ -673,7 +679,7 @@ int deepseek_load(const char *dir, const Options *options) {
       fprintf(stderr, "%s online predictor state: %s\n", loaded ? "loaded" : "new", opt.deepseek.predictor_state);
     }
   }
-    cache_init(0, opt.draft ? CACHE_LAYERS : LAYERS);
+    cache_init(experts_store, 0, opt.draft ? CACHE_LAYERS : LAYERS);
     base_state();
     model_buffers_ready = 1;
   }
@@ -1178,7 +1184,7 @@ typedef struct { uint64_t p[3]; uint32_t start, count; } MoeTile;
 #define SUB_KEEP 2
 static int substitute(int cl, const Layer *y, const float *z, int n, int *idx, float *wts, int k, const char *read, int vl) {
   int missing = 0;
-  for (int j = 0; j < k; j++) missing |= !cache_slot(cl, idx[j]) && !(read && read[idx[j]]);
+  for (int j = 0; j < k; j++) missing |= !cache_slot(experts_store, cl, idx[j]) && !(read && read[idx[j]]);
   if (!missing) return 0;
   const float *bias = (const float *)(vl ? y->gate_bias_vl : y->gate_bias).ptr;
   float key[EXPERTS], sc[EXPERTS];
@@ -1195,12 +1201,12 @@ static int substitute(int cl, const Layer *y, const float *z, int n, int *idx, f
     keep[b] = 1;
   }
   for (int j = k - 1; j >= 0; j--) {
-    if (keep[j] || cache_slot(cl, idx[j]) || (read && read[idx[j]])) continue;
+    if (keep[j] || cache_slot(experts_store, cl, idx[j]) || (read && read[idx[j]])) continue;
     int best = -1;
     for (int e = 0; e < n; e++) {
       int taken = 0;
       for (int i = 0; i < k; i++) taken |= idx[i] == e;
-      if (!taken && key[e] >= key[idx[j]] - opt.deepseek.substitute && (best < 0 || key[e] > key[best]) && cache_ready(cl, e))
+      if (!taken && key[e] >= key[idx[j]] - opt.deepseek.substitute && (best < 0 || key[e] > key[best]) && cache_ready(experts_store, cl, e))
         best = e;
     }
     if (best >= 0) idx[j] = best, changed++;
@@ -1231,13 +1237,13 @@ static void substitute_row(void *ctx, size_t r) {
   memcpy(idx, rt, sizeof idx), memcpy(w, rw, sizeof w);
   substitute(sub_layer, &L[sub_layer], z, EXPERTS, idx, w, TOPK, 0, vl);
   for (int k = 0; k < TOPK; k++)
-    if (!cache_slot(sub_layer, idx[k])) sub_read[idx[k]] = 1;  // rows may race here: each stores 1
+    if (!cache_slot(experts_store, sub_layer, idx[k])) sub_read[idx[k]] = 1;  // rows may race here: each stores 1
 }
 static void substitute_batch(int l, int m, int row) {
   sub_layer = l, sub_row = row, memset(sub_read, 0, sizeof sub_read);
   for (sub_pass = 0; sub_pass < 2; sub_pass++)
     dispatch_apply_f(m, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), 0, substitute_row);
-  for (int r = 0; r < m; r++) cache_stats.substituted += sub_count[r];
+  for (int r = 0; r < m; r++) expert_stats()->substituted += sub_count[r];
 }
 
 // Row r's routed experts as its entries in ETAB (from eo) name them, in
@@ -1273,7 +1279,7 @@ static void fill_entries(int l, size_t eo, const int *experts, const float *weig
   for (int k = 0; k < TOPK; k++) {
     uint32_t at[3];
     int fresh;
-    const Buf *b = !ready || ready[idx[k]] == want ? cache_get(l, idx[k], at, &fresh) : 0;
+    const Buf *b = !ready || ready[idx[k]] == want ? cache_get(experts_store, l, idx[k], at, &fresh) : 0;
     ref[k] = b ? (ExpertRef){{b->gpu + at[0], b->gpu + at[1], b->gpu + at[2]}, wts[k], 0} : (ExpertRef){{0, 0, 0}, 0, 0};
     if (b && fresh) gpu_use(b);
   }
@@ -1310,14 +1316,14 @@ static void read_ahead(int l, int m, const int *pr) {
     for (int k = 0; k < AHEAD; k++) next[n] = pr[r * PREDICT + k], after[n++] = pr[(m + r) * PREDICT + k];
   }
   int inflight = INFLIGHT * m;
-  if (l + 1 < LAYERS) cache_refine(l + 1, keep, nk);
-  if (l + 1 < LAYERS) cache_prefetch_from(l + 1, next, n, inflight, PF_H1);
-  if (l + 2 < LAYERS) cache_prefetch_from(l + 2, after, n, inflight, PF_H2);
+  if (l + 1 < LAYERS) cache_refine(experts_store, l + 1, keep, nk);
+  if (l + 1 < LAYERS) cache_prefetch_from(experts_store, l + 1, next, n, inflight, PF_H1);
+  if (l + 2 < LAYERS) cache_prefetch_from(experts_store, l + 2, after, n, inflight, PF_H2);
 }
 
 static void read_residual_ahead(int layer, const int *keep, int nkeep, const int *first, int nfirst, int inflight) {
-  cache_refine(layer, keep, nkeep);
-  cache_prefetch_from(layer, first, nfirst, inflight, PF_PC);
+  cache_refine(experts_store, layer, keep, nkeep);
+  cache_prefetch_from(experts_store, layer, first, nfirst, inflight, PF_PC);
 }
 
 // A batch's read-aheads after layer l's routing: the next layer's experts
@@ -1332,7 +1338,7 @@ static void read_ahead_rows(int m, int l, const int *pr, int ahead, int inflight
     for (int k = 0; k < ahead; k++) want[pr[r * PREDICT + k]] = 1;
   for (int e = 0; e < EXPERTS; e++)
     if (want[e]) list[nl++] = e;
-  cache_prefetch_from(l + 1, list, nl, inflight, PF_H1);
+  cache_prefetch_from(experts_store, l + 1, list, nl, inflight, PF_H1);
 }
 
 
@@ -1363,24 +1369,24 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
   float *rw = (float *)RT.ptr;
   char used[EXPERTS] = {0}, ready[EXPERTS] = {0};
   CacheObservation observed;
-  cache_observe_snapshot(l, &observed);
-  cache_observe_routes(&observed, rt, m, 16, 0);
+  cache_observe_snapshot(experts_store, l, &observed);
+  cache_observe_routes(experts_store, &observed, rt, m, 16, 0);
   int native_rt[FEW * 16];
   if (opt.deepseek.online_predictor && approx) memcpy(native_rt, rt, (size_t)m * 16 * sizeof *rt);
   for (int r = 0; approx && r < m; r++) {
     memcpy(chosen + r * TOPK, rt + r * 16, TOPK * sizeof *chosen);
-    cache_stats.substituted += substitute(l, &L[l], (const float *)GL.ptr + (size_t)r * EXPERTS, EXPERTS, rt + r * 16,
+    expert_stats()->substituted += substitute(l, &L[l], (const float *)GL.ptr + (size_t)r * EXPERTS, EXPERTS, rt + r * 16,
                                           rw + r * 16 + 8, TOPK, 0, ((const uint8_t *)IMG.ptr)[b->row + r]);
   }
-  cache_observe_routes(&observed, rt, m, 16, 1);
-  uint64_t *tally[] = {&cache_stats.row_ssd, &cache_stats.row_own, &cache_stats.row_ahead, &cache_stats.row_late,
-                       &cache_stats.row_sub};
+  cache_observe_routes(experts_store, &observed, rt, m, 16, 1);
+  uint64_t *tally[] = {&expert_stats()->row_ssd, &expert_stats()->row_own, &expert_stats()->row_ahead, &expert_stats()->row_late,
+                       &expert_stats()->row_sub};
   int record = !prompt_pass && l < LAYERS;  // the model's own layers, in decode steps
   for (int r = 0; r < m; r++)
     for (int k = 0; k < TOPK; k++) { // each row's selections, by where their experts are now
       int e = rt[r * 16 + k];
       used[e] = 1;
-      int where = approx && e != chosen[r * TOPK + k] ? 4 : cache_where(l, e);
+      int where = approx && e != chosen[r * TOPK + k] ? 4 : cache_where(experts_store, l, e);
       (*tally[where])++;
       if (record && b->row + r < FEW) {  // tally's order (from the SSD first) to route_from's
         route_id[b->row + r][l][k] = (uint16_t)e, route_from[b->row + r][l][k] = (uint8_t)((where + 4) % 5);
@@ -1389,10 +1395,10 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
     }
   for (int e = 0; e < EXPERTS; e++)
     if (used[e]) need[nn++] = e;
-  cache_stats.row_unique += nn;
+  expert_stats()->row_unique += nn;
   double t0 = now();
-  int reading = cache_request(l, need, nn);  // this layer's reads first, then the predicted ones
-  cache_demote(l);
+  int reading = cache_request(experts_store, l, need, nn);  // this layer's reads first, then the predicted ones
+  cache_demote(experts_store, l);
   if (reading) gpu_keep_clock(reading * 1e-3); // the GPU idles until they are in
   if (opt.deepseek.online_predictor) {
     const int *forecast =
@@ -1406,7 +1412,7 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
     if (full_ahead(m)) read_ahead(l, m, (const int *)PR.ptr);
     else read_ahead_rows(m, l, (const int *)PR.ptr, ahead, inflight);
   }
-  for (int i = 0; i < nn; i++) nready += ready[need[i]] = cache_ready(l, need[i]);
+  for (int i = 0; i < nn; i++) nready += ready[need[i]] = cache_ready(experts_store, l, need[i]);
   int split = rest && nready > 0 && nready < nn;
   for (int r = 0; split && r < m; r++) {
     size_t eo = (size_t)(l * FEW + r) * 256;
@@ -1415,7 +1421,7 @@ static int routed_rows(const Batch *b, int l, int ahead, int inflight, int appro
   }
   if (split) gpu_commit(), gpu_encode(rest);
   double t1 = now();
-  cache_wait(l, need, nn);
+  cache_wait(experts_store, l, need, nn);
   phase_s[3] += t1 - t0, phase_s[2] += now() - t1, phase_s[4] -= now() - t0;
   for (int r = 0; r < m; r++) {
     size_t mf = mf_off(b) + (size_t)r * MIX * 4, hs = hs_off(b) + (size_t)r * HC * DIM * STREAM_BYTES;
@@ -1444,10 +1450,10 @@ static void routed_batch(const Batch *b, int l, int ahead, int inflight, int app
   const int *rt = (const int *)RT.ptr;
   const float *rw = (const float *)RT.ptr;
   CacheObservation observed;
-  cache_observe_snapshot(l, &observed);
-  cache_observe_routes(&observed, rt, m, 16, 0);
+  cache_observe_snapshot(experts_store, l, &observed);
+  cache_observe_routes(experts_store, &observed, rt, m, 16, 0);
   if (approx) substitute_batch(l, m, b->row);
-  cache_observe_routes(&observed, rt, m, 16, 1);
+  cache_observe_routes(experts_store, &observed, rt, m, 16, 1);
   for (int r = 0; r < m; r++)
     for (int k = 0; k < TOPK; k++) count[rt[r * 16 + k]]++;
   for (int e = 0, s = 0; e < EXPERTS; e++) {
@@ -1455,8 +1461,8 @@ static void routed_batch(const Batch *b, int l, int ahead, int inflight, int app
     if (count[e]) need[nn++] = e;
   }
   double t0 = now();
-  cache_request(l, need, nn);
-  cache_demote(l);
+  cache_request(experts_store, l, need, nn);
+  cache_demote(experts_store, l);
   if (full_ahead(m)) read_ahead(l, m, (const int *)PR.ptr);
   else {
     int skip = 0;
@@ -1466,7 +1472,7 @@ static void routed_batch(const Batch *b, int l, int ahead, int inflight, int app
     if (skip < m) read_ahead_rows(m - skip, l, (const int *)PR.ptr + skip * PREDICT, ahead, inflight);
   }
   double t1 = now();
-  cache_wait(l, need, nn);
+  cache_wait(experts_store, l, need, nn);
   phase_s[3] += t1 - t0, phase_s[2] += now() - t1, phase_s[4] -= now() - t0;
   int *ptok = (int *)PTOK.ptr, *tp = (int *)TP.ptr;
   float *pw = (float *)PW.ptr;
@@ -1489,7 +1495,7 @@ static void routed_batch(const Batch *b, int l, int ahead, int inflight, int app
   for (int i = 0; i < nn; i++) {
     int e = need[i], fresh;
     uint32_t at[3];
-    const Buf *slot = cache_get(l, e, at, &fresh);
+    const Buf *slot = cache_get(experts_store, l, e, at, &fresh);
     if (fresh) gpu_use(slot);
     for (int c = 0; c < count[e]; c += per)
       tiles[nt++] = (MoeTile){{slot->gpu + at[0], slot->gpu + at[1], slot->gpu + at[2]}, (uint32_t)(start[e] + c),
@@ -1697,7 +1703,7 @@ static void step_rows(const int *tokens, int m, int pos) {
   // groups defer front submission until all expert groups are queued.
   uint64_t sig = layer_front(&b, 0), next = 0;
   ts = now();
-  cache_adapt();  // no slot is in use between tokens; layer 0's front uses none
+  cache_adapt(experts_store);  // no slot is in use between tokens; layer 0's front uses none
   phase_s[5] += now() - ts;
   for (int l = 0; l < LAYERS; l++) {
     void *experts = gpu_open(), *rest = ahead ? gpu_open() : 0;  // rest: see routed_rows
@@ -1769,7 +1775,7 @@ double decode_gpu_s, decode_s;
 int prefill_layer, prefill_n;
 
 static void stats_add(CacheStats *sum, const CacheStats *before) {
-  const CacheStats *c = &cache_stats;
+  const CacheStats *c = expert_stats();
   sum->hits += c->hits - before->hits, sum->misses += c->misses - before->misses;
   sum->prefetch_hits += c->prefetch_hits - before->prefetch_hits, sum->prefetches += c->prefetches - before->prefetches;
   sum->bytes += c->bytes - before->bytes, sum->evictions += c->evictions - before->evictions;
@@ -1786,12 +1792,12 @@ static void step(const int *tokens, int m, int pos) {
   if (opt.deepseek.online_predictor) {
     online_predictor_begin(m, nrows || pos > 0); // the initial single-token prompt stays cold
   }
-  cache_metrics_begin(PF_DECODE, m);
-  CacheStats c0 = cache_stats;
+  cache_metrics_begin(experts_store, PF_DECODE, m);
+  CacheStats c0 = *expert_stats();
   double g0 = gpu_busy, t0 = now();
   step_rows(tokens, m, pos);
   if (opt.deepseek.online_predictor) online_predictor_end();
-  cache_metrics_end();
+  cache_metrics_end(experts_store);
   stats_add(&decode_stats, &c0);
   decode_rows += m, decode_gpu_s += gpu_busy - g0, decode_s += now() - t0;
 }
@@ -1971,8 +1977,8 @@ static int prefill(const int *tokens, int n, int pos0) {
     retained = plan.suffix_rows;
   }
   forward_info.chunks++, forward_info.decoder_tokens += prefill_prune_active ? plan.kept : retained;
-  cache_metrics_begin(PF_PREFILL, n);
-  CacheStats c0 = cache_stats;
+  cache_metrics_begin(experts_store, PF_PREFILL, n);
+  CacheStats c0 = *expert_stats();
   prefill_n = n, prefill_layer = 0;
   reserve(pos0 + n, pos0);
   request_capacity(n);
@@ -1990,12 +1996,12 @@ static int prefill(const int *tokens, int n, int pos0) {
   if (n >= 256 && opt.deepseek.substitute <= 0) {  // a large batch needs nearly every expert: read layer 0's, after the embedding's rows
     int all[EXPERTS];
     for (int e = 0; e < EXPERTS; e++) all[e] = e;
-    cache_prefetch_from(0, all, EXPERTS, 2 * EXPERTS, PF_BULK);
+    cache_prefetch_from(experts_store, 0, all, EXPERTS, 2 * EXPERTS, PF_BULK);
   }
   int stopped = 0;
   for (int l = 0; l < LAYERS && !stopped; l++) {
     if (prefill_prune_active && l > 20) plan = decoder_plan(pos0, n, l);
-    cache_pass(l);
+    cache_pass(experts_store, l);
     if (l == 1 || l == 14) dispatch_group_wait(rr.read[l == 14], DISPATCH_TIME_FOREVER);
     int begin = 0, next_rows = n;
     if (ced_compact) {
@@ -2030,7 +2036,7 @@ static int prefill(const int *tokens, int n, int pos0) {
       ffn_front(&b, l);
       shared_expert(b.m, &L[l]);
       gpu_commit();
-      if (first_batch) cache_adapt_pass(l);  // layer l - 1's experts may still be in use
+      if (first_batch) cache_adapt_pass(experts_store, l);  // layer l - 1's experts may still be in use
       first_batch = 0;
       gpu_sync();
       prefix_after(&b, l);
@@ -2048,7 +2054,7 @@ static int prefill(const int *tokens, int n, int pos0) {
     if (!opt.quiet) fprintf(stderr, "\rprefill: layer %d/%d", l + 1, LAYERS);
     prefill_layer = l + 1;
   }
-  cache_pass(-1);
+  cache_pass(experts_store, -1);
   prompt_pass = 0;  // the head: one row, as decoding runs it
   if (!opt.quiet) fprintf(stderr, "\r                         \r");
   if (retained && !stopped) {
@@ -2081,10 +2087,10 @@ static int prefill(const int *tokens, int n, int pos0) {
     draft_keys(keep, pos0 + n - keep);
     prompt_pass = 0;
   }
-  cache_adapt();
+  cache_adapt(experts_store);
   stats_add(&prefill_stats, &c0);
   prefill_rows += n, prefill_layer = prefill_n = 0;
-  cache_metrics_end();
+  cache_metrics_end(experts_store);
   ced_active = 0;
   return !stopped;
 }
@@ -2119,8 +2125,8 @@ static int prepare_rows(int rows, int prompt) {
     int layer_rows = request_rows < MB ? request_rows : MB;
     uint64_t workspace = fixed + request_plan(request_rows, 0) + work_plan(layer_rows, 0);
     uint64_t host = row_scratch(candidate) + (uint64_t)candidate * 2 * ENGRAM_ROWS * 8 + (uint64_t)layer_rows * 64;
-    cache_working_rows(candidate);
-    uint64_t required = weights_required(core_weights) + workspace + host + cache_required(opt.draft ? CACHE_LAYERS : LAYERS);
+    cache_working_rows(experts_store, candidate);
+    uint64_t required = weights_required(core_weights) + workspace + host + cache_required(experts_store, opt.draft ? CACHE_LAYERS : LAYERS);
     MemoryAdmission mode = candidate > 1 && prompt ? MEMORY_WORKSPACE : MEMORY_REQUIRED;
     if (memory_minimum_mode(work->account, required, mode)) {
       previous_rows = prompt ? 0 : rows;
@@ -2429,8 +2435,8 @@ static void draft_stage(int d, int pos) {
     memcpy(wts[r], (float *)RT.ptr + r * 16 + 8, sizeof wts[r]);
     // A bounded draft cache loads native selections; missing draft slots
     // must not activate the backbone's approximate substitution rule.
-    if (opt.deepseek.substitute > 0 && cache_draft_capacity() == DRAFT_EXPERTS)
-      cache_stats.substituted += substitute(LAYERS + d, &D[d], (const float *)GL.ptr + (size_t)r * DRAFT_EXPERTS,
+    if (opt.deepseek.substitute > 0 && cache_draft_capacity(experts_store) == DRAFT_EXPERTS)
+      expert_stats()->substituted += substitute(LAYERS + d, &D[d], (const float *)GL.ptr + (size_t)r * DRAFT_EXPERTS,
                                             DRAFT_EXPERTS, idx[r], wts[r], DRAFT_TOPK, 0, 0);
     for (int i = 1; i < DRAFT_TOPK; i++)
       for (int j = i; j > 0 && idx[r][j - 1] > idx[r][j]; j--) {
@@ -2443,7 +2449,7 @@ static void draft_stage(int d, int pos) {
       if (i == nn) need[nn++] = idx[r][k];
     }
   }
-  cache_load(LAYERS + d, need, nn);
+  cache_load(experts_store, LAYERS + d, need, nn);
   gpu_begin();
   for (int r = 0; r < m; r++) {
     size_t eo = (size_t)(LAYERS * FEW + d * BLOCK + r) * 256;
@@ -2451,7 +2457,7 @@ static void draft_stage(int d, int pos) {
     for (int k = 0; k < DRAFT_TOPK; k++) {
       uint32_t at[3];
       int fresh;
-      const Buf *b = cache_get(LAYERS + d, idx[r][k], at, &fresh);
+      const Buf *b = cache_get(experts_store, LAYERS + d, idx[r][k], at, &fresh);
       ref[k] = (ExpertRef){{b->gpu + at[0], b->gpu + at[1], b->gpu + at[2]}, wts[r][k], 0};
       if (fresh) gpu_use(b);
     }
@@ -2645,7 +2651,7 @@ void deepseek_bench(void) {
   fprintf(stderr, "%-24s %8.1f us %7.1f GB/s\n", head_q6.obj ? "head  129280x5120 q6_k" : "head  129280x5120 bf16", t * 1e6,
           129280.0 * 5120 * (head_q6.obj ? 210.0 / 256 : 2) / t / 1e9);
   int idx[TOPK] = {0, 1, 2, 3, 4, 5};
-  for (int l = 0; l < 8; l++) cache_load(l, idx, TOPK);  // 48 distinct experts
+  for (int l = 0; l < 8; l++) cache_load(experts_store, l, idx, TOPK);  // 48 distinct experts
 
   t = timed(bench_experts, 40);
   double ebytes = 0;  // one expert's bytes as stored, averaged over layers 0 to 7
@@ -2906,21 +2912,21 @@ static void run_bind(RunJob *job, Buf **live) {
 static void run_issue(RunJob *job) {
   const int *rt = (const int *)RT.ptr;
   CacheObservation observation;
-  cache_observe_snapshot(job->layer, &observation);
-  cache_observe_routes(&observation, rt, 1, 16, 0);
-  cache_observe_routes(&observation, rt, 1, 16, 1);
-  uint64_t *tally[] = {&cache_stats.row_ssd, &cache_stats.row_own, &cache_stats.row_ahead, &cache_stats.row_late};
+  cache_observe_snapshot(experts_store, job->layer, &observation);
+  cache_observe_routes(experts_store, &observation, rt, 1, 16, 0);
+  cache_observe_routes(experts_store, &observation, rt, 1, 16, 1);
+  uint64_t *tally[] = {&expert_stats()->row_ssd, &expert_stats()->row_own, &expert_stats()->row_ahead, &expert_stats()->row_late};
   for (int k = 0; k < TOPK; k++) {
     job->experts[k] = rt[k];
-    (*tally[cache_where(job->layer, rt[k])])++;
+    (*tally[cache_where(experts_store, job->layer, rt[k])])++;
   }
   for (int i = 1; i < TOPK; i++)
     for (int k = i; k > 0 && job->experts[k] < job->experts[k - 1]; k--) {
       int e = job->experts[k]; job->experts[k] = job->experts[k - 1], job->experts[k - 1] = e;
     }
-  cache_stats.row_unique += TOPK;
-  cache_hold(job->layer, job->experts, TOPK);
-  cache_demote(job->layer);
+  expert_stats()->row_unique += TOPK;
+  cache_hold(experts_store, job->layer, job->experts, TOPK);
+  cache_demote(experts_store, job->layer);
 }
 
 // Gather ready jobs at one layer into the existing small-batch kernels.
@@ -2935,7 +2941,7 @@ static int run_group(RunJob **jobs, const int *ids, int count, Buf **live, const
   for (int k = 0; k < RUN_BUFFERS; k++) *live[k] = original[k];
   for (int r = 0; r < count; r++) {
     RunJob *job = jobs[r];
-    cache_wait(layer, job->experts, TOPK);
+    cache_wait(experts_store, layer, job->experts, TOPK);
     for (int k = 0; k < RUN_BUFFERS; k++) if (bytes[k])
       copies[ncopy++] = (GpuCopy){&job->saved[k], live[k], 0, r * bytes[k], bytes[k]};
   }
@@ -2976,7 +2982,7 @@ static int run_group(RunJob **jobs, const int *ids, int count, Buf **live, const
   }
   for (int r = 0; r < count; r++) {
     RunJob *job = jobs[r];
-    cache_unhold(layer, job->experts, TOPK);
+    cache_unhold(experts_store, layer, job->experts, TOPK);
     job->layer++;
     if (layer == LAYERS - 1) memcpy(outputs + (size_t)ids[r] * VOCAB, logits.ptr + (size_t)r * VOCAB * 4, VOCAB * 4);
     else RT = job->saved[7], run_issue(job);
@@ -3008,10 +3014,10 @@ static const float *runahead_rows(State **states, const int *tokens, const int *
       scheduler_workspace_bytes += job->saved[k].size;
     }
   }
-  CacheStats before = cache_stats;
+  CacheStats before = *expert_stats();
   double began = now(), gpu_before = gpu_busy;
-  cache_metrics_begin(PF_DECODE, count);
-  cache_adapt(); // no job holds a slot or a GPU command at a step boundary
+  cache_metrics_begin(experts_store, PF_DECODE, count);
+  cache_adapt(experts_store); // no job holds a slot or a GPU command at a step boundary
   for (int r = 0; r < count; r++) {
     RunJob *job = &run_jobs[r];
     run_bind(job, live);
@@ -3033,7 +3039,7 @@ static const float *runahead_rows(State **states, const int *tokens, const int *
       RunJob *job = &run_jobs[r];
       if (job->layer == LAYERS) continue;
       int missing = 0;
-      for (int k = 0; k < TOPK; k++) missing += !cache_ready(job->layer, job->experts[k]);
+      for (int k = 0; k < TOPK; k++) missing += !cache_ready(experts_store, job->layer, job->experts[k]);
       if (!missing && (ready < 0 || job->layer < run_jobs[ready].layer)) ready = r;
       if (wait < 0 || job->layer < run_jobs[wait].layer ||
           (job->layer == run_jobs[wait].layer && missing < wait_misses)) wait = r, wait_misses = missing;
@@ -3045,7 +3051,7 @@ static const float *runahead_rows(State **states, const int *tokens, const int *
       RunJob *jobs[FEW];
       for (int j = 0; j < count; j++) if (run_jobs[j].layer == run_jobs[ready].layer) {
         int available = 1;
-        for (int k = 0; k < TOPK; k++) available &= cache_ready(run_jobs[j].layer, run_jobs[j].experts[k]);
+        for (int k = 0; k < TOPK; k++) available &= cache_ready(experts_store, run_jobs[j].layer, run_jobs[j].experts[k]);
         if (available) ids[group] = j, jobs[group++] = &run_jobs[j];
       }
       if (group > 1) {
@@ -3055,7 +3061,7 @@ static const float *runahead_rows(State **states, const int *tokens, const int *
     }
     RunJob *job = &run_jobs[r];
     if (ready < 0) gpu_keep_clock(.001);
-    cache_wait(job->layer, job->experts, TOPK);
+    cache_wait(experts_store, job->layer, job->experts, TOPK);
     run_bind(job, live);
     const int *rt = (const int *)RT.ptr;
     uint64_t signal = 0;
@@ -3069,7 +3075,7 @@ static const float *runahead_rows(State **states, const int *tokens, const int *
     gpu_commit();
     if (job->layer + 1 < LAYERS) signal = layer_front(&(Batch){1, job->pos, 0}, job->layer + 1);
     gpu_wait_signal(signal);
-    cache_unhold(job->layer, job->experts, TOPK);
+    cache_unhold(experts_store, job->layer, job->experts, TOPK);
     if (++job->layer == LAYERS) {
       memcpy(run_logits + (size_t)r * VOCAB, logits.ptr, VOCAB * sizeof(float));
       remaining--;
@@ -3078,7 +3084,7 @@ static const float *runahead_rows(State **states, const int *tokens, const int *
   gpu_sync();
   for (int k = 0; k < RUN_BUFFERS; k++) *live[k] = original[k];
   bind(original_state), memcpy(history, original_state->history, sizeof history);
-  cache_metrics_end();
+  cache_metrics_end(experts_store);
   stats_add(&decode_stats, &before);
   decode_rows += count, decode_gpu_s += gpu_busy - gpu_before, decode_s += now() - began;
   runahead_route_only = 0;
@@ -3129,12 +3135,12 @@ static void pipe_front(PipeJob *job, Buf **live) {
 static void pipe_issue(PipeJob *job) {
   const int *rt = (const int *)job->saved[7].ptr;
   CacheObservation observed;
-  cache_observe_snapshot(job->layer, &observed);
-  cache_observe_routes(&observed, rt, 1, 16, 0);
-  cache_observe_routes(&observed, rt, 1, 16, 1);
-  uint64_t *tally[] = {&cache_stats.row_ssd, &cache_stats.row_own, &cache_stats.row_ahead, &cache_stats.row_late};
+  cache_observe_snapshot(experts_store, job->layer, &observed);
+  cache_observe_routes(experts_store, &observed, rt, 1, 16, 0);
+  cache_observe_routes(experts_store, &observed, rt, 1, 16, 1);
+  uint64_t *tally[] = {&expert_stats()->row_ssd, &expert_stats()->row_own, &expert_stats()->row_ahead, &expert_stats()->row_late};
   for (int k = 0; k < TOPK; k++) {
-    int e = rt[k], where = cache_where(job->layer, e);
+    int e = rt[k], where = cache_where(experts_store, job->layer, e);
     job->experts[k] = e;
     (*tally[where])++;
     route_id[job->row][job->layer][k] = e;
@@ -3145,9 +3151,9 @@ static void pipe_issue(PipeJob *job) {
     for (int k = i; k && job->experts[k] < job->experts[k - 1]; k--) {
       int e = job->experts[k]; job->experts[k] = job->experts[k - 1], job->experts[k - 1] = e;
     }
-  cache_stats.row_unique += TOPK;
-  cache_hold(job->layer, job->experts, TOPK);
-  cache_demote(job->layer);
+  expert_stats()->row_unique += TOPK;
+  cache_hold(experts_store, job->layer, job->experts, TOPK);
+  cache_demote(experts_store, job->layer);
   job->held_layer = job->layer;
   job->phase = PIPE_READ;
 }
@@ -3193,10 +3199,10 @@ static const float *pipeline_rows(State **states, const int *tokens, const int *
     }
     memset(job->saved[16].ptr, 0, job->saved[16].size);
   }
-  CacheStats before = cache_stats;
+  CacheStats before = *expert_stats();
   double began = now(), gpu_before = gpu_busy;
-  cache_metrics_begin(PF_DECODE, count);
-  cache_adapt();
+  cache_metrics_begin(experts_store, PF_DECODE, count);
+  cache_adapt(experts_store);
   runahead_route_only = 1;
   route_steps++;
   pipe_stats.steps++;
@@ -3214,13 +3220,13 @@ static const float *pipeline_rows(State **states, const int *tokens, const int *
   }
   int remaining = count, batch = 0;
   while (remaining) {
-    uint64_t epoch = cache_read_epoch(), completed = gpu_signal_value(), wait = UINT64_MAX;
+    uint64_t epoch = cache_read_epoch(experts_store), completed = gpu_signal_value(), wait = UINT64_MAX;
     PipeJob *ready[BATCH_ROWS];
     int kind[BATCH_ROWS], nr = 0, pending = 0;
     for (int r = 0; r < count; r++) {
       PipeJob *job = pipe_jobs + r;
       if (job->release_at && job->release_at <= completed) {
-        cache_unhold(job->held_layer, job->experts, TOPK);
+        cache_unhold(experts_store, job->held_layer, job->experts, TOPK);
         job->held_layer = -1, job->release_at = 0;
       }
       if (job->phase == PIPE_DONE) continue;
@@ -3234,7 +3240,7 @@ static const float *pipeline_rows(State **states, const int *tokens, const int *
       }
       if (job->phase == PIPE_READ) {
         int all = 1;
-        for (int k = 0; k < TOPK; k++) all &= cache_ready(job->layer, job->experts[k]);
+        for (int k = 0; k < TOPK; k++) all &= cache_ready(experts_store, job->layer, job->experts[k]);
         if (all) ready[nr] = job, kind[nr++] = 0;
       } else if (job->phase == PIPE_DOWN) {
         ready[nr] = job, kind[nr++] = 1;
@@ -3251,9 +3257,9 @@ static const float *pipeline_rows(State **states, const int *tokens, const int *
       if (wait != UINT64_MAX) gpu_wait_signal(wait), pipe_stats.gpu_wait += now() - start;
       else {
         gpu_keep_clock(.001);
-        cache_wait_progress(epoch);
+        cache_wait_progress(experts_store, epoch);
         double elapsed = now() - start;
-        pipe_stats.read_wait += elapsed, cache_stats.read_s += elapsed;
+        pipe_stats.read_wait += elapsed, expert_stats()->read_s += elapsed;
       }
       continue;
     }
@@ -3268,7 +3274,7 @@ static const float *pipeline_rows(State **states, const int *tokens, const int *
       pipe_bind(job, live);
       size_t entries = (size_t)job->layer * FEW * 256;
       if (!kind[i]) {
-        cache_wait(job->layer, job->experts, TOPK);
+        cache_wait(experts_store, job->layer, job->experts, TOPK);
         const int *rt = (const int *)RT.ptr;
         fill_entries(job->layer, entries, rt, (const float *)rt + 8, NULL, 0);
       } else {
@@ -3276,7 +3282,7 @@ static const float *pipeline_rows(State **states, const int *tokens, const int *
         // yet. This new encoder must declare the down stage's resources too.
         for (int k = 0; k < TOPK; k++) {
           uint32_t at[3]; int fresh;
-          const Buf *b = cache_get(job->layer, job->experts[k], at, &fresh);
+          const Buf *b = cache_get(experts_store, job->layer, job->experts[k], at, &fresh);
           if (fresh) gpu_use(b);
         }
       }
@@ -3328,7 +3334,7 @@ static const float *pipeline_rows(State **states, const int *tokens, const int *
   for (int k = 0; k < PIPE_BUFFERS; k++) *live[k] = original[k];
   bind(original_state), memcpy(history, original_state->history, sizeof history);
   runahead_route_only = 0;
-  cache_metrics_end();
+  cache_metrics_end(experts_store);
   stats_add(&decode_stats, &before);
   decode_rows += count, decode_gpu_s += gpu_busy - gpu_before, decode_s += now() - began;
   return pipe_logits;
@@ -3543,12 +3549,19 @@ static void ds_counters(ModelCounters *c) {
                        .decode_gpu_seconds = decode_gpu_s, .prefill_layer = prefill_layer, .prefill_rows_now = prefill_n,
                        .layers = LAYERS, .experts_per_row = LAYERS * TOPK, .dense_bytes = weights_resident_bytes(core_weights) + weights_resident_bytes(vision_weights),
                        .decode = decode_stats, .prefill = prefill_stats};
-  c->cache = cache_stats;
-  c->cache_bytes = cache_bytes(); c->slot_bytes = cache_slot_bytes();
-  c->cache_slots = cache_slots(); c->mapped = cache_mapped();
-  c->cap = cache_cap(); c->max_slots = cache_max(); c->experts = LAYERS * EXPERTS;
-  c->uncached_bytes = cache_uncached_bytes(&c->uncached);
+  c->experts = LAYERS * EXPERTS;
+  if (!experts_store) return;  // registered, never loaded
+  c->cache = *expert_stats();
+  c->cache_bytes = cache_bytes(experts_store); c->slot_bytes = cache_slot_bytes(experts_store);
+  c->cache_slots = cache_slots(experts_store); c->mapped = cache_mapped(experts_store);
+  c->cap = cache_cap(experts_store); c->max_slots = cache_max(experts_store);
+  c->uncached_bytes = cache_uncached_bytes(experts_store, &c->uncached);
 }
+// Before the first load there is no store: nothing to mark or count.
+static void ds_active(int active) {
+  if (experts_store) cache_active(experts_store, active);
+}
+static uint64_t ds_cache_bytes(void) { return experts_store ? cache_bytes(experts_store) : 0; }
 
 static void ds_plan(ModelPlan *p) {
   DeepSeekForwardInfo f = deepseek_forward_info();
@@ -3557,8 +3570,8 @@ static void ds_plan(ModelPlan *p) {
 }
 
 static int ds_idle(void) {
-  cache_idle();
-  return cache_slots();
+  cache_idle(experts_store);
+  return cache_slots(experts_store);
 }
 static void ds_finish(void) {
   deepseek_save_predictor();
@@ -3579,7 +3592,7 @@ static void ds_report(FILE *out, int at, int tokens) {
             "\"chunks\":%d,\"prefix_tokens\":%d}}\n",
             f.prune_applied ? "true" : "false", f.tokens, f.decoder_tokens, f.decoder_row_layers, f.chunks,
             f.prefix_tokens);
-    rows0 = decode_rows, unique0 = cache_stats.row_unique, workspace = deepseek_workspace_bytes();
+    rows0 = decode_rows, unique0 = expert_stats()->row_unique, workspace = deepseek_workspace_bytes();
     memcpy(phase0, phase_s, sizeof phase0);
     gap0 = gpu_gap, gaps0 = gpu_gaps;
     return;
@@ -3587,7 +3600,7 @@ static void ds_report(FILE *out, int at, int tokens) {
   uint64_t computed = decode_rows - rows0;
   fprintf(out, "{\"decode_experts\":{\"computed_rows\":%llu,\"selected\":%llu,\"unique_layer_requests\":%llu}}\n",
           (unsigned long long)computed, (unsigned long long)(computed * LAYERS * TOPK),
-          (unsigned long long)(cache_stats.row_unique - unique0));
+          (unsigned long long)(expert_stats()->row_unique - unique0));
   fprintf(out, "{\"workspace\":{\"resizable_after_prefill_bytes\":%llu,\"resizable_after_decode_bytes\":%llu}}\n",
           (unsigned long long)workspace, (unsigned long long)deepseek_workspace_bytes());
   double per = tokens ? 1e3 / tokens : 0;
@@ -3597,7 +3610,7 @@ static void ds_report(FILE *out, int at, int tokens) {
           (phase_s[0] - phase0[0]) * per, (phase_s[1] - phase0[1]) * per, (phase_s[2] - phase0[2]) * per,
           (phase_s[3] - phase0[3]) * per, (phase_s[4] - phase0[4]) * per, (phase_s[5] - phase0[5]) * per,
           (phase_s[6] - phase0[6]) * per, (gpu_gap - gap0) * per, (double)(gpu_gaps - gaps0) / (tokens ? tokens : 1));
-  cache_metrics_report(out);
+  deepseek_metrics_report(out);
 }
 
 static void ds_chat(char *text, size_t cap, const char *prompt, int images, int think) {
@@ -3619,7 +3632,7 @@ static int ds_prepare_image(const char *dir, Media *im, const void *data, size_t
 
 const ModelOps deepseek_ops = {
     .family = "DeepSeek V4.1", .model_types = ds_types, .media_token = "<｜deepseek_image｜>", .refuse = ds_refuse,
-    .load = ds_load, .weight_slot = ds_weight_slot, .active = cache_active, .counters = ds_counters, .cache_bytes = cache_bytes, .plan = ds_plan, .routes = deepseek_routes, .vocab = ds_vocab,
+    .load = ds_load, .weight_slot = ds_weight_slot, .active = ds_active, .counters = ds_counters, .cache_bytes = ds_cache_bytes, .plan = ds_plan, .routes = deepseek_routes, .vocab = ds_vocab,
     .max_rows = ds_max_rows, .max_verify = ds_max_verify, .draft_block = ds_draft_block, .rewind = ds_rewind,
     .prefill_rows = ds_prefill_rows,
     .stop = ds_stop, .state_new = ds_state_new, .state_free = ds_state_free, .state_bytes = ds_state_bytes,

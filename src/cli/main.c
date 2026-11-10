@@ -382,7 +382,7 @@ int main(int argc, char **argv) {
   }
   if (ids && !perplexity) { // replay: one token at a time, every position's logits dumped
     for (int i = 0; i < n && !shutdown_requested(); i++) ops->rows(&st, tokens + i, &i, 1);
-    if (cached()) cache_metrics_report(stderr);
+    if (cached()) deepseek_metrics_report(stderr);
     return complete();
   }
   if (perplexity) { // tokens prefill.. scored, each on the logits after the token before it, decoded one at a time
@@ -408,7 +408,7 @@ int main(int argc, char **argv) {
     else if (shutdown_requested()) fprintf(stderr, "perplexity interrupted before scoring\n");
     fprintf(stderr, "%.2f tokens/s; %.1f experts substituted per token\n", steps / (now() - t0),
             (counters().cache.substituted - c0.substituted) / (double)(steps ? steps : 1));
-    if (cached()) cache_metrics_report(stderr);
+    if (cached()) deepseek_metrics_report(stderr);
     return complete();
   }
   Sampler sampler = {.temp = temp, .top_p = top_p};

@@ -33,7 +33,7 @@ static void expect(const char *name, uint64_t actual, uint64_t wanted) {
 }
 
 int main(void) {
-  deepseek_cache_layout();
+  st = deepseek_cache_create();
   vm_statistics64_data_t pages = {.free_count = 100, .external_page_count = 500, .speculative_count = 20};
   query_failed = 1;
   expect("an unreadable share counts only the free pages", avail_of(pages), 100 * vm_page_size);

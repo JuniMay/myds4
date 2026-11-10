@@ -62,11 +62,28 @@ static void child_case(int kind) {
   st->nslots = st->cap = st->max_slots - 256;
   if (kind == 7) st->nslots = 0;
   if (kind == 8) st->nslots = st->cap = 2 * EXPERTS;
-  if (kind == 9 || kind == 10) vm_fixture.external_page_count = (8ull << 30) / vm_page_size;  // within the kept share
-  if (kind == 10) vm_fixture.free_count = (15ull << 28) / vm_page_size;  // 3.75 GiB: 0.25 GiB short of the reserve
+  if (kind >= 9) vm_fixture.external_page_count = (8ull << 30) / vm_page_size;  // within the kept share
+  if (kind >= 10) vm_fixture.free_count = (15ull << 28) / vm_page_size;  // 3.75 GiB: 0.25 GiB short of the reserve
+  if (kind == 11) {  // a second model's store beside the first, the same shortfall for both
+    ExpertStore *other = deepseek_cache_create();
+    cache_init(other, 56ull << 30, LAYERS);
+    other->nslots = other->cap = other->max_slots - 256;
+    uint64_t alone = cache_unwritten();
+    other->slots[0].b = (Buf){.obj = &other->slots[0], .allocated = 1ull << 20};  // charged, never written
+    int counted = cache_unwritten() == alone + (1ull << 20);
+    other->slots[0].b = (Buf){0};
+    int first = st->cap, second = other->cap;
+    resize(st, -1);
+    resize(other, -1);  // at once: the memory the first gave back cannot show yet
+    int expected = first - (int)(((4ull << 30) - (15ull << 28)) / st->SLOT_SIZE) - 1;
+    fprintf(stderr, "cache reproduction %d: two stores 0.25 GiB short of the reserve: limits %d -> %d and %d -> %d "
+            "(expected %d and %d); the second store's unwritten slot %s\n", kind, first, st->cap, second, other->cap,
+            expected, second, counted ? "counts" : "does not count");
+    _exit(counted && st->cap == expected && other->cap == second ? 0 : 1);
+  }
   int before = st->cap;
   if (kind == 2) pressure_fixture = 2;
-  resize(-1);
+  resize(st, -1);
   if (kind == 10) {  // the slots that restore the reserve, not a sixteenth of the cache
     int expected = before - (int)(((4ull << 30) - (15ull << 28)) / st->SLOT_SIZE) - 1;
     fprintf(stderr, "cache reproduction %d: 0.25 GiB short of the reserve, no pressure: limit %d -> %d (expected %d)\n",
@@ -75,7 +92,7 @@ static void child_case(int kind) {
   }
   if (kind == 0) _exit(st->cap == before ? 0 : 1);
   if (kind == 1) {
-    for (int i = 0; i < 32; i++) resize(-1);
+    for (int i = 0; i < 32; i++) resize(st, -1);
     _exit(st->cap > before && st->cap <= st->max_slots ? 0 : 1);
   }
   if (kind == 3) vm_fixture.compressions++, compressed_fixture = 128ull << 20;
@@ -85,18 +102,18 @@ static void child_case(int kind) {
   if (kind == 5) {
     for (int i = 0; i < 32; i++) {
       vm_fixture.compressions++, compressed_fixture += 128ull << 20;
-      resize(-1);
+      resize(st, -1);
     }
     _exit(st->cap > before && st->cap <= st->max_slots ? 0 : 1);
   }
-  if (kind >= 3) resize(-1);
+  if (kind >= 3) resize(st, -1);
   if (kind == 6 || kind == 7) {
     fprintf(stderr, "cache reproduction %d: limit %d -> %d, allocated %d, swapouts %llu, wakeups %llu\n",
             kind, before, st->cap, st->nslots, (unsigned long long)vm_fixture.swapouts, (unsigned long long)wakeups_fixture);
     _exit(st->cap == before ? 0 : 1);
   }
   if (kind == 8) {
-    for (int i = 0; i < 32; i++) resize(-1);
+    for (int i = 0; i < 32; i++) resize(st, -1);
     fprintf(stderr, "cache reproduction %d: limit %d -> %d after 32 calm calls, allocated %d\n", kind, before, st->cap, st->nslots);
     _exit(st->cap > before && st->cap <= st->max_slots ? 0 : 1);
   }
@@ -112,7 +129,7 @@ static void child_case(int kind) {
 // cache reports the charged bytes no completed load has written
 // (memory_unwritten). Layer 1's experts here are smaller than the slot.
 static void reads(Slot *s, int from, int to) {  // a reader completes pieces from..to-1
-  for (int k = from; k < to; k++) atomic_store(&s->taken[k], 1), piece_finished(s, k, 1);
+  for (int k = from; k < to; k++) atomic_store(&s->taken[k], 1), piece_finished(st, s, k, 1);
 }
 static void unwritten_checks(void) {
   for (int e = 0; e < EXPERTS; e++) expert_span[1][e][0].len = EXPERT_W / 2;
@@ -120,7 +137,7 @@ static void unwritten_checks(void) {
   uint64_t whole = gpu_allocation_size(st->SLOT_SIZE);
   s->b = (Buf){.obj = s, .ptr = malloc(whole), .allocated = whole};  // a new buffer, never touched
   s->layer = 1, s->expert = 0;
-  start(0, 0);
+  start(st, 0, 0);
   expect("a new slot counts as unwritten while its read is under way", cache_unwritten() == whole);
   reads(s, 0, s->npiece - 1);
   expect("a partly read slot still counts as unwritten", cache_unwritten() == whole);
@@ -128,24 +145,24 @@ static void unwritten_checks(void) {
   uint64_t small = s->extent;
   expect("a completed read counts as written before the model thread reaps it",
          small && small < whole && cache_unwritten() == whole - small);
-  finish(0);
+  finish(st, 0);
   expect("a reaped read leaves unwritten only the slot beyond its smaller expert",
          s->written == small && cache_unwritten() == whole - small);
   s->layer = 0;
-  start(0, 0);
+  start(st, 0, 0);
   reads(s, 0, 1);
-  cancel(0);
+  cancel(st, 0);
   expect("a load that dropped a piece adds nothing written", s->written == small && cache_unwritten() == whole - small);
-  start(0, 0);
+  start(st, 0, 0);
   reads(s, 0, s->npiece);
-  finish(0);
+  finish(st, 0);
   expect("a larger expert's completed read writes the rest of the slot",
          s->written == s->extent && cache_unwritten() == whole - s->extent && s->extent > small);
   memset(s, 0, sizeof *s);
 }
 
 int main(void) {
-  deepseek_cache_layout();
+  st = deepseek_cache_create();
   alarm(10);
   working_set_fixture = 0;
   expect("an unopened Metal device supplies no residency target", mem_gpu_limit() == INT64_MAX);
@@ -165,7 +182,7 @@ int main(void) {
     }
   }
   cache_reserve(4);
-  cache_init(56ull << 30, LAYERS);
+  cache_init(st, 56ull << 30, LAYERS);
   expect("initial capacity uses file cache beyond the kept share to fit the requested 56 GiB",
          st->cap == (int)((56ull << 30) / st->SLOT_SIZE));
   expect("initial capacity respects the configured upper bound", st->cap <= st->max_slots);
@@ -175,8 +192,9 @@ int main(void) {
                          "compression alone does not prevent growth", "a swapper wakeup without swap-outs does not shrink",
                          "a global swap-out cannot reclaim an empty expert cache", "a minimum-sized cache can recover using available memory",
                          "file cache within the kept share does not count: low free pages shrink",
-                         "a shortfall without pressure gives back only the slots that restore the reserve"};
-  for (int kind = 0; kind < 11; kind++) {
+                         "a shortfall without pressure gives back only the slots that restore the reserve",
+                         "two stores give one shortfall back once, and both stores' unwritten slots count"};
+  for (int kind = 0; kind < 12; kind++) {
     pid_t pid = fork();
     if (!pid) child_case(kind);
     int status;
