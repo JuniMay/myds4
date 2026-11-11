@@ -368,6 +368,7 @@ struct ExpertStore {
   uint64_t progress_epoch;
   int serving;  // the layer cache_request makes resident: its experts used this token stay
   unsigned held_references;
+  unsigned *layer_holds;  // [layers]: passes whose GPU work reaches the layer through its table
   // resize's readings and clocks (the clock of the last give-back is shared)
   uint64_t swapouts;
   int calm, init;
@@ -392,6 +393,12 @@ static double gave;  // when a store last gave slots back: their memory shows as
 #define WHERE_BYTES ((size_t)st->layers * st->experts * sizeof *st->where)
 #define SCORE_BYTES ((size_t)st->layers * st->experts * sizeof *st->escore)
 #define DRAFT_AGE_BYTES (((size_t)(st->layers - st->scored_layers) * st->stage_experts + 1) * sizeof *st->draft_age)
+
+// Whether the expert in slot s must stay: a pass holds it, or GPU work reaches
+// its layer through the layer's table.
+static int slot_held(const ExpertStore *st, const Slot *s) {
+  return s->holds || (s->expert >= 0 && st->layer_holds[s->layer]);
+}
 
 // Puts expert e of the layer in slot i (-1: in none). A table of the layer's
 // addresses is then out of date (cache_layer_ready).
@@ -424,6 +431,8 @@ ExpertStore *cache_create(const ExpertLayout *l) {
   memset(st->generation, 0, (size_t)l->layers * sizeof *st->generation);
   st->ready_generation = xmalloc((size_t)l->layers * sizeof *st->ready_generation);
   memset(st->ready_generation, 0xff, (size_t)l->layers * sizeof *st->ready_generation);  // never found ready
+  st->layer_holds = calloc((size_t)l->layers, sizeof *st->layer_holds);
+  if (!st->layer_holds) die("out of memory");
   st->ready_unmaps = xmalloc((size_t)l->layers * sizeof *st->ready_unmaps);
   memset(st->ready_unmaps, 0, (size_t)l->layers * sizeof *st->ready_unmaps);
   st->escore = xmalloc(SCORE_BYTES), st->dscore = xmalloc(SCORE_BYTES);
@@ -669,7 +678,7 @@ static void cancel(ExpertStore *st, int i), start_readers(ExpertStore *st), star
     finish(ExpertStore *st, int i), map_slot(ExpertStore *st, int i);
 
 static void release(ExpertStore *st, int i) {
-  if (st->slots[i].holds) die("cannot release an expert held by a runahead job");
+  if (slot_held(st, &st->slots[i])) die("cannot release an expert held by a runahead job");
   cancel(st, i);
   metrics_retire(st, i, 0);
   unlink_slot(st, i);
@@ -699,7 +708,7 @@ void cache_working_rows(ExpertStore *st, int rows) {
 static int pool_can_evict(void *context) {
   Slot *slot = context;
   ExpertStore *st = slot->store;
-  if (!slot->b.obj || slot->holds) return 0;
+  if (!slot->b.obj || slot_held(st, slot)) return 0;
   if (!st->cache_busy) return 1;
   if (slot->pinned || slot->used == st->token) return 0;
   return st->pass_layer < 0 || slot->layer < st->pass_layer - 1;
@@ -1013,6 +1022,11 @@ static uint64_t cache_unwritten(void) {
 // experts of this layer and the next; it is done with earlier layers.
 void cache_pass(ExpertStore *st, int layer) { st->pass_layer = layer; }
 
+void cache_pass_variables(ExpertStore *st, PassVariable out[CACHE_PASS_VARIABLES]) {
+  out[0] = (PassVariable){&st->pass_layer, sizeof st->pass_layer};
+  out[1] = (PassVariable){&st->serving, sizeof st->serving};
+}
+
 // A slot for (layer, e), resident and non-volatile: a free one, or a victim.
 // When decoding, the victim has the lowest priority (eviction_priority), so
 // the experts used most stay; the experts that the layer being served
@@ -1044,7 +1058,7 @@ static int victim(ExpertStore *st) {
   if (st->pass_layer < 0) {
     for (int j = 0; j < st->max_slots; j++)
       if (st->score[j] < INFINITY && !st->slots[j].prefetched &&
-          !st->slots[j].holds &&
+          !slot_held(st, &st->slots[j]) &&
           !(st->slots[j].expert >= 0 && st->slots[j].layer == st->serving && st->slots[j].used == st->token)) {
         double priority = eviction_priority(st, j);
         if (priority < lowest) best = j, lowest = priority;
@@ -1056,7 +1070,7 @@ static int victim(ExpertStore *st) {
     for (int j = st->tail; j >= 0; j = st->slots[j].prev) {
       int l = st->slots[j].layer;
       if (later ? l <= st->pass_layer + 1 : l >= st->pass_layer) continue;
-      if (st->score[j] == INFINITY || st->slots[j].holds) continue;
+      if (st->score[j] == INFINITY || slot_held(st, &st->slots[j])) continue;
       double priority = decoding_priority(st, j);
       if (best < 0 || priority < lowest) best = j, lowest = priority;
     }
@@ -1088,7 +1102,11 @@ static int take(ExpertStore *st, int layer, int e, int optional) {
     i = victim(st);
     if (i < 0) {
       if (optional) return -1;
-      die("the expert cache (%d slots) cannot hold the experts of two layers", st->nslots);
+      // The preferences leave only slots that another pass may read soon: a
+      // demand may take any slot that nothing holds.
+      for (int j = 0; i < 0 && j < st->max_slots; j++)
+        if (st->score[j] < INFINITY && !slot_held(st, &st->slots[j])) i = j;
+      if (i < 0) die("the expert cache (%d slots) cannot hold the experts of two layers", st->nslots);
     }
     // Routing can demote a prefetch while its read is still running. Do not
     // stall the model for optional work or evict a higher-scoring resident.
@@ -1319,6 +1337,13 @@ int cache_hold(ExpertStore *st, int layer, const int *experts, int n) {
   return pending;
 }
 
+void cache_hold_layer(ExpertStore *st, int layer) { st->layer_holds[layer]++; }
+
+void cache_unhold_layer(ExpertStore *st, int layer) {
+  if (!st->layer_holds[layer]) die("a layer's hold was released twice");
+  st->layer_holds[layer]--;
+}
+
 void cache_unhold(ExpertStore *st, int layer, const int *experts, int n) {
   for (int k = 0; k < n; k++) {
     int i = WHERE(layer, experts[k]);
@@ -1429,7 +1454,7 @@ static int discard_unstarted(ExpertStore *st, int layer, const int *keep, int n)
     int k = 0;
     while (k < n && keep[k] != e) k++;
     if (k < n) continue;
-    if (st->slots[i].holds) continue;
+    if (slot_held(st, &st->slots[i])) continue;
     int started = 0;
     for (int p = 0; p < st->slots[i].npiece; p++) started |= atomic_load(&st->slots[i].taken[p]);
     if (!started) retired[nc++] = i;
@@ -1535,13 +1560,13 @@ static void resize(ExpertStore *st, int below) {
   }
   for (int i = st->tail; st->nslots > st->cap && i >= 0;) {
     int prev = st->slots[i].prev;
-    if (st->slots[i].layer < below && !st->slots[i].holds) release(st, i), st->stats.given_back++;
+    if (st->slots[i].layer < below && !slot_held(st, &st->slots[i])) release(st, i), st->stats.given_back++;
     i = prev;
   }
   while (st->nmapped > st->mcap) {  // the mapped slots with the lowest scores that nothing of this pass still needs
     int best = -1;
     for (int j = 0; j < st->max_slots; j++)
-      if (st->slots[j].b.obj && st->slots[j].mapped && st->slots[j].layer < below && !st->slots[j].holds &&
+      if (st->slots[j].b.obj && st->slots[j].mapped && st->slots[j].layer < below && !slot_held(st, &st->slots[j]) &&
           !st->slots[j].loading && !st->slots[j].prefetched && (best < 0 || st->score[j] < st->score[best]))
         best = j;
     if (best < 0) break;

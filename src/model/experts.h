@@ -61,6 +61,7 @@ typedef struct {
   ExpertStore *store;          // the routed experts' store (experts_store)
   const ExpertFiles *files;    // the store's layout of them
   int held_layer;              // the store layer of the held experts
+  int *held_tables, held_table_count;  // [layers]: the layers held through their tables (experts_hold_table)
   const Buf **slot;            // [experts]: a held expert's slot
   uint8_t *fresh;              // [experts]: its slot needs gpu_use until the residency set is committed
   int input_kernel, up_kernel, hidden_kernel, down_kernel, sum_kernel;
@@ -73,6 +74,14 @@ void experts_init(ExpertWork *work, int hidden, int intermediate, int experts, i
                   ExpertActivation activation, ExpertAccumulation accumulation);
 // The routed experts' weights are in the store's slots, laid out by files.
 void experts_store(ExpertWork *work, ExpertStore *store, const ExpertFiles *files);
+// A planner of its own for a pass (src/engine/pass.h): the shape and kernels
+// of `from`, without buffers until experts_workspace allocates them.
+void experts_pass_begin(ExpertWork *work, const ExpertWork *from);
+// Frees a pass's planner, after the pass's GPU work has finished.
+void experts_pass_end(ExpertWork *work);
+// The layer's experts stay in their slots until experts_release, for the GPU
+// work that reaches them through the layer's table.
+void experts_hold_table(ExpertWork *work, int layer);
 // The store's layout from the routed experts' tensors and matrices: for each
 // expert ([layers][experts][3]), its matrices' weights, their stored scales
 // or compressed rows, and their exceptions (a zero Tensor, without a dtype,

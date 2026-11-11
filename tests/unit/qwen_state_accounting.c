@@ -50,7 +50,7 @@ int main(void) {
   }
   qwen_state_free(s);
   }
-  unown(&PART), unown(&ML);
+  unown(&work->PART), unown(&work->ML);
   free(owned);
   CHECK(allocated == 0);
   fprintf(stderr, "Qwen state accounting: %d/%d checks passed; peak=%zu bytes\n", checks - failures, checks, peak);

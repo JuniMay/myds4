@@ -43,6 +43,15 @@ int main(void) {
   CHECK(cache_ready(st, 0, 3) && fixture[3].holds == 1);
   cache_unhold(st, 0, pending, 1);
   CHECK(fixture[3].holds == 0 && st->held_references == 0);
+  // A layer's hold keeps all of its experts until the last hold of the layer
+  // goes.
+  cache_hold_layer(st, 0), cache_hold_layer(st, 0);
+  st->serving = 3;  // no slot counts as being made resident now
+  CHECK(victim(st) < 0);
+  cache_unhold_layer(st, 0);
+  CHECK(victim(st) < 0);
+  cache_unhold_layer(st, 0);
+  CHECK(victim(st) >= 0);
   // A resize gives back unheld slots, the least recently used first, and
   // leaves held ones, whatever their age, for the work that holds them.
   int oldest[] = {0, 1};

@@ -274,8 +274,9 @@ A pass is a piece of the engine's work that runs on its own stack and gives
 the processor back where it would wait, so that one thread can advance
 several passes (`src/engine/pass.c`). The worker and the command line do not
 create passes yet: each engine call still runs to completion on the engine
-thread. DeepSeek is the first family that can run as passes, and
-`build/tests/passes` runs two of its passes interleaved.
+thread. DeepSeek, Qwen3.8-27B, Flash-Next and Nemotron can each run as
+passes (`ModelOps`: `pass_new`, `pass_begin`, `pass_end`), and
+`build/tests/passes` runs two passes of a model interleaved.
 
 A switch saves the callee-saved registers and the stack pointer, in a few
 lines of AArch64 assembly. A yield and a resume together take about 30 ns.
@@ -296,31 +297,42 @@ has no place in the queue until it is committed.
 
 These belong to one pass:
 - The model-wide variables that a family lists with `pass_variables`. They
-  are copied out when the pass yields and back when it resumes.
-- Buffers whose contents are used across a yield, and buffers that the CPU
-  fills for GPU work that may still be queued. Those are DeepSeek's routing
-  and selection buffers, the logits, what the routed experts read from the
-  layer's front (the residual streams `H1`, the FFN input `XQ` and the shared
-  expert's output `SHO`), and the tile tables and work lists of the expert
-  kernels. A pass allocates its own in `deepseek_pass_begin` and frees them
-  in `deepseek_pass_end`.
+  are copied out when the pass yields and back when it resumes. The expert
+  store's values for the pass's current layer and the layer it is making
+  resident are among them (`cache_pass_variables`): the store applies the
+  preferences of the pass that is running.
+- Its workspace. Qwen3.8-27B, Flash-Next and Nemotron give each pass a whole
+  workspace of its own: every activation buffer, the expert planner and, for
+  Nemotron, DFlash2's buffers. The workspace is allocated at the size the
+  pass asks for, and freed when the pass ends. DeepSeek's workspace is too
+  large to duplicate, so a pass owns only the buffers whose contents are used
+  across a yield, or that the CPU fills for GPU work that may still be queued:
+  the routing and selection buffers, the logits, what the routed experts read
+  from the layer's front (the residual streams `H1`, the FFN input `XQ` and the
+  shared expert's output `SHO`), the tile tables and work lists of the expert
+  kernels, and the draft's buffers (its inputs from layers 37 to 39, its
+  stages' streams and its tokens). The other work buffers stay shared, because
+  nothing in them is used across a yield; they only grow while passes are
+  running.
 - A Metal shared event for its signals. Signals fire in queue order, and
   each pass numbers its signals as it encodes them, so a shared numbering
   could report one pass's signal because of another pass's later work.
 
-The other work buffers stay shared between passes, because nothing in them
-is used across a yield. They only grow while passes are running.
+Holds protect the experts that queued GPU work reads. A pass holds the
+experts of a layer until the GPU has finished the layer, because a store that
+evicted them could hand their slots to another pass. A layer reached through
+its table of resident experts is held as a whole (`cache_hold_layer`), since
+the GPU chooses among all of its experts. The cache's resize, the eviction
+for a new expert and the memory pool's eviction all skip held slots. An
+expert that a pass needs may take any slot that is not held when the store's
+preferences leave none; a read-ahead is dropped instead. Requests take their
+holds one expert at a time, so a large request cannot evict an expert that
+it requested a moment earlier.
 
-A pass holds the experts of the layer it has encoded until the GPU has
-finished the layer, because a store that evicted them could hand their
-slots to another pass. The expert cache's resize skips held slots. Requests
-take their holds one expert at a time, so a large request cannot evict an
-expert that it requested a moment earlier.
-
-The expert store's read epoch, `pass_layer`, `serving` and `minimum_slots`,
-and `gpu_sync`'s wait for the last command buffer of any pass, are still
-shared: the scheduler that runs passes of different requests must make them
-per-pass before it goes live.
+Still shared between passes: the store's `minimum_slots`, and `gpu_sync`'s
+wait, which waits for the last command buffer of any pass. A pass's request
+for a new expert ends the process if every slot is held. The scheduler that
+runs passes of different requests must change these before it goes live.
 
 ### Saved states
 

@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include "memory.h"
 #include "myds4.h"
+#include "pass.h"
 
 // One model's routed experts in memory (cache_create); every call takes it.
 typedef struct ExpertStore ExpertStore;
@@ -89,6 +90,15 @@ int cache_slot(ExpertStore *st, int layer, int expert);   // it has a slot: resi
 // eviction until cache_unhold, after the GPU work that uses them completes.
 int cache_hold(ExpertStore *st, int layer, const int *experts, int n);
 void cache_unhold(ExpertStore *st, int layer, const int *experts, int n);
+// The store's values that belong to one pass (pass.h): the layer it is at
+// (cache_pass) and the layer it is making resident. Which pass's values apply
+// is decided by which pass is running.
+enum { CACHE_PASS_VARIABLES = 2 };
+void cache_pass_variables(ExpertStore *st, PassVariable out[CACHE_PASS_VARIABLES]);
+// Every expert of the layer stays until cache_unhold_layer, for GPU work that
+// reaches them through the layer's table. Holds of a layer add up.
+void cache_hold_layer(ExpertStore *st, int layer);
+void cache_unhold_layer(ExpertStore *st, int layer);
 int cache_ready(ExpertStore *st, int layer, int expert);  // resident and read
 // Whether the GPU can reach every expert of the layer through addresses
 // alone: each is read, its reads are reaped (cache_wait), and it is mapped

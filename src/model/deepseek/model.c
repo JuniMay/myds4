@@ -3771,7 +3771,9 @@ static const PassVariable pass_own[] = {
     V(SEL),           V(CAND),        V(IMG),                  V(EC),                V(ES),         V(H1),
     V(XQ),            V(SHO),         V(RT),                   V(GL),                V(GP),         V(PR),
     V(PC),            V(ETAB),        V(PARTS),                V(logits),            V(EROW),       V(TILES),
-    V(PTOK),          V(PW),          V(TP),
+    V(PTOK),          V(PW),          V(TP),           V(MAINH),             V(MXA),        V(MXN),
+    V(MXQ),           V(DHS),         V(DMF),          V(BLK),               V(DSEL),       V(DLOG),
+    V(DTOK),          V(DEROW),
 };
 #undef V
 
@@ -3781,37 +3783,32 @@ static void rebind(void) {
 
 Pass *deepseek_pass_new(void (*body)(void *), void *argument) {
   enum { OWN = sizeof pass_own / sizeof *pass_own };
-  static PassVariable all[OWN + 8];
-  static int count;
-  if (!count) {
-    int n;
-    const PassVariable *gpu = gpu_pass_variables(&n);
-    memcpy(all, pass_own, sizeof pass_own);
-    memcpy(all + OWN, gpu, (size_t)n * sizeof *gpu);
-    count = OWN + n;
-  }
-  Pass *pass = pass_new(body, argument, 64u << 20);
-  pass_variables(pass, all, count);
-  pass_on_resume(pass, rebind);
-  return pass;
+  PassVariable variables[OWN + CACHE_PASS_VARIABLES];
+  memcpy(variables, pass_own, sizeof pass_own);
+  cache_pass_variables(experts_store, variables + OWN);
+  return pass_new_model(body, argument, variables, OWN + CACHE_PASS_VARIABLES, rebind);
 }
 
-static Buf *const pass_fixed_buffers[] = {&PC, &ETAB, &PARTS, &logits};
+static Buf *const pass_fixed_buffers[] = {&PC, &ETAB, &PARTS, &logits, &MAINH, &MXA, &MXN, &MXQ, &DHS, &DMF, &BLK, &DSEL, &DLOG, &DTOK, &DEROW};
 static Buf *const pass_request_buffers[] = {&HS, &MF, &SEL, &CAND, &IMG, &EC[0], &EC[1], &ES[0], &ES[1]};
 
 // Inside a new pass, before its work: it owns its signals and buffers. The
 // buffers that grow with the rows start empty, and the capacity code
-// allocates this pass's own; those of a fixed size get copies of their size.
+// allocates this pass's own; those of a fixed size start as copies, which
+// keeps the constant rows some of them hold (the draft's noise tokens).
 void deepseek_pass_begin(void) {
   gpu_pass_begin();
+  cache_pass(experts_store, -1);
   active = &parked;
   memset(history, 0, sizeof history);
   held.n = 0, nrows = 0, request_rows = 0, pass_work_rows = 0;
   for (size_t i = 0; i < sizeof pass_request_buffers / sizeof *pass_request_buffers; i++) *pass_request_buffers[i] = (Buf){0};
   for (size_t i = 0; i < sizeof pass_work_buffers / sizeof *pass_work_buffers; i++) *pass_work_buffers[i] = (Buf){0};
   for (size_t i = 0; i < sizeof pass_fixed_buffers / sizeof *pass_fixed_buffers; i++) {
-    size_t size = pass_fixed_buffers[i]->size;
-    *pass_fixed_buffers[i] = zeros(size);
+    Buf outer = *pass_fixed_buffers[i];
+    if (!outer.size) continue;
+    *pass_fixed_buffers[i] = zeros(outer.size);
+    memcpy(pass_fixed_buffers[i]->ptr, outer.ptr, outer.size);
   }
 }
 
@@ -3843,4 +3840,4 @@ const ModelOps deepseek_ops = {
     .snapshot_alloc = ds_snapshot_alloc, .prefill = ds_prefill, .replay_rows = deepseek_replay_rows, .replay_start = deepseek_replay_start,
     .rows = ds_rows, .draft = ds_draft, .verify = ds_verify, .accept = ds_accept, .seek = ds_seek, .idle = ds_idle,
     .finish = ds_finish, .report = ds_report, .prepare_media = ds_prepare_image, .encode_media = deepseek_image, .media = deepseek_images, .chat = ds_chat,
-    .bench = deepseek_bench};
+    .bench = deepseek_bench, .pass_new = deepseek_pass_new, .pass_begin = deepseek_pass_begin, .pass_end = deepseek_pass_end};

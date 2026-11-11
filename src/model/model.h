@@ -43,6 +43,7 @@ typedef struct {
 
 typedef struct ModelState ModelState;        // one sequence: a family's own state
 typedef struct ModelSnapshot ModelSnapshot;  // a state's rolling part at one position
+struct Pass;                                 // src/engine/pass.h
 
 // One append-only array of a state's rows, which state_copy copies and saved
 // states hold (src/engine/state_file.c): row 0 at data, unit bytes a row. A
@@ -204,6 +205,11 @@ typedef struct {
   void (*chat)(char *text, size_t cap, const char *prompt, int media_count, int think);
   // The CLI's --bench: the kernels timed on the model's own matrices; or null.
   void (*bench)(void);
+  // A pass of this model (src/engine/pass.h) that will run body(argument),
+  // and, inside it, the start and the end of its work on buffers of its own.
+  struct Pass *(*pass_new)(void (*body)(void *), void *argument);
+  void (*pass_begin)(void);
+  void (*pass_end)(void);
 } ModelOps;
 
 typedef struct {

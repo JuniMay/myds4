@@ -43,6 +43,10 @@ enum {
   CONDITION,
   BUFFERS
 };
+typedef struct {
+  Buf buffer[BUFFERS];
+  int rows, blocks;
+} DFlashWork;
 struct DFlash {
   TensorIndex *checkpoint;
   WeightSet *weights;
@@ -52,8 +56,8 @@ struct DFlash {
   Linear combine, condition;
   Buf hidden_norm, final_norm, predecessor, successor;
   Block layer[LAYERS];
-  Buf buffer[BUFFERS];
-  int target_layers[LAYERS], rows, blocks;
+  DFlashWork first, *work;  // the buffers in use: the first ones, or a pass's (src/engine/pass.h)
+  int target_layers[LAYERS];
   float eps, theta;
   int capture, norm, embed, conv, rope, store, attention, sum, add, swiglu;
 };
@@ -76,12 +80,13 @@ static void vec(DFlash *d, TensorIndex *index, Buf *out, const char *name) {
 static void release(void *context) {
   DFlash *d = context;
   for (int i = 0; i < BUFFERS; i++)
-    gpu_free(d->buffer + i);
-  d->rows = d->blocks = 0;
+    gpu_free(d->work->buffer + i);
+  d->work->rows = d->work->blocks = 0;
   gpu_residency_commit();
 }
 DFlash *dflash_open(const char *directory, WeightSet *backbone, const Buf *embedding, const Linear *head) {
   DFlash *d = xmalloc(sizeof *d);
+  d->work = &d->first;
   d->embedding = embedding;
   d->head = head;
   char path[4096], name[256];
@@ -153,6 +158,16 @@ DFlash *dflash_open(const char *directory, WeightSet *backbone, const Buf *embed
 #undef K
   return d;
 }
+PassVariable dflash_pass_variable(DFlash *d) { return (PassVariable){&d->work, sizeof d->work}; }
+void dflash_pass_begin(DFlash *d) {
+  if (d) d->work = xmalloc(sizeof *d->work);
+}
+void dflash_pass_end(DFlash *d) {
+  if (!d) return;
+  for (int i = 0; i < BUFFERS; i++)
+    gpu_free(d->work->buffer + i);
+  free(d->work);
+}
 int dflash_load(DFlash *d) {
   return !d || weights_load(d->weights);
 }
@@ -213,18 +228,18 @@ int dflash_prepare(DFlash *d, int rows, int positions) {
   MemorySlot *before = memory_scope(&d->workspace);
   gpu_sync();
   for (int i = 0; i < BUFFERS; i++)
-    if (d->buffer[i].size != size[i]) {
-      gpu_free(d->buffer + i);
-      d->buffer[i] = gpu_alloc(size[i]);
+    if (d->work->buffer[i].size != size[i]) {
+      gpu_free(d->work->buffer + i);
+      d->work->buffer[i] = gpu_alloc(size[i]);
     }
   memory_scope(before);
   memory_trim(&d->workspace);
-  d->rows = rows;
-  d->blocks = blocks;
+  d->work->rows = rows;
+  d->work->blocks = blocks;
   return 1;
 }
 static void product(DFlash *d, const Linear *m, const Buf *x, size_t offset, const Buf *out, int rows, int rounding) {
-  linear_product(m, x, offset, out, 0, rows, rows > 8, &d->buffer[PACKED], 0, rounding);
+  linear_product(m, x, offset, out, 0, rows, rows > 8, &d->work->buffer[PACKED], 0, rounding);
 }
 static void normalize(DFlash *d, const Buf *x, const Buf *weight, const Buf *out, int rows) {
   struct {
@@ -249,12 +264,12 @@ static void rotate(DFlash *d, const Buf *x, const Buf *weight, const Buf *out, i
   gpu_buf(0, x, 0);
   gpu_buf(1, weight, 0);
   gpu_buf(2, out, 0);
-  gpu_buf(3, &d->buffer[SEQUENCES], 0);
+  gpu_buf(3, &d->work->buffer[SEQUENCES], 0);
   gpu_bytes(4, &p, sizeof p);
   gpu_go(heads, rows, 1, 128, 1, 1);
 }
 static void sequences(DFlash *d, const DFlashRow *rows, int count) {
-  Sequence *out = (Sequence *)d->buffer[SEQUENCES].ptr;
+  Sequence *out = (Sequence *)d->work->buffer[SEQUENCES].ptr;
   for (int i = 0; i < count; i++)
     out[i] = (Sequence){.k = rows[i].kv->gpu,
                         .v = rows[i].kv->gpu + dflash_kv_bytes(rows[i].capacity) / 2,
@@ -264,9 +279,9 @@ static void sequences(DFlash *d, const DFlashRow *rows, int count) {
 static void store_keys(DFlash *d, int layer, int rows) {
   uint32_t p[2] = {256, (uint32_t)layer};
   gpu_kern(d->store);
-  gpu_buf(0, &d->buffer[KR], 0);
-  gpu_buf(1, &d->buffer[V], 0);
-  gpu_buf(2, &d->buffer[SEQUENCES], 0);
+  gpu_buf(0, &d->work->buffer[KR], 0);
+  gpu_buf(1, &d->work->buffer[V], 0);
+  gpu_buf(2, &d->work->buffer[SEQUENCES], 0);
   gpu_bytes(3, p, sizeof p);
   gpu_go(1, rows, 1, 256, 1, 1);
 }
@@ -290,23 +305,23 @@ void dflash_context(DFlash *d, const Buf *captured, const DFlashRow *rows, int c
   if (!d)
     return;
   sequences(d, rows, count);
-  product(d, &d->combine, captured, 0, &d->buffer[CONTEXT], count, 1);
-  normalize(d, &d->buffer[CONTEXT], &d->hidden_norm, &d->buffer[NORMAL], count);
+  product(d, &d->combine, captured, 0, &d->work->buffer[CONTEXT], count, 1);
+  normalize(d, &d->work->buffer[CONTEXT], &d->hidden_norm, &d->work->buffer[NORMAL], count);
   for (int l = 0; l < LAYERS; l++) {
     Block *b = d->layer + l;
-    product(d, &b->k, &d->buffer[NORMAL], 0, &d->buffer[K], count, 1);
-    product(d, &b->v, &d->buffer[NORMAL], 0, &d->buffer[V], count, 1);
-    rotate(d, &d->buffer[K], &b->knorm, &d->buffer[KR], count, 2);
+    product(d, &b->k, &d->work->buffer[NORMAL], 0, &d->work->buffer[K], count, 1);
+    product(d, &b->v, &d->work->buffer[NORMAL], 0, &d->work->buffer[V], count, 1);
+    rotate(d, &d->work->buffer[K], &b->knorm, &d->work->buffer[KR], count, 2);
     store_keys(d, l, count);
   }
 }
 static void convolve(DFlash *d, const Convolution *conv, const Buf *x, const Buf *out, int rows, int side) {
   if (!side)
-    product(d, &conv->coefficients, x, 0, &d->buffer[COEFFICIENTS], rows, 1);
+    product(d, &conv->coefficients, x, 0, &d->work->buffer[COEFFICIENTS], rows, 1);
   uint32_t p[4] = {HIDDEN, (uint32_t)rows, (uint32_t)side, 0};
   gpu_kern(d->conv);
   gpu_buf(0, x, 0);
-  gpu_buf(1, &d->buffer[COEFFICIENTS], 0);
+  gpu_buf(1, &d->work->buffer[COEFFICIENTS], 0);
   gpu_buf(2, &conv->base, 0);
   gpu_buf(3, out, 0);
   gpu_bytes(4, p, sizeof p);
@@ -322,31 +337,31 @@ static void add(DFlash *d, const Buf *out, const Buf *x, int rows) {
 }
 static void attention(DFlash *d, int layer, int rows, int length) {
   Block *b = d->layer + layer;
-  product(d, &b->q, &d->buffer[CONVOLVED], 0, &d->buffer[Q], rows, 1);
-  product(d, &b->k, &d->buffer[CONVOLVED], 0, &d->buffer[K], rows, 1);
-  product(d, &b->v, &d->buffer[CONVOLVED], 0, &d->buffer[V], rows, 1);
-  rotate(d, &d->buffer[Q], &b->qnorm, &d->buffer[Q], rows, 32);
-  rotate(d, &d->buffer[K], &b->knorm, &d->buffer[KR], rows, 2);
+  product(d, &b->q, &d->work->buffer[CONVOLVED], 0, &d->work->buffer[Q], rows, 1);
+  product(d, &b->k, &d->work->buffer[CONVOLVED], 0, &d->work->buffer[K], rows, 1);
+  product(d, &b->v, &d->work->buffer[CONVOLVED], 0, &d->work->buffer[V], rows, 1);
+  rotate(d, &d->work->buffer[Q], &b->qnorm, &d->work->buffer[Q], rows, 32);
+  rotate(d, &d->work->buffer[K], &b->knorm, &d->work->buffer[KR], rows, 2);
   store_keys(d, layer, rows);
   struct {
     uint32_t heads, kv, dim, layer, blocks, causal, length, pad;
     float scale;
-  } p = {32, 2, 128, (uint32_t)layer, (uint32_t)d->blocks, 0, (uint32_t)length, 0, 1 / sqrtf(128)};
+  } p = {32, 2, 128, (uint32_t)layer, (uint32_t)d->work->blocks, 0, (uint32_t)length, 0, 1 / sqrtf(128)};
   gpu_kern(d->attention);
-  gpu_buf(0, &d->buffer[Q], 0);
-  gpu_buf(1, &d->buffer[SEQUENCES], 0);
-  gpu_buf(2, &d->buffer[PARTS], 0);
-  gpu_buf(3, &d->buffer[MAXIMA], 0);
+  gpu_buf(0, &d->work->buffer[Q], 0);
+  gpu_buf(1, &d->work->buffer[SEQUENCES], 0);
+  gpu_buf(2, &d->work->buffer[PARTS], 0);
+  gpu_buf(3, &d->work->buffer[MAXIMA], 0);
   gpu_bytes(4, &p, sizeof p);
-  gpu_go(32, d->blocks, rows, 256, 1, 1);
+  gpu_go(32, d->work->blocks, rows, 256, 1, 1);
   gpu_kern(d->sum);
-  gpu_buf(0, &d->buffer[PARTS], 0);
-  gpu_buf(1, &d->buffer[MAXIMA], 0);
-  gpu_buf(2, &d->buffer[SEQUENCES], 0);
-  gpu_buf(3, &d->buffer[ATTENTION], 0);
+  gpu_buf(0, &d->work->buffer[PARTS], 0);
+  gpu_buf(1, &d->work->buffer[MAXIMA], 0);
+  gpu_buf(2, &d->work->buffer[SEQUENCES], 0);
+  gpu_buf(3, &d->work->buffer[ATTENTION], 0);
   gpu_bytes(4, &p, sizeof p);
   gpu_go(32, rows, 1, 128, 1, 1);
-  product(d, &b->output, &d->buffer[ATTENTION], 0, &d->buffer[RESULT], rows, 1);
+  product(d, &b->output, &d->work->buffer[ATTENTION], 0, &d->work->buffer[RESULT], rows, 1);
 }
 static void top_candidates(const float *logits, int *ids, float *scores) {
   for (int k = 0; k < TOP; k++)
@@ -369,8 +384,8 @@ void dflash_predict(DFlash *d, const DFlashRow *state, int anchor, int *tokens, 
   if (!dflash_prepare(d, rows, state->position + rows))
     die("DFlash2 workspace does not fit model-memory budget");
   for (int i = 0; i < rows; i++) {
-    ((int *)d->buffer[TOKENS].ptr)[i] = i ? 990 : anchor;
-    ((uint64_t *)d->buffer[EMBEDDINGS].ptr)[i] = 0;
+    ((int *)d->work->buffer[TOKENS].ptr)[i] = i ? 990 : anchor;
+    ((uint64_t *)d->work->buffer[EMBEDDINGS].ptr)[i] = 0;
     sequence[i] = *state;
     sequence[i].position += i;
   }
@@ -379,44 +394,44 @@ void dflash_predict(DFlash *d, const DFlashRow *state, int anchor, int *tokens, 
   uint32_t hidden = HIDDEN;
   gpu_kern(d->embed);
   gpu_buf(0, d->embedding, 0);
-  gpu_buf(1, &d->buffer[TOKENS], 0);
-  gpu_buf(2, &d->buffer[X], 0);
+  gpu_buf(1, &d->work->buffer[TOKENS], 0);
+  gpu_buf(2, &d->work->buffer[X], 0);
   gpu_bytes(3, &hidden, 4);
-  gpu_buf(4, &d->buffer[EMBEDDINGS], 0);
+  gpu_buf(4, &d->work->buffer[EMBEDDINGS], 0);
   gpu_go((HIDDEN + 255) / 256, rows, 1, 256, 1, 1);
   for (int l = 0; l < LAYERS; l++) {
     Block *b = d->layer + l;
-    normalize(d, &d->buffer[X], &b->input_norm, &d->buffer[NORMAL], rows);
-    convolve(d, &b->attention_conv, &d->buffer[NORMAL], &d->buffer[CONVOLVED], rows, 0);
+    normalize(d, &d->work->buffer[X], &b->input_norm, &d->work->buffer[NORMAL], rows);
+    convolve(d, &b->attention_conv, &d->work->buffer[NORMAL], &d->work->buffer[CONVOLVED], rows, 0);
     attention(d, l, rows, state->position + rows);
-    convolve(d, &b->attention_conv, &d->buffer[RESULT], &d->buffer[NORMAL], rows, 1);
-    add(d, &d->buffer[X], &d->buffer[NORMAL], rows);
-    normalize(d, &d->buffer[X], &b->output_norm, &d->buffer[NORMAL], rows);
-    convolve(d, &b->mlp_conv, &d->buffer[NORMAL], &d->buffer[CONVOLVED], rows, 0);
-    product(d, &b->gate, &d->buffer[CONVOLVED], 0, &d->buffer[GATE], rows, 1);
-    product(d, &b->up, &d->buffer[CONVOLVED], 0, &d->buffer[UP], rows, 1);
+    convolve(d, &b->attention_conv, &d->work->buffer[RESULT], &d->work->buffer[NORMAL], rows, 1);
+    add(d, &d->work->buffer[X], &d->work->buffer[NORMAL], rows);
+    normalize(d, &d->work->buffer[X], &b->output_norm, &d->work->buffer[NORMAL], rows);
+    convolve(d, &b->mlp_conv, &d->work->buffer[NORMAL], &d->work->buffer[CONVOLVED], rows, 0);
+    product(d, &b->gate, &d->work->buffer[CONVOLVED], 0, &d->work->buffer[GATE], rows, 1);
+    product(d, &b->up, &d->work->buffer[CONVOLVED], 0, &d->work->buffer[UP], rows, 1);
     uint32_t n = rows * 6144;
     gpu_kern(d->swiglu);
-    gpu_buf(0, &d->buffer[GATE], 0);
-    gpu_buf(1, &d->buffer[UP], 0);
-    gpu_buf(2, &d->buffer[HIDDEN_PRODUCT], 0);
+    gpu_buf(0, &d->work->buffer[GATE], 0);
+    gpu_buf(1, &d->work->buffer[UP], 0);
+    gpu_buf(2, &d->work->buffer[HIDDEN_PRODUCT], 0);
     gpu_bytes(3, &n, 4);
     gpu_go((n + 255) / 256, 1, 1, 256, 1, 1);
-    product(d, &b->down, &d->buffer[HIDDEN_PRODUCT], 0, &d->buffer[RESULT], rows, 1);
-    convolve(d, &b->mlp_conv, &d->buffer[RESULT], &d->buffer[NORMAL], rows, 1);
-    add(d, &d->buffer[X], &d->buffer[NORMAL], rows);
+    product(d, &b->down, &d->work->buffer[HIDDEN_PRODUCT], 0, &d->work->buffer[RESULT], rows, 1);
+    convolve(d, &b->mlp_conv, &d->work->buffer[RESULT], &d->work->buffer[NORMAL], rows, 1);
+    add(d, &d->work->buffer[X], &d->work->buffer[NORMAL], rows);
   }
-  normalize(d, &d->buffer[X], &d->final_norm, &d->buffer[NORMAL], rows);
-  product(d, d->head, &d->buffer[NORMAL], HIDDEN * 4, &d->buffer[LOGITS], count, 1);
-  product(d, &d->condition, &d->buffer[NORMAL], HIDDEN * 4, &d->buffer[CONDITION], count, 1);
+  normalize(d, &d->work->buffer[X], &d->final_norm, &d->work->buffer[NORMAL], rows);
+  product(d, d->head, &d->work->buffer[NORMAL], HIDDEN * 4, &d->work->buffer[LOGITS], count, 1);
+  product(d, &d->condition, &d->work->buffer[NORMAL], HIDDEN * 4, &d->work->buffer[CONDITION], count, 1);
   gpu_commit();
   gpu_sync();
   int candidates[15][TOP], previous[15][TOP];
   float unary[15][TOP], score[TOP] = {0};
-  const float *condition = (const float *)d->buffer[CONDITION].ptr;
+  const float *condition = (const float *)d->work->buffer[CONDITION].ptr;
   const uint16_t *pre = (const uint16_t *)d->predecessor.ptr, *post = (const uint16_t *)d->successor.ptr;
   for (int step = 0; step < count; step++) {
-    top_candidates((const float *)d->buffer[LOGITS].ptr + (size_t)step * VOCAB, candidates[step], unary[step]);
+    top_candidates((const float *)d->work->buffer[LOGITS].ptr + (size_t)step * VOCAB, candidates[step], unary[step]);
     float next[TOP];
     for (int current = 0; current < TOP; current++) {
       next[current] = -INFINITY;

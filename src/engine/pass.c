@@ -16,7 +16,7 @@ struct Pass {
   void *argument;
   PassWait wait;     // what it waits for; ready is null when it waits for nothing
   int ended;
-  const PassVariable *variables;
+  PassVariable *variables;  // copied from pass_variables' list
   int nvariables;
   char *saved, *outer;   // the pass's values while it does not run; the resumer's while it does
   void (*resumed)(void);
@@ -86,7 +86,10 @@ void pass_variables(Pass *p, const PassVariable *variables, int count) {
   for (int i = 0; i < count; i++) bytes += variables[i].bytes;
   free(p->saved), free(p->outer);
   p->saved = xmalloc(bytes ? bytes : 1), p->outer = xmalloc(bytes ? bytes : 1);
-  p->variables = variables, p->nvariables = count;
+  free(p->variables);
+  p->variables = xmalloc((size_t)count * sizeof *p->variables + 1);
+  memcpy(p->variables, variables, (size_t)count * sizeof *p->variables);
+  p->nvariables = count;
   char *at = p->saved;
   for (int i = 0; i < count; i++) memcpy(at, variables[i].address, variables[i].bytes), at += variables[i].bytes;
 }
@@ -97,7 +100,7 @@ void pass_free(Pass *p) {
   if (!p) return;
   if (running == p) die("a pass cannot free itself");
   munmap(p->stack, p->mapped);
-  free(p->saved), free(p->outer);
+  free(p->saved), free(p->outer), free(p->variables);
   free(p);
 }
 

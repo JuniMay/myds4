@@ -176,16 +176,21 @@ so the eviction must not wait for the GPU; a wait that never ends fails the
 check by its 20-second alarm.
 
 `build/tests/passes CHECKPOINT --text FILE [--experts GGUF] [--memory GIB]
-[--tokens N] [--decode N] [--no-garbage]` needs a DeepSeek model and a text
-of at least twice `--tokens` tokens. It runs two passes, each a prefill and
-greedy decoding, alone and then interleaved at every yield, and compares
-every logit vector byte for byte. Between the passes' turns it fills the
-buffers that passes share with garbage. A buffer or variable that should
-belong to a pass but does not shows up as a difference. `--no-garbage`
-leaves GPU work queued across the switches, so that the two passes' command
-buffers overlap in the queue, which catches CPU-filled shared buffers. The
-check prints how long the passes took alone and interleaved. Run it with
-and without `--no-garbage`.
+[--tokens N] [--decode N] [--draft N] [--draft-model DIR] [--no-garbage]
+[--verbose]` runs any model family. It needs a text of at least twice
+`--tokens` tokens. It runs two passes, each a prefill and greedy decoding
+(with `--draft N`, drafting and verifying), alone and then interleaved at
+every yield, and compares every logit vector and every proposed token byte
+for byte. A buffer or variable that should belong to a pass but does not shows
+up as a difference. It also prints how many layer passes went through tables
+and how many experts were evicted while the passes were interleaved, so a run
+at a memory size that evicts shows that layer holds were contested.
+For DeepSeek it also fills the buffers that passes share with garbage between
+the passes' turns; `--no-garbage` instead leaves GPU work queued across the
+switches, so that the two passes' command buffers overlap in the queue, which
+catches CPU-filled shared buffers. Run it with and without `--no-garbage` for
+DeepSeek. The check prints how long the passes took alone and interleaved.
+`--verbose` shows the memory messages that are usually suppressed.
 
 `build/tests/gpu-steps` needs no model. A buffer that queued work uses must
 stay allocated and charged until that work has finished (`gpu_free_later`,

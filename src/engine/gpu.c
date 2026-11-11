@@ -654,6 +654,18 @@ const PassVariable *gpu_pass_variables(int *count) {
   return signal_variables;
 }
 
+Pass *pass_new_model(void (*body)(void *), void *argument, const PassVariable *variables, int count, void (*resumed)(void)) {
+  int gpu_count;
+  const PassVariable *gpu = gpu_pass_variables(&gpu_count);
+  PassVariable all[count + gpu_count];
+  memcpy(all, variables, (size_t)count * sizeof *all);
+  memcpy(all + count, gpu, (size_t)gpu_count * sizeof *all);
+  Pass *pass = pass_new(body, argument, 64u << 20);
+  pass_variables(pass, all, count + gpu_count);
+  pass_on_resume(pass, resumed);
+  return pass;
+}
+
 void gpu_pass_begin(void) {
   event = MSG(id (*)(id, SEL), dev, S("newSharedEvent"));
   signaled = 0;

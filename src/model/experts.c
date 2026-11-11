@@ -1,4 +1,5 @@
 #include "experts.h"
+#include <stdlib.h>
 #include <string.h>
 
 static uint32_t *counts(const ExpertWork *w) { return (uint32_t *)w->plan.ptr; }
@@ -29,6 +30,26 @@ void experts_store(ExpertWork *w, ExpertStore *store, const ExpertFiles *files) 
   w->slot = xmalloc((size_t)w->experts * sizeof *w->slot);
   w->fresh = xmalloc((size_t)w->experts);
   memset(w->fresh, 0, (size_t)w->experts);
+  w->held_tables = xmalloc((size_t)files->layers * sizeof *w->held_tables);
+}
+void experts_pass_begin(ExpertWork *w, const ExpertWork *from) {
+  *w = *from;
+  w->plan = w->entries = w->order = w->groups = w->row_groups = w->tiles = (Buf){0};
+  w->input = w->second = w->hidden_values = w->quantized = w->output = (Buf){0};
+  w->active_ids = NULL, w->held = NULL, w->held_count = 0, w->held_table_count = 0;
+  w->rows = w->active = w->group_count = w->group_rows = w->matrix_tiles = 0;
+  experts_store(w, from->store, from->files);
+}
+void experts_pass_end(ExpertWork *w) {
+  experts_release(w);
+  Buf *const buffers[] = {&w->plan, &w->entries, &w->order, &w->groups, &w->row_groups, &w->tiles,
+                          &w->input, &w->second, &w->hidden_values, &w->quantized, &w->output};
+  for (size_t i = 0; i < sizeof buffers / sizeof *buffers; i++) gpu_free(buffers[i]);
+  free(w->slot), free(w->fresh), free(w->held_tables);
+}
+void experts_hold_table(ExpertWork *w, int layer) {
+  cache_hold_layer(w->store, layer);
+  w->held_tables[w->held_table_count++] = layer;
 }
 // An expert's nonempty tensors as spans: consecutive tensors of one file
 // share a span. Writes each tensor's span and offset; returns the spans.
@@ -269,6 +290,8 @@ int experts_routes_get(const ExpertRoutes *r, int row, uint16_t *id, uint8_t *fr
   return 1;
 }
 void experts_release(ExpertWork *w) {
+  for (int i = 0; i < w->held_table_count; i++) cache_unhold_layer(w->store, w->held_tables[i]);
+  w->held_table_count = 0;
   if (w->held_count) {
     int ids[w->held_count];
     for (int i = 0; i < w->held_count; i++) ids[i] = (int)w->active_ids[i];

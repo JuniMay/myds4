@@ -4,6 +4,7 @@
 #include "audio.h"
 #include "dflash.h"
 #include <math.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -38,7 +39,7 @@ typedef struct {
 static struct {
   int ready, layers, recurrent, attention, hidden, intermediate, shared, experts, chosen;
   int heads, kv_heads, head_dim, ssm_heads, ssm_dim, ssm_state, groups, channels, projected, vocab;
-  int normalize_topk, stop[8], nstop, rows, blocks, dump_fd, draft_depth, prompt_pass;
+  int normalize_topk, stop[8], nstop, dump_fd, draft_depth, prompt_pass;
   float eps, factor, dt_minimum;
   TensorIndex *checkpoint;
   Layer *layer;
@@ -51,10 +52,6 @@ static struct {
   ExpertRoutes routes;  // each decoded row's experts in the MoE layers (myds4_routes)
   Buf embedding, final_norm;
   Linear head;
-  Buf tokens, embeddings, sequences, x, norm, quant, packed, projected_values, convolved, scan, gated;
-  Buf q, k, v, attended, part, maxima, result, shared_result, routing, selected, coefficients;
-  Buf gathered, up, logits, captured;
-  ExpertWork routed;
   Buf resident_table, resident_counts;
   ModelCounters counters;
   ModelPlan plan;
@@ -66,6 +63,18 @@ static struct {
   int embed_kernel, norm_kernel, round_kernel, quant_kernel, conv_kernel, scan_kernel, gate_kernel;
   int relu_kernel, add_kernel, route_kernel, gather_kernel, store_kernel, attention_kernel, sum_kernel;
 } nm;
+// What belongs to a forward pass: its buffers, its expert planner, and the
+// shape they were made for. Each pass (src/engine/pass.h) has its own; `work`
+// is the one in use.
+typedef struct {
+  Buf tokens, embeddings, sequences, x, norm, quant, packed, projected_values, convolved, scan, gated;
+  Buf q, k, v, attended, part, maxima, result, shared_result, routing, selected, coefficients;
+  Buf gathered, up, logits, captured;
+  ExpertWork routed;
+  int rows, blocks;
+} Work;
+enum { WORK_BUFFERS = offsetof(Work, routed) / sizeof(Buf) };
+static Work first_work, *work = &first_work;
 
 static int integer(const Json *j, const char *name, int fallback) {
   const Json *v = json_get(j, name);
@@ -109,7 +118,7 @@ static void store_layout(const Tensor *weight, const Tensor *scales, const Tenso
                                           .extra = nm.files.extra, .transform = nm.files.extra ? experts_decode : NULL,
                                           .context = &nm.files});
   cache_memory(nm.store, weights_slot(nm.core));
-  experts_store(&nm.routed, nm.store, &nm.files);
+  experts_store(&work->routed, nm.store, &nm.files);
 }
 static void prepare(const char *directory) {
   char path[4096], name[256];
@@ -147,7 +156,7 @@ static void prepare(const char *directory) {
     die("unsupported Nemotron-H checkpoint dimensions");
   gpu_start();
   linear_init();
-  experts_init(&nm.routed, nm.hidden, nm.intermediate, nm.experts, nm.chosen, EXPERT_RELU2, EXPERT_SUM_FP32);
+  experts_init(&work->routed, nm.hidden, nm.intermediate, nm.experts, nm.chosen, EXPERT_RELU2, EXPERT_SUM_FP32);
 #define K(field, name) nm.field = gpu_kernel(name)
   K(embed_kernel, "embed_rows");
   K(norm_kernel, "group_rms_bf16");
@@ -268,13 +277,24 @@ static uint64_t workspace(int rows, int blocks, int allocate) {
   do {                                                                                                                 \
     size_t need = (amount);                                                                                            \
     bytes += gpu_allocation_size(need);                                                                                \
+    if (allocate && work->field.size != need) {                                                                        \
+      gpu_free(&work->field);                                                                                          \
+      work->field = gpu_alloc(need);                                                                                   \
+    }                                                                                                                  \
+  } while (0)
+// The tables of the layers' expert addresses: one per model, as they are
+// valid for as long as their layer's experts stay.
+#define T(field, amount)                                                                                               \
+  do {                                                                                                                 \
+    size_t need = (amount);                                                                                            \
+    bytes += gpu_allocation_size(need);                                                                                \
     if (allocate && nm.field.size != need) {                                                                           \
       gpu_free(&nm.field);                                                                                             \
       nm.field = gpu_alloc(need);                                                                                      \
     }                                                                                                                  \
   } while (0)
-  B(resident_table, (size_t)nm.layers * nm.experts * sizeof(ExpertGroup));
-  B(resident_counts, nm.layers * 4);
+  T(resident_table, (size_t)nm.layers * nm.experts * sizeof(ExpertGroup));
+  T(resident_counts, nm.layers * 4);
   B(tokens, rows * 4);
   B(embeddings, rows * 8);
   B(sequences, rows * sizeof(Sequence));
@@ -302,41 +322,16 @@ static uint64_t workspace(int rows, int blocks, int allocate) {
   B(logits, (size_t)(nm.draft_depth + 1 > NM_BATCH ? nm.draft_depth + 1 : NM_BATCH) * nm.vocab * 4);
   B(captured, nm.draft_depth ? r * nm.hidden * 6 : 0);
 #undef B
-  bytes += experts_workspace(&nm.routed, rows, allocate);
+#undef T
+  bytes += experts_workspace(&work->routed, rows, allocate);
   if (allocate)
-    nm.rows = rows, nm.blocks = blocks;
+    work->rows = rows, work->blocks = blocks;
   return bytes;
 }
 static uint64_t workspace_bytes(void) {
-  Buf *buffers[] = {&nm.resident_table, &nm.resident_counts, &nm.tokens,
-                    &nm.embeddings,
-                    &nm.sequences,
-                    &nm.x,
-                    &nm.norm,
-                    &nm.quant,
-                    &nm.packed,
-                    &nm.projected_values,
-                    &nm.convolved,
-                    &nm.scan,
-                    &nm.gated,
-                    &nm.q,
-                    &nm.k,
-                    &nm.v,
-                    &nm.attended,
-                    &nm.part,
-                    &nm.maxima,
-                    &nm.result,
-                    &nm.shared_result,
-                    &nm.routing,
-                    &nm.selected,
-                    &nm.coefficients,
-                    &nm.gathered,
-                    &nm.up,
-                    &nm.logits,
-                    &nm.captured};
-  uint64_t bytes = experts_bytes(&nm.routed);
-  for (size_t i = 0; i < sizeof buffers / sizeof *buffers; i++)
-    bytes += buffers[i]->allocated;
+  uint64_t bytes = experts_bytes(&work->routed) + nm.resident_table.allocated + nm.resident_counts.allocated;
+  for (int i = 0; i < WORK_BUFFERS; i++)
+    bytes += ((const Buf *)work)[i].allocated;
   return bytes;
 }
 static int prepare_rows(int rows, int positions) {
@@ -542,31 +537,31 @@ static void product(const Linear *matrix, const Buf *input, const Buf *output, i
            matrix->input_scale, 0};
     gpu_kern(nm.quant_kernel);
     gpu_buf(0, input, 0);
-    gpu_buf(1, &nm.quant, 0);
+    gpu_buf(1, &work->quant, 0);
     gpu_bytes(2, &p, sizeof p);
     gpu_go((p.count + 255) / 256, 1, 1, 256, 1, 1);
-    x = &nm.quant;
+    x = &work->quant;
     if (matrix->kind != 'm')
       scaled.scale *= matrix->input_scale;
   }
   if (nm.prompt_pass || rows <= 8)
-    linear_product(&scaled, x, 0, output, 0, rows, rows > 8, &nm.packed, 0, round);
+    linear_product(&scaled, x, 0, output, 0, rows, rows > 8, &work->packed, 0, round);
   else
     for (int at = 0; at < rows; at += 8) {
       int count = rows - at < 8 ? rows - at : 8;
       linear_product(&scaled, x, (size_t)at * matrix->cols * 4, output, (size_t)at * matrix->rows * 4, count, 0,
-                     &nm.packed, 0, round);
+                     &work->packed, 0, round);
     }
 }
 static void recurrent(const Layer *y, int rows) {
-  product(&y->input, &nm.norm, &nm.projected_values, rows, 1, 1);
+  product(&y->input, &work->norm, &work->projected_values, rows, 1, 1);
   uint32_t cp[4] = {(uint32_t)rows, (uint32_t)nm.channels, (uint32_t)(nm.ssm_heads * nm.ssm_dim), (uint32_t)y->index};
   gpu_kern(nm.conv_kernel);
-  gpu_buf(0, &nm.projected_values, 0);
+  gpu_buf(0, &work->projected_values, 0);
   gpu_buf(1, &y->conv, 0);
   gpu_buf(2, &y->conv_bias, 0);
-  gpu_buf(3, &nm.sequences, 0);
-  gpu_buf(4, &nm.convolved, 0);
+  gpu_buf(3, &work->sequences, 0);
+  gpu_buf(4, &work->convolved, 0);
   gpu_bytes(5, cp, sizeof cp);
   gpu_go((nm.channels + 255) / 256, 1, 1, 256, 1, 1);
   struct {
@@ -575,13 +570,13 @@ static void recurrent(const Layer *y, int rows) {
   } sp = {(uint32_t)rows,         64,           8, 64, 128, (uint32_t)y->index, (uint32_t)nm.channels,
           (uint32_t)nm.projected, nm.dt_minimum};
   gpu_kern(nm.scan_kernel);
-  gpu_buf(0, &nm.convolved, 0);
-  gpu_buf(1, &nm.projected_values, 0);
+  gpu_buf(0, &work->convolved, 0);
+  gpu_buf(1, &work->projected_values, 0);
   gpu_buf(2, &y->decay, 0);
   gpu_buf(3, &y->skip, 0);
   gpu_buf(4, &y->dt, 0);
-  gpu_buf(5, &nm.sequences, 0);
-  gpu_buf(6, &nm.scan, 0);
+  gpu_buf(5, &work->sequences, 0);
+  gpu_buf(6, &work->scan, 0);
   gpu_bytes(7, &sp, sizeof sp);
   gpu_go(64, 16, 1, 128, 1, 1);
   struct {
@@ -589,23 +584,23 @@ static void recurrent(const Layer *y, int rows) {
     float eps;
   } gp = {512, 8, (uint32_t)nm.projected, 0, nm.eps};
   gpu_kern(nm.gate_kernel);
-  gpu_buf(0, &nm.scan, 0);
-  gpu_buf(1, &nm.projected_values, 0);
+  gpu_buf(0, &work->scan, 0);
+  gpu_buf(1, &work->projected_values, 0);
   gpu_buf(2, &y->gate_norm, 0);
-  gpu_buf(3, &nm.gated, 0);
+  gpu_buf(3, &work->gated, 0);
   gpu_bytes(4, &gp, sizeof gp);
   gpu_go(rows * 8, 1, 1, 256, 1, 1);
-  product(&y->output, &nm.gated, &nm.result, rows, 1, 1);
+  product(&y->output, &work->gated, &work->result, rows, 1, 1);
 }
 static void attention(const Layer *y, int rows) {
-  product(&y->q, &nm.norm, &nm.q, rows, 1, 1);
-  product(&y->k, &nm.norm, &nm.k, rows, 1, 1);
-  product(&y->v, &nm.norm, &nm.v, rows, 1, 1);
+  product(&y->q, &work->norm, &work->q, rows, 1, 1);
+  product(&y->k, &work->norm, &work->k, rows, 1, 1);
+  product(&y->v, &work->norm, &work->v, rows, 1, 1);
   uint32_t kp[2] = {(uint32_t)(nm.kv_heads * nm.head_dim), (uint32_t)y->index};
   gpu_kern(nm.store_kernel);
-  gpu_buf(0, &nm.k, 0);
-  gpu_buf(1, &nm.v, 0);
-  gpu_buf(2, &nm.sequences, 0);
+  gpu_buf(0, &work->k, 0);
+  gpu_buf(1, &work->v, 0);
+  gpu_buf(2, &work->sequences, 0);
   gpu_bytes(3, kp, sizeof kp);
   gpu_go((kp[0] + 255) / 256, rows, 1, 256, 1, 1);
   struct {
@@ -615,87 +610,88 @@ static void attention(const Layer *y, int rows) {
           (uint32_t)nm.kv_heads,
           (uint32_t)nm.head_dim,
           (uint32_t)y->index,
-          (uint32_t)nm.blocks,
+          (uint32_t)work->blocks,
           1,
           0,
           0,
           1 / sqrtf(nm.head_dim)};
   gpu_kern(nm.attention_kernel);
-  gpu_buf(0, &nm.q, 0);
-  gpu_buf(1, &nm.sequences, 0);
-  gpu_buf(2, &nm.part, 0);
-  gpu_buf(3, &nm.maxima, 0);
+  gpu_buf(0, &work->q, 0);
+  gpu_buf(1, &work->sequences, 0);
+  gpu_buf(2, &work->part, 0);
+  gpu_buf(3, &work->maxima, 0);
   gpu_bytes(4, &ap, sizeof ap);
-  gpu_go(nm.heads, nm.blocks, rows, 256, 1, 1);
+  gpu_go(nm.heads, work->blocks, rows, 256, 1, 1);
   gpu_kern(nm.sum_kernel);
-  gpu_buf(0, &nm.part, 0);
-  gpu_buf(1, &nm.maxima, 0);
-  gpu_buf(2, &nm.sequences, 0);
-  gpu_buf(3, &nm.attended, 0);
+  gpu_buf(0, &work->part, 0);
+  gpu_buf(1, &work->maxima, 0);
+  gpu_buf(2, &work->sequences, 0);
+  gpu_buf(3, &work->attended, 0);
   gpu_bytes(4, &ap, sizeof ap);
   gpu_go(nm.heads, rows, 1, 128, 1, 1);
-  product(&y->output, &nm.attended, &nm.result, rows, 1, 1);
+  product(&y->output, &work->attended, &work->result, rows, 1, 1);
 }
 static void feed_forward(const Expert *e, const Buf *input, const Buf *output, int rows) {
-  product(&e->up, input, &nm.up, rows, 1, 1);
-  unary(nm.relu_kernel, &nm.up, (uint32_t)(rows * e->up.rows));
-  product(&e->down, &nm.up, output, rows, 1, 1);
+  product(&e->up, input, &work->up, rows, 1, 1);
+  unary(nm.relu_kernel, &work->up, (uint32_t)(rows * e->up.rows));
+  product(&e->down, &work->up, output, rows, 1, 1);
 }
 static int routed(Layer *y, int rows) {
   size_t offset = (size_t)y->number * nm.experts * sizeof(ExpertGroup);
   uint64_t generation;
   int resident = (nm.prompt_pass || rows <= 8) && cache_layer_ready(nm.store, y->moe, &generation);
   if (resident && y->table_generation != generation) {
-    y->table_valid = experts_table(&nm.routed, y->experts, y->moe, &nm.resident_table, offset);
+    y->table_valid = experts_table(&work->routed, y->experts, y->moe, &nm.resident_table, offset);
     y->table_generation = generation;
   }
   resident &= y->table_valid;
-  Buf selected = experts_selection(&nm.selected, y->number, rows, nm.chosen);
-  feed_forward(&y->shared, &nm.norm, &nm.shared_result, rows);
-  product(&y->router, &nm.norm, &nm.routing, rows, 0, 0);
+  Buf selected = experts_selection(&work->selected, y->number, rows, nm.chosen);
+  feed_forward(&y->shared, &work->norm, &work->shared_result, rows);
+  product(&y->router, &work->norm, &work->routing, rows, 0, 0);
   struct {
     uint32_t experts, chosen;
     float factor;
     uint32_t normalize;
   } p = {128, (uint32_t)nm.chosen, nm.factor, (uint32_t)nm.normalize_topk};
   gpu_kern(nm.route_kernel);
-  gpu_buf(0, &nm.routing, 0);
+  gpu_buf(0, &work->routing, 0);
   gpu_buf(1, &y->correction, 0);
   gpu_buf(2, &selected, 0);
-  gpu_buf(3, &nm.coefficients, 0);
+  gpu_buf(3, &work->coefficients, 0);
   gpu_bytes(4, &p, sizeof p);
   gpu_go(rows, 1, 1, 128, 1, 1);
   if (resident) {
-    experts_resident(&nm.routed, &nm.resident_table, offset, &selected, &nm.coefficients, &nm.norm,
+    experts_hold_table(&work->routed, y->moe);
+    experts_resident(&work->routed, &nm.resident_table, offset, &selected, &work->coefficients, &work->norm,
                       &nm.resident_counts, y->number * 4, rows, nm.prompt_pass);
-    experts_sum(&nm.routed, &nm.result);
-    add(&nm.result, &nm.shared_result, rows * nm.hidden);
+    experts_sum(&work->routed, &work->result);
+    add(&work->result, &work->shared_result, rows * nm.hidden);
     return 2;
   }
   gpu_commit();
   gpu_sync();
   if (!nm.prompt_pass)
     experts_routes_record(&nm.routes, nm.store, y->moe, (const uint32_t *)selected.ptr, rows, 0);
-  experts_acquire(&nm.routed, y->experts, y->moe, (const uint32_t *)selected.ptr,
-                  (const float *)nm.coefficients.ptr, rows, nm.prompt_pass, cache_counters(nm.store));
+  experts_acquire(&work->routed, y->experts, y->moe, (const uint32_t *)selected.ptr,
+                  (const float *)work->coefficients.ptr, rows, nm.prompt_pass, cache_counters(nm.store));
   gpu_begin();
-  experts_encode(&nm.routed, y->experts, &nm.norm);
-  for (int i = 0; i < nm.routed.active; i++) {
-    int e = nm.routed.active_ids[i];
-    int count = experts_count(&nm.routed, e);
-    if (experts_grouped(&nm.routed, e)) continue;
+  experts_encode(&work->routed, y->experts, &work->norm);
+  for (int i = 0; i < work->routed.active; i++) {
+    int e = work->routed.active_ids[i];
+    int count = experts_count(&work->routed, e);
+    if (experts_grouped(&work->routed, e)) continue;
     uint32_t shape[2] = {(uint32_t)nm.hidden, (uint32_t)count};
     gpu_kern(nm.gather_kernel);
-    gpu_buf(0, &nm.norm, 0);
-    gpu_buf(1, &nm.routed.entries, experts_entry_offset(&nm.routed, e));
-    gpu_buf(2, &nm.gathered, 0);
+    gpu_buf(0, &work->norm, 0);
+    gpu_buf(1, &work->routed.entries, experts_entry_offset(&work->routed, e));
+    gpu_buf(2, &work->gathered, 0);
     gpu_bytes(3, shape, sizeof shape);
     gpu_go((shape[0] * shape[1] + 255) / 256, 1, 1, 256, 1, 1);
-    Buf out = experts_output(&nm.routed, e);
-    feed_forward(y->experts + e, &nm.gathered, &out, count);
+    Buf out = experts_output(&work->routed, e);
+    feed_forward(y->experts + e, &work->gathered, &out, count);
   }
-  experts_sum(&nm.routed, &nm.result);
-  add(&nm.result, &nm.shared_result, rows * nm.hidden);
+  experts_sum(&work->routed, &work->result);
+  add(&work->result, &work->shared_result, rows * nm.hidden);
   return 1;
 }
 static void add_stats(CacheStats *to, CacheStats before, CacheStats after) {
@@ -719,17 +715,17 @@ static const float *pass(const Row *rows, int count, int logits, int prompt) {
     if (positions > maximum)
       maximum = positions;
   }
-  if ((nm.rows < count || nm.blocks < (maximum + 255) / 256) && prepare_rows(count, maximum) < count)
+  if ((work->rows < count || work->blocks < (maximum + 255) / 256) && prepare_rows(count, maximum) < count)
     return NULL;
   if (!dflash_prepare(nm.draft, count, maximum))
     return NULL;
-  Sequence *seq = (Sequence *)nm.sequences.ptr;
+  Sequence *seq = (Sequence *)work->sequences.ptr;
   for (int r = 0, repeat = 0; r < count; r++) {
     State *s = rows[r].state;
     repeat = r && rows[r - 1].state == s ? repeat + 1 : 0;
     int position = s->pos + repeat;
-    ((int *)nm.tokens.ptr)[r] = rows[r].token < 0 ? 0 : rows[r].token;
-    ((uint64_t *)nm.embeddings.ptr)[r] = rows[r].token < 0 ? media_embedding(nm.media, nm.media_count, position) : 0;
+    ((int *)work->tokens.ptr)[r] = rows[r].token < 0 ? 0 : rows[r].token;
+    ((uint64_t *)work->embeddings.ptr)[r] = rows[r].token < 0 ? media_embedding(nm.media, nm.media_count, position) : 0;
     seq[r] = (Sequence){.state = s->state.gpu,
                         .conv = s->conv.gpu,
                         .k = s->kv.gpu,
@@ -752,15 +748,15 @@ static const float *pass(const Row *rows, int count, int logits, int prompt) {
       gpu_use(&nm.media[i].features);
   gpu_kern(nm.embed_kernel);
   gpu_buf(0, &nm.embedding, 0);
-  gpu_buf(1, &nm.tokens, 0);
-  gpu_buf(2, &nm.x, 0);
+  gpu_buf(1, &work->tokens, 0);
+  gpu_buf(2, &work->x, 0);
   gpu_bytes(3, &hidden, 4);
-  gpu_buf(4, &nm.embeddings, 0);
+  gpu_buf(4, &work->embeddings, 0);
   gpu_go((hidden + 255) / 256, count, 1, 256, 1, 1);
   for (int l = 0; l < nm.layers; l++) {
     Layer *y = nm.layer + l;
     nm.counters.prefill_layer = prompt ? l + 1 : 0;
-    norm(&nm.x, 0, &y->norm, &nm.norm, count);
+    norm(&work->x, 0, &y->norm, &work->norm, count);
     if (!y->kind)
       recurrent(y, count);
     else if (y->kind == 1)
@@ -770,24 +766,24 @@ static const float *pass(const Row *rows, int count, int logits, int prompt) {
         cache_pass(nm.store, y->moe);  // a prompt's reads evict earlier layers' experts first
       if (routed(y, count) == 2) resident_layers[resident_count++] = l;
     }
-    add(&nm.x, &nm.result, count * nm.hidden);
-    dflash_capture(nm.draft, l, &nm.x, &nm.captured, count);
+    add(&work->x, &work->result, count * nm.hidden);
+    dflash_capture(nm.draft, l, &work->x, &work->captured, count);
     if (nm.dump_fd >= 0) {
       gpu_commit();
       gpu_sync();
       size_t bytes = (size_t)count * nm.hidden * 4;
-      if (write(nm.dump_fd, nm.x.ptr, bytes) != (ssize_t)bytes)
+      if (write(nm.dump_fd, work->x.ptr, bytes) != (ssize_t)bytes)
         die("Nemotron trace write failed");
       gpu_begin();
     }
   }
-  norm(&nm.x, (size_t)(count - logits) * nm.hidden * 4, &nm.final_norm, &nm.norm, logits);
-  product(&nm.head, &nm.norm, &nm.logits, logits, 0, 0);
+  norm(&work->x, (size_t)(count - logits) * nm.hidden * 4, &nm.final_norm, &work->norm, logits);
+  product(&nm.head, &work->norm, &work->logits, logits, 0, 0);
   if (nm.draft) {
     DFlashRow context[NM_ROWS];
     for (int r = 0; r < count; r++)
       context[r] = (DFlashRow){&rows[r].state->draft_kv, rows[r].state->cap, (int)seq[r].pos};
-    dflash_context(nm.draft, &nm.captured, context, count);
+    dflash_context(nm.draft, &work->captured, context, count);
   }
   gpu_commit();
   gpu_sync();
@@ -795,8 +791,8 @@ static const float *pass(const Row *rows, int count, int logits, int prompt) {
   // before its pass ends, as a prompt's use.
   for (int i = 0; i < resident_count; i++) {
     const Layer *y = nm.layer + resident_layers[i];
-    Buf selected = experts_selection(&nm.selected, y->number, count, nm.chosen);
-    stats->row_unique += experts_mark_used(&nm.routed, y->experts, y->moe, (const uint32_t *)selected.ptr, count);
+    Buf selected = experts_selection(&work->selected, y->number, count, nm.chosen);
+    stats->row_unique += experts_mark_used(&work->routed, y->experts, y->moe, (const uint32_t *)selected.ptr, count);
     if (!prompt)
       experts_routes_record(&nm.routes, nm.store, y->moe, (const uint32_t *)selected.ptr, count, 1);
     stats->row_own += (uint64_t)count * nm.chosen;
@@ -804,14 +800,14 @@ static const float *pass(const Row *rows, int count, int logits, int prompt) {
   if (prompt)
     cache_pass(nm.store, -1);
   nm.counters.table_layers += resident_count;
-  experts_release(&nm.routed);
+  experts_release(&work->routed);
   // The pass's GPU work has completed and no expert is held: between passes
   // the store may evict any slot, its new slots join the residency set (the
   // next pass reaches them through tables), and the scores age once.
   cache_adapt(nm.store);
   if (nm.dump_fd >= 0) {
     size_t bytes = (size_t)logits * nm.vocab * 4;
-    if (write(nm.dump_fd, nm.logits.ptr, bytes) != (ssize_t)bytes)
+    if (write(nm.dump_fd, work->logits.ptr, bytes) != (ssize_t)bytes)
       die("Nemotron logit trace write failed");
   }
   for (int i = 0; i < count; i++)
@@ -826,7 +822,7 @@ static const float *pass(const Row *rows, int count, int logits, int prompt) {
     add_stats(&nm.counters.decode, before, *stats);
   }
   nm.counters.prefill_layer = 0;
-  return nm.last_logits = (const float *)nm.logits.ptr;
+  return nm.last_logits = (const float *)work->logits.ptr;
 }
 static const float *prefill(ModelState *state, const int *tokens, int n, int from, int replay, int capture,
                             ModelSnapshot **captured, float *every) {
@@ -1008,8 +1004,43 @@ static void accept(ModelState *state, const int *tokens, int count, int position
     memcpy(s->conv.ptr, s->saved_conv[count - 1].ptr, convolution_bytes());
   }
   s->pos = position + count;
-  nm.last_logits = (const float *)nm.logits.ptr + (size_t)(count - 1) * nm.vocab;
+  nm.last_logits = (const float *)work->logits.ptr + (size_t)(count - 1) * nm.vocab;
 }
+#define V(x) {&x, sizeof x}
+static const PassVariable pass_own[] = {V(work), V(nm.prompt_pass), V(nm.last_logits), V(nm.media), V(nm.media_count)};
+#undef V
+
+static Pass *nemotron_pass_new(void (*body)(void *), void *argument) {
+  enum { OWN = sizeof pass_own / sizeof *pass_own };
+  PassVariable variables[OWN + CACHE_PASS_VARIABLES + 1];
+  memcpy(variables, pass_own, sizeof pass_own);
+  cache_pass_variables(nm.store, variables + OWN);
+  int count = OWN + CACHE_PASS_VARIABLES;
+  if (nm.draft) variables[count++] = dflash_pass_variable(nm.draft);
+  return pass_new_model(body, argument, variables, count, NULL);
+}
+
+// Inside a new pass, before its work: its buffers, which prepare_rows and
+// dflash_prepare allocate at the size they ask for, and its signals.
+static void nemotron_pass_begin(void) {
+  gpu_pass_begin();
+  work = xmalloc(sizeof *work);
+  experts_pass_begin(&work->routed, &first_work.routed);
+  dflash_pass_begin(nm.draft);
+  cache_pass(nm.store, -1);
+}
+
+// Inside the pass, at its end: frees what it owned.
+static void nemotron_pass_end(void) {
+  gpu_sync();
+  experts_pass_end(&work->routed);
+  dflash_pass_end(nm.draft);
+  for (int i = 0; i < WORK_BUFFERS; i++)
+    gpu_free((Buf *)work + i);
+  free(work);
+  gpu_pass_end();
+}
+
 static const char *const types[] = {"nemo_speechlm", NULL};
 const ModelOps nemotron_ops = {.family = "Nemotron 3.5 Transcribe",
                                .model_types = types,
@@ -1055,4 +1086,7 @@ const ModelOps nemotron_ops = {.family = "Nemotron 3.5 Transcribe",
                                .chat = chat,
                                .draft = draft,
                                .verify = verify,
-                               .accept = accept};
+                               .accept = accept,
+                               .pass_new = nemotron_pass_new,
+                               .pass_begin = nemotron_pass_begin,
+                               .pass_end = nemotron_pass_end};

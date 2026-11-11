@@ -10,12 +10,14 @@
 #include "../linear.h"
 
 #include <math.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "../../engine/myds4.h"
+#include "../../engine/pass.h"
 #include "../model.h"
 
 #define ROWS QWEN_ROWS
@@ -58,15 +60,20 @@ static int mtp, state_copies = 2;
 static Layer M;
 static Mat mtp_fc;
 static Buf mtp_norm_e, mtp_norm_h, mtp_norm;
-// Activations of up to PF rows; XB: a matrix's input as BF16 (prompt passes);
-// SEQ: the rows' sequences.
-static Buf TOK, EMB, X, XN, R, QKV, CO, Z, A_, B_, G, BETA, GO, GN, QG, KK, VV, Q, KR, AO, GT, UP, HH, LOGITS, XB, SEQ;
-// The MTP head's rows: their hiddens, next tokens and sequences; its fc's input.
-static Buf HB, TOKM, EMBM, SEQM, EH;
-static Buf QH;  // a prompt pass's queries as FP16, by head
-static Buf PART, ML;  // attention blocks' partial sums, for states of up to `blocks` * BLK positions
-static int blocks;
-static int workspace_rows;
+// The buffers of a forward pass and the shape they were made for. Each pass
+// (src/engine/pass.h) has its own; `work` is the one in use.
+typedef struct {
+  // Activations of up to PF rows; XB: a matrix's input as BF16 (prompt
+  // passes); SEQ: the rows' sequences.
+  Buf TOK, EMB, X, XN, R, QKV, CO, Z, A_, B_, G, BETA, GO, GN, QG, KK, VV, Q, KR, AO, GT, UP, HH, LOGITS, XB, SEQ;
+  // The MTP head's rows: their hiddens, next tokens and sequences; its fc's input.
+  Buf HB, TOKM, EMBM, SEQM, EH;
+  Buf QH;  // a prompt pass's queries as FP16, by head
+  Buf PART, ML;  // attention blocks' partial sums, for states of up to `blocks` * BLK positions
+  int blocks, rows;  // `rows`: the rows the activations hold
+} Work;
+enum { WORK_BUFFERS = offsetof(Work, blocks) / sizeof(Buf) };
+static Work first_work, *work = &first_work;
 static int K_gate_up[3], K_gate_up3, K_add_norm, K_concat, K_q_half, K_attend_prompt, K_embed, K_rms_norm, K_l2_norm, K_conv, K_gdn_gates, K_gdn, K_qk_rope, K_kv_store, K_attend_block,
     K_attend_combine, K_swiglu, K_add;
 
@@ -164,12 +171,12 @@ static Buf kv_zeros(size_t bytes) {
 
 static void grow_blocks(int cap) {
   int need = (cap + BLK - 1) / BLK;
-  if (need <= blocks) return;
+  if (need <= work->blocks) return;
   gpu_sync();
-  unown(&PART), unown(&ML);
-  blocks = need;
-  PART = zeros((size_t)ROWS * c.heads * blocks * c.head_dim * 4);
-  ML = zeros((size_t)ROWS * c.heads * blocks * 8);
+  unown(&work->PART), unown(&work->ML);
+  work->blocks = need;
+  work->PART = zeros((size_t)ROWS * c.heads * work->blocks * c.head_dim * 4);
+  work->ML = zeros((size_t)ROWS * c.heads * work->blocks * 8);
 }
 
 static uint64_t workspace(int rows, int position, int allocate) {
@@ -178,27 +185,27 @@ static uint64_t workspace(int rows, int position, int allocate) {
   if (capacity < 128) capacity = 128;
   int keys = 4096;
   while (keys < position) keys *= 2;
-  int parts = keys / BLK > blocks ? keys / BLK : blocks;
+  int parts = keys / BLK > work->blocks ? keys / BLK : work->blocks;
 #define W(buffer, amount) do { size_t size = (amount); bytes += gpu_allocation_size(size); if (allocate && buffer.size != size) { unown(&buffer); buffer = zeros(size); } } while (0)
   size_t r = capacity * 4, vd = (size_t)c.value_heads * c.value_dim;
-  W(TOK, capacity * 4); W(EMB, capacity * 8); W(EMBM, capacity * 8); W(SEQ, capacity * sizeof(Seq));
+  W(work->TOK, capacity * 4); W(work->EMB, capacity * 8); W(work->EMBM, capacity * 8); W(work->SEQ, capacity * sizeof(Seq));
   int widest = c.inter > 2 * c.hidden ? c.inter : 2 * c.hidden;  // 2 * hidden: the MTP head's fc
   if (vd > (size_t)widest) widest = (int)vd;
-  W(XB, (size_t)capacity * widest * 2);
-  W(X, r * c.hidden); W(XN, r * c.hidden); W(R, r * c.hidden);
-  W(QKV, r * c.channels); W(CO, r * c.channels); W(Z, r * vd); W(GO, r * vd); W(GN, r * vd);
-  W(A_, r * c.value_heads); W(B_, r * c.value_heads); W(G, r * c.value_heads);
-  W(BETA, r * c.value_heads);
-  W(QG, r * 2 * c.heads * c.head_dim); W(KK, r * c.kv_heads * c.head_dim);
-  W(VV, r * c.kv_heads * c.head_dim); W(Q, r * c.heads * c.head_dim); W(KR, r * c.kv_heads * c.head_dim);
-  W(AO, r * c.heads * c.head_dim);
-  W(GT, r * c.inter); W(UP, r * c.inter); W(HH, r * c.inter);
-  W(LOGITS, (size_t)ROWS * 4 * c.vocab);
-  W(HB, r * c.hidden); W(TOKM, capacity * 4); W(SEQM, capacity * sizeof(Seq)); W(EH, r * 2 * c.hidden);
-  W(QH, (size_t)c.heads * capacity * c.head_dim * 2);
-  W(PART, (size_t)ROWS * c.heads * parts * c.head_dim * 4);
-  W(ML, (size_t)ROWS * c.heads * parts * 8);
-  if (allocate) { blocks = parts; workspace_rows = capacity; }
+  W(work->XB, (size_t)capacity * widest * 2);
+  W(work->X, r * c.hidden); W(work->XN, r * c.hidden); W(work->R, r * c.hidden);
+  W(work->QKV, r * c.channels); W(work->CO, r * c.channels); W(work->Z, r * vd); W(work->GO, r * vd); W(work->GN, r * vd);
+  W(work->A_, r * c.value_heads); W(work->B_, r * c.value_heads); W(work->G, r * c.value_heads);
+  W(work->BETA, r * c.value_heads);
+  W(work->QG, r * 2 * c.heads * c.head_dim); W(work->KK, r * c.kv_heads * c.head_dim);
+  W(work->VV, r * c.kv_heads * c.head_dim); W(work->Q, r * c.heads * c.head_dim); W(work->KR, r * c.kv_heads * c.head_dim);
+  W(work->AO, r * c.heads * c.head_dim);
+  W(work->GT, r * c.inter); W(work->UP, r * c.inter); W(work->HH, r * c.inter);
+  W(work->LOGITS, (size_t)ROWS * 4 * c.vocab);
+  W(work->HB, r * c.hidden); W(work->TOKM, capacity * 4); W(work->SEQM, capacity * sizeof(Seq)); W(work->EH, r * 2 * c.hidden);
+  W(work->QH, (size_t)c.heads * capacity * c.head_dim * 2);
+  W(work->PART, (size_t)ROWS * c.heads * parts * c.head_dim * 4);
+  W(work->ML, (size_t)ROWS * c.heads * parts * 8);
+  if (allocate) { work->blocks = parts; work->rows = capacity; }
 #undef W
   return bytes;
 }
@@ -325,17 +332,14 @@ static void prepare(const char *dir, int drafts) {
 }
 
 static uint64_t workspace_bytes(void) {
-  const Buf *buffers[] = {&TOK, &EMB, &EMBM, &SEQ, &XB, &X, &XN, &R, &QKV, &CO, &Z, &GO, &GN,
-    &A_, &B_, &G, &BETA, &QG, &KK, &VV, &Q, &KR, &AO, &GT, &UP, &HH, &LOGITS,
-    &HB, &TOKM, &SEQM, &EH, &QH, &PART, &ML};
   uint64_t bytes = 0;
-  for (size_t i = 0; i < sizeof buffers / sizeof *buffers; i++) bytes += buffers[i]->allocated;
+  for (int i = 0; i < WORK_BUFFERS; i++) bytes += ((const Buf *)work)[i].allocated;
   return bytes;
 }
 
 static int prepare_rows(int requested, int position) {
-  MemorySlot *work = memory_current(), *core = weights_slot(dense);
-  uint64_t fixed = work->payload - workspace_bytes();
+  MemorySlot *slot = memory_current(), *core = weights_slot(dense);
+  uint64_t fixed = slot->payload - workspace_bytes();
   int rows = requested < PF ? requested : PF;
   for (;;) {
     uint64_t required = weights_required(dense) + fixed + workspace(rows, position, 0);
@@ -354,9 +358,9 @@ int qwen_load(const char *dir, int drafts) {
   double began = now();
   if (!checkpoint) prepare(dir, drafts);
   state_copies = mtp && drafts > 1 ? drafts + 1 : 2;
-  MemorySlot *core = weights_slot(dense), *work = memory_current();
+  MemorySlot *core = weights_slot(dense), *slot = memory_current();
   memory_pin(core, 1);
-  uint64_t required = weights_required(dense) + work->payload - workspace_bytes() + workspace(128, 0, 0);
+  uint64_t required = weights_required(dense) + slot->payload - workspace_bytes() + workspace(128, 0, 0);
   if (!memory_minimum(core->account, required)) { memory_pin(core, 0); return 0; }
   gpu_sync();
   workspace(128, 0, 1);
@@ -551,7 +555,7 @@ static int nrows, prompt_pass;
 // y (rows of m->rows values) = m x for the n rows of x: in a prompt pass on
 // the matrix units, else with the row kernels.
 static void product(const Mat *m, const Buf *x, size_t xo, const Buf *y, size_t yo, int n, int staged) {
-  linear_product(m, x, xo, y, yo, n, prompt_pass, &XB, staged, 0);
+  linear_product(m, x, xo, y, yo, n, prompt_pass, &work->XB, staged, 0);
 }
 
 static void mv(const Mat *m, const Buf *x, size_t xo, const Buf *y, size_t yo, int n) {
@@ -577,7 +581,7 @@ static void elementwise(int k, const Buf *a, const Buf *b, const Buf *out, uint3
 static void add_norm(const Buf *w, int n) {
   Norm p = {(uint32_t)c.hidden, c.eps, 1, 0};
   gpu_kern(K_add_norm);
-  gpu_buf(0, &X, 0), gpu_buf(1, &R, 0), gpu_buf(2, w, 0), gpu_buf(3, &XN, 0), gpu_bytes(4, &p, sizeof p);
+  gpu_buf(0, &work->X, 0), gpu_buf(1, &work->R, 0), gpu_buf(2, w, 0), gpu_buf(3, &work->XN, 0), gpu_bytes(4, &p, sizeof p);
   gpu_go((uint32_t)n, 1, 1, 1024, 1, 1);
 }
 
@@ -585,8 +589,8 @@ static void add_norm(const Buf *w, int n) {
 // prompt pass the two products on the matrix units and then swiglu.
 static void gate_up(const Layer *y, int n) {
   if (prompt_pass || y->gate.kind != y->up.kind || y->gate.rows != y->up.rows || y->gate.cols != y->up.cols) {
-    mv(&y->gate, &XN, 0, &GT, 0, n), product(&y->up, &XN, 0, &UP, 0, n, 1);
-    elementwise(K_swiglu, &GT, &UP, &HH, (uint32_t)(c.inter * n));
+    mv(&y->gate, &work->XN, 0, &work->GT, 0, n), product(&y->up, &work->XN, 0, &work->UP, 0, n, 1);
+    elementwise(K_swiglu, &work->GT, &work->UP, &work->HH, (uint32_t)(c.inter * n));
     return;
   }
   const Mat *g = &y->gate, *u = &y->up;
@@ -595,7 +599,7 @@ static void gate_up(const Layer *y, int n) {
   gpu_kern(n == 3 && f == 0 ? K_gate_up3 : K_gate_up[f]);
   gpu_buf(0, &g->w, 0), gpu_buf(1, g->kind == 'n' ? &g->s : &g->w, 0);
   gpu_buf(5, &u->w, 0), gpu_buf(6, u->kind == 'n' ? &u->s : &u->w, 0);
-  gpu_buf(2, &XN, 0), gpu_buf(3, &HH, 0), gpu_bytes(4, &p, sizeof p), gpu_bytes(7, &u->scale, 4);
+  gpu_buf(2, &work->XN, 0), gpu_buf(3, &work->HH, 0), gpu_bytes(4, &p, sizeof p), gpu_bytes(7, &u->scale, 4);
   gpu_go((uint32_t)(g->rows + 7) / 8, 1, 1, 256, 1, 1);
 }
 
@@ -603,33 +607,33 @@ static void gate_up(const Layer *y, int n) {
 static void deltanet(const Layer *y) {
   int n = nrows;
   uint32_t keys = (uint32_t)(c.key_heads * c.key_dim);
-  mv(&y->qkv, &XN, 0, &QKV, 0, n), product(&y->z, &XN, 0, &Z, 0, n, 1);
-  product(&y->a, &XN, 0, &A_, 0, n, 1), product(&y->b, &XN, 0, &B_, 0, n, 1);
+  mv(&y->qkv, &work->XN, 0, &work->QKV, 0, n), product(&y->z, &work->XN, 0, &work->Z, 0, n, 1);
+  product(&y->a, &work->XN, 0, &work->A_, 0, n, 1), product(&y->b, &work->XN, 0, &work->B_, 0, n, 1);
   Convp cp = {(uint32_t)c.channels, (uint32_t)n, (uint32_t)y->index, 0};
   gpu_kern(K_conv);
-  gpu_buf(0, &QKV, 0), gpu_buf(1, &CO, 0), gpu_buf(2, &y->conv, 0), gpu_buf(3, seqbuf, 0);
+  gpu_buf(0, &work->QKV, 0), gpu_buf(1, &work->CO, 0), gpu_buf(2, &y->conv, 0), gpu_buf(3, seqbuf, 0);
   gpu_bytes(4, &cp, sizeof cp);
   gpu_go((uint32_t)(c.channels + 255) / 256, 1, 1, 256, 1, 1);
   L2p qn = {(uint32_t)c.key_dim, (uint32_t)c.channels, 1e-6f, 1.0f / sqrtf((float)c.key_dim)};
   L2p kn = {(uint32_t)c.key_dim, (uint32_t)c.channels, 1e-6f, 1.0f};
   gpu_kern(K_l2_norm);
-  gpu_buf(0, &CO, 0), gpu_bytes(1, &qn, sizeof qn);
+  gpu_buf(0, &work->CO, 0), gpu_bytes(1, &qn, sizeof qn);
   gpu_go((uint32_t)c.key_heads, (uint32_t)n, 1, 128, 1, 1);
-  gpu_buf(0, &CO, keys * 4), gpu_bytes(1, &kn, sizeof kn);
+  gpu_buf(0, &work->CO, keys * 4), gpu_bytes(1, &kn, sizeof kn);
   gpu_go((uint32_t)c.key_heads, (uint32_t)n, 1, 128, 1, 1);
   uint32_t gp[2] = {(uint32_t)c.value_heads, (uint32_t)n};
   gpu_kern(K_gdn_gates);
-  gpu_buf(0, &A_, 0), gpu_buf(1, &B_, 0), gpu_buf(2, &y->A, 0), gpu_buf(3, &y->dt_bias, 0), gpu_buf(4, &G, 0);
-  gpu_buf(5, &BETA, 0), gpu_bytes(6, gp, sizeof gp);
+  gpu_buf(0, &work->A_, 0), gpu_buf(1, &work->B_, 0), gpu_buf(2, &y->A, 0), gpu_buf(3, &y->dt_bias, 0), gpu_buf(4, &work->G, 0);
+  gpu_buf(5, &work->BETA, 0), gpu_bytes(6, gp, sizeof gp);
   gpu_go((gp[0] * gp[1] + 63) / 64, 1, 1, 64, 1, 1);
   Gdnp dp = {(uint32_t)n, (uint32_t)c.value_heads, (uint32_t)(c.value_heads / c.key_heads), (uint32_t)y->index,
              (uint32_t)c.channels, keys, 0, 0};
   gpu_kern(K_gdn);
-  gpu_buf(0, &CO, 0), gpu_buf(1, &G, 0), gpu_buf(2, &BETA, 0), gpu_buf(3, seqbuf, 0);
-  gpu_buf(4, &GO, 0), gpu_bytes(5, &dp, sizeof dp);
+  gpu_buf(0, &work->CO, 0), gpu_buf(1, &work->G, 0), gpu_buf(2, &work->BETA, 0), gpu_buf(3, seqbuf, 0);
+  gpu_buf(4, &work->GO, 0), gpu_bytes(5, &dp, sizeof dp);
   gpu_go((uint32_t)c.value_heads, (uint32_t)c.value_dim / 4, 1, 128, 1, 1);
-  norm(&GO, 0, &y->norm, &GN, 0, n * c.value_heads, c.value_dim, &Z);
-  mv(&y->out, &GN, 0, &R, 0, n);
+  norm(&work->GO, 0, &y->norm, &work->GN, 0, n * c.value_heads, c.value_dim, &work->Z);
+  mv(&y->out, &work->GN, 0, &work->R, 0, n);
 }
 
 // Whether the pass's rows are one sequence's consecutive positions (a prompt
@@ -642,33 +646,33 @@ static int one_sequence(int n) {
 
 static void attention(const Layer *y) {
   int n = nrows;
-  mv(&y->q, &XN, 0, &QG, 0, n), product(&y->k, &XN, 0, &KK, 0, n, 1), product(&y->v, &XN, 0, &VV, 0, n, 1);
+  mv(&y->q, &work->XN, 0, &work->QG, 0, n), product(&y->k, &work->XN, 0, &work->KK, 0, n, 1), product(&y->v, &work->XN, 0, &work->VV, 0, n, 1);
   Rope qr = {(uint32_t)c.heads, (uint32_t)c.head_dim, (uint32_t)c.rot, (uint32_t)(2 * c.head_dim), c.theta, c.eps, (uint32_t)c.rope_h, (uint32_t)c.rope_w};
   Rope kr = {(uint32_t)c.kv_heads, (uint32_t)c.head_dim, (uint32_t)c.rot, (uint32_t)c.head_dim, c.theta, c.eps, (uint32_t)c.rope_h, (uint32_t)c.rope_w};
   gpu_kern(K_qk_rope);
-  gpu_buf(0, &QG, 0), gpu_buf(1, &y->q_norm, 0), gpu_buf(2, &Q, 0), gpu_bytes(3, &qr, sizeof qr);
+  gpu_buf(0, &work->QG, 0), gpu_buf(1, &y->q_norm, 0), gpu_buf(2, &work->Q, 0), gpu_bytes(3, &qr, sizeof qr);
   gpu_buf(4, seqbuf, 0);
   gpu_go((uint32_t)c.heads, (uint32_t)n, 1, 256, 1, 1);
-  gpu_buf(0, &KK, 0), gpu_buf(1, &y->k_norm, 0), gpu_buf(2, &KR, 0), gpu_bytes(3, &kr, sizeof kr);
+  gpu_buf(0, &work->KK, 0), gpu_buf(1, &y->k_norm, 0), gpu_buf(2, &work->KR, 0), gpu_bytes(3, &kr, sizeof kr);
   gpu_go((uint32_t)c.kv_heads, (uint32_t)n, 1, 256, 1, 1);
   uint32_t width = (uint32_t)(c.kv_heads * c.head_dim);
   Kvp kp = {(uint32_t)n, width, (uint32_t)y->index, 0};
   gpu_kern(K_kv_store);
-  gpu_buf(0, &KR, 0), gpu_buf(1, &VV, 0), gpu_buf(2, seqbuf, 0), gpu_bytes(3, &kp, sizeof kp);
+  gpu_buf(0, &work->KR, 0), gpu_buf(1, &work->VV, 0), gpu_buf(2, seqbuf, 0), gpu_bytes(3, &kp, sizeof kp);
   gpu_go((width + 255) / 256, (uint32_t)n, 1, 256, 1, 1);
   Att ap = {(uint32_t)c.heads, (uint32_t)c.kv_heads, (uint32_t)c.head_dim, (uint32_t)y->index,
-            1.0f / sqrtf((float)c.head_dim), (uint32_t)blocks, 0, 0};
+            1.0f / sqrtf((float)c.head_dim), (uint32_t)work->blocks, 0, 0};
   size_t q_row = (size_t)c.heads * c.head_dim * 4;
   if (prompt_pass && one_sequence(n)) {  // on the matrix units, 32 rows of a head a threadgroup
     AttPrompt pp = {(uint32_t)c.heads, (uint32_t)c.kv_heads, (uint32_t)n, seq[0].pos, (uint32_t)y->index, seq[0].cap,
                     (uint32_t)(n + 31) / 32 * 32, 0, 1.0f / sqrtf((float)c.head_dim), 0, 0, 0};
     gpu_kern(K_q_half);
-    gpu_buf(0, &Q, 0), gpu_buf(1, &QH, 0), gpu_bytes(2, &pp, sizeof pp);
+    gpu_buf(0, &work->Q, 0), gpu_buf(1, &work->QH, 0), gpu_bytes(2, &pp, sizeof pp);
     gpu_go(1, pp.rows, (uint32_t)c.heads, 256, 1, 1);
     gpu_kern(K_attend_prompt);
-    gpu_buf(0, &QH, 0), gpu_buf(1, seqbuf, 0), gpu_buf(3, &QG, 0), gpu_buf(4, &AO, 0), gpu_bytes(5, &pp, sizeof pp);
+    gpu_buf(0, &work->QH, 0), gpu_buf(1, seqbuf, 0), gpu_buf(3, &work->QG, 0), gpu_buf(4, &work->AO, 0), gpu_bytes(5, &pp, sizeof pp);
     gpu_go((uint32_t)c.heads, pp.rows / 32, 1, 256, 1, 1);
-    mv(&y->o, &AO, 0, &R, 0, n);
+    mv(&y->o, &work->AO, 0, &work->R, 0, n);
     return;
   }
   for (int g = 0; g < n; g += ROWS) {  // ROWS rows at a time: the blocks' partial sums hold ROWS rows
@@ -676,15 +680,15 @@ static void attention(const Layer *y) {
     uint32_t last = 0;
     for (int i = g; i < g + k; i++) last = seq[i].pos > last ? seq[i].pos : last;
     gpu_kern(K_attend_block);
-    gpu_buf(0, &Q, g * q_row), gpu_buf(1, seqbuf, g * sizeof(Seq)), gpu_buf(2, &PART, 0), gpu_buf(3, &ML, 0);
+    gpu_buf(0, &work->Q, g * q_row), gpu_buf(1, seqbuf, g * sizeof(Seq)), gpu_buf(2, &work->PART, 0), gpu_buf(3, &work->ML, 0);
     gpu_bytes(4, &ap, sizeof ap);
     gpu_go((uint32_t)c.kv_heads, last / BLK + 1, (uint32_t)k, BLK, 1, 1);
     gpu_kern(K_attend_combine);
-    gpu_buf(0, &PART, 0), gpu_buf(1, &ML, 0), gpu_buf(2, &QG, 2 * g * q_row), gpu_buf(3, &AO, g * q_row);
+    gpu_buf(0, &work->PART, 0), gpu_buf(1, &work->ML, 0), gpu_buf(2, &work->QG, 2 * g * q_row), gpu_buf(3, &work->AO, g * q_row);
     gpu_buf(4, seqbuf, g * sizeof(Seq)), gpu_bytes(5, &ap, sizeof ap);
     gpu_go((uint32_t)c.heads, (uint32_t)k, 1, (uint32_t)c.head_dim, 1, 1);
   }
-  mv(&y->o, &AO, 0, &R, 0, n);
+  mv(&y->o, &work->AO, 0, &work->R, 0, n);
 }
 
 // The MTP head over m rows: HB holds their hiddens, TOKM their next tokens,
@@ -692,31 +696,31 @@ static void attention(const Layer *y) {
 // sequence's MTP layer at those positions; with logits, the last `logits`
 // rows' draft logits go to LOGITS.
 static void mtp_rows(int m, int logits) {
-  seqbuf = &SEQM, seq = (Seq *)SEQM.ptr, nrows = m;
+  seqbuf = &work->SEQM, seq = (Seq *)work->SEQM.ptr, nrows = m;
   if (prompt_pass) for (int i = 0; i < image_count; i++) if (images[i].features.obj) gpu_use(&images[i].features);
   uint32_t hidden = (uint32_t)c.hidden;
   gpu_kern(K_embed);
-  gpu_buf(0, &embed_w, 0), gpu_buf(1, &TOKM, 0), gpu_buf(2, &X, 0), gpu_bytes(3, &hidden, 4);
-  gpu_buf(4, &EMBM, 0);
+  gpu_buf(0, &embed_w, 0), gpu_buf(1, &work->TOKM, 0), gpu_buf(2, &work->X, 0), gpu_bytes(3, &hidden, 4);
+  gpu_buf(4, &work->EMBM, 0);
   gpu_go((hidden + 255) / 256, (uint32_t)m, 1, 256, 1, 1);
-  norm(&X, 0, &mtp_norm_e, &XN, 0, m, c.hidden, 0);
-  norm(&HB, 0, &mtp_norm_h, &HH, 0, m, c.hidden, 0);  // the target hidden after its final norm
+  norm(&work->X, 0, &mtp_norm_e, &work->XN, 0, m, c.hidden, 0);
+  norm(&work->HB, 0, &mtp_norm_h, &work->HH, 0, m, c.hidden, 0);  // the target hidden after its final norm
   gpu_kern(K_concat);  // [embedding | hidden] a row
-  gpu_buf(0, &XN, 0), gpu_buf(1, &HH, 0), gpu_buf(2, &EH, 0), gpu_bytes(3, &hidden, 4);
+  gpu_buf(0, &work->XN, 0), gpu_buf(1, &work->HH, 0), gpu_buf(2, &work->EH, 0), gpu_bytes(3, &hidden, 4);
   gpu_go((2 * hidden + 255) / 256, (uint32_t)m, 1, 256, 1, 1);
-  mv(&mtp_fc, &EH, 0, &X, 0, m);
-  norm(&X, 0, &M.in_norm, &XN, 0, m, c.hidden, 0);
+  mv(&mtp_fc, &work->EH, 0, &work->X, 0, m);
+  norm(&work->X, 0, &M.in_norm, &work->XN, 0, m, c.hidden, 0);
   attention(&M);
   add_norm(&M.post_norm, m);
   gate_up(&M, m);
-  mv(&M.down, &HH, 0, &R, 0, m);
-  elementwise(K_add, &X, &R, 0, hidden * m);
+  mv(&M.down, &work->HH, 0, &work->R, 0, m);
+  elementwise(K_add, &work->X, &work->R, 0, hidden * m);
   if (logits) {
     size_t first = (size_t)(m - logits) * c.hidden * 4;
-    norm(&X, first, &mtp_norm, &XN, first, logits, c.hidden, 0);
+    norm(&work->X, first, &mtp_norm, &work->XN, first, logits, c.hidden, 0);
     int was = prompt_pass;
     prompt_pass = 0;
-    mv(&head, &XN, first, &LOGITS, 0, logits);
+    mv(&head, &work->XN, first, &work->LOGITS, 0, logits);
     prompt_pass = was;
   }
 }
@@ -731,9 +735,9 @@ static Seq mtp_seq(const QwenState *s, int pos, int prompt) {
 
 static const float *pass(const QwenRow *rows, int n, int logits, int prompt) {
   qwen_reside(1);
-  int32_t *tok = (int32_t *)TOK.ptr;
-  uint64_t *emb = (uint64_t *)EMB.ptr;
-  seqbuf = &SEQ, seq = (Seq *)SEQ.ptr;
+  int32_t *tok = (int32_t *)work->TOK.ptr;
+  uint64_t *emb = (uint64_t *)work->EMB.ptr;
+  seqbuf = &work->SEQ, seq = (Seq *)work->SEQ.ptr;
   prompt_pass = prompt;
   for (int i = 0, k = 0; i < n; i++) {
     QwenState *s = rows[i].state;
@@ -757,28 +761,28 @@ static const float *pass(const QwenRow *rows, int n, int logits, int prompt) {
   gpu_begin();
   if (prompt) for (int i = 0; i < image_count; i++) if (images[i].features.obj) gpu_use(&images[i].features);
   gpu_kern(K_embed);
-  gpu_buf(0, &embed_w, 0), gpu_buf(1, &TOK, 0), gpu_buf(2, &X, 0), gpu_bytes(3, &hidden, 4);
-  gpu_buf(4, &EMB, 0);
+  gpu_buf(0, &embed_w, 0), gpu_buf(1, &work->TOK, 0), gpu_buf(2, &work->X, 0), gpu_bytes(3, &hidden, 4);
+  gpu_buf(4, &work->EMB, 0);
   gpu_go((hidden + 255) / 256, (uint32_t)n, 1, 256, 1, 1);
-  norm(&X, 0, &L[0].in_norm, &XN, 0, n, c.hidden, 0);
+  norm(&work->X, 0, &L[0].in_norm, &work->XN, 0, n, c.hidden, 0);
   for (int l = 0; l < c.layers; l++) {
     const Layer *y = &L[l];
     if (y->linear) deltanet(y);
     else attention(y);
     add_norm(&y->post_norm, n);
     gate_up(y, n);
-    mv(&y->down, &HH, 0, &R, 0, n);
+    mv(&y->down, &work->HH, 0, &work->R, 0, n);
     if (l + 1 < c.layers) add_norm(&L[l + 1].in_norm, n);
-    else elementwise(K_add, &X, &R, 0, hidden * n);
+    else elementwise(K_add, &work->X, &work->R, 0, hidden * n);
   }
   if (logits || mtp) {
     int normalized = mtp ? n : logits;
     size_t first = (size_t)(n - normalized) * c.hidden * 4;
-    norm(&X, first, &final_norm, &XN, first, normalized, c.hidden, 0);
+    norm(&work->X, first, &final_norm, &work->XN, first, normalized, c.hidden, 0);
     if (logits) {
       int was = prompt_pass;
       prompt_pass = 0;
-      mv(&head, &XN, (size_t)(n - logits) * c.hidden * 4, &LOGITS, 0, logits);
+      mv(&head, &work->XN, (size_t)(n - logits) * c.hidden * 4, &work->LOGITS, 0, logits);
       prompt_pass = was;
     }
   }
@@ -786,8 +790,8 @@ static const float *pass(const QwenRow *rows, int n, int logits, int prompt) {
     static GpuCopy cp[2 * PF];
     size_t hb = hid_bytes();
     int m = 0, mm = 0;
-    int32_t *tm = (int32_t *)TOKM.ptr;
-    Seq *sm = (Seq *)SEQM.ptr;
+    int32_t *tm = (int32_t *)work->TOKM.ptr;
+    Seq *sm = (Seq *)work->SEQM.ptr;
     if (prompt) {
       // The MTP head's keys at the pass's positions but its last: each
       // position's hidden with the next position's token (the first takes
@@ -799,15 +803,15 @@ static const float *pass(const QwenRow *rows, int n, int logits, int prompt) {
         while (j < n && rows[j].state == s) j++;
         int p0 = s->pos;
         if (p0 > 0) {
-          cp[m] = (GpuCopy){&s->hid[s->cur], &HB, 0, (size_t)m * hb, hb};
+          cp[m] = (GpuCopy){&s->hid[s->cur], &work->HB, 0, (size_t)m * hb, hb};
           tm[m] = rows[i].token < 0 ? 0 : rows[i].token;
-          ((uint64_t *)EMBM.ptr)[m] = rows[i].token < 0 ? image_embedding(p0) : 0;
+          ((uint64_t *)work->EMBM.ptr)[m] = rows[i].token < 0 ? image_embedding(p0) : 0;
           sm[m] = mtp_seq(s, p0 - 1, 1), m++;
         }
         for (int r = i; r + 1 < j; r++) {
-          cp[m] = (GpuCopy){&XN, &HB, (size_t)r * hb, (size_t)m * hb, hb};
+          cp[m] = (GpuCopy){&work->XN, &work->HB, (size_t)r * hb, (size_t)m * hb, hb};
           tm[m] = rows[r + 1].token < 0 ? 0 : rows[r + 1].token;
-          ((uint64_t *)EMBM.ptr)[m] = rows[r + 1].token < 0 ? image_embedding(p0 + r + 1 - i) : 0;
+          ((uint64_t *)work->EMBM.ptr)[m] = rows[r + 1].token < 0 ? image_embedding(p0 + r + 1 - i) : 0;
           sm[m] = mtp_seq(s, p0 + (r - i), 1), m++;
         }
         i = j;
@@ -817,8 +821,8 @@ static const float *pass(const QwenRow *rows, int n, int logits, int prompt) {
     // Each target hidden is normalized before the MTP head consumes it.
     for (int i = 0; i < n; i++) {
       QwenState *s = rows[i].state;
-      if (i + 1 == n || rows[i + 1].state != s) cp[mm++] = (GpuCopy){&XN, &s->hid[s->cur], (size_t)i * hb, 0, hb};
-      if (rows[i].save) cp[mm++] = (GpuCopy){&XN, &s->hid[rows[i].save - 1], (size_t)i * hb, 0, hb};
+      if (i + 1 == n || rows[i + 1].state != s) cp[mm++] = (GpuCopy){&work->XN, &s->hid[s->cur], (size_t)i * hb, 0, hb};
+      if (rows[i].save) cp[mm++] = (GpuCopy){&work->XN, &s->hid[rows[i].save - 1], (size_t)i * hb, 0, hb};
     }
     gpu_copies(cp, mm);
     if (m) mtp_rows(m, 0);
@@ -827,7 +831,7 @@ static const float *pass(const QwenRow *rows, int n, int logits, int prompt) {
   gpu_sync();
   for (int i = 0; i < n; i++) {
     QwenState *s = rows[i].state;
-    const Seq *row = &((Seq *)SEQ.ptr)[i];
+    const Seq *row = &((Seq *)work->SEQ.ptr)[i];
     int next = row->rope_t > row->rope_h ? row->rope_t : row->rope_h;
     if (row->rope_w > next) next = row->rope_w;
     s->rope_delta = next - (int)row->pos;
@@ -839,7 +843,7 @@ static const float *pass(const QwenRow *rows, int n, int logits, int prompt) {
     }
     if (mtp && prompt) s->mtp_next = s->pos - 1;  // every key of the pass's positions but its last
   }
-  return logits ? (const float *)LOGITS.ptr : 0;
+  return logits ? (const float *)work->LOGITS.ptr : 0;
 }
 
 // The MTP head's drafts: row i takes rows[i].token as the token after its
@@ -850,15 +854,15 @@ const float *qwen_mtp(const QwenMtpRow *rows, int n, int logits) {
   qwen_reside(1);
   static GpuCopy cp[ROWS];
   size_t hb = hid_bytes();
-  int32_t *tm = (int32_t *)TOKM.ptr;
-  Seq *sm = (Seq *)SEQM.ptr;
+  int32_t *tm = (int32_t *)work->TOKM.ptr;
+  Seq *sm = (Seq *)work->SEQM.ptr;
   for (int i = 0; i < n; i++) {
     QwenState *s = rows[i].state;
     int hidden = rows[i].saved ? rows[i].saved - 1 : s->cur;
     int pos = rows[i].saved ? s->saved_pos[hidden] - 1 : s->pos - 1;
-    cp[i] = (GpuCopy){&s->hid[hidden], &HB, 0, (size_t)i * hb, hb};
+    cp[i] = (GpuCopy){&s->hid[hidden], &work->HB, 0, (size_t)i * hb, hb};
     tm[i] = rows[i].token, sm[i] = mtp_seq(s, pos, 0);
-    ((uint64_t *)EMBM.ptr)[i] = 0;
+    ((uint64_t *)work->EMBM.ptr)[i] = 0;
   }
   prompt_pass = 0;
   gpu_begin();
@@ -866,7 +870,7 @@ const float *qwen_mtp(const QwenMtpRow *rows, int n, int logits) {
   mtp_rows(n, logits);
   gpu_commit();
   gpu_sync();
-  return logits ? (const float *)LOGITS.ptr : 0;
+  return logits ? (const float *)work->LOGITS.ptr : 0;
 }
 
 const float *qwen_forward(const QwenRow *rows, int n, int logits) { return pass(rows, n, logits, 0); }
@@ -999,7 +1003,7 @@ static const float *q_prefill(ModelState *st, const int *tokens, int n, int from
   if (captured) *captured = 0;
   if (capture >= 0 && (capture <= from || capture >= n || !captured))
     die("qwen3_5: a capture at %d in a prefill of positions %d to %d", capture, from, n);
-  static QwenRow rows[PF];
+  QwenRow rows[PF];
   // with every position's logits, passes of ROWS rows (the head takes at most
   // ROWS): a prompt's rows give the same logits however it is split
   int most = every ? ROWS : PF;
@@ -1024,7 +1028,7 @@ static const float *q_prefill(ModelState *st, const int *tokens, int n, int from
 static const float *q_rows(ModelState *const *states, const int *tokens, const int *pos, int m) {
   int end = 0;
   for (int r = 0; r < m; r++) if (pos[r] + 1 > end) end = pos[r] + 1;
-  if ((m > workspace_rows || end > blocks * BLK) && !prepare_rows(m, end)) return NULL;
+  if ((m > work->rows || end > work->blocks * BLK) && !prepare_rows(m, end)) return NULL;
   QwenRow rows[ROWS];
   for (int r = 0; r < m; r++) {
     QwenState *s = (QwenState *)states[r];
@@ -1041,23 +1045,23 @@ static const double *q_draft(ModelState *st, int token, int pos, int *drafts, in
   drafts[0] = sample_proposal(mtp_fill(s, token, 1), c.vocab, sampler, proposal_probabilities);
   for (int i = 1; i < n; i++) {
     // The preceding draft head's hidden predicts the next target hidden.
-    GpuCopy copy = {&XN, &HB, 0, 0, hid_bytes()};
-    ((int32_t *)TOKM.ptr)[0] = drafts[i - 1];
-    ((uint64_t *)EMBM.ptr)[0] = 0;
-    ((Seq *)SEQM.ptr)[0] = mtp_seq(s, pos + i - 1, 0);
+    GpuCopy copy = {&work->XN, &work->HB, 0, 0, hid_bytes()};
+    ((int32_t *)work->TOKM.ptr)[0] = drafts[i - 1];
+    ((uint64_t *)work->EMBM.ptr)[0] = 0;
+    ((Seq *)work->SEQM.ptr)[0] = mtp_seq(s, pos + i - 1, 0);
     prompt_pass = 0;
     gpu_begin();
     gpu_copies(&copy, 1);
     mtp_rows(1, 1);
     gpu_commit(); gpu_sync();
-    drafts[i] = sample_proposal((const float *)LOGITS.ptr, c.vocab, sampler, proposal_probabilities + (size_t)i * c.vocab);
+    drafts[i] = sample_proposal((const float *)work->LOGITS.ptr, c.vocab, sampler, proposal_probabilities + (size_t)i * c.vocab);
   }
   return sampler->temp > 0 ? proposal_probabilities : NULL;
 }
 
 static const float *q_verify(ModelState *st, const int *tokens, int m, int pos) {
   QwenState *s = (QwenState *)st;
-  if ((m > workspace_rows || pos + m > blocks * BLK) && !prepare_rows(m, pos + m)) return NULL;
+  if ((m > work->rows || pos + m > work->blocks * BLK) && !prepare_rows(m, pos + m)) return NULL;
   mtp_fill(s, tokens[0], 0);
   QwenRow rows[ROWS];
   s->verify_origin = s->cur;
@@ -1083,7 +1087,7 @@ static void q_accept(ModelState *st, const int *tokens, int n, int pos) {
     qwen_mtp(rows, n - 1, 0);
   }
   s->mtp_next = s->pos > 0 ? s->pos - 1 : 0;
-  last_logits = (const float *)LOGITS.ptr + (size_t)(n - 1) * c.vocab;
+  last_logits = (const float *)work->LOGITS.ptr + (size_t)(n - 1) * c.vocab;
 }
 
 static void q_seek(ModelState *s, const int *tokens, int pos) {}
@@ -1113,6 +1117,36 @@ static void q_chat(char *text, size_t cap, const char *prompt, int images, int t
                         think ? "<think>\n" : "<think>\n\n</think>\n\n");
 }
 
+// ---- passes (src/engine/pass.h) ----
+
+#define V(x) {&x, sizeof x}
+static const PassVariable pass_own[] = {V(work), V(seq), V(seqbuf), V(nrows), V(prompt_pass), V(images),
+                                        V(image_count), V(last_logits), V(proposal_probabilities)};
+#undef V
+
+static Pass *q_pass_new(void (*body)(void *), void *argument) {
+  return pass_new_model(body, argument, pass_own, sizeof pass_own / sizeof *pass_own, NULL);
+}
+
+// Inside a new pass, before its work: its buffers, which prepare_rows
+// allocates at the size it asks for, and its signals.
+static void q_pass_begin(void) {
+  gpu_pass_begin();
+  work = xmalloc(sizeof *work);
+  *work = (Work){0};
+  if (proposal_capacity) proposal_probabilities = memory_host_required(proposal_capacity * sizeof *proposal_probabilities, 0);
+}
+
+// Inside the pass, at its end: frees what it owned.
+static void q_pass_end(void) {
+  gpu_sync();
+  for (int i = 0; i < WORK_BUFFERS; i++)
+    if (((Buf *)work)[i].obj) unown((Buf *)work + i);
+  free(work);
+  if (proposal_capacity) memory_host_free(proposal_probabilities);
+  gpu_pass_end();
+}
+
 static const char *const q_types[] = {"qwen3_5", "qwen3_5_text", 0};
 
 const ModelOps qwen_ops = {
@@ -1125,5 +1159,5 @@ const ModelOps qwen_ops = {
     .snapshot_bytes = q_snapshot_bytes, .snapshot_logits = q_snapshot_logits, .state_version = 1,
     .state_regions = q_state_regions, .snapshot_parts = q_snapshot_parts, .snapshot_alloc = q_snapshot_alloc, .prefill = q_prefill,
     .replay_rows = q_replay_rows, .replay_start = q_replay_start, .rows = q_rows, .draft = q_draft, .verify = q_verify, .accept = q_accept,
-    .seek = q_seek, .idle = q_idle, .chat = q_chat,
+    .seek = q_seek, .idle = q_idle, .chat = q_chat, .pass_new = q_pass_new, .pass_begin = q_pass_begin, .pass_end = q_pass_end,
     .prepare_media = qwen_prepare_image, .encode_media = q_image, .media = q_images};

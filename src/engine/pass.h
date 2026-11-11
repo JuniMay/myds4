@@ -31,6 +31,9 @@ Pass *pass_new(void (*body)(void *), void *argument, size_t stack_bytes);
 void pass_variables(Pass *pass, const PassVariable *variables, int count);
 // Called after the pass's variables are back, before it continues.
 void pass_on_resume(Pass *pass, void (*resumed)(void));
+// A pass of a model family's forward path: a stack large enough for it, the
+// family's variables and the GPU layer's, and `resumed` (or null).
+Pass *pass_new_model(void (*body)(void *), void *argument, const PassVariable *variables, int count, void (*resumed)(void));
 void pass_free(Pass *pass);
 
 // Runs the pass until it yields or ends; returns whether it has ended.
