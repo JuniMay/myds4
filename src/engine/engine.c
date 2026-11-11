@@ -482,6 +482,17 @@ int myds4_lookup_propose(const myds4_lookup *x, int max, int32_t *drafts) {
 
 void myds4_lookup_feedback(myds4_lookup *x, int offered, int accepted) { context_lookup_feedback(x, offered, accepted); }
 
+myds4_draft_choice *myds4_draft_choice_new(void) {
+  myds4_draft_choice *x = xmalloc(sizeof *x);
+  draft_choice_init(x);
+  return x;
+}
+void myds4_draft_choice_free(myds4_draft_choice *x) { free(x); }
+int myds4_draft_choice_count(myds4_draft_choice *x, int most) { return draft_choice_count(x, most); }
+void myds4_draft_choice_feedback(myds4_draft_choice *x, int count, int kept, double seconds) {
+  draft_choice_feedback(x, count, kept, seconds);
+}
+
 // ---- images ----
 
 myds4_media *myds4_media_open(myds4_model *m, const uint8_t *const *data, const size_t *len, int n, char *message,

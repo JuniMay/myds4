@@ -304,6 +304,14 @@ int myds4_lookup_append(myds4_lookup *x, const int32_t *tokens, int n);  // 0 wh
 int myds4_lookup_propose(const myds4_lookup *x, int max, int32_t *drafts);  // how many
 void myds4_lookup_feedback(myds4_lookup *x, int offered, int accepted);
 
+// ---- how many draft-model drafts a pass runs (src/model/draft.h) ----
+typedef struct DraftChoice myds4_draft_choice;
+myds4_draft_choice *myds4_draft_choice_new(void);
+void myds4_draft_choice_free(myds4_draft_choice *x);
+int myds4_draft_choice_count(myds4_draft_choice *x, int most);  // 0 to most
+// A pass with `count` drafts kept the first `kept` and took `seconds`, with no other call beside it.
+void myds4_draft_choice_feedback(myds4_draft_choice *x, int count, int kept, double seconds);
+
 // ---- encoded media ----
 
 // A prompt's media inputs: each placeholder becomes its feature span.

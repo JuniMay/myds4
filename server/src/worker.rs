@@ -29,7 +29,8 @@ use tokio::sync::mpsc;
 
 use crate::control::{self, Action, Control, Phase, Target};
 use crate::engine::{
-    self, CacheCounts, Logits, Lookup, Media, Model, PrefillInfo, RawSnapshot, RawState, Sampler, Stream,
+    self, CacheCounts, DraftChoice, Logits, Lookup, Media, Model, PrefillInfo, RawSnapshot, RawState, Sampler,
+    Stream,
 };
 use crate::disk::{Engine, LoadError, Store};
 use crate::kv::{self, Cache, Entry, Freed, Kind, Limits, Plan, Snap};
@@ -777,6 +778,11 @@ struct Gen {
     lookup_passes: usize,
     lookup_offered: usize,
     lookup_accepted: usize,
+    /// How many of the draft model's drafts its passes run, when the model drafts.
+    choice: Option<DraftChoice>,
+    /// The start and the draft count of its pass in flight while no other call
+    /// of the model runs beside it: the chooser learns from such passes only.
+    pass: Option<(Instant, usize)>,
     max_new: usize,
     t1: Instant,
     tick: Instant,
@@ -1642,6 +1648,14 @@ impl Slot {
     /// Before a pass that makes the busy state `id` hold `positions`: the
     /// cache charges its growth before the engine grows it (kv::Cache::grow),
     /// and what the cache gives up for it is freed.
+    /// A call starts beside the passes in flight: their times no longer
+    /// measure them alone, so the draft-count chooser does not learn from them.
+    fn crowd(&mut self) {
+        for g in &mut self.gens {
+            g.pass = None;
+        }
+    }
+
     fn make_room(&mut self, id: kv::Id, positions: usize, memory: &mut Memory) {
         let before = memory.cache.entries[&id].bytes;
         let (snaps, states) = memory.cache.grow(
@@ -1969,6 +1983,8 @@ impl Slot {
             lookup_passes: 0,
             lookup_offered: 0,
             lookup_accepted: 0,
+            choice: None,
+            pass: None,
             max_new,
             t1: now,
             tick: now,
@@ -2052,6 +2068,7 @@ impl Slot {
         stream.prefill(st, &p.prompt[..end], done, replay, inner, p.media.as_ref());
         let id = self.gens[i].job.id;
         self.gens[i].flying = true;
+        self.crowd();
         self.flights.push(Flight {
             stream,
             call: Call::Prefill { id, end, inner },
@@ -2258,6 +2275,9 @@ impl Slot {
                 panic!("cannot initialize context lookup");
             }
             g.lookup = Some(l);
+        }
+        if self.model.draft_block() > 0 {
+            g.choice = Some(DraftChoice::new());
         }
         g.t1 = t1;
         g.tick = t1;
@@ -2536,15 +2556,24 @@ impl Slot {
                     g.lookup_offered += proposal;
                     proposal
                 } else {
-                    self.model.draft_block().min(room.max(0) as usize)
+                    let most = self.model.draft_block().min(room.max(0) as usize);
+                    match g.choice.as_mut() {
+                        Some(c) if most > 0 => c.count(most),
+                        _ => most,
+                    }
                 };
                 (rows, proposal, k, g.pos)
             };
             // The rows the pass writes: the token and its drafts or proposals.
             self.make_room(state, pos + 1 + k, memory);
             let stream = self.decode_stream();
+            self.crowd();
+            let alone = self.flights.is_empty();
             let g = &mut self.gens[gi];
             g.flying = true;
+            if alone && proposal == 0 && g.choice.is_some() {
+                g.pass = Some((Instant::now(), k));
+            }
             let id = g.job.id;
             let call = if k > 0 {
                 if proposal == 0 {
@@ -2580,6 +2609,7 @@ impl Slot {
             for &i in group {
                 self.gens[i].flying = true;
             }
+            self.crowd();
             self.flights.push(Flight {
                 stream,
                 call: Call::Rows { ids, tokens },
@@ -2592,15 +2622,24 @@ impl Slot {
     fn rows_finish(&mut self, stream: Stream, ids: Vec<u64>, tokens: Vec<i32>, s: &Shared, memory: &mut Memory) {
         let indices: Vec<usize> = ids.iter().map(|&id| self.index_of(id)).collect();
         let ended = Instant::now();
+        let mut passes = Vec::new();  // a request's pass without drafts, chosen while drafting
         for &i in &indices {
             self.gens[i].flying = false;
             self.gens[i].ready = ended;
+            if let Some(pass) = self.gens[i].pass.take() {
+                passes.push((i, pass));
+            }
         }
         let Some(lg) = stream.logits() else {
             self.decode_streams.push(stream);
             self.pass_failed(&indices, memory);
             return;
         };
+        for (i, (started, count)) in passes {
+            if let Some(c) = self.gens[i].choice.as_mut() {
+                c.feedback(count, 0, ended.duration_since(started).as_secs_f64());
+            }
+        }
         let vocab = self.model.vocab();
         let model = self.model.clone();
         let think_end = self.think_end;
@@ -2624,6 +2663,7 @@ impl Slot {
         let gi = self.index_of(id);
         self.gens[gi].flying = false;
         self.gens[gi].ready = Instant::now();
+        let pass = self.gens[gi].pass.take();
         if stream.logits().is_none() {
             self.decode_streams.push(stream);
             self.pass_failed(&[gi], memory);
@@ -2636,6 +2676,9 @@ impl Slot {
         let g = &mut self.gens[gi];
         g.draft_passes += 1;
         g.draft_accepted += accepted;
+        if let (Some((started, count)), Some(c)) = (pass, g.choice.as_mut()) {
+            c.feedback(count, accepted, started.elapsed().as_secs_f64());
+        }
         if proposal > 0
             && let Some(l) = g.lookup.as_mut()
         {

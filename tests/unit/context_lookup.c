@@ -129,6 +129,35 @@ int main(void) {
            p.count == 15 && p.matched == 16 && p.source == 16 && p.tokens[0] == 1000);
   }
   context_lookup_free(s);
-  fprintf(stderr, "context lookup: %d/%d CPU checks passed\n", checks - failures, checks);
+
+  // The draft count: every count is measured DRAFT_CHOICE_WARM times, in
+  // rounds from the most down; then the count with the most expected tokens
+  // per second, and every DRAFT_CHOICE_EXPLORE-th pass a neighbour of it.
+  DraftChoice c;
+  draft_choice_init(&c);
+  int order[4 * DRAFT_CHOICE_WARM], rounds = 1;
+  for (int i = 0; i < 4 * DRAFT_CHOICE_WARM; i++)
+    order[i] = draft_choice_count(&c, 3), draft_choice_feedback(&c, order[i], order[i], 0.04 + 0.01 * order[i]);
+  for (int i = 0; i < 4 * DRAFT_CHOICE_WARM; i++) rounds &= order[i] == 3 - i % 4;
+  expect("each count is measured DRAFT_CHOICE_WARM times, in rounds from the most down", rounds);
+  expect("kept drafts make the most drafts the fastest", draft_choice_count(&c, 3) == 3);
+  expect("a smaller limit bounds the count", draft_choice_count(&c, 2) == 2);
+  for (int i = 0; i < 64; i++) draft_choice_feedback(&c, 3, 0, 0.07);
+  expect("rejected drafts make no drafts the fastest", draft_choice_count(&c, 3) == 0);
+  expect("a figure follows its last observations", c.kept[1] < 0.01 && c.kept_n[1] == DRAFT_CHOICE_MEMORY);
+  draft_choice_init(&c);
+  for (int w = 0; w < DRAFT_CHOICE_WARM; w++)
+    for (int k = 0; k <= 3; k++) draft_choice_feedback(&c, k, k, 0.04 + 0.01 * k);
+  int explored = 0, choices = 0;
+  for (int i = 0; i < 4 * DRAFT_CHOICE_EXPLORE; i++, choices++) explored += draft_choice_count(&c, 3) != 3;
+  expect("every DRAFT_CHOICE_EXPLORE-th pass tries a neighbour", explored == choices / DRAFT_CHOICE_EXPLORE);
+  draft_choice_init(&c);
+  draft_choice_feedback(&c, 2, 3, 0.05);
+  draft_choice_feedback(&c, 16, 0, 0.05);
+  draft_choice_feedback(&c, 1, 0, 0);
+  expect("invalid feedback is ignored", !c.seconds_n[1] && !c.seconds_n[2] && !c.kept_n[1]);
+  expect("no room means no drafts", draft_choice_count(&c, 0) == 0);
+
+  fprintf(stderr, "context lookup and draft count: %d/%d CPU checks passed\n", checks - failures, checks);
   return failures != 0;
 }

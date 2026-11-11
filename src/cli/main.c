@@ -45,7 +45,8 @@ static void usage(void) {
         "  --check-prefill  compare the prompt's batched prefill with token-by-token decoding\n"
         "  --check-batch  compare a token decoded alone with the same token decoded beside another sequence\n"
         "                (and, with --draft, in a verify pass): the logits must be equal\n"
-        "  --draft N     proposals per pass: DeepSeek/Qwen MTP 0-5, Nemotron DFlash2 0-15\n"
+        "  --draft N     at most N proposals per pass: DeepSeek/Qwen MTP 0-5, Nemotron DFlash2 0-15; each pass\n"
+        "                runs the count that has given the most tokens per second\n"
         "  --draft-model DIR  DFlash2 checkpoint directory for Nemotron drafting\n"
         "  --lookup off|N  verify up to N (1-15) context-copy drafts; --draft supplies fallback (default off)\n"
         "  --draft-cache N  with --draft: expert slots per stage, 15-128 (default: all 128 preloaded);\n"
@@ -430,12 +431,16 @@ int main(int argc, char **argv) {
   lookup = o.lookup ? context_lookup_new(o.ctx) : NULL;
   if (o.lookup && (!lookup || !context_lookup_append(lookup, tokens, n))) die("cannot initialize context lookup");
   int lookup_attempts = 0, lookup_passes = 0, lookup_offered = 0, lookup_kept = 0;
+  DraftChoice choice;  // how many of the draft model's drafts each pass runs
+  draft_choice_init(&choice);
+  int chosen[DRAFT_CHOICE_MAX + 1] = {0};
   uint64_t cache_start = model_cache_bytes(), cache_min = cache_start, cache_max = cache_start;
   while (gen < ntokens && pos < o.ctx && !ops->stop(t) && !shutdown_requested()) {
     // A verification pass runs the current token and its proposed successors.
     // Target samples confirm a prefix and supply the next token, consuming
     // exactly the draws used by ordinary sampling.
     int rows[VERIFY_DRAFTS + 1] = {t}, k = 0, a = 0, next;
+    double pass_start = now();  // the draft call counts toward the pass's time
     const double *proposal_probabilities = NULL;
     int room = ntokens - gen - 1;
     if (room > o.ctx - pos - 1) room = o.ctx - pos - 1;
@@ -453,6 +458,8 @@ int main(int argc, char **argv) {
       lookup_offered += k;
     } else {
       k = drafts < room ? drafts : room;
+      if (drafts) k = draft_choice_count(&choice, k);
+      if (drafts) chosen[k]++;
       if (k) proposal_probabilities = ops->draft(st, t, pos, rows + 1, k, &sampler);
     }
     if (k > 0) {
@@ -465,6 +472,7 @@ int main(int argc, char **argv) {
       logits = ops->rows(&st, &t, &pos, 1);
       next = sample_token(logits, V, &sampler);
     }
+    if (drafts && !proposal.count) draft_choice_feedback(&choice, k, a, now() - pass_start);
     if (lookup && a && !context_lookup_append(lookup, rows + 1, a)) die("context lookup exceeds the configured context");
     if (proposal.count) {
       if (lookup) context_lookup_feedback(lookup, k, a);
@@ -494,6 +502,10 @@ int main(int argc, char **argv) {
   if (passes)
     fprintf(stderr, "speculative: %d passes, %.2f of up to %d drafts kept per pass\n", passes,
             (double)accepted / passes, verify_limit);
+  if (drafts) {
+    fprintf(stderr, "draft counts chosen:");
+    for (int k = 0; k <= drafts && k <= DRAFT_CHOICE_MAX; k++) fprintf(stderr, " %d drafts %d times%s", k, chosen[k], k < drafts ? "," : "\n");
+  }
   if (o.lookup)
     fprintf(stderr, "{\"context_lookup\":{\"attempts\":%d,\"passes\":%d,\"offered\":%d,\"accepted\":%d}}\n",
             lookup_attempts, lookup_passes, lookup_offered, lookup_kept);

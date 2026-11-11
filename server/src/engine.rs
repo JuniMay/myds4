@@ -101,6 +101,11 @@ struct RawLookup {
 }
 
 #[repr(C)]
+struct RawDraftChoice {
+    _opaque: [u8; 0],
+}
+
+#[repr(C)]
 struct RawMedia {
     _opaque: [u8; 0],
 }
@@ -318,6 +323,10 @@ unsafe extern "C" {
     fn myds4_lookup_append(x: *mut RawLookup, tokens: *const i32, n: c_int) -> c_int;
     fn myds4_lookup_propose(x: *const RawLookup, max: c_int, drafts: *mut i32) -> c_int;
     fn myds4_lookup_feedback(x: *mut RawLookup, offered: c_int, accepted: c_int);
+    fn myds4_draft_choice_new() -> *mut RawDraftChoice;
+    fn myds4_draft_choice_free(x: *mut RawDraftChoice);
+    fn myds4_draft_choice_count(x: *mut RawDraftChoice, most: c_int) -> c_int;
+    fn myds4_draft_choice_feedback(x: *mut RawDraftChoice, count: c_int, kept: c_int, seconds: f64);
     fn myds4_media_open(
         m: *mut RawModel,
         data: *const *const u8,
@@ -1104,6 +1113,33 @@ impl Lookup {
 impl Drop for Lookup {
     fn drop(&mut self) {
         unsafe { myds4_lookup_free(self.0) }
+    }
+}
+
+/// How many of the draft model's drafts each pass of one request runs: the
+/// count with the most expected tokens per second, from the drafts kept and
+/// the times of earlier passes (src/model/draft.h). The outputs do not
+/// depend on it.
+pub struct DraftChoice(*mut RawDraftChoice);
+
+impl DraftChoice {
+    pub fn new() -> DraftChoice {
+        DraftChoice(unsafe { myds4_draft_choice_new() })
+    }
+    /// 0 to `most`.
+    pub fn count(&mut self, most: usize) -> usize {
+        unsafe { myds4_draft_choice_count(self.0, most.min(c_int::MAX as usize) as c_int).max(0) as usize }
+    }
+    /// A pass with `count` drafts kept the first `kept` of them and took
+    /// `seconds`, with no other call beside it.
+    pub fn feedback(&mut self, count: usize, kept: usize, seconds: f64) {
+        unsafe { myds4_draft_choice_feedback(self.0, count as c_int, kept as c_int, seconds) }
+    }
+}
+
+impl Drop for DraftChoice {
+    fn drop(&mut self) {
+        unsafe { myds4_draft_choice_free(self.0) }
     }
 }
 

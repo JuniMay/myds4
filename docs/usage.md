@@ -49,7 +49,7 @@ of each architecture per process.
 | `batch` | Maximum admitted requests for this model; default 4. Requests beyond the rows a decoding call takes (6 for DeepSeek, 8 for Qwen3.8-27B, Flash-Next and Nemotron) run in further decoding calls at the same time. |
 | `temperature`, `top_p`, `top_k`, `seed` | Defaults for requests that omit them or send null. Request values override them. `top_k: 0` uses the full vocabulary. |
 | `think` | Default reasoning effort, 0 for off and 1–100 for enabled reasoning. |
-| `draft` | Speculative proposals: DeepSeek DSpark 0–5; Qwen3.8-27B chained MTP 0–5; Nemotron DFlash2 0–15. Flash-Next requires 0. |
+| `draft` | The most speculative proposals per pass: DeepSeek DSpark 0–5; Qwen3.8-27B chained MTP 0–5; Nemotron DFlash2 0–15. Flash-Next requires 0. Each pass runs the count, up to this one, that has given the most tokens per second (design.md). |
 | `draft_model` | For Nemotron with `draft` enabled, the separate DFlash2 checkpoint directory. |
 | `lookup` | `off` or 1–15 context-copy proposals, limited by the model's verification capacity. |
 | `idle_unload` | Seconds this model may go without requests before its weights and experts unload, 0 never; default: the server-wide `idle_unload`. |

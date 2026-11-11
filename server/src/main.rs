@@ -69,7 +69,8 @@ const USAGE: &str = "usage: myds4-server [--config FILE | -m MODEL [model option
   --seed N        the seed of requests that set none (default: random for each)
   --think N       thinking effort 1-100 of requests that set none; 0 turns thinking off
   --ctx N         context capacity in tokens, at most 1048576 and the model's own (default: the most)
-  --draft N       proposals per pass: DeepSeek/Qwen MTP 0-5, Nemotron DFlash2 0-15
+  --draft N       at most N proposals per pass: DeepSeek/Qwen MTP 0-5, Nemotron DFlash2 0-15;
+                  each pass runs the count that has given the most tokens per second
   --draft-model DIR  the DFlash2 checkpoint for Nemotron drafting
   --lookup off|N  verify up to N (1-15) context-copy drafts; --draft supplies fallback
   DeepSeek only:

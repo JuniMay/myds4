@@ -676,6 +676,17 @@ the proposal distribution. Both methods preserve the target distribution.
 Context lookup generates proposals from prior tokens and has no authority
 to accept them.
 
+A request's passes run from none up to `draft` of the draft model's drafts,
+because every verified row costs GPU work and expert reads whether it is
+kept or not. The count is the one with the most expected tokens per second:
+one plus, for each position up to the count, the measured rate at which the
+drafts up to that position were all kept, over the measured time of a pass
+with that many drafts. Every count is first measured three times, in rounds
+from the most down; afterwards every eighth pass tries a count next to the
+best, so that the figures follow the text. In the server only passes with
+no other call of the model beside them are measured. The outputs do not
+depend on the count. Context-lookup proposals are verified as proposed.
+
 ## Numerical contract
 
 Exact routing means using the selected experts without substitution. It
