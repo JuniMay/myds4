@@ -5,15 +5,16 @@
 //! events back on a channel.
 //!
 //! Each turn of the loop gives every model one step, in turn: it admits the
-//! model's waiting requests while fewer than its batch run, runs one prefill
+//! model's waiting requests while fewer than its batch run, starts one prefill
 //! call of its oldest prefilling request (the whole prompt for a model that
-//! plans its prefill over the whole prompt; otherwise up to its prefill rows,
-//! [`SHARED_PREFILL`] while others decode, so that a long prompt does not
-//! stall the replies in progress), then advances every decoding request by a
-//! token: alone with the model's drafts (draft, lookup), or together with the
-//! others in one decoding pass. Prompts resume from the model's KV prefix
-//! cache (kv.rs). The worker also builds each model's status and the live
-//! view's snapshot.
+//! plans its prefill over the whole prompt; otherwise up to its prefill rows)
+//! if none runs, and starts a decoding call for every decoding request with no
+//! call running: alone with the model's drafts (draft, lookup), or together
+//! with the others, at most the model's rows per call. Calls run on streams
+//! (engine.rs), of any model at the same time: after the models' steps the
+//! loop advances the streams for a short time slice and finishes the call
+//! that ended. Prompts resume from the model's KV prefix cache (kv.rs). The
+//! worker also builds each model's status and the live view's snapshot.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -28,7 +29,7 @@ use tokio::sync::mpsc;
 
 use crate::control::{self, Action, Control, Phase, Target};
 use crate::engine::{
-    self, CacheCounts, Logits, Lookup, Media, Model, PrefillInfo, RawSnapshot, RawState, Sampler,
+    self, CacheCounts, Logits, Lookup, Media, Model, PrefillInfo, RawSnapshot, RawState, Sampler, Stream,
 };
 use crate::disk::{Engine, LoadError, Store};
 use crate::kv::{self, Cache, Entry, Freed, Kind, Limits, Plan, Snap};
@@ -37,16 +38,34 @@ use crate::kv::{self, Cache, Entry, Freed, Kind, Limits, Plan, Snap};
 pub const WAITING: usize = 16;
 /// Attention states the shared cache keeps at most, across all models.
 pub const STATES: usize = 256;
-/// A prefill call's rows while other requests of the model decode, for a
-/// model whose prefill runs in calls of its prefill rows.
-const SHARED_PREFILL: usize = 128;
 /// A prefill in calls snapshots its state at every multiple of this many
 /// positions (within the KV cache's budget), when the model cannot replay: a
 /// later prompt that shares a long prefix with it but parts before its end
 /// (another conversation with the same system prompt and tools) resumes from
 /// the last one before the point where it parts.
 const SNAP_GRID: usize = 2048;
+/// How long the streams run before the worker looks at its queue again.
+const RUN_SLICE_SECONDS: f64 = 0.005;
+/// A request that has just finished its prefill waits for the prefills still
+/// to come while they are at most this many tokens in all, and for at most
+/// HOLD_TIME: its first calls then start full.
+const HOLD_PREFILL_ROWS: usize = 4096;
+const HOLD_TIME: Duration = Duration::from_secs(20);
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// How many decoding calls of a model run at once: as many as its decoding
+/// requests fill (a call takes at most `most` rows), and one for a model whose
+/// decoder keeps its jobs in model-wide state.
+fn calls_at_once(decoding: usize, most: usize, serial: bool) -> usize {
+    if serial { 1 } else { (decoding / most).max(1) }
+}
+
+/// Whether a request ready to decode waits for the `prefilling` prompt tokens
+/// still to come: only a request that has not decoded yet, for short prefills,
+/// and not for long.
+fn held_for_prefills(generated: usize, waited: Duration, prefilling: usize) -> bool {
+    prefilling > 0 && prefilling <= HOLD_PREFILL_ROWS && generated == 0 && waited <= HOLD_TIME
+}
 
 // ---- requests: the handlers' side ----
 
@@ -762,12 +781,34 @@ struct Gen {
     t1: Instant,
     tick: Instant,
     c1: CacheCounts,
+    /// Whether a call of this request is running on a stream.
+    flying: bool,
+    /// Since when it can decode: the request that has waited longest goes first.
+    ready: Instant,
 }
 
 impl Gen {
     fn decoding(&self) -> bool {
         self.prefill.is_none()
     }
+}
+
+/// An engine call running on a stream, and what to do when it ends.
+enum Call {
+    /// One prefill call of the request: its prompt up to `end`, and the
+    /// snapshot position the call itself takes, if any.
+    Prefill { id: u64, end: usize, inner: Option<usize> },
+    /// One token for each of these requests, row by row.
+    Rows { ids: Vec<u64>, tokens: Vec<i32> },
+    /// The request's token and its drafts or proposals (`proposal` of them
+    /// proposed) in one pass.
+    Verify { id: u64, rows: Vec<i32>, proposal: usize },
+}
+
+/// A call and the stream it runs on.
+struct Flight {
+    stream: Stream,
+    call: Call,
 }
 
 /// One model's engine handle and requests. State IDs belong to Memory's
@@ -779,6 +820,8 @@ struct Slot {
     ctx: usize,
     batch: usize,
     gens: Vec<Gen>,
+    /// Admitted requests that wait for their turn to plan their prefill.
+    pending: VecDeque<Job>,
     think_start: Option<i32>,
     think_end: Option<i32>,
     shown: usize,
@@ -786,6 +829,12 @@ struct Slot {
     per_row: usize,
     /// When the model last had a request, for its idle unload.
     used: Instant,
+    /// The calls running now, and the streams that ended a call and wait for
+    /// another. A prefill's stream holds its large working buffers only while
+    /// a prompt fills.
+    flights: Vec<Flight>,
+    prefill_stream: Option<Stream>,
+    decode_streams: Vec<Stream>,
 }
 
 // One KV budget and one LRU clock across models. Prefix matching is
@@ -989,13 +1038,17 @@ impl Worker {
                 Slot {
                     index,
                     ctx: served.engine.ctx as usize,
-                    batch: served.batch.max(1).min(model.max_rows()),
+                    batch: served.batch.max(1),
                     gens: Vec::new(),
+                    pending: VecDeque::new(),
                     think_start: model.tokenizer().special("<think>"),
                     think_end: model.tokenizer().special("</think>"),
                     shown: 0,
                     per_row: model.stats().experts_per_row.max(0) as usize,
                     used: Instant::now(),
+                    flights: Vec::new(),
+                    prefill_stream: None,
+                    decode_streams: Vec::new(),
                     model,
                     served,
                 }
@@ -1096,6 +1149,7 @@ impl Worker {
             let after = slot.served.idle_unload;
             if after <= 0.0
                 || !slot.gens.is_empty()
+                || !slot.pending.is_empty()
                 || waiting.get(slot.index).copied().unwrap_or(false)
                 || slot.used.elapsed().as_secs_f64() < after
                 || !slot.model.loaded()
@@ -1187,7 +1241,39 @@ impl Worker {
         }
     }
 
+    /// Runs every call in flight, of every model, for a short while: until one
+    /// finishes (its request then goes on) or the time slice ends, so that new
+    /// requests and the control interface are served meanwhile.
+    fn advance_flights(&mut self) {
+        let mut streams = Vec::new();
+        let mut owners = Vec::new();
+        for (slot, x) in self.slots.iter().enumerate() {
+            for (flight, f) in x.flights.iter().enumerate() {
+                streams.push(f.stream.raw());
+                owners.push((slot, flight));
+            }
+        }
+        if streams.is_empty() {
+            return;
+        }
+        if let Some(i) = engine::run(&streams, RUN_SLICE_SECONDS) {
+            let (slot, flight) = owners[i];
+            let s = self.s.clone();
+            let x = &mut self.slots[slot];
+            let done = x.flights.remove(flight);
+            x.finish_flight(done, &s, &mut self.memory);
+        }
+    }
+
+    /// Lets every call in flight end, of every model.
+    fn drain_flights(&mut self) {
+        while self.slots.iter().any(|x| !x.flights.is_empty()) {
+            self.advance_flights();
+        }
+    }
+
     fn control_action(&mut self, action: Action) {
+        self.drain_flights();
         let configured = lock(&self.s.queue).control.configured;
         engine::drain();
         match action {
@@ -1284,7 +1370,7 @@ impl Worker {
                 q.jobs.iter().all(|j| j.is_empty())
                     && q.text.is_none()
                     && q.control.phase == Phase::Running
-                    && slots.iter().all(|x| x.gens.is_empty())
+                    && slots.iter().all(|x| x.gens.is_empty() && x.pending.is_empty())
             };
             while idle(&q, &self.slots) && !engine::stopping() {
                 let (guard, timeout) = s
@@ -1305,7 +1391,7 @@ impl Worker {
             let mut admitted: Vec<Vec<Job>> = Vec::new();
             for x in &self.slots {
                 let mut admit = Vec::new();
-                while x.gens.len() + admit.len() < x.batch && !engine::stopping() {
+                while x.gens.len() + x.pending.len() + admit.len() < x.batch && !engine::stopping() {
                     let Some(job) = q.jobs[x.index].pop_front() else {
                         break;
                     };
@@ -1336,22 +1422,27 @@ impl Worker {
                 }
                 x.model.active(!x.gens.is_empty());
             }
+            self.advance_flights();
             if self.published.elapsed() >= Duration::from_millis(250) {
                 engine::refresh_stats();
                 self.publish_counters();
                 self.published = Instant::now();
             }
         }
+        self.drain_flights();
         for x in &mut self.slots {
             for g in std::mem::take(&mut x.gens) {
                 x.finish(&s, g, true, &mut self.memory);
             }
         }
-        let waiting: Vec<Job> = {
+        let mut waiting: Vec<Job> = {
             let mut q = lock(&s.queue);
             q.closed = true;
             q.jobs.iter_mut().flat_map(|j| j.drain(..)).collect()
         };
+        for x in &mut self.slots {
+            waiting.extend(x.pending.drain(..));
+        }
         for job in waiting {
             end_waiting(job, Finish::Shutdown);
         }
@@ -1421,7 +1512,14 @@ impl Slot {
     /// One step of the model: its admitted requests start, one prefill call
     /// runs, the generations that are done end, the others advance a token.
     fn step(&mut self, s: &Shared, admit: Vec<Job>, memory: &mut Memory) {
-        for job in admit {
+        self.pending.extend(admit);
+        // A request plans which state its prefill resumes from when the
+        // prefills before it have ended, so that it can resume from theirs:
+        // one request at a time starts its prefill.
+        while !self.gens.iter().any(|g| !g.decoding()) {
+            let Some(job) = self.pending.pop_front() else {
+                break;
+            };
             if engine::stopping() {
                 end_waiting(job, Finish::Shutdown);
             } else if job.flags.cancelled.load(Ordering::SeqCst) {
@@ -1432,7 +1530,11 @@ impl Slot {
                     if !self.model.loaded() {
                         self.set_status(s, "loading");
                     }
-                    if let Err(error) = self.model.load() {
+                    // A call in flight keeps the model's memory; its load must
+                    // not run under the call, which it would resize buffers for.
+                    if self.flights.is_empty()
+                        && let Err(error) = self.model.load()
+                    {
                         if engine::stopping() {
                             end_waiting(job, Finish::Shutdown); // quitting stopped the load
                             continue;
@@ -1456,14 +1558,15 @@ impl Slot {
         if engine::stopping() {
             return;
         }
-        self.prefill_call(s, memory);
+        self.prefill_start(memory);
         let ctx = self.ctx;
         let mut i = 0;
         while i < self.gens.len() {
-            if self.gens[i].decoding() && Self::over(&self.model, &mut self.gens[i], ctx) {
+            if !self.gens[i].flying && self.gens[i].decoding() && Self::over(&self.model, &mut self.gens[i], ctx) {
                 let g = self.gens.swap_remove(i);
                 self.finish(s, g, false, memory);
-            } else if !self.gens[i].decoding()
+            } else if !self.gens[i].flying
+                && !self.gens[i].decoding()
                 && self.gens[i].job.flags.cancelled.load(Ordering::SeqCst)
             {
                 let mut g = self.gens.swap_remove(i);
@@ -1483,14 +1586,13 @@ impl Slot {
         }
         self.shown = decoding;
         if self.gens.is_empty() {
+            self.prefill_stream = None;
+            self.decode_streams.clear();
             self.set_status(s, "idle");
             return;
         }
         if decoding > 0 {
-            self.advance(memory);
-            if self.per_row > 0 && ROUTES.swap(false, Ordering::Relaxed) {
-                self.copy_routes(s);
-            }
+            self.decode_start(memory);
         }
         for g in &mut self.gens {
             if !g.out.is_empty() {
@@ -1871,6 +1973,8 @@ impl Slot {
             t1: now,
             tick: now,
             c1: CacheCounts::default(),
+            flying: false,
+            ready: now,
         };
         if from == n {
             // The same prompt again: its prompt-end snapshot holds its logits.
@@ -1891,15 +1995,28 @@ impl Slot {
         self.gens.push(g);
     }
 
-    /// One prefill call of the oldest request still prefilling: the rest of
-    /// its prompt for a model that takes it in one call, otherwise up to its
-    /// prefill rows (fewer while others decode), cut at the capture point and,
-    /// for a model that cannot replay, at the snapshot grid.
-    fn prefill_call(&mut self, s: &Shared, memory: &mut Memory) {
+    /// The index in `gens` of a request whose call just ended.
+    fn index_of(&self, id: u64) -> usize {
+        self.gens
+            .iter()
+            .position(|g| g.job.id == id)
+            .expect("a running call's request")
+    }
+
+    /// Starts one prefill call of the oldest request still prefilling, if no
+    /// prefill call runs: the rest of its prompt for a model that takes it in
+    /// one call, otherwise up to its prefill rows, cut at the capture point
+    /// and, for a model that cannot replay, at the snapshot grid.
+    fn prefill_start(&mut self, memory: &mut Memory) {
+        if self.flights.iter().any(|f| matches!(f.call, Call::Prefill { .. })) {
+            return;
+        }
+        if self.one_call_at_a_time() && !self.flights.is_empty() {
+            return;
+        }
         let Some(i) = self.gens.iter().position(|g| !g.decoding()) else {
             return;
         };
-        let others = self.gens.iter().any(|g| g.decoding());
         let chunked = self.model.prefill_rows();
         let can_replay = self.model.replay_rows(1).is_some();
         let (state, rows) = (self.gens[i].state, self.gens[i].n);
@@ -1909,13 +2026,7 @@ impl Slot {
         let end = match chunked {
             None => rows,
             Some(most) => {
-                let mut end = (done
-                    + if others {
-                        SHARED_PREFILL.min(most)
-                    } else {
-                        most
-                    })
-                .min(rows);
+                let mut end = (done + most).min(rows);
                 if !can_replay {
                     end = end.min((done / SNAP_GRID + 1) * SNAP_GRID);
                 }
@@ -1934,11 +2045,37 @@ impl Slot {
         let replay = p.replay && done == self.gens[i].from;
         // in one call the capture is the prefill's own; in calls, a snapshot where a call ends
         let inner = if chunked.is_none() { capture } else { None };
-        let prompt = &p.prompt[..end];
-        let Some((lg, captured, info)) =
-            self.model
-                .prefill(st, prompt, done, replay, inner, p.media.as_ref())
-        else {
+        let stream = self
+            .prefill_stream
+            .take()
+            .unwrap_or_else(|| Stream::new(&self.model));
+        stream.prefill(st, &p.prompt[..end], done, replay, inner, p.media.as_ref());
+        let id = self.gens[i].job.id;
+        self.gens[i].flying = true;
+        self.flights.push(Flight {
+            stream,
+            call: Call::Prefill { id, end, inner },
+        });
+    }
+
+    /// A prefill call has ended: the request's snapshots are saved, and at its
+    /// prompt's end its first token is sampled.
+    fn prefill_finish(
+        &mut self,
+        stream: Stream,
+        id: u64,
+        end: usize,
+        inner: Option<usize>,
+        s: &Shared,
+        memory: &mut Memory,
+    ) {
+        let i = self.index_of(id);
+        self.gens[i].flying = false;
+        let chunked = self.model.prefill_rows();
+        let can_replay = self.model.replay_rows(1).is_some();
+        let (state, rows) = (self.gens[i].state, self.gens[i].n);
+        let st = memory.entries[&state].raw;
+        let Some(lg) = stream.logits() else {
             if engine::stopping() {
                 return; // quitting stopped the prefill: the stop ends the request
             }
@@ -1951,10 +2088,12 @@ impl Slot {
             ));
             return;
         };
-        let origin = p.origin;
+        let (captured, info) = (stream.captured(), stream.info());
+        let p = self.gens[i].prefill.as_ref().expect("a prefill");
+        let (origin, capture) = (p.origin, p.capture);
         memory
             .cache
-            .prefilled(state, prompt, kv::stale_at(origin, end));
+            .prefilled(state, &p.prompt[..end], kv::stale_at(origin, end));
         if let Some(at) = inner
             && !captured.is_null()
         {
@@ -1983,7 +2122,7 @@ impl Slot {
                         true
                     });
                 if fits {
-                    let x = self.model.snapshot_take(st, end, false);
+                    let x = self.model.snapshot_take(st, end, std::ptr::null());
                     memory.save_snapshot(state, end, x);
                     let stale = kv::stale_at(origin, end);
                     memory.cache.add_snap(
@@ -2000,9 +2139,10 @@ impl Slot {
         }
         if !last {
             self.gens[i].prefill.as_mut().expect("a prefill").done = end;
+            self.prefill_stream = Some(stream);
             return;
         }
-        let x = self.model.snapshot_take(st, rows, true);
+        let x = self.model.snapshot_take(st, rows, lg);
         memory.save_snapshot(state, rows, x);
         let stale = kv::stale_at(origin, rows);
         memory.cache.add_snap(
@@ -2017,6 +2157,18 @@ impl Slot {
         let mut g = self.gens.remove(i);
         self.started(s, &mut g, lg, info, memory);
         self.gens.insert(i, g);
+        // `lg` is the stream's until here; the prompt's large buffers go with it.
+        drop(stream);
+    }
+
+    /// A call has ended: the requests it served go on.
+    fn finish_flight(&mut self, flight: Flight, s: &Shared, memory: &mut Memory) {
+        let Flight { stream, call } = flight;
+        match call {
+            Call::Prefill { id, end, inner } => self.prefill_finish(stream, id, end, inner, s, memory),
+            Call::Rows { ids, tokens } => self.rows_finish(stream, ids, tokens, s, memory),
+            Call::Verify { id, rows, proposal } => self.verify_finish(stream, id, rows, proposal, s, memory),
+        }
     }
 
     /// A cancelled request whose prefill ran part of its prompt: its state's
@@ -2109,6 +2261,7 @@ impl Slot {
         }
         g.t1 = t1;
         g.tick = t1;
+        g.ready = t1;
         g.c1 = c1.cache;
         memory.publish(s);
     }
@@ -2208,7 +2361,7 @@ impl Slot {
         if take {
             let x = self
                 .model
-                .snapshot_take(memory.entries[&g.state].raw, g.pos, false);
+                .snapshot_take(memory.entries[&g.state].raw, g.pos, std::ptr::null());
             memory.save_snapshot(g.state, g.pos, x);
         }
         memory.evicted((snaps, states));
@@ -2288,14 +2441,69 @@ impl Slot {
         }
     }
 
-    /// One token for each decoding generation: alone with its drafts, or
-    /// together, each row as it would run alone.
-    fn advance(&mut self, memory: &mut Memory) {
-        let (think_end, ctx) = (self.think_end, self.ctx);
-        let decoding: Vec<usize> = (0..self.gens.len())
-            .filter(|&i| self.gens[i].decoding())
+    /// A stream for a decoding call: one that ended a call, or a new one.
+    fn decode_stream(&mut self) -> Stream {
+        self.decode_streams
+            .pop()
+            .unwrap_or_else(|| Stream::new(&self.model))
+    }
+
+    /// The DeepSeek runahead and pipeline decoders keep their jobs in
+    /// model-wide state: a model with one of them runs one call at a time.
+    fn one_call_at_a_time(&self) -> bool {
+        self.served.engine.deepseek().is_some_and(|d| d.runahead || d.pipeline)
+    }
+
+    /// Starts one token for each decoding request with no call running: alone
+    /// with its drafts or proposals, or together, each row as it would run
+    /// alone, at most the model's rows per call.
+    fn decode_start(&mut self, memory: &mut Memory) {
+        // Rows of one call share the GPU's work per layer, so calls stay as
+        // full as the requests allow: at most as many run at once as the
+        // decoding requests fill, and a request that finds no room waits for
+        // the next call. A call starts as soon as requests are free and there
+        // is room for it: groups of requests run independently of each other,
+        // and each call's waits are filled by the others' GPU work.
+        let most = self.model.max_rows().max(1);
+        let total = self.gens.iter().filter(|g| g.decoding()).count();
+        let serial = self.one_call_at_a_time();
+        if serial && !self.flights.is_empty() {
+            return;
+        }
+        let allowed = calls_at_once(total, most, serial);
+        let mut running = self
+            .flights
+            .iter()
+            .filter(|f| !matches!(f.call, Call::Prefill { .. }))
+            .count();
+        if running >= allowed {
+            return;
+        }
+        let ctx = self.ctx;
+        let mut decoding: Vec<usize> = (0..self.gens.len())
+            .filter(|&i| self.gens[i].decoding() && !self.gens[i].flying)
             .collect();
-        if decoding.len() == 1 {
+        if decoding.is_empty() {
+            return;
+        }
+        decoding.sort_by_key(|&i| self.gens[i].ready);
+        // Requests that have just finished their prefill wait for the short
+        // prefills still to come: their first calls then start full, and they
+        // do not take SSD reads and cache room from the prefills. A long
+        // prefill keeps no one waiting, and neither does any wait past HOLD_TIME.
+        let prefilling: usize = self
+            .gens
+            .iter()
+            .filter(|g| !g.decoding())
+            .map(|g| g.n - g.prefill.as_ref().map_or(g.n, |p| p.done))
+            .sum::<usize>()
+            + self.pending.iter().map(|j| j.request.prompt.len()).sum::<usize>();
+        let now = Instant::now();
+        decoding.retain(|&i| !held_for_prefills(self.gens[i].generated, now.duration_since(self.gens[i].ready), prefilling));
+        if decoding.is_empty() {
+            return;
+        }
+        if total == 1 {
             let gi = decoding[0];
             let state = self.gens[gi].state;
             let st = memory.entries[&state].raw;
@@ -2334,96 +2542,162 @@ impl Slot {
             };
             // The rows the pass writes: the token and its drafts or proposals.
             self.make_room(state, pos + 1 + k, memory);
-            let model = self.model.clone();
+            let stream = self.decode_stream();
             let g = &mut self.gens[gi];
-            let pass = if k > 0 {
-                let probabilities = if proposal == 0 {
+            g.flying = true;
+            let id = g.job.id;
+            let call = if k > 0 {
+                if proposal == 0 {
                     rows.resize(k + 1, 0);
-                    model.draft(st, g.t, g.pos, &mut rows[1..], &mut g.sampler)
-                } else {
-                    std::ptr::null()
-                };
-                model.verify(st, &rows, g.pos).map(|lg| {
-                    let (next, a) = model.sample_verify(lg, &rows[1..], probabilities, &mut g.sampler);
-                    g.draft_passes += 1;
-                    g.draft_accepted += a;
-                    model.accept(st, &rows[..a + 1], g.pos);
-                    (next, a)
-                })
-            } else {
-                model
-                    .rows(&mut [st], &[g.t], &[g.pos as i32])
-                    .map(|lg| (model.sample(lg, &mut g.sampler), 0))
-            };
-            let Some((next, a)) = pass else {
-                self.pass_failed(&[gi], memory);
-                return;
-            };
-            let g = &mut self.gens[gi];
-            if proposal > 0
-                && let Some(l) = g.lookup.as_mut()
-            {
-                l.feedback(k, a);
-                g.lookup_accepted += a;
-            }
-            let mut kept = 0;
-            for &t in &rows[..=a] {
-                if g.ended {
-                    break;
                 }
-                Self::emit(&model, &mut memory.cache, g, t, think_end);
-                kept += 1;
-            }
-            // the pass's rows after the kept tokens took places in the rings
-            memory.cache.rejected(g.state, rows.len() - kept);
-            g.t = next;
+                stream.verify(st, &mut rows, proposal > 0, g.pos, &mut g.sampler);
+                Call::Verify { id, rows, proposal }
+            } else {
+                stream.rows(&mut [st], &[g.t], &[g.pos as i32]);
+                Call::Rows { ids: vec![id], tokens: vec![g.t] }
+            };
+            self.flights.push(Flight { stream, call });
             return;
         }
-        let rooms: Vec<(kv::Id, usize)> = decoding
-            .iter()
-            .map(|&i| (self.gens[i].state, self.gens[i].pos + 1))
-            .collect();
-        for (id, positions) in rooms {
-            self.make_room(id, positions, memory);
+        for group in decoding.chunks(most) {
+            if running >= allowed {
+                break;
+            }
+            running += 1;
+            for &i in group {
+                let (id, positions) = (self.gens[i].state, self.gens[i].pos + 1);
+                self.make_room(id, positions, memory);
+            }
+            let mut st: Vec<*mut RawState> = group
+                .iter()
+                .map(|&i| memory.entries[&self.gens[i].state].raw)
+                .collect();
+            let tokens: Vec<i32> = group.iter().map(|&i| self.gens[i].t).collect();
+            let pos: Vec<i32> = group.iter().map(|&i| self.gens[i].pos as i32).collect();
+            let ids: Vec<u64> = group.iter().map(|&i| self.gens[i].job.id).collect();
+            let stream = self.decode_stream();
+            stream.rows(&mut st, &tokens, &pos);
+            for &i in group {
+                self.gens[i].flying = true;
+            }
+            self.flights.push(Flight {
+                stream,
+                call: Call::Rows { ids, tokens },
+            });
         }
-        let mut st: Vec<*mut RawState> = decoding
-            .iter()
-            .map(|&i| memory.entries[&self.gens[i].state].raw)
-            .collect();
-        let tokens: Vec<i32> = decoding.iter().map(|&i| self.gens[i].t).collect();
-        let pos: Vec<i32> = decoding.iter().map(|&i| self.gens[i].pos as i32).collect();
-        let model = self.model.clone();
-        let Some(lg) = model.rows(&mut st, &tokens, &pos) else {
-            self.pass_failed(&decoding, memory);
+    }
+
+    /// A call of one token per request has ended: the requests emit their
+    /// tokens and sample their next ones.
+    fn rows_finish(&mut self, stream: Stream, ids: Vec<u64>, tokens: Vec<i32>, s: &Shared, memory: &mut Memory) {
+        let indices: Vec<usize> = ids.iter().map(|&id| self.index_of(id)).collect();
+        let ended = Instant::now();
+        for &i in &indices {
+            self.gens[i].flying = false;
+            self.gens[i].ready = ended;
+        }
+        let Some(lg) = stream.logits() else {
+            self.decode_streams.push(stream);
+            self.pass_failed(&indices, memory);
             return;
         };
-        let vocab = model.vocab();
-        for (r, &i) in decoding.iter().enumerate() {
+        let vocab = self.model.vocab();
+        let model = self.model.clone();
+        let think_end = self.think_end;
+        for (r, &i) in indices.iter().enumerate() {
             let g = &mut self.gens[i];
             Self::emit(&model, &mut memory.cache, g, tokens[r], think_end);
             // Safety: myds4_rows returns one row of the vocabulary for each state.
             g.t = model.sample(unsafe { lg.add(r * vocab) }, &mut g.sampler);
         }
+        self.decode_streams.push(stream);
+        // Calls that ran beside each other wrote the same routes: the live
+        // view shows routes only while one decoding call runs.
+        let one_call = self.gens.iter().filter(|g| g.decoding()).count() <= self.model.max_rows().max(1);
+        if self.per_row > 0 && one_call && ROUTES.swap(false, Ordering::Relaxed) {
+            self.copy_routes(s, &ids);
+        }
     }
 
-    /// The decoding requests' routed rows of the latest pass, for the live
-    /// view: row r is the r-th decoding request's (alone, its token is row 0).
-    fn copy_routes(&self, s: &Shared) {
-        let routes: Vec<Route> = self
-            .gens
+    /// A token and its drafts or proposals have run: the kept ones go out.
+    fn verify_finish(&mut self, stream: Stream, id: u64, rows: Vec<i32>, proposal: usize, s: &Shared, memory: &mut Memory) {
+        let gi = self.index_of(id);
+        self.gens[gi].flying = false;
+        self.gens[gi].ready = Instant::now();
+        if stream.logits().is_none() {
+            self.decode_streams.push(stream);
+            self.pass_failed(&[gi], memory);
+            return;
+        }
+        let (next, accepted) = stream.next();
+        self.decode_streams.push(stream);
+        let model = self.model.clone();
+        let think_end = self.think_end;
+        let g = &mut self.gens[gi];
+        g.draft_passes += 1;
+        g.draft_accepted += accepted;
+        if proposal > 0
+            && let Some(l) = g.lookup.as_mut()
+        {
+            l.feedback(rows.len() - 1, accepted);
+            g.lookup_accepted += accepted;
+        }
+        let mut kept = 0;
+        for &t in &rows[..=accepted] {
+            if g.ended {
+                break;
+            }
+            Self::emit(&model, &mut memory.cache, g, t, think_end);
+            kept += 1;
+        }
+        // the pass's rows after the kept tokens took places in the rings
+        memory.cache.rejected(g.state, rows.len() - kept);
+        g.t = next;
+        if self.per_row > 0 && ROUTES.swap(false, Ordering::Relaxed) {
+            self.copy_routes(s, &[id]);
+        }
+    }
+
+    /// The routed rows of the call that just ended, for the live view: row r
+    /// is the r-th request of the call (`ids`).
+    fn copy_routes(&self, s: &Shared, ids: &[u64]) {
+        let routes: Vec<Route> = ids
             .iter()
-            .filter(|g| g.decoding())
             .enumerate()
-            .filter_map(|(r, g)| {
+            .filter_map(|(r, &request)| {
                 self.model
                     .routes(r, self.per_row)
                     .map(|(experts, sources)| Route {
-                        request: g.job.id,
+                        request,
                         experts,
                         sources,
                     })
             })
             .collect();
         lock(&s.models[self.index].status).routes = routes;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoding_calls_run_as_many_as_their_requests_fill() {
+        assert_eq!(calls_at_once(12, 6, false), 2);
+        assert_eq!(calls_at_once(13, 6, false), 2);
+        assert_eq!(calls_at_once(5, 6, false), 1);
+        // a decoder that keeps its jobs in model-wide state runs one call at a time
+        assert_eq!(calls_at_once(12, 6, true), 1);
+    }
+
+    #[test]
+    fn a_new_request_waits_only_for_short_prefills_and_not_for_long() {
+        let moment = Duration::from_secs(1);
+        assert!(held_for_prefills(0, moment, 100));
+        assert!(!held_for_prefills(3, moment, 100)); // it has decoded before
+        assert!(!held_for_prefills(0, moment, 0)); // no prefill to wait for
+        assert!(!held_for_prefills(0, moment, HOLD_PREFILL_ROWS + 1)); // a long prefill keeps no one waiting
+        assert!(!held_for_prefills(0, HOLD_TIME + moment, 100)); // the wait has an end
     }
 }

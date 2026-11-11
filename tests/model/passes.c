@@ -7,25 +7,33 @@
 // them across a wait.
 //
 // usage: passes CHECKPOINT --text FILE [--experts GGUF] [--memory GIB]
-//               [--tokens N] [--decode N] [--draft N] [--draft-model DIR]
-//               [--no-garbage] [--verbose]
+//               [--tokens N] [--decode N] [--rows N] [--draft N] [--draft-model DIR]
+//               [--no-garbage] [--release] [--phases] [--verbose]
 #include "../../src/model/deepseek/model.h"
 #include <math.h>
 
 #include "../../src/model/deepseek/model.c"
 
-enum { MAX_DRAFTS = 15 };
+enum { MAX_DRAFTS = 15, MAX_ROWS = 8 };
 
-static int use_garbage = 1, drafts_wanted, vocab;
+static int use_garbage = 1, drafts_wanted, vocab, rows_each = 1, release_between, phases;
 static uint64_t garbage_filled;
 static const ModelOps *ops;
 
+// As the server's streams do between calls.
+static void between_calls(void) {
+  if (release_between && ops->pass_release) ops->pass_release();
+}
+
+// A job's sequences: its first prompt, and each further one later in the
+// text and a little shorter, so that they decode at different positions.
 typedef struct {
   const int *tokens;
   int n, decode;
-  ModelState *state;
+  ModelState *state[MAX_ROWS];
   uint64_t digest, proposals;
   int resumes, last, accepted;
+  int pos[MAX_ROWS], token[MAX_ROWS];  // what the decoding continues from
 } Job;
 
 static uint64_t fnv(uint64_t h, const void *data, size_t n) {
@@ -41,37 +49,64 @@ static int best(const float *logits) {
   return b;
 }
 
-static void job_body(void *argument) {
-  Job *j = argument;
-  ops->pass_begin();
-  ModelState *state = j->state;
-  const float *logits = ops->prefill(state, j->tokens, j->n, 0, 0, -1, 0, 0);
-  if (!logits) die("the prefill did not fit in memory");
-  j->digest = fnv(14695981039346656037ull, logits, (size_t)vocab * 4);
-  int pos = j->n, token = best(logits);
+static void job_prefill(Job *j) {
+  j->digest = 14695981039346656037ull;
+  for (int r = 0; r < rows_each; r++) {
+    j->pos[r] = j->n - r * 17;
+    const float *logits = ops->prefill(j->state[r], j->tokens + r * 211, j->pos[r], 0, 0, -1, 0, 0);
+    if (!logits) die("the prefill did not fit in memory");
+    between_calls();
+    j->digest = fnv(j->digest, logits, (size_t)vocab * 4);
+    j->token[r] = best(logits);
+  }
+}
+
+static void job_decode(Job *j) {
+  const float *logits;
+  int *pos = j->pos, *token = j->token;
   Sampler greedy = {.temp = 0, .top_p = 1};
   for (int done = 0; done < j->decode;) {
     if (drafts_wanted) {
-      int rows[MAX_DRAFTS + 1] = {token}, kept;
-      ops->draft(state, token, pos, rows + 1, drafts_wanted, &greedy);
+      int rows[MAX_DRAFTS + 1] = {token[0]}, kept;
+      ops->draft(j->state[0], token[0], pos[0], rows + 1, drafts_wanted, &greedy);
       j->proposals = fnv(j->proposals, rows + 1, (size_t)drafts_wanted * sizeof *rows);
-      logits = ops->verify(state, rows, drafts_wanted + 1, pos);
+      logits = ops->verify(j->state[0], rows, drafts_wanted + 1, pos[0]);
       int next = sample_verify_probabilities(logits, vocab, rows + 1, drafts_wanted, NULL, ops->stop, &greedy, &kept);
-      ops->accept(state, rows, kept + 1, pos);
+      ops->accept(j->state[0], rows, kept + 1, pos[0]);
+      between_calls();
       j->digest = fnv(j->digest, logits, (size_t)(kept + 1) * vocab * 4);
       j->accepted += kept;
-      done += kept + 1, pos += kept + 1;
+      done += kept + 1, pos[0] += kept + 1;
       logits += (size_t)kept * vocab;
-      token = next;
+      token[0] = next;
     } else {
-      logits = ops->rows(&state, &token, &pos, 1);
+      logits = ops->rows(j->state, token, pos, rows_each);
       if (!logits) die("a decoded token did not fit in memory");
-      j->digest = fnv(j->digest, logits, (size_t)vocab * 4);
-      done++, pos++;
-      token = best(logits);
+      between_calls();
+      j->digest = fnv(j->digest, logits, (size_t)rows_each * vocab * 4);
+      for (int r = 0; r < rows_each; r++) pos[r]++, token[r] = best(logits + (size_t)r * vocab);
+      done++;
     }
   }
-  j->last = token;
+  j->last = token[0];
+}
+
+static void job_body(void *argument) {
+  ops->pass_begin();
+  job_prefill(argument);
+  job_decode(argument);
+  ops->pass_end();
+}
+
+static void prefill_body(void *argument) {
+  ops->pass_begin();
+  job_prefill(argument);
+  ops->pass_end();
+}
+
+static void decode_body(void *argument) {
+  ops->pass_begin();
+  job_decode(argument);
   ops->pass_end();
 }
 
@@ -90,17 +125,13 @@ static void garbage(void) {
 
 // Runs the jobs' passes, resuming each as soon as it can continue; alone
 // (count 1) each waits as a single pass does.
-static void run(Job *jobs, int count) {
+static void interleave(Job **jobs, void (*const *bodies)(void *), int count) {
   Pass *passes[4];
   int ended[4] = {0}, alive = count;
-  for (int i = 0; i < count; i++) {
-    jobs[i].state = ops->state_new();
-    jobs[i].resumes = 0, jobs[i].accepted = 0, jobs[i].proposals = 0;
-    passes[i] = ops->pass_new(job_body, &jobs[i]);
-  }
+  for (int i = 0; i < count; i++) passes[i] = ops->pass_new(bodies[i], jobs[i]);
   if (count == 1) {
-    while (!pass_resume(passes[0])) jobs[0].resumes++, pass_block(passes[0]);
-    jobs[0].resumes++;
+    while (!pass_resume(passes[0])) jobs[0]->resumes++, pass_block(passes[0]);
+    jobs[0]->resumes++;
     ended[0] = 1, alive = 0;
   }
   while (alive) {
@@ -108,19 +139,53 @@ static void run(Job *jobs, int count) {
     for (int i = 0; i < count; i++) {
       if (ended[i] || !pass_ready(passes[i])) continue;
       if (use_garbage && ops == &deepseek_ops) garbage();
-      jobs[i].resumes++;
+      jobs[i]->resumes++;
       ended[i] = pass_resume(passes[i]);
       alive -= ended[i];
       ran = 1;
     }
     if (!ran) usleep(10);
   }
-  for (int i = 0; i < count; i++) pass_free(passes[i]), ops->state_free(jobs[i].state);
+  for (int i = 0; i < count; i++) pass_free(passes[i]);
+}
+
+static void states_new(Job *jobs, int count) {
+  for (int i = 0; i < count; i++) {
+    for (int r = 0; r < rows_each; r++) jobs[i].state[r] = ops->state_new();
+    jobs[i].resumes = 0, jobs[i].accepted = 0, jobs[i].proposals = 0;
+  }
+}
+
+static void states_free(Job *jobs, int count) {
+  for (int i = 0; i < count; i++)
+    for (int r = 0; r < rows_each; r++) ops->state_free(jobs[i].state[r]);
+}
+
+static void run(Job *jobs, int count) {
+  states_new(jobs, count);
+  Job *list[2] = {&jobs[0], count > 1 ? &jobs[1] : NULL};
+  void (*const bodies[2])(void *) = {job_body, job_body};
+  interleave(list, bodies, count);
+  states_free(jobs, count);
+}
+
+// As the server runs two requests: the first prompt in a pass of its own, the
+// second prompt beside the first request's decoding, each in a new pass, and
+// the second request's decoding after them.
+static void run_phased(Job *jobs) {
+  states_new(jobs, 2);
+  void (*const prefill_only[1])(void *) = {prefill_body}, (*const decode_only[1])(void *) = {decode_body};
+  void (*const both[2])(void *) = {prefill_body, decode_body};
+  Job *first[1] = {&jobs[0]}, *second[1] = {&jobs[1]}, *pair[2] = {&jobs[1], &jobs[0]};
+  interleave(first, prefill_only, 1);
+  interleave(pair, both, 2);
+  interleave(second, decode_only, 1);
+  states_free(jobs, 2);
 }
 
 int main(int argc, char **argv) {
   if (argc < 4)
-    die("usage: passes CHECKPOINT --text FILE [--experts GGUF] [--memory GIB] [--tokens N] [--decode N] [--draft N] [--draft-model DIR] [--no-garbage]");
+    die("usage: passes CHECKPOINT --text FILE [--experts GGUF] [--memory GIB] [--tokens N] [--decode N] [--rows N] [--draft N] [--draft-model DIR] [--no-garbage]");
   double memory_gib = 40;
   Options o = {.ctx = 32768, .dump_fd = -1, .routes_fd = -1, .quiet = 1};
   const char *text = 0;
@@ -133,12 +198,16 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--tokens") && i + 1 < argc) tokens_each = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--decode") && i + 1 < argc) decode = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--draft") && i + 1 < argc) o.draft = drafts_wanted = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--rows") && i + 1 < argc) rows_each = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--no-garbage")) use_garbage = 0;
+    else if (!strcmp(argv[i], "--release")) release_between = 1;
+    else if (!strcmp(argv[i], "--phases")) phases = 1;
     else if (!strcmp(argv[i], "--verbose")) o.quiet = 0;
     else die("invalid argument: %s", argv[i]);
   }
   if (!text) die("--text FILE is required");
   if (drafts_wanted > MAX_DRAFTS) die("--draft takes at most %d", MAX_DRAFTS);
+  if (rows_each < 1 || rows_each > MAX_ROWS || (drafts_wanted && rows_each > 1)) die("--rows takes 1 to %d, and 1 with drafts", MAX_ROWS);
   ops = model_find(argv[1]);
   Tokenizer *tk = tok_open(argv[1], ops->media_token);
   size_t size;
@@ -146,7 +215,8 @@ int main(int argc, char **argv) {
   int *tokens = xmalloc((size + 2) * sizeof *tokens);
   int count = tok_encode(tk, t, tokens, (int)size + 2);
   free(t);
-  if (count < 2 * tokens_each) die("the text has %d tokens; %d are needed", count, 2 * tokens_each);
+  int needed = 2 * tokens_each + rows_each * 211;
+  if (count < needed) die("the text has %d tokens; %d are needed", count, needed);
   memory_configure(memory_gib, 4);
   if (!model_open(argv[1], &o)) die("the model did not load");
   vocab = ops->vocab();
@@ -168,7 +238,8 @@ int main(int argc, char **argv) {
   t0 = now(), busy0 = gpu_busy;
   ModelCounters before, after;
   ops->counters(&before);
-  run(together, 2);
+  if (phases) run_phased(together);
+  else run(together, 2);
   ops->counters(&after);
   double both = now() - t0, both_busy = gpu_busy - busy0;
   printf("alone: %.2f s and %.2f s (GPU busy %.2f and %.2f s), one after the other %.2f s; interleaved %.2f s (GPU busy %.2f s)\n", a, b, a_busy, b_busy,

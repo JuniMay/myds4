@@ -212,7 +212,7 @@ int main(int argc, char **argv) {
   ModelState *live = ops->state_new();
   const float *logits = ops->prefill(live, tokens, n, 0, 0, -1, NULL, NULL);
   CHECK(logits);
-  ModelSnapshot *prompt_end = ops->snapshot_take(live, n, 1);
+  ModelSnapshot *prompt_end = ops->snapshot_take(live, n, logits);
   int rows0 = open_new("rows-0"), snap0 = open_new("snap-0"), end0 = open_new("end-0");
   CHECK(state_file_write(ops, live, 0, n, rows0) > 0);
   CHECK(snapshot_file_write(ops, prompt_end, NULL, 0, snap0) > 0);

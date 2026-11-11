@@ -190,7 +190,31 @@ the passes' turns; `--no-garbage` instead leaves GPU work queued across the
 switches, so that the two passes' command buffers overlap in the queue, which
 catches CPU-filled shared buffers. Run it with and without `--no-garbage` for
 DeepSeek. The check prints how long the passes took alone and interleaved.
-`--verbose` shows the memory messages that are usually suppressed.
+`--verbose` shows the memory messages that are usually suppressed. `--rows N`
+decodes N sequences per pass, `--release` releases the state between calls as
+a server stream does, and `--phases` orders the passes as the server does:
+the first prompt alone, then the second prompt beside the first request's
+decoding, each in a pass of its own.
+
+`benchmarks/throughput.py --new SERVER [--old SERVER] [--deepseek DIR] [--experts
+GGUF] [--qwen DIR] [--flash DIR] [--nemotron DIR] --cases deepseek:8
+deepseek:3,qwen:3 ...` measures the total tokens per second of concurrent
+requests, greedy, on fresh servers. For each case it reports the `--old`
+server serving one request at a time (`old:1`) and with its batch decoding
+(`old:b`), and the `--new` server serving every request at once (`new`); each
+model first answers a short warm-up request, so the time counts neither its
+load nor its coldest cache. For each mode it also reports the steady rate
+(all requests decoding, none finished yet), the expert bytes read, the time
+waiting for them, the expert cache's hit rate and the GPU's mean use (sampled
+from the system, so it includes the desktop's share). It runs on AC power
+with an idle GPU, as the other measurement drivers do. It also holds the
+correctness guard for concurrency: each request first runs alone on the
+`--new` server, and every response of every mode must equal that answer. A
+response that differs fails the case whatever its speed, and the report names
+the first differing character. `--modes` chooses the modes, `--no-reference`
+skips the runs alone (and the check), `--option model:key:value` sets a
+per-model configuration key (for instance `deepseek:runahead:true`), and
+`--server-log -` prints the servers' messages.
 
 `build/tests/gpu-steps` needs no model. A buffer that queued work uses must
 stay allocated and charged until that work has finished (`gpu_free_later`,

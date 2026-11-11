@@ -76,6 +76,7 @@ Their throughput does not represent ordinary inference.
 | --- | --- |
 | `benchmarks/compare.py` | Matched CLI control/candidate generations and output checks. |
 | `benchmarks/concurrency.py` | HTTP throughput and latency on Harness requests or local audio fixtures. |
+| `benchmarks/throughput.py` | Total tokens per second of concurrent requests against the serving modes, with the same requests alone as the correctness guard. |
 | `benchmarks/turns.py` | A conversation followed by a longer tool-like input. |
 | `benchmarks/prefill.py` | CED prefill and continuation comparisons. |
 | `benchmarks/decode.c` | Batched model-row timing. |

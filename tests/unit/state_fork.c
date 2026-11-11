@@ -81,7 +81,7 @@ static void run(int ratio, int positions, int large, int draft) {
   L[2].kv_source = 1;
   L[2].ratio = ratio;
   State *src = make_state(opt.ctx), *dst = make_state(start_cap());
-  active = src;
+  active = src, history = src->history;
   bind(src);
   remember_state_layout(); // the fixture supplies the model's small rolling-buffer layout
   // What the server's KV prefix cache charges for a state (myds4_state_bytes).
@@ -91,7 +91,7 @@ static void run(int ratio, int positions, int large, int draft) {
   deepseek_state_free(fresh);
   rolling_fill(src, 0x42);
   int32_t fork_history[3] = {11, 12, 13};
-  memcpy(history, fork_history, sizeof history);  // the state in use keeps its history in `history`
+  memcpy(history, fork_history, sizeof fork_history);  // the state in use keeps its history in the state
   Snapshot *x = deepseek_snapshot(src, positions, 0);
   rolling_fill(src, 0x39);
   for (int i = 0; i < 3; i++) history[i] = src->history[i] = 70 + i;

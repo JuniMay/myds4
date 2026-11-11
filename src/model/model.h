@@ -135,7 +135,7 @@ typedef struct {
   // into dst. A running src is fine.
   void (*state_copy)(ModelState *dst, const ModelState *src, int positions);
 
-  ModelSnapshot *(*snapshot_take)(ModelState *s, int pos, int with_logits);
+  ModelSnapshot *(*snapshot_take)(ModelState *s, int pos, const float *logits);
   void (*snapshot_restore)(ModelState *s, const ModelSnapshot *x);
   void (*snapshot_free)(ModelSnapshot *x);
   size_t (*snapshot_bytes)(int with_logits);
@@ -210,6 +210,10 @@ typedef struct {
   struct Pass *(*pass_new)(void (*body)(void *), void *argument);
   void (*pass_begin)(void);
   void (*pass_end)(void);
+  // Between two calls of a pass, what binds the states it used to the
+  // model-wide variables is released, so that code outside the pass may use
+  // those states; or null where nothing is bound.
+  void (*pass_release)(void);
 } ModelOps;
 
 typedef struct {

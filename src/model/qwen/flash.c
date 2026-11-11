@@ -80,7 +80,6 @@ static struct {
   Buf resident_table, resident_counts;
   ModelCounters counters;
   ModelPlan plan;
-  const float *last_logits;
   QwenVision *vision;
   const Media *image_list;
   int image_count;
@@ -628,7 +627,7 @@ static ModelSnapshot *snapshot_alloc(const int32_t *meta, int nmeta, int with_lo
   if (with_logits) x->logits = memory_host_required((size_t)f.vocab * 4, 1);
   return (ModelSnapshot *)x;
 }
-static ModelSnapshot *snapshot_take(ModelState *state, int pos, int with_logits) {
+static ModelSnapshot *snapshot_take(ModelState *state, int pos, const float *logits) {
   FlashState *s = (FlashState *)state;
   FlashSnapshot *x = xmalloc(sizeof *x);
   x->gdn = gpu_alloc_kv(gdn_bytes());
@@ -643,9 +642,9 @@ static ModelSnapshot *snapshot_take(ModelState *state, int pos, int with_logits)
   x->pos = pos;
   x->rope_delta = s->rope_delta;
   memcpy(x->previous, s->previous, sizeof x->previous);
-  if (with_logits) {
+  if (logits) {
     x->logits = memory_host_required((size_t)f.vocab * 4, 1);
-    memcpy(x->logits, f.last_logits, (size_t)f.vocab * 4);
+    memcpy(x->logits, logits, (size_t)f.vocab * 4);
   }
   return (ModelSnapshot *)x;
 }
@@ -1320,7 +1319,7 @@ static const float *pass(const Row *rows, int n, int logits, int prompt) {
     add_stats(&f.counters.decode, before, *stats);
   }
   f.counters.prefill_layer = 0;
-  return f.last_logits = (const float *)work->logits.ptr;
+  return (const float *)work->logits.ptr;
 }
 
 static const char *refuse(const Options *o) {
@@ -1405,7 +1404,7 @@ static const float *prefill(ModelState *state, const int *tokens, int n, int fro
     if (shutdown_requested())
       return NULL;
   }
-  return f.last_logits = lg;
+  return lg;
 }
 static const float *forward_rows(ModelState *const *states, const int *tokens, const int *positions, int n) {
   Row rows[FLASH_BATCH];
@@ -1475,7 +1474,7 @@ static void active(int on) {
     cache_active(f.store, on);
 }
 #define V(x) {&x, sizeof x}
-static const PassVariable pass_own[] = {V(work), V(f.recording), V(f.last_logits), V(f.image_list), V(f.image_count)};
+static const PassVariable pass_own[] = {V(work), V(f.recording), V(f.image_list), V(f.image_count)};
 #undef V
 
 static Pass *flash_pass_new(void (*body)(void *), void *argument) {

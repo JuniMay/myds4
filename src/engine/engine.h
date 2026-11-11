@@ -21,7 +21,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYDS4_ABI 18
+#define MYDS4_ABI 19
 
 // ---- the process ----
 
@@ -165,9 +165,9 @@ void myds4_state_copy(myds4_model *m, myds4_state *dst, const myds4_state *src, 
 // of it) continues at most myds4_rewind() less these stale rows before its
 // position; the caller counts them (server/src/kv.rs).
 typedef struct ModelSnapshot myds4_snapshot;
-// s's rolling rows now, as at pos, and with with_logits the logits the last
-// prefill or decoding pass returned (those pos's token is sampled from).
-myds4_snapshot *myds4_snapshot_take(myds4_model *m, myds4_state *s, int pos, int with_logits);
+// s's rolling rows now, as at pos, and, when given, the logits pos's token is
+// sampled from, as a prefill or decoding call returned them.
+myds4_snapshot *myds4_snapshot_take(myds4_model *m, myds4_state *s, int pos, const float *logits);
 void myds4_snapshot_restore(myds4_model *m, myds4_state *s, const myds4_snapshot *x);
 void myds4_snapshot_free(myds4_model *m, myds4_snapshot *x);
 size_t myds4_snapshot_bytes(const myds4_model *m, int with_logits);
@@ -250,6 +250,36 @@ const float *myds4_verify(myds4_model *m, myds4_state *s, const int32_t *rows, i
 void myds4_accept(myds4_model *m, myds4_state *s, const int32_t *rows, int n, int pos);
 // s's token history at pos from the tokens before it (DeepSeek's Engram).
 void myds4_seek(myds4_model *m, myds4_state *s, const int32_t *tokens, int pos);
+
+// ---- streams ----
+
+// A stream runs one model's calls, one after another, on its own stack and
+// with its own working buffers. The calls of several streams, of any models,
+// run at the same time: whichever stream can continue runs while the others
+// wait for the GPU or the SSD. Posting a call returns at once, and myds4_run
+// advances the streams. A state takes part in one call at a time; other
+// states may be used between the calls of a stream. Pointers given to a call
+// stay valid until it finishes.
+typedef struct myds4_stream myds4_stream;
+myds4_stream *myds4_stream_new(myds4_model *m);
+void myds4_stream_free(myds4_stream *x);  // no call posted
+// As myds4_prefill, myds4_rows; results below.
+void myds4_stream_prefill(myds4_stream *x, myds4_state *s, const int32_t *tokens, int n, int from, int replay, int capture,
+                          const myds4_media *images);
+void myds4_stream_rows(myds4_stream *x, myds4_state **states, const int32_t *tokens, const int32_t *pos, int count);
+// A token and drafts decoded together: rows[0] is the token at pos of s;
+// with proposed 0 the model's drafts fill rows[1..drafts], otherwise they are
+// already there. The verified rows are then sampled and the kept ones accepted.
+void myds4_stream_verify(myds4_stream *x, myds4_state *s, int32_t *rows, int drafts, int proposed, int pos, myds4_sampler *sampler);
+// Advances the streams until a call finishes or `seconds` have passed; returns
+// that stream's index, or -1. Only this function runs them.
+int myds4_run(myds4_stream *const *streams, int n, double seconds);
+// A finished call's results. The logits stay valid until the stream's next
+// call. Null logits: the call did not fit in memory.
+const float *myds4_stream_logits(const myds4_stream *x);
+myds4_snapshot *myds4_stream_captured(const myds4_stream *x);
+void myds4_stream_info(const myds4_stream *x, myds4_prefill_info *info);
+int32_t myds4_stream_next(const myds4_stream *x, int *accepted);  // a verify call: the next token, and the drafts kept
 
 // ---- sampling ----
 

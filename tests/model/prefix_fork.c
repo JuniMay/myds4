@@ -461,7 +461,7 @@ static void keep_source_rows(void) {
 
 static void snapshot_source(int pos, int with_logits) {
   if (nsaved == MAXSAVED) die("too many snapshots");
-  saved[nsaved].pos = pos, saved[nsaved++].snap = deepseek_snapshot(source, pos, with_logits);
+  saved[nsaved].pos = pos, saved[nsaved++].snap = deepseek_snapshot(source, pos, with_logits ? (const float *)logits.ptr : NULL);
 }
 
 // The conversation: the prompt, a decoded reply, a tool-like result, a second

@@ -133,6 +133,7 @@ void gpu_copies(const GpuCopy *copies, int count);
 void gpu_go(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t tx, uint32_t ty, uint32_t tz);
 uint64_t gpu_signal(void);  // ends the encoder, signals the returned value
 void gpu_keep_clock(double seconds);  // keeps the GPU's clock up for about that long
+extern int gpu_other_passes;  // passes with work besides the one running: their work keeps the clock up
 void gpu_commit(void);
 void gpu_wait_signal(uint64_t v);
 uint64_t gpu_signal_value(void);  // latest completed signal, without waiting

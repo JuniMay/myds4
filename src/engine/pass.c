@@ -124,6 +124,7 @@ int pass_resume(Pass *p) {
     memcpy(p->variables[i].address, p->outer + at, p->variables[i].bytes);
     at += p->variables[i].bytes;
   }
+  if (p->resumed) p->resumed();  // what depends on the variables now holds the resumer's values
   return p->ended;
 }
 

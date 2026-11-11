@@ -46,7 +46,7 @@ of each architecture per process.
 | --- | --- |
 | `id` | Name clients send in `model`. Defaults to `deepseek-v4.1-flash` or the Qwen directory name in lower case. |
 | `ctx` | Maximum context positions. The server defaults to the model's limit: 1,048,576 for DeepSeek Flash and 262,144 for the supported Qwen checkpoint. |
-| `batch` | Maximum admitted requests for this model; default 4, capped at 6 for DeepSeek and 8 for Qwen. |
+| `batch` | Maximum admitted requests for this model; default 4. Requests beyond the rows a decoding call takes (6 for DeepSeek, 8 for Qwen3.8-27B, Flash-Next and Nemotron) run in further decoding calls at the same time. |
 | `temperature`, `top_p`, `top_k`, `seed` | Defaults for requests that omit them or send null. Request values override them. `top_k: 0` uses the full vocabulary. |
 | `think` | Default reasoning effort, 0 for off and 1–100 for enabled reasoning. |
 | `draft` | Speculative proposals: DeepSeek DSpark 0–5; Qwen3.8-27B chained MTP 0–5; Nemotron DFlash2 0–15. Flash-Next requires 0. |
@@ -425,7 +425,10 @@ experts, for DeepSeek, Flash-Next and Transcribe alike: each expert of its
 last sampled tokens in the color of where it was when last chosen (in
 memory, read ahead, late, substituted or from the SSD), and at the right
 each layer's experts of those tokens by where each one was. A cell holds
-two experts where the terminal is wide enough, otherwise four or more.
+two experts where the terminal is wide enough, otherwise four or more. Its
+routes come from the model's latest decoding call: while more than one such
+call of a model runs (more requests than one call takes), the tab shows no
+new routes for that model.
 
 The Memory tab draws the Mac's installed memory as a treemap: each
 rectangle's area follows its bytes, and a character cell counts as twice

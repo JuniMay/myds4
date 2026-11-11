@@ -30,6 +30,7 @@
 #include <mach/mach.h>
 #include <math.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <sys/sysctl.h>
@@ -250,6 +251,7 @@ typedef struct {
   int16_t layer, expert;
   int prev, next;  // links in the recency list, head = most recent
   int prefetched;  // loaded on a prediction, not yet requested
+  const Pass *issuer;  // the pass that predicted it: only that pass cancels or demotes it
   int pinned;      // a DSpark pool buffer, exempt from backbone eviction/unmapping
   int fresh;       // joined the residency set this token: needs gpu_use until it is committed
   int mapped;      // in the residency set (or joining it: fresh)
@@ -695,7 +697,11 @@ void cache_memory(ExpertStore *st, MemorySlot *backbone) { st->cache_backbone = 
 void cache_active(ExpertStore *st, int active) { st->cache_busy = !!active; }
 void cache_working_rows(ExpertStore *st, int rows) {
   int experts = rows * st->chosen < st->experts ? rows * st->chosen : st->experts;
-  st->minimum_slots = 2 * experts;
+  int slots = 2 * experts;
+  // Passes that run together each need their slots: while others run, the
+  // minimum only rises, and a pass that needs fewer does not take it away.
+  if (__atomic_load_n(&gpu_other_passes, __ATOMIC_RELAXED) > 0 && slots < st->minimum_slots) slots = st->minimum_slots;
+  st->minimum_slots = slots;
   // The model reserves these slots' memory before such a pass (cache_required),
   // so limits that cache_init or a resize set for fewer rows rise to them.
   if (st->max_slots) {
@@ -903,7 +909,11 @@ static void *reader(void *arg) {
   ExpertStore *st = arg;
   for (;;) {
     pthread_mutex_lock(&st->qlock);
-    while (st->qhead == st->qtail || st->demand) pthread_cond_wait(&st->qcond, &st->qlock);
+    // Demand reads go first, as long as they are this pass's own: while other
+    // passes run, read-aheads go on beside another pass's demand reads, which
+    // would otherwise hold them back almost all the time.
+    while (st->qhead == st->qtail || (st->demand && __atomic_load_n(&gpu_other_passes, __ATOMIC_RELAXED) <= 0))
+      pthread_cond_wait(&st->qcond, &st->qlock);
     if (st->qtail - st->qhead == QUEUE) pthread_cond_broadcast(&st->qcond);  // room for start()
     uint32_t q = st->queue[st->qhead++ % QUEUE];
     // Cancellation examines taken under this lock. Announce ownership
@@ -1089,6 +1099,30 @@ static void map_slot(ExpertStore *st, int i) {
   st->slots[i].mapped_once = 1;
 }
 
+// A pass that needs a slot while every slot is held waits for the GPU work of
+// other passes to release one; after this long it gives up (a program error).
+enum { TAKE_RESIDENT = -2 };
+typedef struct {
+  ExpertStore *st;
+  double deadline;
+} SlotWait;
+
+static int slot_unheld(ExpertStore *st) {
+  for (int j = 0; j < st->max_slots; j++)
+    if (st->score[j] < INFINITY && !slot_held(st, &st->slots[j])) return j;
+  return -1;
+}
+static int slot_released(void *context) {
+  SlotWait *w = context;
+  return slot_unheld(w->st) >= 0 || now() > w->deadline;
+}
+static void slot_released_block(void *context) {
+  while (!slot_released(context)) sched_yield();
+}
+
+// A slot for expert e of the layer, or -1 for an optional request when none
+// is free, or TAKE_RESIDENT when, during the wait above, another pass made the
+// expert resident.
 static int take(ExpertStore *st, int layer, int e, int optional) {
   int i = -1;
   int reuse = st->nslots >= st->cap || !st->nfree;
@@ -1104,8 +1138,13 @@ static int take(ExpertStore *st, int layer, int e, int optional) {
       if (optional) return -1;
       // The preferences leave only slots that another pass may read soon: a
       // demand may take any slot that nothing holds.
-      for (int j = 0; i < 0 && j < st->max_slots; j++)
-        if (st->score[j] < INFINITY && !slot_held(st, &st->slots[j])) i = j;
+      i = slot_unheld(st);
+      if (i < 0 && pass_current()) {
+        SlotWait wait = {st, now() + 60};
+        pass_wait(&(PassWait){slot_released, slot_released_block, &wait});
+        if (WHERE(layer, e) >= 0) return TAKE_RESIDENT;
+        i = slot_unheld(st);
+      }
       if (i < 0) die("the expert cache (%d slots) cannot hold the experts of two layers", st->nslots);
     }
     // Routing can demote a prefetch while its read is still running. Do not
@@ -1267,8 +1306,13 @@ int cache_request(ExpertStore *st, int layer, const int *experts, int n) {
   for (int k = 0; k < n; k++)  // the resident ones first, so that the others' slots are not theirs
     if (WHERE(layer, experts[k]) >= 0) st->slots[WHERE(layer, experts[k])].used = st->token;
   for (int k = 0; k < n; k++) {
-    int e = experts[k], i = WHERE(layer, e), pending;
-    if (i >= 0) {
+    int e = experts[k], i = WHERE(layer, e), pending, fresh = 0;
+    if (i < 0) {
+      i = take(st, layer, e, 0);
+      if (i == TAKE_RESIDENT) i = WHERE(layer, e);  // another pass read it while this one waited for a slot
+      else fresh = 1;
+    }
+    if (!fresh) {
       if (!st->slots[i].pinned) unlink_slot(st, i), push_front(st, i);
       pending = slot_reading(st, i);
       // A forecast can outlive its predicted pass and lose its protection.
@@ -1281,7 +1325,6 @@ int cache_request(ExpertStore *st, int layer, const int *experts, int n) {
         st->stats.hits++;
       }
     } else {
-      i = take(st, layer, e, 0);
       st->stats.misses++;
       start(st, i, 1);
       pending = slot_reading(st, i);
@@ -1419,12 +1462,16 @@ void cache_load(ExpertStore *st, int layer, const int *experts, int n) {
 // that are not resident, while fewer than `inflight` prefetches are reading.
 void cache_prefetch(ExpertStore *st, int layer, const int *experts, int n, int inflight) {
   if (layer >= st->scored_layers && st->draft_capacity < st->stage_experts) return;  // bounded draft pools are demand-only
-  for (int k = 0; k < n && st->prefetching < inflight; k++) {
+  // The limit is per pass: passes running together each read ahead as many.
+  int others = __atomic_load_n(&gpu_other_passes, __ATOMIC_RELAXED);
+  int limit = inflight * (1 + (others > 0 ? others : 0));
+  for (int k = 0; k < n && st->prefetching < limit; k++) {
     int e = experts[k];
     if (WHERE(layer, e) >= 0) continue;
     int i = take(st, layer, e, 1);
     if (i < 0) return;
     st->slots[i].prefetched = 1;
+    st->slots[i].issuer = pass_current();
     st->slots[i].used = st->token;
     if (st->cache_backbone) memory_touch(&st->slots[i].memory);
     start(st, i, 0);
@@ -1451,6 +1498,7 @@ static int discard_unstarted(ExpertStore *st, int layer, const int *keep, int n)
   for (int e = 0; e < st->experts; e++) {
     int i = WHERE(layer, e);
     if (i < 0 || !st->slots[i].prefetched || !st->slots[i].loading || !st->slots[i].npiece) continue;
+    if (st->slots[i].issuer != pass_current()) continue;  // another pass's prediction, for its own layer
     int k = 0;
     while (k < n && keep[k] != e) k++;
     if (k < n) continue;
@@ -1507,7 +1555,7 @@ static int discard_unstarted(ExpertStore *st, int layer, const int *keep, int n)
 void cache_demote(ExpertStore *st, int layer) {
   for (int e = 0; e < st->experts; e++) {
     int i = WHERE(layer, e);
-    if (i >= 0) st->slots[i].prefetched = 0;
+    if (i >= 0 && st->slots[i].issuer == pass_current()) st->slots[i].prefetched = 0;
   }
 }
 

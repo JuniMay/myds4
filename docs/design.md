@@ -233,10 +233,35 @@ active request. Idle models load on demand. Control requests and status
 queries continue on the HTTP threads throughout the transition.
 
 The worker gives each model a turn. It admits requests up to that model's
-batch limit, advances prefill, then advances decoding. Qwen prefill uses
-bounded chunks. DeepSeek plans the remaining prompt in one call and adapts its internal
-chunk size to the model-memory budget. Such a call can still delay another
-model's turn. Qwen also adapts its prefill rows and workspace to the budget.
+batch limit, starts one prefill call and the decoding calls that have room,
+and then advances all running calls together: the calls run on streams
+(`myds4_stream`, built on passes), so that whichever stream can continue runs
+while the others wait for the GPU or the SSD, for any mix of models.
+
+A request plans which KV state its prefill resumes from when the prefills
+before it have ended, so that it can resume from their states; until then it
+waits among the model's admitted requests. Decoding requests run in calls of
+at most the model's rows per call (6 for DeepSeek, 8 for Qwen3.8-27B,
+Flash-Next and Nemotron), because rows of one call share the GPU's work per
+layer. At most as many calls run at once as the decoding requests fill, and a
+call takes the requests that are free, the longest waiting first, so groups of
+requests advance independently: each call's waits are filled with the other
+calls' GPU work. A request that has just finished its prefill waits for the
+prefills still to come when they are short (at most 4,096 tokens in all) and
+for at most 20 seconds, so that its first decoding calls start full and do
+not take SSD reads and cache room from the prefills; a request that has
+decoded before never waits for a prefill. A DeepSeek model with the `runahead`
+or `pipeline` option runs one call at a time: those decoders keep their jobs
+in model-wide state.
+
+Qwen prefill uses bounded chunks. DeepSeek plans the remaining prompt in one
+call and adapts its internal chunk size to the model-memory budget. Qwen also
+adapts its prefill rows and workspace to the budget.
+
+Work that does not run on a stream stops every stream for its duration:
+loading a model, encoding images and audio, and the worker's state operations
+(snapshots, copies and SSD saves, which also wait for the GPU work queued by
+streams).
 
 A request owns a state while it runs. The shared KV pool keeps completed
 states and snapshots for prefix reuse. It compares token histories at any
@@ -272,11 +297,16 @@ kept in the sequence and its snapshots.
 
 A pass is a piece of the engine's work that runs on its own stack and gives
 the processor back where it would wait, so that one thread can advance
-several passes (`src/engine/pass.c`). The worker and the command line do not
-create passes yet: each engine call still runs to completion on the engine
-thread. DeepSeek, Qwen3.8-27B, Flash-Next and Nemotron can each run as
-passes (`ModelOps`: `pass_new`, `pass_begin`, `pass_end`), and
-`build/tests/passes` runs two passes of a model interleaved.
+several passes (`src/engine/pass.c`). DeepSeek, Qwen3.8-27B, Flash-Next and
+Nemotron can each run as passes (`ModelOps`: `pass_new`, `pass_begin`,
+`pass_end`, `pass_release`). The worker runs its calls on streams
+(`myds4_stream`): a stream is a pass that takes one engine call after another.
+`myds4_run` advances the streams round-robin on the engine thread. It polls
+what each waits for instead of blocking; after a moment without progress it
+sleeps briefly between its looks, because a spinning core takes power that the
+GPU would otherwise use. The command line runs its calls
+directly, without passes, and `build/tests/passes` runs two passes of a model
+interleaved.
 
 A switch saves the callee-saved registers and the stack pointer, in a few
 lines of AArch64 assembly. A yield and a resume together take about 30 ns.
@@ -327,12 +357,18 @@ for a new expert and the memory pool's eviction all skip held slots. An
 expert that a pass needs may take any slot that is not held when the store's
 preferences leave none; a read-ahead is dropped instead. Requests take their
 holds one expert at a time, so a large request cannot evict an expert that
-it requested a moment earlier.
+it requested a moment earlier. A pass that needs a slot while every slot is
+held waits until the GPU work of another pass releases one.
 
-Still shared between passes: the store's `minimum_slots`, and `gpu_sync`'s
-wait, which waits for the last command buffer of any pass. A pass's request
-for a new expert ends the process if every slot is held. The scheduler that
-runs passes of different requests must change these before it goes live.
+Passes running together share the expert store without working against each
+other: a read-ahead belongs to the pass that issued it, and only that pass
+cancels or demotes it; each pass has its own limit of read-aheads in flight;
+the store's minimum number of slots only rises while several passes run; and
+background readers go on beside another pass's demand reads, which would
+otherwise hold them back almost all the time. A pass waits for its own last
+command buffer (`gpu_sync`). The GPU's clock-keeping spin (`gpu_keep_clock`)
+runs only when no other pass has a call in progress, because the spin's
+command buffer would hold back that pass's work.
 
 ### Saved states
 

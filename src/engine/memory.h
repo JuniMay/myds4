@@ -74,6 +74,7 @@ void memory_collect_with(void (*collect)(void));
 // The engine thread supplies the current operation's allocation owner.
 MemorySlot *memory_scope(MemorySlot *slot);
 MemorySlot *memory_current(void);
+MemorySlot **memory_scope_variable(void);  // the current scope, which a pass (pass.h) keeps as its own
 MemorySlot *memory_shared(void);
 uint64_t memory_room(const MemoryAccount *account);
 uint64_t memory_reclaim(uint64_t bytes); // release idle entries, respecting active allocations and dependencies

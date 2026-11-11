@@ -55,7 +55,6 @@ static struct {
   Buf resident_table, resident_counts;
   ModelCounters counters;
   ModelPlan plan;
-  const float *last_logits;
   SpeechEncoder *speech;
   DFlash *draft;
   const Media *media;
@@ -459,7 +458,7 @@ static ModelSnapshot *snapshot_alloc(const int32_t *meta, int nmeta, int with_lo
   if (with_logits) x->logits = memory_host_required((size_t)nm.vocab * 4, 1);
   return (ModelSnapshot *)x;
 }
-static ModelSnapshot *snapshot_take(ModelState *state, int position, int logits) {
+static ModelSnapshot *snapshot_take(ModelState *state, int position, const float *logits) {
   State *s = (State *)state;
   Snapshot *x = xmalloc(sizeof *x);
   gpu_sync();
@@ -470,7 +469,7 @@ static ModelSnapshot *snapshot_take(ModelState *state, int position, int logits)
   x->pos = position;
   if (logits) {
     x->logits = memory_host_required((size_t)nm.vocab * 4, 1);
-    memcpy(x->logits, nm.last_logits, (size_t)nm.vocab * 4);
+    memcpy(x->logits, logits, (size_t)nm.vocab * 4);
   }
   return (ModelSnapshot *)x;
 }
@@ -822,7 +821,7 @@ static const float *pass(const Row *rows, int count, int logits, int prompt) {
     add_stats(&nm.counters.decode, before, *stats);
   }
   nm.counters.prefill_layer = 0;
-  return nm.last_logits = (const float *)work->logits.ptr;
+  return (const float *)work->logits.ptr;
 }
 static const float *prefill(ModelState *state, const int *tokens, int n, int from, int replay, int capture,
                             ModelSnapshot **captured, float *every) {
@@ -856,7 +855,7 @@ static const float *prefill(ModelState *state, const int *tokens, int n, int fro
     if (shutdown_requested())
       return NULL;
   }
-  return nm.last_logits = logits;
+  return logits;
 }
 static const float *forward_rows(ModelState *const *states, const int *tokens, const int *positions, int count) {
   Row rows[NM_BATCH];
@@ -1004,10 +1003,9 @@ static void accept(ModelState *state, const int *tokens, int count, int position
     memcpy(s->conv.ptr, s->saved_conv[count - 1].ptr, convolution_bytes());
   }
   s->pos = position + count;
-  nm.last_logits = (const float *)work->logits.ptr + (size_t)(count - 1) * nm.vocab;
 }
 #define V(x) {&x, sizeof x}
-static const PassVariable pass_own[] = {V(work), V(nm.prompt_pass), V(nm.last_logits), V(nm.media), V(nm.media_count)};
+static const PassVariable pass_own[] = {V(work), V(nm.prompt_pass), V(nm.media), V(nm.media_count)};
 #undef V
 
 static Pass *nemotron_pass_new(void (*body)(void *), void *argument) {

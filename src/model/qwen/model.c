@@ -881,7 +881,6 @@ const float *qwen_prefill(const QwenRow *rows, int n, int logits) { return pass(
 static Options qopt;
 static double *proposal_probabilities;
 static size_t proposal_capacity;
-static const float *last_logits;  // what the last call returned, for a snapshot's logits
 static double last_pass;          // when the last pass ran (now())
 enum { RELEASE_AFTER = 60 };      // seconds without passes before the buffers leave the residency set
 static ModelCounters counted;     // decoding and prompt passes' rows and times
@@ -948,14 +947,13 @@ typedef struct {
   float *logits;  // or null
 } Taken;
 
-static ModelSnapshot *q_snapshot_take(ModelState *s, int pos, int with_logits) {
+static ModelSnapshot *q_snapshot_take(ModelState *s, int pos, const float *logits) {
   QwenState *q = (QwenState *)s;
   if (pos != q->pos) die("qwen3_5: a snapshot at %d of a state at %d", pos, q->pos);
   Taken *t = xmalloc(sizeof *t);
   *t = (Taken){qwen_snap_take(q), 0};
-  if (with_logits) {
-    if (!last_logits) die("qwen3_5: a snapshot's logits before any pass");
-    t->logits = memory_host_required((size_t)c.vocab * 4, 1), memcpy(t->logits, last_logits, (size_t)c.vocab * 4);
+  if (logits) {
+    t->logits = memory_host_required((size_t)c.vocab * 4, 1), memcpy(t->logits, logits, (size_t)c.vocab * 4);
   }
   return (ModelSnapshot *)t;
 }
@@ -1022,7 +1020,7 @@ static const float *q_prefill(ModelState *st, const int *tokens, int n, int from
     if (at == capture) *captured = q_snapshot_take(st, at, 0);
   }
   last_pass = now();
-  return last_logits = lg;
+  return lg;
 }
 
 static const float *q_rows(ModelState *const *states, const int *tokens, const int *pos, int m) {
@@ -1036,7 +1034,7 @@ static const float *q_rows(ModelState *const *states, const int *tokens, const i
     rows[r] = (QwenRow){s, tokens[r], 0};
   }
   double t0 = last_pass = now(), g0 = gpu_busy;
-  return last_logits = decoded(qwen_forward(rows, m, m), m, t0, g0);
+  return decoded(qwen_forward(rows, m, m), m, t0, g0);
 }
 
 static const double *q_draft(ModelState *st, int token, int pos, int *drafts, int n, Sampler *sampler) {
@@ -1070,7 +1068,7 @@ static const float *q_verify(ModelState *st, const int *tokens, int m, int pos) 
     rows[i] = (QwenRow){s, tokens[i], save};
   }
   double t0 = last_pass = now(), g0 = gpu_busy;
-  return last_logits = decoded(qwen_forward(rows, m, m), m, t0, g0);
+  return decoded(qwen_forward(rows, m, m), m, t0, g0);
 }
 
 static void q_accept(ModelState *st, const int *tokens, int n, int pos) {
@@ -1087,7 +1085,6 @@ static void q_accept(ModelState *st, const int *tokens, int n, int pos) {
     qwen_mtp(rows, n - 1, 0);
   }
   s->mtp_next = s->pos > 0 ? s->pos - 1 : 0;
-  last_logits = (const float *)work->LOGITS.ptr + (size_t)(n - 1) * c.vocab;
 }
 
 static void q_seek(ModelState *s, const int *tokens, int pos) {}
@@ -1121,7 +1118,7 @@ static void q_chat(char *text, size_t cap, const char *prompt, int images, int t
 
 #define V(x) {&x, sizeof x}
 static const PassVariable pass_own[] = {V(work), V(seq), V(seqbuf), V(nrows), V(prompt_pass), V(images),
-                                        V(image_count), V(last_logits), V(proposal_probabilities)};
+                                        V(image_count), V(proposal_probabilities)};
 #undef V
 
 static Pass *q_pass_new(void (*body)(void *), void *argument) {

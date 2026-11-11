@@ -203,6 +203,24 @@ int main(void) {
          fixture[6].expert == -1 && !slot_reading(st, 6));
   expect("completed forecast remains available", WHERE(LAYER, 3) == 5 && !slot_reading(st, 5));
   teardown();
+
+  // Passes running together: one pass's newer prediction and demotion concern
+  // its own read-aheads, whatever it knows of the others'.
+  setup(fd, 0);
+  for (int i = 0; i < NSLOT; i++) if (i != 1 && i != 2) fixture[i].issuer = (const Pass *)&checks;
+  {
+    uint64_t cancelled = st->stats.cancelled;
+    cache_refine(st, LAYER, newer, 3);
+    expect("another pass's unstarted forecast is not cancelled", WHERE(LAYER, 4) == 6 && fixture[6].loading &&
+           fixture[6].prefetched && st->stats.cancelled == cancelled + 1);
+    expect("the pass's own excluded forecast is cancelled", WHERE(LAYER, 1) == -1 && fixture[1].expert == -1);
+    cache_demote(st, LAYER);
+    expect("another pass's forecast keeps its protection", fixture[6].prefetched);
+    expect("the pass's own forecast is demoted", !fixture[2].prefetched);
+    fixture[1].issuer = NULL;
+  }
+  teardown();
+
   dispatch_release(deferred);
   close(fd);
   printf("prefetch demotion: %d/%d CPU checks passed\n", checks - failures, checks);

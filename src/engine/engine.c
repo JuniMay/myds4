@@ -16,6 +16,7 @@
 
 #include "engine.h"
 #include "myds4.h"
+#include "pass.h"
 #include "state_file.h"
 #include "../model/model.h"
 #include "../model/draft.h"
@@ -187,9 +188,9 @@ void myds4_state_copy(myds4_model *m, myds4_state *dst, const myds4_state *src, 
   m->ops->state_copy(dst, src, positions);
 }
 
-myds4_snapshot *myds4_snapshot_take(myds4_model *m, myds4_state *s, int pos, int with_logits) {
+myds4_snapshot *myds4_snapshot_take(myds4_model *m, myds4_state *s, int pos, const float *logits) {
   memory_scope(&m->m->work);
-  return m->ops->snapshot_take(s, pos, with_logits);
+  return m->ops->snapshot_take(s, pos, logits);
 }
 void myds4_snapshot_restore(myds4_model *m, myds4_state *s, const myds4_snapshot *x) {
   memory_scope(&m->m->work);
@@ -268,6 +269,154 @@ const float *myds4_prefill(myds4_model *m, myds4_state *s, const int32_t *tokens
                                  .prefix_tokens = p.prefix_tokens};
   }
   return lg;
+}
+
+// ---- streams ----
+
+enum { STREAM_ROWS = 16 };
+typedef enum { STREAM_NONE, STREAM_PREFILL, STREAM_DECODE, STREAM_VERIFY, STREAM_QUIT } StreamCall;
+
+struct myds4_stream {
+  myds4_model *m;
+  Pass *pass;
+  StreamCall call;  // the call posted and not finished
+  int finished;     // it finished, and myds4_run has not reported that yet
+  // the call's arguments
+  myds4_state *states[STREAM_ROWS];
+  int32_t row_tokens[STREAM_ROWS], row_pos[STREAM_ROWS];
+  const int32_t *tokens;  // a prefill's prompt; a verify's rows (the token, then the drafts)
+  int n, from, replay, capture, count, drafts, proposed, pos;
+  const myds4_media *images;
+  myds4_sampler *sampler;
+  // its results
+  const float *logits;
+  myds4_snapshot *captured;
+  myds4_prefill_info info;
+  int32_t next;
+  int accepted;
+};
+
+static int stream_has_call(void *context) { return ((myds4_stream *)context)->call != STREAM_NONE; }
+
+static void stream_run(myds4_stream *x) {
+  myds4_model *m = x->m;
+  x->logits = NULL;
+  switch (x->call) {
+    case STREAM_PREFILL:
+      x->logits = myds4_prefill(m, x->states[0], x->tokens, x->n, x->from, x->replay, x->capture, &x->captured, &x->info, x->images);
+      break;
+    case STREAM_DECODE:
+      x->logits = myds4_rows(m, x->states, x->row_tokens, x->row_pos, x->count);
+      break;
+    case STREAM_VERIFY: {
+      int32_t *rows = (int32_t *)x->tokens;
+      const double *q = x->proposed ? NULL : myds4_draft(m, x->states[0], rows[0], x->pos, rows + 1, x->drafts, x->sampler);
+      x->logits = myds4_verify(m, x->states[0], rows, x->drafts + 1, x->pos);
+      if (x->logits) {
+        x->next = myds4_sample_verify(m, x->logits, rows + 1, x->drafts, q, x->sampler, &x->accepted);
+        myds4_accept(m, x->states[0], rows, x->accepted + 1, x->pos);
+      }
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+// The stream's pass: a call after another, with its own buffers; between
+// calls no state stays bound to it.
+static void stream_body(void *argument) {
+  myds4_stream *x = argument;
+  x->m->ops->pass_begin();
+  for (;;) {
+    pass_wait(&(PassWait){stream_has_call, NULL, x});
+    if (x->call == STREAM_QUIT) break;
+    stream_run(x);
+    if (x->m->ops->pass_release) x->m->ops->pass_release();
+    x->call = STREAM_NONE;
+    x->finished = 1;
+  }
+  x->m->ops->pass_end();
+}
+
+myds4_stream *myds4_stream_new(myds4_model *m) {
+  myds4_stream *x = xmalloc(sizeof *x);
+  x->m = m;
+  memory_scope(&m->m->work);  // the scope the pass keeps as its own
+  x->pass = m->ops->pass_new(stream_body, x);
+  return x;
+}
+
+void myds4_stream_free(myds4_stream *x) {
+  if (!x) return;
+  x->call = STREAM_QUIT;
+  pass_run(x->pass);
+  pass_free(x->pass);
+  free(x);
+}
+
+void myds4_stream_prefill(myds4_stream *x, myds4_state *s, const int32_t *tokens, int n, int from, int replay, int capture,
+                          const myds4_media *images) {
+  x->states[0] = s, x->tokens = tokens, x->n = n, x->from = from, x->replay = replay, x->capture = capture, x->images = images;
+  x->captured = NULL;
+  x->call = STREAM_PREFILL;
+}
+
+void myds4_stream_rows(myds4_stream *x, myds4_state **states, const int32_t *tokens, const int32_t *pos, int count) {
+  if (count < 1 || count > STREAM_ROWS) die("a stream's decoding call takes 1 to %d rows", STREAM_ROWS);
+  memcpy(x->states, states, (size_t)count * sizeof *states);
+  memcpy(x->row_tokens, tokens, (size_t)count * sizeof *tokens);
+  memcpy(x->row_pos, pos, (size_t)count * sizeof *pos);
+  x->count = count;
+  x->call = STREAM_DECODE;
+}
+
+void myds4_stream_verify(myds4_stream *x, myds4_state *s, int32_t *rows, int drafts, int proposed, int pos, myds4_sampler *sampler) {
+  x->states[0] = s, x->tokens = rows, x->drafts = drafts, x->proposed = proposed, x->pos = pos, x->sampler = sampler;
+  x->accepted = 0;
+  x->call = STREAM_VERIFY;
+}
+
+// The streams' calls advance on this thread: each stream that can go on runs
+// until it would wait, and a thread that finds none ready looks again at once
+// (a GPU wait is mostly shorter than the time a blocking wait takes to wake up)
+// and after a moment sleeps briefly between its looks.
+enum { RUN_SLEEP_US = 50 };
+#define RUN_SPIN_SECONDS 1e-4
+int myds4_run(myds4_stream *const *streams, int n, double seconds) {
+  static unsigned first;
+  double started = now(), deadline = started + seconds, idle_since = started;
+  int posted = 0;
+  for (int k = 0; k < n; k++) posted += streams[k]->call != STREAM_NONE;
+  __atomic_store_n(&gpu_other_passes, posted - 1, __ATOMIC_RELAXED);
+  for (;;) {
+    int ran = 0;
+    for (int k = 0; k < n; k++) {
+      int i = (int)(((unsigned)first + (unsigned)k) % (unsigned)n);
+      myds4_stream *x = streams[i];
+      if (pass_ready(x->pass)) pass_resume(x->pass), ran = 1;
+      if (x->finished) {
+        x->finished = 0;
+        first = (unsigned)i + 1;
+        return i;
+      }
+    }
+    double t = now();
+    if (t >= deadline) return -1;
+    if (ran) idle_since = t;
+    // A short wait is polled, a longer one sleeps between looks: a spinning
+    // core takes power and memory bandwidth that the GPU would otherwise use.
+    else if (t - idle_since < RUN_SPIN_SECONDS) __asm__ __volatile__("yield");
+    else usleep(RUN_SLEEP_US);
+  }
+}
+
+const float *myds4_stream_logits(const myds4_stream *x) { return x->logits; }
+myds4_snapshot *myds4_stream_captured(const myds4_stream *x) { return x->captured; }
+void myds4_stream_info(const myds4_stream *x, myds4_prefill_info *info) { *info = x->info; }
+int32_t myds4_stream_next(const myds4_stream *x, int *accepted) {
+  if (accepted) *accepted = x->accepted;
+  return x->next;
 }
 
 int myds4_replay_rows(const myds4_model *m, int k) { return m->ops->replay_rows(k); }

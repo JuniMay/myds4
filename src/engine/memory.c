@@ -362,6 +362,7 @@ uint64_t memory_room(const MemoryAccount *account) {
 }
 MemorySlot *memory_scope(MemorySlot *slot) { MemorySlot *before = current; current = slot; return before; }
 MemorySlot *memory_current(void) { return current; }
+MemorySlot **memory_scope_variable(void) { return &current; }
 MemorySlot *memory_shared(void) {
   static MemoryAccount shared;
   static MemorySlot slot;

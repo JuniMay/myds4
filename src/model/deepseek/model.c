@@ -870,7 +870,7 @@ static void hc_pre_norm(int m, const Buf *h, size_t h_off, const Buf *mix, size_
 // ---- Engram ----
 
 double phase_s[7];  // decoding: rows read, routing waits, expert loads, prefetch, encoding, adapt, drafting
-static int32_t history[3];  // compressed ids of the previous three tokens
+static int32_t *history;  // the state in use's compressed ids of the previous three tokens
 
 // An image position (a negative token) takes part in no n-gram
 // (NgramHashState's DEAD): its own n-gram is all pad, which engram() leaves
@@ -1756,9 +1756,8 @@ static void step_rows(const int *tokens, int m, int pos) {
   double ts = now();
   int64_t rows[FEW][2][ENGRAM_ROWS];
   for (int i = 0; i < m; i++) {  // rows of several sequences hash with their own histories
-    if (nrows) memcpy(history, row_state[i]->history, sizeof history);
+    if (nrows) history = row_state[i]->history;
     engram_hash(tokens[i], nrows ? row_pos[i] : pos + i, rows[i]);
-    if (nrows) memcpy(row_state[i]->history, history, sizeof history);
   }
   // The Engram rows are read while the first layers run: the command buffers
   // of layers 1 and 14 run after the experts' of the layer before, which are
@@ -2058,7 +2057,7 @@ static int prefill(const int *tokens, int n, int pos0) {
   int64_t (*rows)[2][ENGRAM_ROWS] = memory_host_required((size_t)n * sizeof *rows, 0);
   for (int i = 0; i < n; i++) {
     engram_hash(tokens[i], pos0 + i, rows[i]);
-    if (prefix_capture.at == pos0 + i + 1) memcpy(prefix_capture.history, history, sizeof history);
+    if (prefix_capture.at == pos0 + i + 1) memcpy(prefix_capture.history, history, sizeof active->history);
   }
   Rows rr = {.rows = rows, .n = n, .read = {dispatch_group_create(), dispatch_group_create()}};
   rows_begin(&rr);
@@ -2601,7 +2600,7 @@ static int32_t verify_history[3];
 
 const float *deepseek_verify(const int *tokens, int m, int pos) {
   if (m < 1 || m > replay_margin() + 1 || m > FEW) die("invalid target verification row count");
-  memcpy(verify_history, history, sizeof history);
+  memcpy(verify_history, history, sizeof active->history);
   verifying = 1;
   step(tokens, m, pos);
   verifying = 0;
@@ -2610,7 +2609,7 @@ const float *deepseek_verify(const int *tokens, int m, int pos) {
 
 
 void deepseek_accept(const int *tokens, int n, int pos) {
-  memcpy(history, verify_history, sizeof history);
+  memcpy(history, verify_history, sizeof active->history);
   for (int i = 0; i < n; i++) history[2] = history[1], history[1] = history[0], history[0] = ngram.map[tokens[i]];
   if (opt.draft) {
     verifying = 1;
@@ -2634,7 +2633,7 @@ void deepseek_reset(void) {
       memset(L[l].cstate.ptr, 0, L[l].cstate.size);
     }
   }
-  memset(history, 0, sizeof history);
+  memset(history, 0, sizeof active->history);
 }
 
 // ---- kernel bandwidth on the model's own matrices ----
@@ -2875,7 +2874,7 @@ static size_t rows_bytes(int l, int cap, int keys) {  // a KV source's compresse
 // The rows later positions overwrite: every window ring, the compressor
 // rows and the Engram history.
 static size_t saved_bytes(void) {
-  size_t n = sizeof history;
+  size_t n = sizeof active->history;
   for (int l = 0; l < LAYERS; l++) n += state_rings[l] + state_compressors[l];
   for (int d = 0; opt.draft && d < DRAFTS; d++) n += state_drafts[d];
   return n;
@@ -2887,7 +2886,7 @@ static size_t saved_bytes(void) {
 // that deepseek_state_save made, if any.
 size_t deepseek_state_bytes(const State *s, int positions) {
   int cap = grown(s ? s->cap : start_cap(), positions);
-  size_t n = saved_bytes() - sizeof history + (s && s->saved ? saved_bytes() : 0);
+  size_t n = saved_bytes() - sizeof active->history + (s && s->saved ? saved_bytes() : 0);
   for (int l = 0; l < LAYERS; l++)
     if (L[l].kv_source) n += rows_bytes(l, cap, 0) + rows_bytes(l, cap, 1);
   return n;
@@ -2921,7 +2920,7 @@ static void shrink(void) {  // the state in use back to its first capacity
 
 static void base_state(void) {  // deepseek_load's buffers as the state in use
   remember_state_layout();
-  active = xmalloc(sizeof *active);
+  active = xmalloc(sizeof *active), history = active->history;
   for (int l = 0; l < LAYERS; l++) {
     active->ring[l] = L[l].ring;
     if (L[l].kv_source) active->comp[l] = L[l].comp, active->keys[l] = L[l].keys, active->cstate[l] = L[l].cstate;
@@ -2955,7 +2954,10 @@ void deepseek_state_free(State *s) {
   free(s);
 }
 
+static const State *bound;  // the state the layers' buffers are bound to
+
 static void bind(const State *s) {  // the layers' state buffers: s's, for the dispatches encoded next
+  bound = s;
   for (int l = 0; l < LAYERS; l++) {
     L[l].ring = s->ring[l];
     if (L[l].kv_source) L[l].comp = s->comp[l], L[l].keys = s->keys[l], L[l].cstate = s->cstate[l];
@@ -2965,9 +2967,8 @@ static void bind(const State *s) {  // the layers' state buffers: s's, for the d
 
 void deepseek_state_use(State *s) {
   gpu_sync();
-  memcpy(active->history, history, sizeof history);
   bind(s);
-  memcpy(history, s->history, sizeof history);
+  history = s->history;
   active = s;
 }
 
@@ -3100,9 +3101,8 @@ static const float *runahead_rows(State **states, const int *tokens, const int *
     RunJob *job = &run_jobs[r];
     run_bind(job, live);
     int64_t rows[1][2][ENGRAM_ROWS];
-    memcpy(history, job->state->history, sizeof history);
+    history = job->state->history;
     engram_hash(tokens[r], job->pos, rows[0]);
-    memcpy(job->state->history, history, sizeof history);
     // These small reads finish before switching EC/ES to another job.
     // Expert reads from preceding jobs remain in flight meanwhile.
     engram_read(0, rows, 1, (uint8_t *)EC[0].ptr, (uint8_t *)ES[0].ptr), engram_read(1, rows, 1, (uint8_t *)EC[1].ptr, (uint8_t *)ES[1].ptr);
@@ -3161,7 +3161,7 @@ static const float *runahead_rows(State **states, const int *tokens, const int *
   }
   gpu_sync();
   for (int k = 0; k < RUN_BUFFERS; k++) *live[k] = original[k];
-  bind(original_state), memcpy(history, original_state->history, sizeof history);
+  bind(original_state), history = original_state->history;
   cache_metrics_end(experts_store);
   stats_add(&decode_stats, &before);
   decode_rows += count, decode_gpu_s += gpu_busy - gpu_before, decode_s += now() - began;
@@ -3289,9 +3289,8 @@ static const float *pipeline_rows(State **states, const int *tokens, const int *
     if (tokens[r] < 0) die("pipeline needs decoded text tokens");
     pipe_bind(job, live);
     int64_t rows[1][2][ENGRAM_ROWS];
-    memcpy(history, job->state->history, sizeof history);
+    history = job->state->history;
     engram_hash(tokens[r], job->pos, rows[0]);
-    memcpy(job->state->history, history, sizeof history);
     engram_read(0, rows, 1, (uint8_t *)EC[0].ptr, (uint8_t *)ES[0].ptr), engram_read(1, rows, 1, (uint8_t *)EC[1].ptr, (uint8_t *)ES[1].ptr);
     embed_read(tokens + r, 1, 0, job->pos);
     pipe_front(job, live);
@@ -3410,7 +3409,7 @@ static const float *pipeline_rows(State **states, const int *tokens, const int *
   }
   gpu_sync();
   for (int k = 0; k < PIPE_BUFFERS; k++) *live[k] = original[k];
-  bind(original_state), memcpy(history, original_state->history, sizeof history);
+  bind(original_state), history = original_state->history;
   runahead_route_only = 0;
   cache_metrics_end(experts_store);
   stats_add(&decode_stats, &before);
@@ -3426,14 +3425,13 @@ const float *deepseek_forward_rows(State **st, const int *tokens, const int *pos
     if (pos[r] + 1 > st[r]->cap) resize(st[r], grown(st[r]->cap, pos[r] + 1), pos[r]);
     row_state[r] = st[r], row_pos[r] = pos[r];
   }
-  memcpy(active->history, history, sizeof history);
   if (pipeline_enabled && m > 1) return pipeline_rows(st, tokens, pos, m);
   if (runahead_enabled && m > 1) return runahead_rows(st, tokens, pos, m);
   nrows = m;
   step(tokens, m, pos[0]);
   nrows = 0;
   if (opt.draft) draft_rows(st, pos, m);
-  memcpy(history, active->history, sizeof history);
+  history = active->history;
   return (const float *)logits.ptr;
 }
 
@@ -3451,8 +3449,8 @@ static void save_rows(int restore) {
   }
   for (int d = 0; opt.draft && d < DRAFTS; d++) ROWS(D[d].ring);
 #undef ROWS
-  if (restore) memcpy(history, p, sizeof history);
-  else memcpy(p, history, sizeof history);
+  if (restore) memcpy(history, p, sizeof active->history);
+  else memcpy(p, history, sizeof active->history);
 }
 
 void deepseek_state_save(void) { save_rows(0); }
@@ -3469,17 +3467,17 @@ static void rolling(State *s, char *p, int restore) {
   }
   for (int d = 0; opt.draft && d < DRAFTS; d++) ROLL(s->dring[d]);
 #undef ROLL
-  int32_t *h = s == active ? history : s->history;
-  if (restore) memcpy(h, p, sizeof history);
-  else memcpy(p, h, sizeof history);
+  int32_t *h = s->history;
+  if (restore) memcpy(h, p, sizeof active->history);
+  else memcpy(p, h, sizeof active->history);
 }
 
-Snapshot *deepseek_snapshot(State *s, int pos, int with_logits) {
+Snapshot *deepseek_snapshot(State *s, int pos, const float *lg) {
   gpu_sync();
   Snapshot *x = xmalloc(sizeof *x);
   *x = (Snapshot){.pos = pos, .extent = LAYERS - 1, .rows = memory_host_required(saved_bytes(), 1)};
   rolling(s, x->rows, 0);
-  if (with_logits) x->logits = memory_host_required(VOCAB * 4, 1), memcpy(x->logits, logits.ptr, VOCAB * 4);
+  if (lg) x->logits = memory_host_required(VOCAB * 4, 1), memcpy(x->logits, lg, VOCAB * 4);
   return x;
 }
 
@@ -3547,7 +3545,7 @@ static int snapshot_parts(Snapshot *x, State *s, int pos, SnapshotPart *out, int
     if (L[l].kv_source) out[n++] = (SnapshotPart){s->cstate[l].ptr, s->cstate[l].size};
   }
   for (int d = 0; opt.draft && d < DRAFTS; d++) out[n++] = (SnapshotPart){s->dring[d].ptr, s->dring[d].size};
-  out[n++] = (SnapshotPart){s == active ? history : s->history, sizeof history};
+  out[n++] = (SnapshotPart){s->history, sizeof s->history};
   return n;
 }
 
@@ -3612,8 +3610,8 @@ static void ds_state_copy(ModelState *dst, const ModelState *src, int positions)
   park(dst);
   deepseek_state_copy((State *)dst, (const State *)src, positions);
 }
-static ModelSnapshot *ds_snapshot_take(ModelState *s, int pos, int with_logits) {
-  return (ModelSnapshot *)deepseek_snapshot((State *)s, pos, with_logits);
+static ModelSnapshot *ds_snapshot_take(ModelState *s, int pos, const float *lg) {
+  return (ModelSnapshot *)deepseek_snapshot((State *)s, pos, lg);
 }
 static void ds_snapshot_restore(ModelState *s, const ModelSnapshot *x) {
   deepseek_snapshot_restore((State *)s, (const Snapshot *)x);
@@ -3647,9 +3645,9 @@ static const float *ds_prefill(ModelState *s, const int *tokens, int n, int from
 }
 
 static const float *ds_rows(ModelState *const *states, const int *tokens, const int *pos, int m) {
+  use(states[0]);  // the layers are bound to a real state while the rows bind their own
   if (m > 1 && !prepare_rows(m, 0)) return NULL;
   if (m == 1) {  // one state's token: the decoding path with its read-aheads
-    use(states[0]);
     return deepseek_forward(tokens, 1, pos[0]);
   }
   return deepseek_forward_rows((State **)states, tokens, pos, m);
@@ -3767,7 +3765,7 @@ static const PassVariable pass_own[] = {
     V(ced_compact),   V(forward_info), V(bounded),             V(bounded_first),     V(bounded_keep), V(request_rows),
     V(pass_work_rows), V(active),     V(prefix_capture),       V(history),           V(row_state),  V(row_pos),
     V(nrows),         V(replay_first), V(replaying),           V(verify_history),    V(all_logits), V(nimgs),
-    V(imgs),          V(held),        V(prefill_n),            V(prefill_layer),     V(HS),         V(MF),
+    V(imgs),          V(held),        V(HS),                   V(MF),
     V(SEL),           V(CAND),        V(IMG),                  V(EC),                V(ES),         V(H1),
     V(XQ),            V(SHO),         V(RT),                   V(GL),                V(GP),         V(PR),
     V(PC),            V(ETAB),        V(PARTS),                V(logits),            V(EROW),       V(TILES),
@@ -3777,8 +3775,9 @@ static const PassVariable pass_own[] = {
 };
 #undef V
 
+// The layers' buffers follow the state of whichever pass runs.
 static void rebind(void) {
-  if (active) bind(active);
+  if (active && active != bound) bind(active);
 }
 
 Pass *deepseek_pass_new(void (*body)(void *), void *argument) {
@@ -3799,8 +3798,8 @@ static Buf *const pass_request_buffers[] = {&HS, &MF, &SEL, &CAND, &IMG, &EC[0],
 void deepseek_pass_begin(void) {
   gpu_pass_begin();
   cache_pass(experts_store, -1);
-  active = &parked;
-  memset(history, 0, sizeof history);
+  active = &parked, history = parked.history;
+  memset(history, 0, sizeof active->history);
   held.n = 0, nrows = 0, request_rows = 0, pass_work_rows = 0;
   for (size_t i = 0; i < sizeof pass_request_buffers / sizeof *pass_request_buffers; i++) *pass_request_buffers[i] = (Buf){0};
   for (size_t i = 0; i < sizeof pass_work_buffers / sizeof *pass_work_buffers; i++) *pass_work_buffers[i] = (Buf){0};
@@ -3810,6 +3809,12 @@ void deepseek_pass_begin(void) {
     *pass_fixed_buffers[i] = zeros(outer.size);
     memcpy(pass_fixed_buffers[i]->ptr, outer.ptr, outer.size);
   }
+}
+
+// Inside a pass, between two calls: no state stays bound to the pass, so that
+// the server may read, copy or restore the state the pass last used.
+static void deepseek_pass_release(void) {
+  if (active != &parked) deepseek_state_use(&parked);
 }
 
 // Inside the pass, after its work has been waited for: frees what it owned.
@@ -3840,4 +3845,5 @@ const ModelOps deepseek_ops = {
     .snapshot_alloc = ds_snapshot_alloc, .prefill = ds_prefill, .replay_rows = deepseek_replay_rows, .replay_start = deepseek_replay_start,
     .rows = ds_rows, .draft = ds_draft, .verify = ds_verify, .accept = ds_accept, .seek = ds_seek, .idle = ds_idle,
     .finish = ds_finish, .report = ds_report, .prepare_media = ds_prepare_image, .encode_media = deepseek_image, .media = deepseek_images, .chat = ds_chat,
-    .bench = deepseek_bench, .pass_new = deepseek_pass_new, .pass_begin = deepseek_pass_begin, .pass_end = deepseek_pass_end};
+    .bench = deepseek_bench, .pass_new = deepseek_pass_new, .pass_begin = deepseek_pass_begin, .pass_end = deepseek_pass_end,
+    .pass_release = deepseek_pass_release};

@@ -193,13 +193,21 @@ int main(void) {
     cache_working_rows(st, 1);
     st->cap = st->mcap = st->minimum_slots;  // as cache_init sets them for one row, with little memory free
     cache_working_rows(st, 4);
+    // A pass of one row beside this one leaves the slots this one needs.
+    gpu_other_passes = 1;
+    cache_working_rows(st, 1);
+    int kept = st->minimum_slots == 16;
+    gpu_other_passes = 0;
+    cache_working_rows(st, 1);
+    kept &= st->minimum_slots == 4;
+    cache_working_rows(st, 4);
     int layer[8] = {0, 1, 2, 3, 4, 5, 6, 7};
     cache_pass(st, 0);
     cache_hold(st, 0, layer, 8);
     cache_wait(st, 0, layer, 8);
     int held = st->nslots == 8;
     for (int e = 0; e < 8; e++) held &= WHERE(0, e) >= 0;
-    _exit(held ? 0 : 1);
+    _exit(held && kept ? 0 : 1);
   }
   int status = 0;
   CHECK(child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);

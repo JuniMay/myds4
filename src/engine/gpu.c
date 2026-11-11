@@ -24,8 +24,15 @@ static id dev, queue, event, cb, enc, last, pipes[512];
 // oldest first; each is retained until then, so that the autorelease pool
 // can be drained while they run.
 static id *done;
+static uint64_t *done_numbers;  // the number each was given when it was opened
 static int done_cap;
 static uint64_t ncommitted, naccounted;  // command buffers committed, and accounted for
+// Command buffers get a number when opened; those not committed yet. Buffers
+// can be committed in another order than they were opened (a pass's detached
+// buffer), so what a later free waits for is identified by these numbers.
+static uint64_t nopened;
+static struct { id buffer; uint64_t number; } *open_buffers;
+static int nopen, open_cap;
 enum { RESIDENT_SETS = 32 };
 static struct { id object; uint64_t bytes; } resident[RESIDENT_SETS];
 static uint32_t resident_count, resident_dirty;
@@ -57,6 +64,7 @@ long gpu_gaps;
 static int npipes;
 static const char *names[512];
 static uint64_t signaled;
+static uint64_t pass_last;  // the number of the running pass's last committed command buffer (in done[], 1 for the first)
 static void *pool;
 static SEL s_pipe, s_buf, s_bytes, s_use, s_dispatch;
 
@@ -74,6 +82,7 @@ static id library, clock_queue;
 static int spin_kernel = -1;
 static double spin_s;  // seconds per iteration
 static Buf spin_out;
+int gpu_other_passes;
 
 // The GPU lowers its clock within milliseconds of idling, and the work after
 // a wait runs up to 3 times slower. While decoding waits for expert reads,
@@ -92,6 +101,9 @@ static id spin(uint32_t iters) {
 }
 
 void gpu_keep_clock(double seconds) {
+  // While other passes run, their GPU work keeps the clock up: a spin would
+  // only hold it back (a command buffer starts when the running one ends).
+  if (gpu_other_passes > 0) return;
   if (spin_kernel < 0) {  // first use: the time per iteration
     spin_kernel = gpu_kernel("spin");
     spin_out = gpu_alloc(16);
@@ -400,10 +412,31 @@ uint64_t gpu_working_set(void) {
 // the thread that will commit it must not wait for the later buffer.
 static int reserved;
 
+static void opened(id c) {
+  if (nopen == open_cap) {
+    open_cap = open_cap ? 2 * open_cap : 16;
+    open_buffers = realloc(open_buffers, (size_t)open_cap * sizeof *open_buffers);
+    if (!open_buffers) die("out of memory");
+  }
+  open_buffers[nopen].buffer = c;
+  open_buffers[nopen++].number = ++nopened;
+}
+
+// Removes a command buffer from the open ones; returns its number.
+static uint64_t no_longer_open(id c) {
+  int at = 0;
+  while (at < nopen && open_buffers[at].buffer != c) at++;
+  if (at == nopen) die("a command buffer that is not open");
+  uint64_t number = open_buffers[at].number;
+  open_buffers[at] = open_buffers[--nopen];
+  return number;
+}
+
 void *gpu_open(void) {
   id c = MSG(id (*)(id, SEL), queue, S("commandBufferWithUnretainedReferences"));
   MSG(void (*)(id, SEL), c, S("enqueue"));
   reserved++;
+  opened(c);
   return c;
 }
 
@@ -443,6 +476,7 @@ void *gpu_open_detached(void) {
   id c = MSG(id (*)(id, SEL), queue, S("commandBufferWithUnretainedReferences"));
   MSG(id (*)(id, SEL), c, S("retain"));
   reserved++;
+  opened(c);
   return c;
 }
 
@@ -457,10 +491,13 @@ static void committed(id c) {
   if (ndone == done_cap) {
     done_cap = done_cap ? 2 * done_cap : 256;
     done = realloc(done, (size_t)done_cap * sizeof *done);
-    if (!done) die("out of memory");
+    done_numbers = realloc(done_numbers, (size_t)done_cap * sizeof *done_numbers);
+    if (!done || !done_numbers) die("out of memory");
   }
+  done_numbers[ndone] = no_longer_open(c);
   done[ndone++] = MSG(id (*)(id, SEL), c, S("retain"));
   ncommitted++;
+  pass_last = ncommitted;
   last = c;
   reserved--;
 }
@@ -551,6 +588,7 @@ void gpu_go(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t tx, uint32_t ty, uin
     MSG(void (*)(id, SEL), enc, S("endEncoding"));
     MSG(void (*)(id, SEL), cb, S("commit"));
     reserved--;
+    no_longer_open(cb);
     MSG(void (*)(id, SEL), cb, S("waitUntilCompleted"));
     prof_s[current] += MSG(double (*)(id, SEL), cb, S("GPUEndTime")) - MSG(double (*)(id, SEL), cb, S("GPUStartTime"));
     prof_n[current]++;
@@ -647,7 +685,7 @@ uint64_t gpu_signal_value(void) {
 // Each pass numbers its signals on its own event: its command buffers may be
 // committed after a buffer another pass encoded later, and one event's values
 // fire in queue order.
-static const PassVariable signal_variables[] = {{&event, sizeof event}, {&signaled, sizeof signaled}};
+static const PassVariable signal_variables[] = {{&event, sizeof event}, {&signaled, sizeof signaled}, {&pass_last, sizeof pass_last}};
 
 const PassVariable *gpu_pass_variables(int *count) {
   *count = (int)(sizeof signal_variables / sizeof *signal_variables);
@@ -657,16 +695,18 @@ const PassVariable *gpu_pass_variables(int *count) {
 Pass *pass_new_model(void (*body)(void *), void *argument, const PassVariable *variables, int count, void (*resumed)(void)) {
   int gpu_count;
   const PassVariable *gpu = gpu_pass_variables(&gpu_count);
-  PassVariable all[count + gpu_count];
+  PassVariable all[count + gpu_count + 1];
   memcpy(all, variables, (size_t)count * sizeof *all);
   memcpy(all + count, gpu, (size_t)gpu_count * sizeof *all);
+  all[count + gpu_count] = (PassVariable){memory_scope_variable(), sizeof(MemorySlot *)};  // what the pass allocates is its model's
   Pass *pass = pass_new(body, argument, 64u << 20);
-  pass_variables(pass, all, count + gpu_count);
+  pass_variables(pass, all, count + gpu_count + 1);
   pass_on_resume(pass, resumed);
   return pass;
 }
 
 void gpu_pass_begin(void) {
+  pass_last = 0;
   event = MSG(id (*)(id, SEL), dev, S("newSharedEvent"));
   signaled = 0;
 }
@@ -678,14 +718,26 @@ static int by_start(const void *a, const void *b) {
   return (x > y) - (x < y);
 }
 
-typedef struct { Buf b; uint64_t after; } Deferred;  // freed once `after` command buffers are accounted for
+typedef struct { Buf b; uint64_t after; } Deferred;  // freed once every command buffer up to number `after` is accounted for
 static Deferred *deferred;
 static int ndeferred, deferred_cap;
 
+// The smallest number among the command buffers that are open or not yet
+// accounted for; beyond all that were opened when there are none.
+static uint64_t lowest_open(void) {
+  uint64_t lowest = nopened + 1;
+  for (int i = 0; i < nopen; i++)
+    if (open_buffers[i].number < lowest) lowest = open_buffers[i].number;
+  for (int i = 0; i < ndone; i++)
+    if (done_numbers[i] < lowest) lowest = done_numbers[i];
+  return lowest;
+}
+
 static void free_deferred(void) {
+  uint64_t lowest = lowest_open();
   int kept = 0;
   for (int i = 0; i < ndeferred; i++) {
-    if (deferred[i].after > naccounted) deferred[kept++] = deferred[i];
+    if (deferred[i].after >= lowest) deferred[kept++] = deferred[i];
     else gpu_free(&deferred[i].b);
   }
   ndeferred = kept;
@@ -694,8 +746,8 @@ static void free_deferred(void) {
 // As gpu_free, for a buffer that work committed or still being encoded may
 // use: it stays allocated and charged until that work has finished.
 void gpu_free_later(Buf *b) {
-  uint64_t after = ncommitted + (uint64_t)reserved;
-  if (!b->obj || after <= naccounted) { gpu_free(b); return; }
+  uint64_t after = nopened;  // any command buffer opened by now may use it
+  if (!b->obj || lowest_open() > after) { gpu_free(b); return; }
   if (ndeferred == deferred_cap) {
     deferred_cap = deferred_cap ? 2 * deferred_cap : 64;
     deferred = realloc(deferred, (size_t)deferred_cap * sizeof *deferred);
@@ -734,6 +786,7 @@ static void account(int count) {
   free(iv);
   ndone -= count;
   memmove(done, done + count, (size_t)ndone * sizeof *done);
+  memmove(done_numbers, done_numbers + count, (size_t)ndone * sizeof *done_numbers);
   naccounted += (uint64_t)count;
   free_deferred();
 }
@@ -746,13 +799,25 @@ void gpu_reap(void) {
   account(n);
 }
 
-static int sync_ready(void *context) { return !last || MSG(long (*)(id, SEL), last, S("status")) >= 4; }
-static void sync_block(void *context) { gpu_sync(); }
+// A pass's last committed command buffer, while it is not accounted for: its
+// wait reaches every buffer the pass committed, and so all before them in the
+// queue. The number lives in the wait, because `pass_last` then holds the
+// values of whoever runs.
+static id unaccounted(uint64_t number) { return number > naccounted ? done[number - naccounted - 1] : nil; }
+static int sync_ready(void *context) {
+  id c = unaccounted((uint64_t)(uintptr_t)context);
+  return !c || MSG(long (*)(id, SEL), c, S("status")) >= 4;
+}
+static void sync_block(void *context) {
+  id c = unaccounted((uint64_t)(uintptr_t)context);
+  if (c) MSG(void (*)(id, SEL), c, S("waitUntilCompleted"));
+}
 
 // Waits for the last committed command buffer; with it, all opened before.
+// Inside a pass: the pass's own last one.
 void gpu_sync(void) {
   if (pass_current()) {
-    pass_wait(&(PassWait){sync_ready, sync_block, NULL});
+    pass_wait(&(PassWait){sync_ready, sync_block, (void *)(uintptr_t)pass_last});
     gpu_reap();
     return;
   }

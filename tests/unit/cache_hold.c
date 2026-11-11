@@ -2,6 +2,16 @@
 #include "../../src/model/deepseek/model.h"
 #include "../../src/engine/io.c"
 #include "cache_layout.h"
+#include <fcntl.h>
+#include <unistd.h>
+
+static int needed = 9, requested;
+
+static void request_needed(void *argument) {
+  (void)argument;
+  cache_request(st, 0, &needed, 1);
+  requested = 1;
+}
 
 int main(void) {
   st = deepseek_cache_create();
@@ -62,6 +72,29 @@ int main(void) {
   CHECK(WHERE(0, 0) == 0 && WHERE(0, 1) == 1 && WHERE(0, 2) < 0 && WHERE(0, 3) < 0);
   CHECK(st->held_references == 2);
   cache_unhold(st, 0, oldest, 2);
+
+  // A pass that needs a slot while every slot is held waits for a hold to go
+  // instead of ending the process; the slot it gets holds its expert.
+  int zero = open("/dev/zero", O_RDONLY);
+  CHECK(zero >= 0);
+  for (int i = 0; i < 4; i++) fixture[i].b.ptr = xmalloc(65536), fixture[i].b.size = 65536;
+  expert_spans[0] = 1;
+  expert_span[0][needed][0] = (FileSpan){zero, 0, 4096};
+  for (int i = 0; i < 4; i++) WHERE(0, i) = i, fixture[i].layer = 0, fixture[i].expert = i;
+  st->nslots = st->cap = 4, st->nfree = 0;
+  int all[] = {0, 1, 2, 3};
+  CHECK(cache_hold(st, 0, all, 4) == 0);
+  Pass *waiting = pass_new(request_needed, NULL, 1 << 20);
+  CHECK(!pass_resume(waiting));  // every slot is held: the pass yields
+  CHECK(!requested && !pass_ready(waiting));
+  cache_unhold(st, 0, all + 3, 1);
+  CHECK(pass_ready(waiting));
+  CHECK(pass_resume(waiting) && requested);
+  CHECK(WHERE(0, needed) == 3 && fixture[3].expert == needed);
+  cache_wait(st, 0, &needed, 1);
+  cache_unhold(st, 0, all, 3);
+  pass_free(waiting);
+  close(zero);
   printf("cache job reservations: %d/%d CPU checks passed\n", checks - failures, checks);
   return failures != 0;
 }

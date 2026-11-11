@@ -9,7 +9,7 @@ use std::ptr;
 
 use deepseek_recipe::stream::StreamTokenizer;
 
-const ABI: c_int = 18;
+const ABI: c_int = 19;
 
 #[repr(C)]
 struct RawProcess {
@@ -86,6 +86,12 @@ pub struct RawSnapshot {
 
 #[repr(C)]
 struct RawSampler {
+    _opaque: [u8; 0],
+}
+
+/// A stream of one model's calls (myds4_stream).
+#[repr(C)]
+pub struct RawStream {
     _opaque: [u8; 0],
 }
 
@@ -232,7 +238,7 @@ unsafe extern "C" {
         m: *mut RawModel,
         s: *mut RawState,
         pos: c_int,
-        with_logits: c_int,
+        logits: *const f32,
     ) -> *mut RawSnapshot;
     fn myds4_snapshot_restore(m: *mut RawModel, s: *mut RawState, x: *const RawSnapshot);
     fn myds4_snapshot_free(m: *mut RawModel, x: *mut RawSnapshot);
@@ -262,45 +268,42 @@ unsafe extern "C" {
     ) -> i64;
     fn myds4_snapshot_read(m: *mut RawModel, fd: c_int) -> *mut RawSnapshot;
     fn myds4_state_identity(m: *mut RawModel, out: *mut u8);
-    fn myds4_prefill(
-        m: *mut RawModel,
+    fn myds4_replay_rows(m: *const RawModel, k: c_int) -> c_int;
+    fn myds4_replay_start(m: *const RawModel, k: c_int) -> c_int;
+    fn myds4_seek(m: *mut RawModel, s: *mut RawState, tokens: *const i32, pos: c_int);
+    fn myds4_stream_new(m: *mut RawModel) -> *mut RawStream;
+    fn myds4_stream_free(x: *mut RawStream);
+    fn myds4_stream_prefill(
+        x: *mut RawStream,
         s: *mut RawState,
         tokens: *const i32,
         n: c_int,
         from: c_int,
         replay: c_int,
         capture: c_int,
-        captured: *mut *mut RawSnapshot,
-        info: *mut PrefillInfo,
-        media: *const RawMedia,
-    ) -> *const f32;
-    fn myds4_replay_rows(m: *const RawModel, k: c_int) -> c_int;
-    fn myds4_replay_start(m: *const RawModel, k: c_int) -> c_int;
-    fn myds4_rows(
-        m: *mut RawModel,
+        images: *const RawMedia,
+    );
+    fn myds4_stream_rows(
+        x: *mut RawStream,
         states: *mut *mut RawState,
         tokens: *const i32,
         pos: *const i32,
         count: c_int,
-    ) -> *const f32;
-    fn myds4_draft(
-        m: *mut RawModel,
+    );
+    fn myds4_stream_verify(
+        x: *mut RawStream,
         s: *mut RawState,
-        token: i32,
+        rows: *mut i32,
+        drafts: c_int,
+        proposed: c_int,
         pos: c_int,
-        drafts: *mut i32,
-        n: c_int,
         sampler: *mut RawSampler,
-    ) -> *const f64;
-    fn myds4_verify(
-        m: *mut RawModel,
-        s: *mut RawState,
-        rows: *const i32,
-        count: c_int,
-        pos: c_int,
-    ) -> *const f32;
-    fn myds4_accept(m: *mut RawModel, s: *mut RawState, rows: *const i32, n: c_int, pos: c_int);
-    fn myds4_seek(m: *mut RawModel, s: *mut RawState, tokens: *const i32, pos: c_int);
+    );
+    fn myds4_run(streams: *const *mut RawStream, n: c_int, seconds: f64) -> c_int;
+    fn myds4_stream_logits(x: *const RawStream) -> *const f32;
+    fn myds4_stream_captured(x: *const RawStream) -> *mut RawSnapshot;
+    fn myds4_stream_info(x: *const RawStream, info: *mut PrefillInfo);
+    fn myds4_stream_next(x: *const RawStream, accepted: *mut c_int) -> i32;
     fn myds4_sampler_new(
         temperature: f64,
         top_p: f64,
@@ -310,15 +313,6 @@ unsafe extern "C" {
     ) -> *mut RawSampler;
     fn myds4_sampler_free(s: *mut RawSampler);
     fn myds4_sample(m: *const RawModel, logits: *const f32, s: *mut RawSampler) -> i32;
-    fn myds4_sample_verify(
-        m: *const RawModel,
-        logits: *const f32,
-        drafts: *const i32,
-        n: c_int,
-        q: *const f64,
-        s: *mut RawSampler,
-        accepted: *mut c_int,
-    ) -> i32;
     fn myds4_lookup_new(capacity: c_int) -> *mut RawLookup;
     fn myds4_lookup_free(x: *mut RawLookup);
     fn myds4_lookup_append(x: *mut RawLookup, tokens: *const i32, n: c_int) -> c_int;
@@ -791,9 +785,9 @@ impl Model {
         &self,
         s: *mut RawState,
         pos: usize,
-        with_logits: bool,
+        logits: *const f32,
     ) -> *mut RawSnapshot {
-        unsafe { myds4_snapshot_take(self.raw, s, pos as c_int, with_logits.into()) }
+        unsafe { myds4_snapshot_take(self.raw, s, pos as c_int, logits) }
     }
     pub fn snapshot_restore(&self, s: *mut RawState, x: *const RawSnapshot) {
         unsafe { myds4_snapshot_restore(self.raw, s, x) }
@@ -850,39 +844,6 @@ impl Model {
 
     // ---- running the model (the engine thread) ----
 
-    /// Prefills positions `from..tokens.len()` of a prompt in `s` (`tokens`:
-    /// all of it so far); with `replay`, the state holds only the rows before
-    /// `from` that state_copy copies. With `capture`, the rolling rows at that
-    /// position come back as a snapshot, or null when the model cannot take a
-    /// whole state's there. None for invalid arguments.
-    pub fn prefill(
-        &self,
-        s: *mut RawState,
-        tokens: &[i32],
-        from: usize,
-        replay: bool,
-        capture: Option<usize>,
-        media: Option<&Media>,
-    ) -> Option<(Logits, *mut RawSnapshot, PrefillInfo)> {
-        let mut captured = ptr::null_mut();
-        let mut info = PrefillInfo::default();
-        let at = capture.map_or(-1, |p| p as c_int);
-        let lg = unsafe {
-            myds4_prefill(
-                self.raw,
-                s,
-                tokens.as_ptr(),
-                tokens.len() as c_int,
-                from as c_int,
-                replay.into(),
-                at,
-                &mut captured,
-                &mut info,
-                media.map_or(ptr::null(), |media| media.0),
-            )
-        };
-        (!lg.is_null()).then_some((lg, captured, info))
-    }
     /// What a replay at k computes again before k, rows per layer on average;
     /// None when the model cannot replay.
     pub fn replay_rows(&self, k: usize) -> Option<usize> {
@@ -893,67 +854,6 @@ impl Model {
     pub fn replay_start(&self, k: usize) -> usize {
         unsafe { myds4_replay_start(self.raw, k as c_int).max(0) as usize }
     }
-    /// One token for each state, at its next position: rows of logits.
-    pub fn rows(
-        &self,
-        states: &mut [*mut RawState],
-        tokens: &[i32],
-        pos: &[i32],
-    ) -> Option<Logits> {
-        let lg = unsafe {
-            myds4_rows(
-                self.raw,
-                states.as_mut_ptr(),
-                tokens.as_ptr(),
-                pos.as_ptr(),
-                states.len() as c_int,
-            )
-        };
-        (!lg.is_null()).then_some(lg)
-    }
-    pub fn draft(
-        &self,
-        s: *mut RawState,
-        token: i32,
-        pos: usize,
-        drafts: &mut [i32],
-        sampler: &mut Sampler,
-    ) -> *const f64 {
-        unsafe {
-            myds4_draft(
-                self.raw,
-                s,
-                token,
-                pos as c_int,
-                drafts.as_mut_ptr(),
-                drafts.len() as c_int,
-                sampler.0,
-            )
-        }
-    }
-    pub fn verify(&self, s: *mut RawState, rows: &[i32], pos: usize) -> Option<Logits> {
-        let lg = unsafe {
-            myds4_verify(
-                self.raw,
-                s,
-                rows.as_ptr(),
-                rows.len() as c_int,
-                pos as c_int,
-            )
-        };
-        (!lg.is_null()).then_some(lg)
-    }
-    pub fn accept(&self, s: *mut RawState, rows: &[i32], pos: usize) {
-        unsafe {
-            myds4_accept(
-                self.raw,
-                s,
-                rows.as_ptr(),
-                rows.len() as c_int,
-                pos as c_int,
-            )
-        }
-    }
     pub fn seek(&self, s: *mut RawState, tokens: &[i32], pos: usize) {
         unsafe { myds4_seek(self.raw, s, tokens.as_ptr(), pos as c_int) }
     }
@@ -962,29 +862,6 @@ impl Model {
 
     pub fn sample(&self, lg: Logits, s: &mut Sampler) -> i32 {
         unsafe { myds4_sample(self.raw, lg, s.0) }
-    }
-    /// Rows of logits for a token and its drafts: the next token, and how many
-    /// drafts it kept; a token that ends a reply ends the kept ones.
-    pub fn sample_verify(
-        &self,
-        lg: Logits,
-        drafts: &[i32],
-        q: *const f64,
-        s: &mut Sampler,
-    ) -> (i32, usize) {
-        let mut accepted = 0;
-        let next = unsafe {
-            myds4_sample_verify(
-                self.raw,
-                lg,
-                drafts.as_ptr(),
-                drafts.len() as c_int,
-                q,
-                s.0,
-                &mut accepted,
-            )
-        };
-        (next, accepted.max(0) as usize)
     }
 
     /// A prompt's decoded media for this model's encoder.
@@ -1295,4 +1172,99 @@ mod ownership_tests {
         impl<T: ?Sized + Sync> NotSync<SyncType> for T {}
         let _ = <Model as NotSync<_>>::check;
     }
+}
+
+/// One model's calls, one after another, on their own stack and working
+/// buffers (myds4_stream): the calls of several streams run at the same time.
+/// A stream's call runs when `run` advances it; what the call was given stays
+/// valid until it finishes.
+pub struct Stream(*mut RawStream);
+
+impl Stream {
+    pub fn new(model: &Model) -> Stream {
+        Stream(unsafe { myds4_stream_new(model.raw) })
+    }
+    pub fn raw(&self) -> *mut RawStream {
+        self.0
+    }
+    pub fn prefill(
+        &self,
+        s: *mut RawState,
+        tokens: &[i32],
+        from: usize,
+        replay: bool,
+        capture: Option<usize>,
+        media: Option<&Media>,
+    ) {
+        unsafe {
+            myds4_stream_prefill(
+                self.0,
+                s,
+                tokens.as_ptr(),
+                tokens.len() as c_int,
+                from as c_int,
+                replay.into(),
+                capture.map_or(-1, |p| p as c_int),
+                media.map_or(ptr::null(), |media| media.0),
+            )
+        }
+    }
+    pub fn rows(&self, states: &mut [*mut RawState], tokens: &[i32], pos: &[i32]) {
+        unsafe {
+            myds4_stream_rows(
+                self.0,
+                states.as_mut_ptr(),
+                tokens.as_ptr(),
+                pos.as_ptr(),
+                states.len() as c_int,
+            )
+        }
+    }
+    /// The token rows[0] at pos and its drafts, verified together; the model's
+    /// drafts fill rows[1..] unless the caller proposed them.
+    pub fn verify(&self, s: *mut RawState, rows: &mut [i32], proposed: bool, pos: usize, sampler: &mut Sampler) {
+        unsafe {
+            myds4_stream_verify(
+                self.0,
+                s,
+                rows.as_mut_ptr(),
+                rows.len() as c_int - 1,
+                proposed.into(),
+                pos as c_int,
+                sampler.0,
+            )
+        }
+    }
+    /// The finished call's logits; None: it did not fit in memory.
+    pub fn logits(&self) -> Option<Logits> {
+        let lg = unsafe { myds4_stream_logits(self.0) };
+        (!lg.is_null()).then_some(lg)
+    }
+    pub fn captured(&self) -> *mut RawSnapshot {
+        unsafe { myds4_stream_captured(self.0) }
+    }
+    pub fn info(&self) -> PrefillInfo {
+        let mut info = PrefillInfo::default();
+        unsafe { myds4_stream_info(self.0, &mut info) };
+        info
+    }
+    /// A verify call's next token and the drafts it kept.
+    pub fn next(&self) -> (i32, usize) {
+        let mut accepted = 0;
+        let token = unsafe { myds4_stream_next(self.0, &mut accepted) };
+        (token, accepted.max(0) as usize)
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        unsafe { myds4_stream_free(self.0) }
+    }
+}
+
+/// Advances the streams until a call finishes or `seconds` pass: that stream's
+/// index, or None.
+pub fn run(streams: &[*mut RawStream], seconds: f64) -> Option<usize> {
+    let i = unsafe { myds4_run(streams.as_ptr(), streams.len() as c_int, seconds) };
+    (i >= 0).then_some(i as usize)
 }

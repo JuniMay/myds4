@@ -8,7 +8,7 @@
 #include <unistd.h>
 
 static int failed;
-#define CHECK(x) do { if (!(x)) printf("FAIL: %s\n", #x), failed = 1; } while (0)
+#define CHECK(x) do { if (!(x)) printf("FAIL line %d: %s\n", __LINE__, #x), failed = 1; } while (0)
 
 static int spin;
 
@@ -79,6 +79,24 @@ int main(void) {
   CHECK(memory_usage().allocated == held);
   gpu_commit();
   CHECK(memory_usage().allocated == held);
+  gpu_sync();
+  CHECK(memory_usage().allocated == held - gpu_allocation_size(SIZE));
+
+  // A detached command buffer can be committed after buffers opened later: what
+  // it uses stays until it has finished, however many others finish first.
+  Buf detached = gpu_alloc(SIZE);
+  held = memory_usage().allocated;
+  void *front = gpu_open_detached();
+  gpu_encode(front);
+  spinning(&detached, 1000);
+  gpu_close();
+  gpu_free_later(&detached);
+  gpu_begin();
+  spinning(&out, 1000);
+  gpu_commit();
+  gpu_sync();
+  CHECK(memory_usage().allocated == held);
+  gpu_submit_detached(front);
   gpu_sync();
   CHECK(memory_usage().allocated == held - gpu_allocation_size(SIZE));
 

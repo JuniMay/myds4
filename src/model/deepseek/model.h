@@ -125,7 +125,7 @@ void deepseek_state_restore(void);
 // at one position: the window rings, compressor rows and draft rings that
 // later positions overwrite, and the Engram history.
 typedef struct Snapshot Snapshot;
-Snapshot *deepseek_snapshot(State *s, int pos, int with_logits);  // s's rolling rows now, as at pos; and the last logits
+Snapshot *deepseek_snapshot(State *s, int pos, const float *logits);  // s's rolling rows now, as at pos; and these logits, if any
 void deepseek_snapshot_restore(State *s, const Snapshot *x);
 void deepseek_snapshot_free(Snapshot *x);
 size_t deepseek_snapshot_bytes(int with_logits);

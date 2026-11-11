@@ -29,7 +29,9 @@ Pass *pass_new(void (*body)(void *), void *argument, size_t stack_bytes);
 // The variables' current values are the pass's starting values. While the
 // pass runs they hold its values; the resumer's are put back when it yields.
 void pass_variables(Pass *pass, const PassVariable *variables, int count);
-// Called after the pass's variables are back, before it continues.
+// Called after the variables change, when the pass resumes and when it gives
+// the processor back to the code that resumed it, for what the family derives
+// from them.
 void pass_on_resume(Pass *pass, void (*resumed)(void));
 // A pass of a model family's forward path: a stack large enough for it, the
 // family's variables and the GPU layer's, and `resumed` (or null).
