@@ -79,7 +79,7 @@ Their throughput does not represent ordinary inference.
 | `benchmarks/throughput.py` | Total tokens per second of concurrent requests against the serving modes, with the same requests alone as the correctness guard. |
 | `benchmarks/turns.py` | A conversation followed by a longer tool-like input. |
 | `benchmarks/prefill.py` | CED prefill and continuation comparisons. |
-| `benchmarks/decode.c` | Batched model-row timing: per step the GPU's busy and idle time, and per row the expert reads and bytes. Its default prompts can make greedy decoding loop; `--text FILE --prompt-tokens N` decodes after real text instead. |
+| `benchmarks/decode.c` | Batched model-row timing: per step the GPU's busy and idle time, and per row the expert reads and bytes, the slots mapped for the GPU again and the slot buffers given back for one of another size; at the end the cache's slot limit, its allocated and mapped slots and its bytes. Its default prompts can make greedy decoding loop; `--text FILE --prompt-tokens N` decodes after real text instead. |
 | `benchmarks/products.c` | Common matrix-product correctness and warmed vector-kernel timing; these are not model throughput or physical memory-bandwidth measurements. |
 | `benchmarks/steps.c` | Whether a matrix product and a chain of vector products overlap in one command buffer, and what cutting long work into short command buffers costs. |
 | `benchmarks/pass_binding.c` | The CPU cost of binding a DeepSeek pass's buffers. |
