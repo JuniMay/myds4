@@ -23,21 +23,19 @@ int sample_argmax(const float *logits, int count) {
 
 // The workspace grows to the largest vocabulary sampled (any model's).
 static double *probability, *target_probability;
-static int *order, room;
+static int *order, *order_moved, room;
+static uint64_t *rank_key, *rank_key_moved;
 
 static void make_room(int count) {
   if (count <= room) return;
-  free(probability), free(target_probability), free(order);
+  free(probability), free(target_probability), free(order), free(order_moved), free(rank_key), free(rank_key_moved);
   probability = xmalloc((size_t)count * sizeof *probability);
   target_probability = xmalloc((size_t)count * sizeof *target_probability);
   order = xmalloc((size_t)count * sizeof *order);
+  order_moved = xmalloc((size_t)count * sizeof *order_moved);
+  rank_key = xmalloc((size_t)count * sizeof *rank_key);
+  rank_key_moved = xmalloc((size_t)count * sizeof *rank_key_moved);
   room = count;
-}
-
-static int by_probability(const void *a, const void *b) {
-  int i = *(const int *)a, j = *(const int *)b;
-  if (probability[i] != probability[j]) return probability[i] > probability[j] ? -1 : 1;
-  return (i > j) - (i < j);
 }
 
 // Whether token a ranks before token b: the higher logit, then the lower id.
@@ -46,6 +44,77 @@ static int ranks_before(const float *logits, int a, int b) {
 }
 
 typedef struct { int best, count, ranked; double sum; } Distribution;
+
+// Sorts order[0..n), tokens with positive probabilities in increasing id
+// order, as a full sort ranks them (the higher probability, then the lower
+// id): a stable radix sort of the probabilities' bits, eight at a time from
+// the lowest, keeps equal probabilities in id order. A positive double's bits
+// order it as its value does; their complement orders it from the highest.
+static void rank_by_probability(int n) {
+  int *ids = order, *moved = order_moved;
+  uint64_t *key = rank_key, *key_moved = rank_key_moved;
+  for (int i = 0; i < n; i++) {
+    uint64_t bits;
+    memcpy(&bits, &probability[ids[i]], sizeof bits);
+    key[i] = ~bits;
+  }
+  for (int shift = 0; shift < 64 && n > 1; shift += 8) {
+    int start[257] = {0};
+    for (int i = 0; i < n; i++) start[(key[i] >> shift & 255) + 1]++;
+    if (start[(key[0] >> shift & 255) + 1] == n) continue;  // one value of this digit: nothing moves
+    for (int d = 0; d < 256; d++) start[d + 1] += start[d];
+    for (int i = 0; i < n; i++) {
+      int at = start[key[i] >> shift & 255]++;
+      key_moved[at] = key[i], moved[at] = ids[i];
+    }
+    uint64_t *k = key;
+    key = key_moved, key_moved = k;
+    int *m = ids;
+    ids = moved, moved = m;
+  }
+  if (ids != order) memcpy(order, ids, (size_t)n * sizeof *order);
+}
+
+// The tokens that top-p may keep (probability[] holds every token's), in
+// order[] as a full sort of every token with a positive probability ranks them
+// (the higher probability, then the lower id); returns their count. Every token
+// below a probability bound ranks after every token at or above it, so sorting
+// only those at or above the bound gives the full sort's first tokens. The
+// bound is the power of two at which the tokens' probabilities, summed by
+// binary order of magnitude, first reach the threshold, lowered by one more
+// order of magnitude because the nucleus sums them in another order. If the
+// sorted tokens still do not reach the threshold, every token is sorted.
+static int nucleus(int count, double threshold) {
+  enum { ORDERS = 64 };
+  double mass[ORDERS] = {0};
+  for (int i = 0; i < count; i++) {
+    uint64_t bits;
+    memcpy(&bits, &probability[i], sizeof bits);
+    int e = 1023 - (int)(bits >> 52 & 0x7ff);  // probability in [2^-e, 2^(1-e)); 1023: zero or subnormal
+    mass[e <= 0 ? 0 : e < ORDERS ? e : ORDERS - 1] += probability[i];
+  }
+  double held = 0;
+  int last = ORDERS;
+  for (int e = 0; e < ORDERS && last == ORDERS; e++)
+    if ((held += mass[e]) >= threshold) last = e;
+  if (last + 1 < ORDERS - 1) {
+    double bound = ldexp(1, -(last + 1));
+    int n = 0;
+    for (int i = 0; i < count; i++)
+      if (probability[i] >= bound) order[n++] = i;
+    rank_by_probability(n);
+    double kept = 0;
+    int k = 0;
+    do kept += probability[order[k++]];
+    while (k < n && kept < threshold);
+    if (kept >= threshold) return n;
+  }
+  int n = 0;
+  for (int i = 0; i < count; i++)
+    if (probability[i] > 0) order[n++] = i;
+  rank_by_probability(n);
+  return n;
+}
 
 // Keep the requested top-k and top-p support; probabilities remain unnormalized.
 static Distribution distribution(const float *logits, int count, const Sampler *s) {
@@ -74,9 +143,7 @@ static Distribution distribution(const float *logits, int count, const Sampler *
       sum += probability[i];
     }
     if (s->top_p < 1) {
-      n = 0;
-      for (int i = 0; i < count; i++) if (probability[i] > 0) order[n++] = i;
-      qsort(order, n, sizeof *order, by_probability);
+      n = nucleus(count, s->top_p * sum);
       ranked = 1;
     }
   }
