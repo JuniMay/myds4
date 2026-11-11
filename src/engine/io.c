@@ -361,6 +361,7 @@ struct ExpertStore {
   int layout_ready;
   // the readers' queue (see the prefetch reads below)
   uint32_t queue[QUEUE], qhead, qtail;  // entries: slot << 4 | piece
+  uint16_t qlayer[QUEUE];               // each entry's layer, as it was queued
   pthread_mutex_t qlock;
   pthread_cond_t qcond;
   _Atomic int demand, prefetching;  // demand pieces, and prefetched slots, in flight
@@ -905,6 +906,18 @@ static void piece_finished(ExpertStore *st, Slot *s, int piece, int read) {
   }
 }
 
+// Queues a read-ahead piece of `layer`, under qlock and with room in the
+// queue, after the queued pieces of its layer and the layers before it: the
+// background readers take the lowest layer's pieces first, because a pass
+// runs its layers in order and the nearest layer needs its experts soonest.
+// Pieces of one layer keep the order they were queued in.
+static void queue_push(ExpertStore *st, uint32_t entry, uint16_t layer) {
+  uint32_t at = st->qtail++;
+  for (; at != st->qhead && st->qlayer[(at - 1) % QUEUE] > layer; at--)
+    st->queue[at % QUEUE] = st->queue[(at - 1) % QUEUE], st->qlayer[at % QUEUE] = st->qlayer[(at - 1) % QUEUE];
+  st->queue[at % QUEUE] = entry, st->qlayer[at % QUEUE] = layer;
+}
+
 static void *reader(void *arg) {
   ExpertStore *st = arg;
   for (;;) {
@@ -1211,7 +1224,7 @@ static void start(ExpertStore *st, int i, int urgent) {
   pthread_mutex_lock(&st->qlock);
   for (int k = 0; k < n; k++) {
     while (st->qtail - st->qhead == QUEUE) pthread_cond_wait(&st->qcond, &st->qlock);
-    st->queue[st->qtail++ % QUEUE] = i << 4 | k;
+    queue_push(st, (uint32_t)(i << 4 | k), (uint16_t)s->layer);
   }
   pthread_cond_broadcast(&st->qcond);
   pthread_mutex_unlock(&st->qlock);
@@ -1525,8 +1538,10 @@ static int discard_unstarted(ExpertStore *st, int layer, const int *keep, int n)
     uint32_t end = st->qtail, write = st->qhead;
     for (uint32_t read = st->qhead; read != end; read++) {
       uint32_t q = st->queue[read % QUEUE];
+      uint16_t ql = st->qlayer[read % QUEUE];
       Slot *s = &st->slots[q >> 4];
       if (s->layer == layer && s->expert >= 0 && discard[s->expert]) continue;
+      st->qlayer[write % QUEUE] = ql;
       st->queue[write++ % QUEUE] = q;
     }
     st->qtail = write;

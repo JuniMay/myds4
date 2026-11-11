@@ -461,6 +461,20 @@ uses. Reads are split into bounded pieces, with demand work ahead of
 background forecasts. Cache policy accounts for reuse and optional read
 cost; speculative reads must not invalidate experts held by active work.
 
+While decoding, DeepSeek reads ahead the experts of three forecasts, each
+a router applied to a row known earlier. Before a layer's attention, the
+layer's own router runs on the residual part of its FFN input; the GPU
+computes the logits and the CPU takes each row's top six from them. After a
+layer's routing, the next two layers' routers run on its FFN input. The
+forecasts read each row's top three experts that are not in memory. The
+residual's forecast and the next layer's first cancel the layer's queued
+read-aheads outside each row's top six. The background readers take queued
+read-aheads from the lowest layer up, because a pass needs the nearest
+layer's experts first. When a layer's routing is known, its queued
+read-aheads that it did not select are cancelled, which leaves the SSD to
+the next layers' reads, and the unselected ones already read become
+evictable by the score that earlier selections gave them.
+
 Ordinary execution overlaps ready expert work with remaining reads.
 Runahead groups ready requests at the same layer. The experimental
 pipeline keeps independent layer stages in flight and groups ready expert

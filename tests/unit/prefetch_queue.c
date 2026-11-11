@@ -96,6 +96,17 @@ int main(void) {
   if (!atomic_load(&st->demand)) claim(st, 0);
   teardown();
 
+  // Background readers take the lowest layer's pieces first, and each
+  // layer's in the order they were queued, also across the ring's end.
+  static const uint16_t layers[] = {2, 0, 1, 0, 2};
+  st->qhead = st->qtail = QUEUE - 2;
+  for (uint32_t k = 0; k < 5; k++) queue_push(st, k, layers[k]);
+  uint32_t order[5];
+  for (int k = 0; k < 5; k++) order[k] = st->queue[st->qhead++ % QUEUE];  // as a reader takes them
+  expect("readers take the nearest layer's pieces first, each layer's in order",
+         order[0] == 1 && order[1] == 3 && order[2] == 2 && order[3] == 0 && order[4] == 4 && st->qhead == st->qtail);
+  st->qhead = st->qtail = 0;
+
   dispatch_release(deferred);
   close(fd);
   fprintf(stderr, "prefetch queue: %d/%d CPU checks passed\n", checks - failures, checks);

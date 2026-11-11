@@ -179,7 +179,7 @@ static Buf SHG, SHU, SHH, SHO, EROW, EC[2], ES[2], EX, EKV, MH, YK, TILES, PTOK,
 static Buf MAINH, MXA, MXN, MXQ, DHS, DMF, BLK, DSEL, DLOG, DTOK, DEROW;
 // The residual prediction's input row, and this layer's top experts it
 // predicts: KEEP when decoding (PC), PREDICT for the routes trace (PT).
-static Buf XP, PT, PC, GP;  // GP: predicted logits, so that GL keeps the router's
+static Buf XP, PT, PC, GP, GPR;  // GP: predicted logits, so that GL keeps the router's; GPR: the residual's
 // A decoded row's attention: scores, chunk maxima and chunk parts (see attend_one).
 static Buf ASC, AMAX, APART;
 static Buf PARTS;  // decoded rows' experts' down products, row r's at 8 DIM r, of expert e at 8 i + e
@@ -538,7 +538,7 @@ static uint64_t fixed_plan(int allocate) {
   size_t expert_tables = 2 * LAYERS * FEW + DRAFTS * BLOCK;
   W(ETAB, expert_tables * 256); W(logits, (size_t)FEW * VOCAB * 4);
   W(PARTS, FEW * DIM * 8 * 4);
-  W(XP, FEW * DIM * 4); W(PT, PREDICT * 4); W(PC, FEW * PREDICT * 4);
+  W(XP, FEW * DIM * 4); W(PT, PREDICT * 4); W(PC, FEW * PREDICT * 4); W(GPR, FEW * EXPERTS * 4);
   W(ASC, HEADS * ATT_ROWS * 4); W(AMAX, ATT_CHUNKS * HEADS * 4); W(APART, ATT_CHUNKS * HEADS * 514 * 4);
   if (opt.draft) {
     W(MAINH, WINDOW * 3 * DIM * 4); W(MXA, WINDOW * DIM * 4); W(MXN, WINDOW * DIM * 4);
@@ -964,14 +964,39 @@ static int native_forecasts(void) {
 
 static int full_ahead(int m) { return !prompt_pass && native_forecasts() && (m == 1 || (small_rows(m) && opt.deepseek.substitute <= 0)); }
 
-// Decoding (m <= FEW rows): layer l's top KEEP experts predicted from the
-// residual part of each row's FFN input (XP, see hc_mix), known before its
-// attention, into PC, row r's at r * PREDICT; for the routes trace of one
-// row also its top PREDICT into PT.
+// Decoding (m <= FEW rows): layer l's experts predicted from the residual part
+// of each row's FFN input (XP, see hc_mix), known before its attention: the
+// router's logits into GPR, from which forecast_keep takes each row's top KEEP
+// on the CPU. For the routes trace the GPU takes them, into PC (row r's at r
+// PREDICT), and for one row also its top PREDICT into PT.
 static void predict_residual(int m, int l) {
-  linear(&L[l].gate, m, &XP, 0, DIM, &GP, 0, EXPERTS, 0);
-  Routing r[2] = {{&GP, 0, &L[l], &PC, 0, KEEP, PREDICT, 0}, {&GP, 0, &L[l], &PT, 0, PREDICT, PREDICT, 0}};
-  route_top(m, r, m == 1 && opt.routes_fd >= 0 ? 2 : 1, 0);
+  linear(&L[l].gate, m, &XP, 0, DIM, &GPR, 0, EXPERTS, 0);
+  if (opt.routes_fd < 0) return;
+  Routing r[2] = {{&GPR, 0, &L[l], &PC, 0, KEEP, PREDICT, 0}, {&GPR, 0, &L[l], &PT, 0, PREDICT, PREDICT, 0}};
+  route_top(m, r, m == 1 ? 2 : 1, 0);
+}
+
+// Each row's top KEEP experts by the residual's logits (GPR), ranked by the
+// key the route kernel ranks by (softplus, square root, the layer's bias), into
+// PC: the forecasts only steer read-ahead, so the CPU takes them once the
+// products are done, instead of a dispatch of the GPU's.
+static void forecast_keep(int m, int l) {
+  const float *bias = (const float *)L[l].gate_bias.ptr;
+  for (int r = 0; r < m; r++) {
+    const float *lg = (const float *)GPR.ptr + (size_t)r * EXPERTS;
+    float key[EXPERTS];
+    for (int t = 0; t < EXPERTS; t++) {
+      float x = lg[t], u = expf(x), v = 1 + u;
+      key[t] = sqrtf(x > 20 ? x : v == 1 ? u : logf(v) * u / (v - 1)) + bias[t];
+    }
+    int *pc = (int *)PC.ptr + (size_t)r * PREDICT;
+    for (int k = 0; k < KEEP; k++) {
+      int best = 0;
+      for (int t = 1; t < EXPERTS; t++)
+        if (key[t] > key[best]) best = t;
+      pc[k] = best, key[best] = -INFINITY;
+    }
+  }
 }
 
 // One row's attention when decoding: chunks of ATT_CHUNK of the up to
@@ -1449,6 +1474,9 @@ static void routed_rows(const Batch *b, int l, int ahead, int inflight, int appr
   expert_stats()->row_unique += nn;
   double t0 = now();
   int reading = hold_experts(l, need, nn);  // this layer's reads first, then the predicted ones
+  // The routing is known: this layer's read-aheads that it did not select and
+  // that no reader has started give the SSD back to the next layers'.
+  cache_refine(experts_store, l, need, nn);
   cache_demote(experts_store, l);
   if (reading) gpu_keep_clock(reading * 1e-3); // the GPU idles until they are in
   if (opt.deepseek.online_predictor) {
@@ -1783,6 +1811,7 @@ static void step_rows(const int *tokens, int m, int pos) {
       int keep[FEW * KEEP], first[FEW * AHEAD], nk = 0, nf = 0;
       const int *pc = (const int *)PC.ptr;
       gpu_wait_signal(sig - 1);
+      if (opt.routes_fd < 0) forecast_keep(m, l);
       for (int r = 0; r < m; r++) {
         for (int k = 0; k < KEEP; k++) keep[nk++] = pc[r * PREDICT + k];
         for (int k = 0; k < AHEAD; k++) first[nf++] = pc[r * PREDICT + k];
@@ -3771,7 +3800,7 @@ static const PassVariable pass_own[] = {
     V(PC),            V(ETAB),        V(PARTS),                V(logits),            V(EROW),       V(TILES),
     V(PTOK),          V(PW),          V(TP),           V(MAINH),             V(MXA),        V(MXN),
     V(MXQ),           V(DHS),         V(DMF),          V(BLK),               V(DSEL),       V(DLOG),
-    V(DTOK),          V(DEROW),
+    V(DTOK),          V(DEROW),       V(GPR),
 };
 #undef V
 
@@ -3788,7 +3817,7 @@ Pass *deepseek_pass_new(void (*body)(void *), void *argument) {
   return pass_new_model(body, argument, variables, OWN + CACHE_PASS_VARIABLES, rebind);
 }
 
-static Buf *const pass_fixed_buffers[] = {&PC, &ETAB, &PARTS, &logits, &MAINH, &MXA, &MXN, &MXQ, &DHS, &DMF, &BLK, &DSEL, &DLOG, &DTOK, &DEROW};
+static Buf *const pass_fixed_buffers[] = {&PC, &GPR, &ETAB, &PARTS, &logits, &MAINH, &MXA, &MXN, &MXQ, &DHS, &DMF, &BLK, &DSEL, &DLOG, &DTOK, &DEROW};
 static Buf *const pass_request_buffers[] = {&HS, &MF, &SEL, &CAND, &IMG, &EC[0], &EC[1], &ES[0], &ES[1]};
 
 // Inside a new pass, before its work: it owns its signals and buffers. The

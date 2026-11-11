@@ -9,10 +9,16 @@
 // into a loop that repeats a few tokens, and a loop uses few experts and
 // runs fast: distinct_8grams is the share of the first sequence's 8-token
 // windows that had not occurred before in its generation (1: no repeats),
-// and --show prints its text.
+// and --show prints its text. --online-predictor, --cache-half-life and
+// --cache-read-cost set the expert cache as the CLI's options do; with
+// MYDS4_PREFETCH_METRICS=1 the end also prints what the read-aheads did.
+// With one row, --routes-fd writes each decoded token's routes as the CLI's
+// option does, for replaying cache policies on the benchmark's own tokens.
 //
 // usage: rows-bench CHECKPOINT ROWS [--experts GGUF] [--memory GIB] [--steps N]
 //                   [--warm N] [--text FILE --prompt-tokens N] [--show]
+//                   [--online-predictor] [--cache-half-life N] [--cache-read-cost]
+//                   [--routes-fd FD]
 #include "../src/model/deepseek/model.h"
 #include "../src/model/deepseek/model.c"
 static Tokenizer *tk;  // the checkpoint's tokenizer
@@ -31,7 +37,7 @@ static double distinct_8grams(const int *gen, int n) {
 }
 
 int main(int argc, char **argv) {
-  if (argc < 3) die("usage: rows-bench CHECKPOINT ROWS [--experts GGUF] [--memory GIB] [--steps N] [--warm N] [--text FILE --prompt-tokens N] [--show]");
+  if (argc < 3) die("usage: rows-bench CHECKPOINT ROWS [--experts GGUF] [--memory GIB] [--steps N] [--warm N] [--text FILE --prompt-tokens N] [--show] [--online-predictor] [--cache-half-life N] [--cache-read-cost] [--routes-fd FD]");
   int rows = atoi(argv[2]), steps = 96, warm = 32, length = 0, show = 0;
   const char *file = NULL;
   double model_memory_gib = 40;
@@ -45,10 +51,15 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--text") && i + 1 < argc) file = argv[++i];
     else if (!strcmp(argv[i], "--prompt-tokens") && i + 1 < argc) length = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--show")) show = 1;
+    else if (!strcmp(argv[i], "--online-predictor")) o.deepseek.online_predictor = 64;
+    else if (!strcmp(argv[i], "--cache-half-life") && i + 1 < argc) o.deepseek.cache_half_life = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--cache-read-cost")) o.deepseek.cache_read_cost = 1;
+    else if (!strcmp(argv[i], "--routes-fd") && i + 1 < argc) o.routes_fd = atoi(argv[++i]);
     else die("invalid rows-bench option %s", argv[i]);
   }
   if (rows < 1 || rows > BATCH_ROWS || steps < 1 || warm < 0)
     die("rows-bench takes 1 to %d rows, at least one step and no negative warm-up", BATCH_ROWS);
+  if (o.routes_fd >= 0 && rows != 1) die("--routes-fd records one row");
   if (!file != !length || length < 0) die("--text and --prompt-tokens go together");
   o.ctx = length + 4096;
   tk = tok_open(argv[1], deepseek_ops.media_token);
@@ -123,5 +134,6 @@ int main(int argc, char **argv) {
     }
     fputc('\n', stderr);
   }
+  deepseek_metrics_report(stdout);  // MYDS4_PREFETCH_METRICS=1: what the read-aheads did
   return 0;
 }
