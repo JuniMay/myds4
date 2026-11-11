@@ -257,6 +257,23 @@ acquired path's, that a new selection moves the holds, and that a release
 lets every slot go back. It also compares the 16-row prompt matrix tile with
 the 128-row tile for 1 to 64 rows.
 
+`build/tests/index-scores` needs no model. It runs DeepSeek's index-score
+kernel on random queries and keys against a kernel that scores every
+position. Without candidate blocks, every score must be the same bits. With
+candidate blocks (every block, half of them, an eighth, the newest alone,
+whole words of 32 blocks, and 0 to 32 blocks a word), each candidate
+position's score must be the same bits, and no other position may be
+written. It then prints both kernels' times for 256 rows over 65,536
+positions, without candidates and with a quarter of the blocks.
+
+`build/tests/prompt-attention` needs no model. It runs DeepSeek's prompt
+attention kernel on random queries, window keys and selected compressed rows
+against a kernel that stages one slice of a chunk's keys at a time. Every
+output must be the same bits: with a full window and 512 selected rows, at
+the first positions without compressed rows, with 0 to 512 selected rows,
+and with a window cut short. It then prints both kernels' times for 512
+rows.
+
 ```sh
 make build/tests/vision
 build/tests/vision

@@ -1090,7 +1090,7 @@ static void attend_rows(int l, int m, int pos, int r0, int srow) {
   if (y->index_source && visible > 0) {
     // index keys live with the KV source of the same ratio (layer 20 for
     // ratio 1). Beyond CAND_TOP blocks, layer 20 keeps its best blocks as
-    // candidates, and the later ratio-1 indexers select within them.
+    // candidates, and the later ratio-1 indexers score and select within them.
     int cand = y->ratio == 1 && visible > CAND_TOP * 8;
     for (int t0 = 0; t0 < m; t0 += sc_rows) {  // rows in tiles, as many as SC holds
       uint32_t rows = m - t0 < sc_rows ? m - t0 : sc_rows, seen = (pos + t0 + rows) / y->ratio;
@@ -1101,6 +1101,7 @@ static void attend_rows(int l, int m, int pos, int r0, int srow) {
       gpu_kern(K_index_score);
       gpu_buf(0, &QI, (size_t)(r0 + t0) * IDX_HEADS * IDX_DIM * 4), gpu_buf(1, &IW, (size_t)(r0 + t0) * IDX_HEADS * 4);
       gpu_buf(2, &src->keys, 0), gpu_buf(3, cs, 0), gpu_buf(4, &SC, 0), gpu_bytes(5, &ix, sizeof ix);
+      gpu_buf(6, &CAND, cand_off);
       gpu_go((seen + 255) / 256, rows, 1, 256, 1, 1);
       if (cand && l == CAND_LAYER) {
         Index cx = ix;

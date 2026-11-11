@@ -655,13 +655,23 @@ kernel void index_key(device const float *k [[buffer(0)]], device const float *w
 // Index scores of one query over n compressed positions:
 // score[t] = sum_h relu(q_h . k_t) w_h, with q rotated and FP4-quantized here.
 // Query row r is at position pos + r and sees (pos + r + 1) / ratio rows.
+// A threadgroup takes 256 positions: 32 blocks of 8, which are one word of a
+// row's candidate bits. With candidate blocks it scores only its word's
+// candidates, since index_topk reads no other score. The candidates take the
+// threadgroup's first threads, so that the simdgroups beyond them do nothing.
 struct Index { uint pos, ratio, stride, cand; };  // cand: words of a row's candidate bits, 0: none
+inline uint nth_set_bit(uint bits, uint n) {  // the place of the bit that has n set bits below it
+  for (uint i = 0; i < n; i++) bits &= bits - 1;
+  return ctz(bits);
+}
 kernel void index_score(device const float *q [[buffer(0)]], device const float *wts [[buffer(1)]],
                         device const bfloat *keys [[buffer(2)]], device const float2 *cs [[buffer(3)]],
                         device float *score [[buffer(4)]], constant Index &ix [[buffer(5)]],
+                        device const uint *cand [[buffer(6)]],
                         uint2 g [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
   threadgroup float4 qs[32 * 32];
-  uint row = g.y, gid = g.x * 256 + t;
+  uint row = g.y, blocks = ix.cand ? cand[row * ix.cand + g.x] : ~0u;
+  if (!blocks) return;
   uint2 p = uint2((ix.pos + row + 1) / ix.ratio, ix.pos + row);
   q += row * 4096, wts += row * 32, score += row * ix.stride;
   threadgroup float ws[32];
@@ -670,6 +680,10 @@ kernel void index_score(device const float *q [[buffer(0)]], device const float 
     qf[i] = fp4_act(rope1(q[i], i % 128, 128, cs + p.y * 32, false));
   if (t < 32) ws[t] = bf(wts[t] * 0.015625f);  // softmax scale 128^-0.5 times 32^-0.5
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint block = t / 8;  // the thread's block among the word's candidates
+  if (block >= popcount(blocks)) return;
+  if (blocks != ~0u) block = nth_set_bit(blocks, block);
+  uint gid = (g.x * 32 + block) * 8 + t % 8;
   if (gid >= p.x) return;
   device const bfloat4 *kr = (device const bfloat4 *)(keys + gid * 128);
   float acc[32];
@@ -974,8 +988,10 @@ kernel void attend_combine(device const float *part [[buffer(0)]], device const 
 // keys in chunks of 32 with an online softmax. The matrix units read the
 // queries (with RoPE, as BF16, as the reference holds them: q_rope) from
 // device memory; the 512 columns of a chunk's keys go through threadgroup
-// memory in slices of 128, each loaded into registers while the products
-// of the slice before run. The keys are also the values.
+// memory in slices of 128, two at a time, each pair loaded into registers
+// while the products of the pair before run. The keys are also the values:
+// the last pair staged for a chunk's scores serves its values first, so a
+// chunk stages three pairs.
 kernel void q_rope(device const float *q [[buffer(0)]], device const float2 *cs [[buffer(1)]],
                    device bfloat *qb [[buffer(2)]], constant uint &pos [[buffer(3)]],
                    uint2 i [[thread_position_in_grid]]) {
@@ -999,7 +1015,7 @@ kernel void attend_m(device const bfloat *qb [[buffer(0)]], device const bfloat 
                      device const float *sink [[buffer(4)]], device float *o [[buffer(5)]],
                      constant Att &at [[buffer(6)]], uint2 gr [[threadgroup_position_in_grid]],
                      uint t [[thread_index_in_threadgroup]]) {
-  threadgroup bfloat kv[32 * 128], ps[32 * 32];
+  threadgroup bfloat kv[2][32 * 128], ps[32 * 32];
   threadgroup float ss[32 * 32], mx[32], sum[32], rescale[32];
   threadgroup uint rows[640];
   uint h0 = gr.x * 32, pos = at.win.pos + gr.y;
@@ -1013,7 +1029,8 @@ kernel void attend_m(device const bfloat *qb [[buffer(0)]], device const bfloat 
   matmul2d<sdesc, execution_simdgroups<8>> sop;
   matmul2d<odesc, execution_simdgroups<8>> oop;
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tq((device bfloat *)qb + gr.y * 32768 + h0 * 512, dextents<int32_t, 2>(512, 32));
-  tensor<threadgroup bfloat, extents<int32_t, 128, 32>, tensor_inline> tk(kv, extents<int32_t, 128, 32>());
+  tensor<threadgroup bfloat, extents<int32_t, 128, 32>, tensor_inline> tk(kv[0], extents<int32_t, 128, 32>());
+  tensor<threadgroup bfloat, extents<int32_t, 128, 32>, tensor_inline> tk1(kv[1], extents<int32_t, 128, 32>());
   tensor<threadgroup bfloat, extents<int32_t, 32, 32>, tensor_inline> tp(ps, extents<int32_t, 32, 32>());
   auto acc0 = oop.get_destination_cooperative_tensor<decltype(tp), decltype(tk), float>();
   auto acc1 = oop.get_destination_cooperative_tensor<decltype(tp), decltype(tk), float>();
@@ -1022,17 +1039,19 @@ kernel void attend_m(device const bfloat *qb [[buffer(0)]], device const bfloat 
   for (uint16_t i = 0; i < acc0.get_capacity(); i++)
     if (acc0.is_valid_element(i)) acc0[i] = acc1[i] = acc2[i] = acc3[i] = 0;
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  Keys kc = keys_load(ring, comp, rows, 0, n, 0, t);
+  Keys ka = keys_load(ring, comp, rows, 0, n, 0, t), kb = keys_load(ring, comp, rows, 0, n, 1, t);
   for (uint r0 = 0; r0 < n; r0 += 32) {
     auto sc = sop.get_destination_cooperative_tensor<decltype(tq.slice(0, 0)), decltype(tk), float>();
     for (uint16_t i = 0; i < sc.get_capacity(); i++)
       if (sc.is_valid_element(i)) sc[i] = 0;
-    for (uint ds = 0; ds < 4; ds++) {  // scores: the chunk's keys, a slice of 128 columns at a time
-      keys_store(kv, kc, t);
+    for (uint ds = 0; ds < 4; ds += 2) {  // scores: the chunk's keys, two slices of 128 columns at a time
+      keys_store(kv[0], ka, t), keys_store(kv[1], kb, t);
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      kc = keys_load(ring, comp, rows, r0, n, (ds + 1) % 4, t);  // after the last, the values' first
-      auto qd = tq.slice(ds * 128, 0);
-      sop.run(qd, tk, sc);
+      // the next pair; after the last, the first again, for the values
+      ka = keys_load(ring, comp, rows, r0, n, (ds + 2) % 4, t), kb = keys_load(ring, comp, rows, r0, n, (ds + 3) % 4, t);
+      auto q0 = tq.slice(ds * 128, 0), q1 = tq.slice(ds * 128 + 128, 0);
+      sop.run(q0, tk, sc);
+      sop.run(q1, tk1, sc);
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     for (uint16_t i = 0; i < sc.get_capacity(); i++)
@@ -1058,17 +1077,16 @@ kernel void attend_m(device const bfloat *qb [[buffer(0)]], device const bfloat 
         float f = rescale[acc0.get_multidimensional_index(i)[1]];
         acc0[i] *= f, acc1[i] *= f, acc2[i] *= f, acc3[i] *= f;
       }
-    for (uint ds = 0; ds < 4; ds++) {  // values: the same rows, a slice of 128 columns at a time
-      keys_store(kv, kc, t);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (ds < 3) kc = keys_load(ring, comp, rows, r0, n, ds + 1, t);
-      else if (r0 + 32 < n) kc = keys_load(ring, comp, rows, r0 + 32, n, 0, t);
-      if (ds == 0) oop.run(tp, tk, acc0);
-      else if (ds == 1) oop.run(tp, tk, acc1);
-      else if (ds == 2) oop.run(tp, tk, acc2);
-      else oop.run(tp, tk, acc3);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    // values: the same rows; slices 2 and 3 are staged, then 0 and 1 again
+    oop.run(tp, tk, acc2);
+    oop.run(tp, tk1, acc3);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    keys_store(kv[0], ka, t), keys_store(kv[1], kb, t);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (r0 + 32 < n) ka = keys_load(ring, comp, rows, r0 + 32, n, 0, t), kb = keys_load(ring, comp, rows, r0 + 32, n, 1, t);
+    oop.run(tp, tk, acc0);
+    oop.run(tp, tk1, acc1);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   for (uint16_t i = 0; i < acc0.get_capacity(); i++)
     if (acc0.is_valid_element(i)) {

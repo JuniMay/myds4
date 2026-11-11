@@ -449,6 +449,11 @@ required by its kernels. Attention includes local windows and compressed
 history with an indexer. The local rolling buffers and compressor state
 are part of a sequence's state and snapshots.
 
+An indexer scores the compressed positions that a row sees and selects up
+to 512 of them. Beyond 16,384 positions, layer 20's indexer also keeps the
+row's 2,048 best blocks of 8 positions as its candidates. The indexers of
+the later layers score and select only within those blocks.
+
 Engram uses normalized token IDs for n-gram hashing. The normalization map
 is generated from the configured tokenizer at loading. The supported hash
 layout is checked against the reference; it is not a tracked binary build
