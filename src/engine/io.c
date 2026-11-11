@@ -3,7 +3,11 @@
 // Experts are read with F_NOCACHE over 16 KiB-aligned spans: unaligned
 // uncached reads still fill the page cache. A slot holds one expert's spans
 // (expert_span) one after the other: its MXFP4 codes (w1, w2, w3), then its
-// scales; or with --experts its GGUF rows of w1, w3 and w2.
+// scales; or with --experts its GGUF rows of w1, w3 and w2. Every slot's
+// buffer has the size of the largest expert, so that any expert fits any
+// slot; when a layer's experts are more than a sixteenth smaller than the
+// largest (a GGUF set quantizes its layers differently), a buffer has the
+// size of its layer's experts instead, and the cache counts bytes (`sized`).
 //
 // Draft stages have separate MXFP4-sized buffer pools whose bytes come off
 // the same budget. By default every expert is preloaded. A bounded pool
@@ -324,6 +328,17 @@ struct ExpertStore {
   void (*transform)(void *context, int layer, int expert, uint8_t *slot, const uint32_t *at, uint64_t slot_bytes);
   void *context;
   uint64_t SLOT_SIZE;  // the largest expert in use
+  // `sized`: the scored layers' experts differ in size by more than a
+  // sixteenth (cache_required). Then a slot's buffer has the size of its
+  // layer's experts (layer_bytes), or the largest when a prompt pass
+  // allocates it, and the cache counts bytes: cap, mcap and max_cap are bytes
+  // in units of SLOT_SIZE, and more slots than cap fit in them. Otherwise
+  // every slot has SLOT_SIZE and the limits count slots.
+  uint64_t *layer_bytes;  // [scored_layers]; 0: the layer's spans are not known
+  int sized;
+  uint64_t bytes, mapped_bytes;  // the scored slots' buffers, and those mapped for the GPU
+  int max_cap;                   // the most cap and mcap may be (max_slots when not sized)
+  uint64_t conversions;          // buffers given back for one of another size
   uint64_t token;
   Slot *slots;
   int pass_layer;
@@ -449,10 +464,39 @@ ExpertStore *cache_create(const ExpertLayout *l) {
   memset(st->pf_ghost, 0, scored);
   st->draft_age = xmalloc(DRAFT_AGE_BYTES);
   memset(st->draft_age, 0, DRAFT_AGE_BYTES);
+  st->layer_bytes = xmalloc((size_t)l->scored_layers * sizeof *st->layer_bytes);
+  memset(st->layer_bytes, 0, (size_t)l->scored_layers * sizeof *st->layer_bytes);
   st->minimum_slots = 2 * l->experts;
   st->draft_capacity = l->stage_experts;
   return st;
 }
+
+// The bytes a slot for an expert of the layer takes.
+static uint64_t slot_need(const ExpertStore *st, int layer) {
+  return st->sized && layer < st->scored_layers && st->layer_bytes[layer] ? st->layer_bytes[layer] : st->SLOT_SIZE;
+}
+
+// Whether a buffer of `size` bytes may hold an expert that takes `need`: it
+// is large enough and wastes at most a sixteenth of the expert's bytes.
+static int slot_fits(uint64_t size, uint64_t need) { return size >= need && size - need <= need / 16; }
+
+// The cache's bytes and its mapped bytes in the unit of its limits: slots
+// of the largest size when the layers differ, else slots.
+static int used_units(const ExpertStore *st) {
+  return st->sized ? (int)((st->bytes + st->SLOT_SIZE - 1) / st->SLOT_SIZE) : st->nslots;
+}
+static int mapped_units(const ExpertStore *st) {
+  return st->sized ? (int)((st->mapped_bytes + st->SLOT_SIZE - 1) / st->SLOT_SIZE) : st->nmapped;
+}
+// Whether the cache holds more than its limit, or maps more than may be mapped.
+static int over_cap(const ExpertStore *st) {
+  return st->sized ? st->bytes > (uint64_t)st->cap * st->SLOT_SIZE : st->nslots > st->cap;
+}
+static int over_mcap(const ExpertStore *st) {
+  return st->sized ? st->mapped_bytes > (uint64_t)st->mcap * st->SLOT_SIZE : st->nmapped > st->mcap;
+}
+// The most the limits may be.
+static int cap_ceiling(const ExpertStore *st) { return st->sized ? st->max_cap : st->max_slots; }
 
 CacheStats *cache_counters(ExpertStore *st) { return &st->stats; }
 static int slot_reading(ExpertStore *st, int i);
@@ -718,19 +762,24 @@ static void push_front(ExpertStore *st, int i) {
 static void cancel(ExpertStore *st, int i), start_readers(ExpertStore *st), start(ExpertStore *st, int i, int urgent),
     finish(ExpertStore *st, int i), map_slot(ExpertStore *st, int i);
 
-static void release(ExpertStore *st, int i) {
+// Gives slot i's buffer back: its expert leaves, and the slot is free again.
+// by_prefetch: a read-ahead takes its room (for the prefetch metrics).
+static void discard(ExpertStore *st, int i, int by_prefetch) {
   if (slot_held(st, &st->slots[i])) die("cannot release an expert held by a runahead job");
   cancel(st, i);
-  metrics_retire(st, i, 0);
+  metrics_retire(st, i, by_prefetch);
   unlink_slot(st, i);
   if (st->slots[i].expert >= 0) place(st, st->slots[i].layer, st->slots[i].expert, -1);
-  if (st->slots[i].mapped) st->nmapped--, st->slots[i].mapped = 0;
+  if (st->slots[i].mapped) st->nmapped--, st->mapped_bytes -= st->slots[i].b.size, st->slots[i].mapped = 0;
+  st->bytes -= st->slots[i].b.size;
   gpu_free(&st->slots[i].b);
   st->score[i] = INFINITY;
   st->free_list[st->nfree++] = i;
   st->nslots--;
   st->stats.evictions++;
 }
+
+static void release(ExpertStore *st, int i) { discard(st, i, 0); }
 
 void cache_memory(ExpertStore *st, MemorySlot *backbone) { st->cache_backbone = backbone; }
 void cache_active(ExpertStore *st, int active) { st->cache_busy = !!active; }
@@ -744,7 +793,7 @@ void cache_working_rows(ExpertStore *st, int rows) {
   // The model reserves these slots' memory before such a pass (cache_required),
   // so limits that cache_init or a resize set for fewer rows rise to them.
   if (st->max_slots) {
-    int fewest = st->minimum_slots < st->max_slots ? st->minimum_slots : st->max_slots;
+    int fewest = st->minimum_slots < cap_ceiling(st) ? st->minimum_slots : cap_ceiling(st);
     if (st->cap < fewest) st->cap = fewest;
     if (st->mcap < fewest) st->mcap = fewest;
   }
@@ -784,6 +833,17 @@ static Buf pool_buffer(ExpertStore *st, int index, size_t bytes, int mapped) {
   return buffer;
 }
 
+// A slot's buffer that a demand cannot do without: required memory, for which
+// the pool takes idle model memory back. Without an object when the pool
+// cannot make the room.
+static Buf pool_buffer_required(ExpertStore *st, int index, size_t bytes) {
+  if (!st->cache_backbone) return gpu_new(bytes);
+  MemorySlot *previous = memory_scope(&st->slots[index].memory);
+  Buf buffer = gpu_try_new(bytes, MEMORY_REQUIRED);
+  memory_scope(previous);
+  return buffer;
+}
+
 uint64_t cache_required(ExpertStore *st, int layers) {
   if (!st->layout_ready) {
   uint64_t pin_size = 0;  // the stages' slots
@@ -796,7 +856,14 @@ uint64_t cache_required(ExpertStore *st, int layers) {
       if (pieces > 16) die("layer %d's experts take %llu reads of %llu MiB, more than a slot tracks", l, pieces, PIECE >> 20);
       uint64_t *at = l < st->scored_layers ? &st->SLOT_SIZE : &pin_size;
       if (size > *at) *at = size;
+      if (l < st->scored_layers && st->spans[l] && size > st->layer_bytes[l]) st->layer_bytes[l] = size;
     }
+  // The layers' own sizes are used when one of them is more than a sixteenth
+  // below the largest. A store whose layers are closer keeps slots of one
+  // size, which any expert fits, and counts slots: buffers of nearly one
+  // size would be given back for one another without holding more experts.
+  for (int l = 0; l < layers && l < st->scored_layers; l++)
+    if (st->layer_bytes[l] && st->layer_bytes[l] < st->SLOT_SIZE - st->SLOT_SIZE / 16) st->sized = 1;
   prepare_reload_cost(st, layers);
   st->npinned = draft_pool_count(st, layers);
   st->pinned_bytes = st->npinned * pin_size;
@@ -826,18 +893,26 @@ void cache_init(ExpertStore *st, uint64_t budget, int layers) {
   st->max_slots = (int)((fixed ? budget : limit) / st->SLOT_SIZE);
   if (st->max_slots > st->scored_layers * st->experts) st->max_slots = st->scored_layers * st->experts;
   if (st->max_slots < st->minimum_slots) st->max_slots = st->minimum_slots;
+  st->max_cap = st->max_slots;
+  if (st->sized) {  // the same bytes hold more slots when they are the smallest layer's
+    uint64_t smallest = st->SLOT_SIZE;
+    for (int l = 0; l < layers && l < st->scored_layers; l++)
+      if (st->layer_bytes[l] && st->layer_bytes[l] < smallest) smallest = st->layer_bytes[l];
+    uint64_t most = (uint64_t)st->max_cap * st->SLOT_SIZE / smallest;
+    st->max_slots = most < (uint64_t)st->scored_layers * st->experts ? (int)most : st->scored_layers * st->experts;
+  }
   if (budget < st->minimum_slots * st->SLOT_SIZE)
     die("an expert cache of %.1f GiB is too small: a prompt needs %.1f GiB", budget / GiB, (double)st->minimum_slots * st->SLOT_SIZE / GiB);
   // File-cache reclamation is handled by macOS as slots are populated.
   uint64_t within = avail > reserve + st->pinned_bytes ? avail - reserve - st->pinned_bytes : 0;
   st->cap = (int)((budget < within ? budget : within) / st->SLOT_SIZE);
-  if (st->cap > st->max_slots) st->cap = st->max_slots;
+  if (st->cap > cap_ceiling(st)) st->cap = cap_ceiling(st);
   if (st->cap < st->minimum_slots) st->cap = st->minimum_slots;
   // The mapped slots stay within Metal's recommendation, beside weights that
   // count as resident only once the GPU uses them.
   int64_t room = mem_gpu_room() - (int64_t)st->pinned_bytes - (int64_t)mem_footprint() - MAP_SLACK;
   st->mcap = room > st->minimum_slots * (int64_t)st->SLOT_SIZE ? (int)(room / (int64_t)st->SLOT_SIZE) : st->minimum_slots;
-  if (st->mcap > st->max_slots) st->mcap = st->max_slots;
+  if (st->mcap > cap_ceiling(st)) st->mcap = cap_ceiling(st);
   st->slots = xmalloc((st->max_slots + st->npinned) * sizeof *st->slots);
   for (int i = 0; i < st->max_slots + st->npinned; i++) st->slots[i].store = st;
   if (st->cache_backbone) for (int i = 0; i < st->max_slots + st->npinned; i++) {
@@ -877,6 +952,13 @@ void cache_init(ExpertStore *st, uint64_t budget, int layers) {
   fprintf(stderr, ", GPU working set %.1f GiB\n", gpu_limit / GiB);
   fprintf(stderr, "cache policy: half-life %d forward passes, read-cost weighting %s\n",
           st->retention_half_life, st->retention_read_cost ? "on" : "off");
+  if (st->sized) {
+    uint64_t smallest = st->SLOT_SIZE;
+    for (int l = 0; l < layers && l < st->scored_layers; l++)
+      if (st->layer_bytes[l] && st->layer_bytes[l] < smallest) smallest = st->layer_bytes[l];
+    fprintf(stderr, "expert slots have their layer's size, %.2f to %.2f MiB: the slot ceiling counts the largest, "
+            "and up to %d slots fit\n", smallest / 1048576.0, st->SLOT_SIZE / 1048576.0, st->max_slots);
+  }
   if (st->npinned) {
     if (st->draft_capacity == st->stage_experts)
       fprintf(stderr, "the DSpark stages' %d experts: %.1f GiB, resident\n", st->npinned, st->pinned_bytes / GiB);
@@ -930,8 +1012,10 @@ static void piece_finished(ExpertStore *st, Slot *s, int piece, int read) {
     if (s->background_load) atomic_fetch_sub_explicit(&st->prefetching, 1, memory_order_relaxed);
     // The layout's step after a complete load, before its group completes:
     // the expert counts as read only after it.
+    // The transform's bytes end where the slot's own buffer ends (experts.c
+    // finds them from the buffer's size).
     if (st->transform && atomic_load_explicit(&s->read, memory_order_acquire) == s->npiece)
-      st->transform(st->context, s->layer, s->expert, s->b.ptr, s->at, st->SLOT_SIZE);
+      st->transform(st->context, s->layer, s->expert, s->b.ptr, s->at, s->pinned ? st->SLOT_SIZE : s->b.size);
   }
   dispatch_group_leave(s->loading);
   // Publish after leaving the group. Every piece signals: the reader that
@@ -956,6 +1040,36 @@ static void queue_push(ExpertStore *st, uint32_t entry, uint16_t layer) {
   st->queue[at % QUEUE] = entry, st->qlayer[at % QUEUE] = layer;
 }
 
+// The SSD's time for expert reads, for measuring where the time goes: the
+// seconds with at least one read in flight (their union), and the demand and
+// background reads' summed seconds. Every store's reads count.
+static pthread_mutex_t ssd_lock = PTHREAD_MUTEX_INITIALIZER;
+static int ssd_reads;
+static double ssd_since, ssd_busy, ssd_read[2];  // ssd_read: demand, background
+
+static double ssd_begin(void) {
+  double t = now();
+  pthread_mutex_lock(&ssd_lock);
+  if (!ssd_reads++) ssd_since = t;
+  pthread_mutex_unlock(&ssd_lock);
+  return t;
+}
+
+static void ssd_end(int background, double began) {
+  double t = now();
+  pthread_mutex_lock(&ssd_lock);
+  ssd_read[background] += t - began;
+  if (!--ssd_reads) ssd_busy += t - ssd_since;
+  pthread_mutex_unlock(&ssd_lock);
+}
+
+void io_ssd_times(double *busy, double *demand, double *background) {
+  pthread_mutex_lock(&ssd_lock);
+  *busy = ssd_busy + (ssd_reads ? now() - ssd_since : 0);
+  *demand = ssd_read[0], *background = ssd_read[1];
+  pthread_mutex_unlock(&ssd_lock);
+}
+
 static void *reader(void *arg) {
   ExpertStore *st = arg;
   for (;;) {
@@ -974,7 +1088,9 @@ static void *reader(void *arg) {
     Slot *s = &st->slots[q >> 4];
     if (owned) {
       uint64_t began = metrics_io_begin(st, s, 0);
+      double reading = ssd_begin();
       read_piece(&s->piece[q & 15], 0);
+      ssd_end(1, reading);
       metrics_io_end(st, s, 0, began);
       __atomic_fetch_add(&st->stats.bytes, s->piece[q & 15].len, __ATOMIC_RELAXED);
       metrics_piece_done(st, s, s->piece[q & 15].len);
@@ -1001,7 +1117,9 @@ static void read_demand(void *ctx) {
   uint32_t q = (uint32_t)entry;
   Slot *s = &st->slots[q >> 4];
   uint64_t began = metrics_io_begin(st, s, 1);
+  double reading = ssd_begin();
   read_piece(&s->piece[q & 15], 0);
+  ssd_end(0, reading);
   metrics_io_end(st, s, 1, began);
   __atomic_fetch_add(&st->stats.bytes, s->piece[q & 15].len, __ATOMIC_RELAXED);
   metrics_piece_done(st, s, s->piece[q & 15].len);
@@ -1138,6 +1256,57 @@ static int victim(ExpertStore *st) {
   return best;
 }
 
+// The victim when the layers' experts differ in size, for an expert that
+// takes `need` bytes. It is victim()'s slot if that slot's buffer fits the
+// expert. Otherwise a slot whose buffer fits is reused if it is nearly as
+// low: when decoding, the lowest-priority fitting slot among the FIT_RANK
+// lowest priorities, which are the slots the next misses would take anyway;
+// in a prompt pass, the least recently used slot of the same priority whose
+// buffer is large enough (a pass's buffers are of the largest size: see
+// take). When there is none, *convert is set and victim()'s slot is
+// returned: the caller gives buffers back until one of the wanted size fits
+// in the cache's bytes (take).
+enum { FIT_RANK = 64 };
+static int victim_sized(ExpertStore *st, uint64_t need, int *convert) {
+  int best = -1, fit = -1;
+  double lowest = INFINITY, fit_lowest = INFINITY;
+  *convert = 0;
+  if (st->pass_layer < 0) {
+    for (int j = 0; j < st->max_slots; j++)
+      if (st->score[j] < INFINITY && !st->slots[j].prefetched &&
+          !slot_held(st, &st->slots[j]) &&
+          !(st->slots[j].expert >= 0 && st->slots[j].layer == st->serving && st->slots[j].used == st->token)) {
+        double priority = eviction_priority(st, j);
+        if (priority < lowest) best = j, lowest = priority;
+        if (priority < fit_lowest && slot_fits(st->slots[j].b.size, need)) fit = j, fit_lowest = priority;
+      }
+    if (best < 0 || fit == best) return best;
+    if (fit >= 0) {
+      int below = 0;
+      for (int j = 0; j < st->max_slots && below < FIT_RANK; j++)
+        below += st->score[j] < INFINITY && !st->slots[j].prefetched && !slot_held(st, &st->slots[j]) &&
+                 !(st->slots[j].expert >= 0 && st->slots[j].layer == st->serving && st->slots[j].used == st->token) &&
+                 eviction_priority(st, j) < fit_lowest;
+      if (below < FIT_RANK) return fit;
+    }
+    *convert = 1;
+    return best;
+  }
+  for (int later = 0; later < 2 && best < 0; later++)
+    for (int j = st->tail; j >= 0; j = st->slots[j].prev) {
+      int l = st->slots[j].layer;
+      if (later ? l <= st->pass_layer + 1 : l >= st->pass_layer) continue;
+      if (st->score[j] == INFINITY || slot_held(st, &st->slots[j])) continue;
+      double priority = decoding_priority(st, j);
+      if (best < 0 || priority < lowest) best = j, lowest = priority;
+      if (st->slots[j].b.size >= need && (fit < 0 || priority < fit_lowest)) fit = j, fit_lowest = priority;
+    }
+  if (best < 0 || st->slots[best].b.size >= need) return best;
+  if (fit >= 0 && fit_lowest == lowest) return fit;
+  *convert = 1;
+  return best;
+}
+
 
 // Maps slot i for the GPU; until the set is committed (between tokens) the
 // GPU reaches it through gpu_use (fresh).
@@ -1145,7 +1314,7 @@ static void map_slot(ExpertStore *st, int i) {
   if (st->slots[i].mapped) return;
   gpu_resident(&st->slots[i].b, 1);
   st->slots[i].mapped = 1, st->slots[i].fresh = 1, st->any_fresh = 1;
-  st->nmapped++;
+  st->nmapped++, st->mapped_bytes += st->slots[i].b.size;
   if (st->slots[i].mapped_once) st->stats.remaps++;
   st->slots[i].mapped_once = 1;
 }
@@ -1171,36 +1340,166 @@ static void slot_released_block(void *context) {
   while (!slot_released(context)) sched_yield();
 }
 
+// The slot whose buffer a conversion gives back next, -1 if none. Nothing
+// holds it, and it is no read-ahead that is still protected. When decoding,
+// it is the lowest priority among the slots not used or read ahead in this
+// token: the memory pool does not free those either (pool_can_evict). In a
+// prompt pass it follows victim()'s order, the layers the pass is done with
+// before the layers after the next, but leaves out the layer just before the
+// pass's own, whose buffers the pool does not free either.
+static int victim_freeable(ExpertStore *st) {
+  int best = -1;
+  double lowest = INFINITY;
+  if (st->pass_layer < 0) {
+    for (int j = 0; j < st->max_slots; j++)
+      if (st->score[j] < INFINITY && !st->slots[j].prefetched && !slot_held(st, &st->slots[j]) &&
+          st->slots[j].used != st->token) {
+        double priority = eviction_priority(st, j);
+        if (priority < lowest) best = j, lowest = priority;
+      }
+    return best;
+  }
+  for (int later = 0; later < 2 && best < 0; later++)
+    for (int j = st->tail; j >= 0; j = st->slots[j].prev) {
+      int l = st->slots[j].layer;
+      if (later ? l <= st->pass_layer + 1 : l >= st->pass_layer - 1) continue;
+      if (st->score[j] == INFINITY || slot_held(st, &st->slots[j])) continue;
+      double priority = decoding_priority(st, j);
+      if (best < 0 || priority < lowest) best = j, lowest = priority;
+    }
+  return best;
+}
+
+// The slot a demand reuses when no buffer can be given back or allocated for
+// it, -1 if none: its buffer is at least `need` bytes, whatever it wastes, and
+// nothing holds it. Among such slots victim()'s preferences decide. First
+// come the slots victim() takes from: when decoding, those that are no
+// protected read-ahead and that the layer being served did not select this
+// token; in a prompt pass, those of the layers the pass is done with, then
+// those of the layers after the next. The other slots come last. Within
+// each group the lowest priority goes, and among equals the least recently
+// used.
+static int victim_large_enough(ExpertStore *st, uint64_t need) {
+  int best[3] = {-1, -1, -1};
+  double lowest[3] = {INFINITY, INFINITY, INFINITY};
+  for (int j = st->tail; j >= 0; j = st->slots[j].prev) {
+    const Slot *s = &st->slots[j];
+    if (st->score[j] == INFINITY || slot_held(st, s) || s->b.size < need) continue;
+    int group;
+    double priority;
+    if (st->pass_layer < 0) {
+      group = s->prefetched || (s->expert >= 0 && s->layer == st->serving && s->used == st->token) ? 2 : 0;
+      priority = eviction_priority(st, j);
+    } else {
+      group = s->layer < st->pass_layer ? 0 : s->layer > st->pass_layer + 1 ? 1 : 2;
+      priority = decoding_priority(st, j);
+    }
+    if (best[group] < 0 || priority < lowest[group]) best[group] = j, lowest[group] = priority;
+  }
+  return best[0] >= 0 ? best[0] : best[1] >= 0 ? best[1] : best[2];
+}
+
+// A conversion: no slot with a fitting buffer is low enough, so the cache
+// gives buffers back, the lowest priorities first, until one of `need` bytes
+// fits in its bytes and the memory pool admits it. Returns the free slot the
+// new buffer (*buffer) is for, or -1. A read-ahead gives at most two buffers
+// back and a demand four: two of the smallest make room for one of the
+// largest, and the pool admits a buffer only while a second one would fit
+// above the reserve (memory_admit). A pool that still refuses is short of
+// memory, and giving more back would empty the cache into it; the demand
+// then reuses a buffer that is large enough (victim_large_enough).
+enum { CONVERT_OPTIONAL = 2, CONVERT_DEMAND = 4 };
+static int convert(ExpertStore *st, uint64_t need, int optional, Buf *buffer) {
+  for (int given = 0;; given++) {
+    if (st->nfree && st->bytes + need <= (uint64_t)st->cap * st->SLOT_SIZE) {
+      int j = st->free_list[st->nfree - 1];
+      *buffer = pool_buffer(st, j, need, 0);
+      if (buffer->obj) {
+        st->conversions += given > 0;
+        return j;
+      }
+    }
+    if (given >= (optional ? CONVERT_OPTIONAL : CONVERT_DEMAND)) return -1;
+    int i = victim_freeable(st);
+    if (i < 0 || (optional && slot_reading(st, i))) return -1;
+    discard(st, i, optional);
+  }
+}
+
 // A slot for expert e of the layer, or -1 for an optional request when none
-// is free, or TAKE_RESIDENT when, during the wait above, another pass made the
-// expert resident.
+// is free, or TAKE_RESIDENT when, during the wait for a slot that passes
+// hold, another pass made the expert resident.
 static int take(ExpertStore *st, int layer, int e, int optional) {
   int i = -1;
-  int reuse = st->nslots >= st->cap || !st->nfree;
-  Buf buffer = {0};
-  if (!reuse) {
-    i = st->free_list[st->nfree - 1];
-    buffer = pool_buffer(st, i, st->SLOT_SIZE, 0);
-    if (!buffer.obj) reuse = 1;
+  // What the expert takes, and the size of a new buffer for it: the expert's
+  // when decoding. A prompt pass goes through every layer and needs each
+  // one's experts only until the next, so its new buffers have the largest
+  // size and serve all its layers; decoding gives them back for buffers of
+  // its experts' sizes as it replaces their experts.
+  uint64_t need = slot_need(st, layer), size = st->pass_layer >= 0 ? st->SLOT_SIZE : need;
+  int reuse;
+  Buf buffer;
+  for (;;) {  // once; again after a demand that found no buffer at all gave a slot back
+    i = -1, buffer = (Buf){0};
+    reuse = (st->sized ? st->bytes + size > (uint64_t)st->cap * st->SLOT_SIZE : st->nslots >= st->cap) || !st->nfree;
+    if (!reuse) {
+      i = st->free_list[st->nfree - 1];
+      buffer = pool_buffer(st, i, size, 0);
+      if (!buffer.obj) reuse = 1;
+    }
+    if (reuse) {
+      int converting = 0;
+      i = st->sized ? victim_sized(st, need, &converting) : victim(st);
+      if (i < 0) {
+        if (optional) return -1;
+        // The preferences leave only slots that another pass may read soon: a
+        // demand may take any slot that nothing holds.
+        i = slot_unheld(st);
+        if (i < 0 && pass_current()) {
+          SlotWait wait = {st, now() + 60};
+          pass_wait(&(PassWait){slot_released, slot_released_block, &wait});
+          if (WHERE(layer, e) >= 0) return TAKE_RESIDENT;
+          i = slot_unheld(st);
+        }
+        if (i < 0) die("the expert cache (%d slots) cannot hold the experts of two layers", st->nslots);
+        converting = st->sized && st->slots[i].b.size < need;
+      }
+      // Routing can demote a prefetch while its read is still running. Do not
+      // stall the model for optional work or evict a higher-scoring resident.
+      if (optional && slot_reading(st, i)) return -1;
+      if (converting) {
+        // The buffer cannot hold the expert, or wastes too much of the cache
+        // on it: buffers go back to make room for one of the wanted size.
+        i = convert(st, size, optional, &buffer);
+        if (i >= 0) reuse = 0;
+        else if (optional) return -1;
+        else if ((i = victim_large_enough(st, need)) < 0) {
+          // No buffer could be converted and none is large enough: the demand
+          // allocates one as required memory, for which the pool makes room.
+          // The pool may take other slots of this cache back for it, and they
+          // join the free list: the slot the buffer is charged to leaves the
+          // list meanwhile and returns to its top.
+          if (st->nfree) {
+            i = st->free_list[--st->nfree];
+            buffer = pool_buffer_required(st, i, size);
+            st->free_list[st->nfree++] = i;
+          }
+          if (!buffer.obj) {
+            // The pool cannot make the room: passes hold what it would take
+            // back. The lowest priority that nothing holds goes back, and the
+            // demand starts over. It then finds room in the cache's own
+            // bytes; or, with nothing left that is not held, it waits above
+            // for another pass to release a slot, as with slots of one size.
+            if ((i = victim_large_enough(st, 0)) >= 0) discard(st, i, 0);
+            continue;
+          }
+          reuse = 0;
+        }
+      }
+    }
+    break;
   }
   if (reuse) {
-    i = victim(st);
-    if (i < 0) {
-      if (optional) return -1;
-      // The preferences leave only slots that another pass may read soon: a
-      // demand may take any slot that nothing holds.
-      i = slot_unheld(st);
-      if (i < 0 && pass_current()) {
-        SlotWait wait = {st, now() + 60};
-        pass_wait(&(PassWait){slot_released, slot_released_block, &wait});
-        if (WHERE(layer, e) >= 0) return TAKE_RESIDENT;
-        i = slot_unheld(st);
-      }
-      if (i < 0) die("the expert cache (%d slots) cannot hold the experts of two layers", st->nslots);
-    }
-    // Routing can demote a prefetch while its read is still running. Do not
-    // stall the model for optional work or evict a higher-scoring resident.
-    if (optional && slot_reading(st, i)) return -1;
     cancel(st, i);
     metrics_retire(st, i, optional);
     unlink_slot(st, i);
@@ -1209,7 +1508,7 @@ static int take(ExpertStore *st, int layer, int e, int optional) {
     if (st->slots[i].mapped) {
       gpu_resident(&st->slots[i].b, 0);
       st->slots[i].mapped = st->slots[i].fresh = 0;
-      st->nmapped--;
+      st->nmapped--, st->mapped_bytes -= st->slots[i].b.size;
     }
   } else {
     i = st->free_list[--st->nfree];
@@ -1217,7 +1516,7 @@ static int take(ExpertStore *st, int layer, int e, int optional) {
     // CPU reads fill the buffer. cache_get maps it when GPU work uses it;
     // a forecast that is never selected does not occupy GPU residency.
     st->slots[i].mapped = st->slots[i].fresh = st->slots[i].mapped_once = 0;
-    st->nslots++;
+    st->nslots++, st->bytes += buffer.size;
   }
   if (st->cache_backbone) memory_touch(&st->slots[i].memory);
   st->slots[i].prefetched = 0;
@@ -1497,7 +1796,7 @@ void cache_wait(ExpertStore *st, int layer, const int *experts, int n) {
   double t = now();
   if (pass_current()) {
     ReadsWait wait = {st, layer, experts, n};
-    pass_wait(&(PassWait){reads_ready, reads_block, &wait});
+    pass_wait(&(PassWait){reads_ready, reads_block, &wait, PASS_WAIT_READ});
   }
   for (int k = 0; k < n; k++) finish(st, WHERE(layer, experts[k]));
   st->stats.read_s += now() - t;
@@ -1635,7 +1934,10 @@ static void resize(ExpertStore *st, int below) {
   if (!st->init) st->swapouts = s.swapouts, st->init = 1;
   int64_t room = mem_gpu_room();
   uint64_t swap_delta = s.swapouts > st->swapouts ? s.swapouts - st->swapouts : 0;
-  int level = mem_pressure(), swapped = swap_delta && st->nslots > st->minimum_slots;
+  // What the cache holds and maps, in the unit of its limits (slots, or the
+  // largest slot's bytes when the layers differ), and the most they may be.
+  int used = used_units(st), mapped = mapped_units(st), ceiling = cap_ceiling(st);
+  int level = mem_pressure(), swapped = swap_delta && used > st->minimum_slots;
   int low = level >= 2 || swapped || avail < reserve;
   if (swapped) st->bad = now();
   st->swapouts = s.swapouts;
@@ -1643,29 +1945,29 @@ static void resize(ExpertStore *st, int below) {
   uint64_t headroom = now() - st->bad > 300 ? avail : free;
   if (low && (level >= 4 || swapped || now() - gave > 1)) {
     uint64_t to = avail;
-    int64_t give = level >= 4 ? st->nslots / 4 : level >= 2 || swapped ? st->nslots / 16 + 1 : 0;
+    int64_t give = level >= 4 ? used / 4 : level >= 2 || swapped ? used / 16 + 1 : 0;
     if (to < reserve && (int64_t)((reserve - to) / slot) + 1 > give) give = (reserve - to) / slot + 1;
-    st->cap = st->nslots - (int)give > st->minimum_slots ? st->nslots - (int)give : st->minimum_slots;
+    st->cap = used - (int)give > st->minimum_slots ? used - (int)give : st->minimum_slots;
     st->calm = 0, gave = now();
-  } else if (!low && ++st->calm >= 32 && st->cap < st->max_slots && headroom > reserve + margin) {
+  } else if (!low && ++st->calm >= 32 && st->cap < ceiling && headroom > reserve + margin) {
     st->cap += (int)((headroom - reserve - margin) / slot / 4) + 1;
-    if (st->cap > st->max_slots) st->cap = st->max_slots;
+    if (st->cap > ceiling) st->cap = ceiling;
     st->calm = 0;
   }
   if (room < 0 && now() - st->unmapped > 1) {  // past the GPU's limit: map fewer, exactly the excess fewer
-    st->mcap = st->nmapped - (int)(-room / (int64_t)slot) - 1 > st->minimum_slots ? st->nmapped - (int)(-room / (int64_t)slot) - 1 : st->minimum_slots;
+    st->mcap = mapped - (int)(-room / (int64_t)slot) - 1 > st->minimum_slots ? mapped - (int)(-room / (int64_t)slot) - 1 : st->minimum_slots;
     st->calm_map = 0, st->unmapped = now();
-  } else if (room >= 0 && ++st->calm_map >= 32 && st->mcap < st->max_slots && room > MAP_SLACK + (int64_t)GiB) {
+  } else if (room >= 0 && ++st->calm_map >= 32 && st->mcap < ceiling && room > MAP_SLACK + (int64_t)GiB) {
     st->mcap += (int)((room - MAP_SLACK - (int64_t)GiB) / (int64_t)slot / 4) + 1;
-    if (st->mcap > st->max_slots) st->mcap = st->max_slots;
+    if (st->mcap > ceiling) st->mcap = ceiling;
     st->calm_map = 0;
   }
-  for (int i = st->tail; st->nslots > st->cap && i >= 0;) {
+  for (int i = st->tail; over_cap(st) && i >= 0;) {
     int prev = st->slots[i].prev;
     if (st->slots[i].layer < below && !slot_held(st, &st->slots[i])) release(st, i), st->stats.given_back++;
     i = prev;
   }
-  while (st->nmapped > st->mcap) {  // the mapped slots with the lowest scores that nothing of this pass still needs
+  while (over_mcap(st)) {  // the mapped slots with the lowest scores that nothing of this pass still needs
     int best = -1;
     for (int j = 0; j < st->max_slots; j++)
       if (st->slots[j].b.obj && st->slots[j].mapped && st->slots[j].layer < below && !slot_held(st, &st->slots[j]) &&
@@ -1674,7 +1976,7 @@ static void resize(ExpertStore *st, int below) {
     if (best < 0) break;
     gpu_resident(&st->slots[best].b, 0);
     st->slots[best].mapped = 0, st->slots[best].fresh = 0;
-    st->nmapped--, st->unmaps++;
+    st->nmapped--, st->mapped_bytes -= st->slots[best].b.size, st->unmaps++;
   }
   gpu_residency_commit();
   static int trace = -1;
@@ -1720,12 +2022,21 @@ void cache_adapt(ExpertStore *st) { cache_adapt_pass(st, -1); }
 // memory and leaves them as they are otherwise.
 void cache_idle(ExpertStore *st) { resize(st, st->layers); }
 
-uint64_t cache_bytes(ExpertStore *st) { return (uint64_t)st->nslots * st->SLOT_SIZE + st->pinned_bytes; }
+// With slots of the layers' own sizes, the limits are bytes: the counts
+// below say how many slots fit in them, the allocated ones and as many of
+// the largest size as the remaining bytes hold; a slot's bytes are the
+// allocated slots' average.
+static int units_as_slots(const ExpertStore *st, int units) {
+  uint64_t limit = (uint64_t)units * st->SLOT_SIZE;
+  return st->sized ? st->nslots + (int)(limit > st->bytes ? (limit - st->bytes) / st->SLOT_SIZE : 0) : units;
+}
+uint64_t cache_bytes(ExpertStore *st) { return (st->sized ? st->bytes : (uint64_t)st->nslots * st->SLOT_SIZE) + st->pinned_bytes; }
 int cache_slots(ExpertStore *st) { return st->nslots; }
 int cache_mapped(ExpertStore *st) { return st->nmapped; }
-int cache_cap(ExpertStore *st) { return st->cap; }
-int cache_max(ExpertStore *st) { return st->max_slots; }
-uint64_t cache_slot_bytes(ExpertStore *st) { return st->SLOT_SIZE; }
+int cache_cap(ExpertStore *st) { return units_as_slots(st, st->cap); }
+int cache_max(ExpertStore *st) { return units_as_slots(st, cap_ceiling(st)); }
+uint64_t cache_slot_bytes(ExpertStore *st) { return st->sized && st->nslots ? st->bytes / st->nslots : st->SLOT_SIZE; }
+uint64_t cache_conversions(ExpertStore *st) { return st->conversions; }
 
 static void metric_array(FILE *out, const char *const *names, const uint64_t *values, int n) {
   fputc('{', out);

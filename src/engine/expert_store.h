@@ -145,7 +145,11 @@ void cache_drain(void);             // complete queued and active expert reads
 uint64_t cache_bytes(ExpertStore *st);
 int cache_slots(ExpertStore *st);
 int cache_mapped(ExpertStore *st);     // slots mapped for the GPU
-int cache_cap(ExpertStore *st);        // slots the cache may hold now
-int cache_max(ExpertStore *st);        // and at most
-uint64_t cache_slot_bytes(ExpertStore *st);
+// The slots the cache may hold now, and at most. When the layers differ in
+// size, the limits are bytes: these are the allocated slots plus as many of
+// the largest size as the limit's remaining bytes hold.
+int cache_cap(ExpertStore *st);
+int cache_max(ExpertStore *st);
+uint64_t cache_slot_bytes(ExpertStore *st);  // a slot's bytes: the allocated slots' average when the layers differ in size
+uint64_t cache_conversions(ExpertStore *st);  // buffers given back so far for one of another size
 uint64_t cache_uncached_bytes(ExpertStore *st, int *experts);  // the backbone's experts without a slot: bytes and count

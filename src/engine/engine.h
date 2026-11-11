@@ -21,7 +21,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MYDS4_ABI 19
+#define MYDS4_ABI 20
 
 // ---- the process ----
 
@@ -355,6 +355,14 @@ typedef struct {
   // memory above the reserve, within --memory
   uint64_t model_memory_limit, model_memory_used, model_memory_committed, model_memory_peak;
   uint64_t kv_allocated, model_workspace;
+  // Process-wide, since start, for measuring where the time goes: the engine
+  // thread's seconds outside myds4_run, running a pass, and in myds4_run with
+  // no pass ready while one waits for the GPU, else for reads, else for
+  // something else; the GPU main queue's busy seconds and its idle seconds
+  // between command buffers by the engine thread's state then (the same
+  // five); the seconds with an expert read in flight, and the demand and
+  // background expert reads' summed seconds.
+  double thread_s[5], gpu_busy_s, gpu_idle_s[5], ssd_busy_s, demand_read_s, background_read_s;
 } myds4_stats;
 void myds4_refresh_stats(void); // sample process memory once for all models
 void myds4_stats_get(const myds4_model *m, myds4_stats *s);

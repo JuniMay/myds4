@@ -630,7 +630,21 @@ pub fn status(model: usize) -> Value {
                          "hits": c.cache.hits + c.cache.prefetch_hits, "misses": c.cache.misses,
                          "read_gb": round(c.cache.bytes as f64 / 1e9, 1), "slots_released": c.cache.given_back},
         "memory": {"available_gib": round(c.available as f64 / GIB, 1), "footprint_gib": round(c.footprint as f64 / GIB, 1)},
+        "engine_times": engine_times(&c),
     })
+}
+
+/// Where the process's time went since start (the same for every model): the
+/// engine thread's seconds by its state, the GPU main queue's busy seconds
+/// and its idle seconds between command buffers by the engine thread's state
+/// then, and the SSD's seconds with an expert read in flight.
+fn engine_times(c: &engine::Stats) -> Value {
+    let states = |t: &[f64; 5]| {
+        json!({"outside": t[0], "pass": t[1], "wait_gpu": t[2], "wait_read": t[3], "wait_other": t[4]})
+    };
+    json!({"thread_seconds": states(&c.thread_s), "gpu_busy_seconds": c.gpu_busy_s,
+           "gpu_idle_seconds": states(&c.gpu_idle_s), "ssd_busy_seconds": c.ssd_busy_s,
+           "demand_read_seconds": c.demand_read_s, "background_read_seconds": c.background_read_s})
 }
 
 /// The states saved on the SSD (null without them): their folder, count and

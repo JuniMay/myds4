@@ -1,8 +1,9 @@
 // Decoding B sequences together (deepseek_forward_rows), for the decode bound:
 // per step, the wall time, the GPU's busy and idle time, and per decoded row
 // the experts read on demand, the expert bytes read and the slots mapped for
-// the GPU again; at the end the cache's slot limit (slots), the slots
-// allocated and those mapped. Each sequence has its own prompt, prefilled alone: an
+// the GPU again and the slot buffers given back for one of another size; at
+// the end the cache's slot limit (slots), the slots allocated, those mapped
+// and the cache's bytes. Each sequence has its own prompt, prefilled alone: an
 // opening line and a short request, or with --text sequence r's own part of
 // FILE, its r-th run of --prompt-tokens tokens. Then the B sequences decode greedily in
 // lockstep, --warm steps (default 32) before the timed --steps. One B per
@@ -104,10 +105,12 @@ int main(int argc, char **argv) {
   int *gen = xmalloc((size_t)(warm + steps + 1) * sizeof *gen), ng = 0;  // the first sequence's tokens
   gen[ng++] = tok[0];
   CacheStats c0 = *expert_stats();
+  uint64_t converted0 = cache_conversions(experts_store);
   double t0 = now(), g0 = gpu_busy, i0 = gpu_gap, ph0[7];
   for (int s = 0; s < warm + steps; s++) {
     if (s == warm) {  // MYDS4_PROFILE=1 covers the timed passes
       c0 = *expert_stats(), t0 = now(), g0 = gpu_busy, i0 = gpu_gap, gpu_profile_reset();
+      converted0 = cache_conversions(experts_store);
       memcpy(ph0, phase_s, sizeof ph0);
     }
     const float *logits = deepseek_forward_rows(st, tok, pos, rows);
@@ -117,11 +120,13 @@ int main(int argc, char **argv) {
   double wall = now() - t0, n = (double)steps * rows;
   printf("{\"rows_bench\":{\"rows\":%d,\"context\":%d,\"steps\":%d,\"step_ms\":%.2f,\"tokens_per_s\":%.2f,\"gpu_busy_ms_per_step\":%.2f,"
          "\"gpu_idle_ms_per_step\":%.2f,\"demand_reads_per_row\":%.2f,\"prefetch_hits_per_row\":%.2f,\"read_mb_per_row\":%.1f,"
-         "\"remaps_per_row\":%.2f,\"slots\":%d,\"allocated\":%d,\"mapped\":%d,\"distinct_8grams\":%.3f}}\n",
+         "\"remaps_per_row\":%.2f,\"slots\":%d,\"allocated\":%d,\"mapped\":%d,\"cache_gib\":%.2f,\"resized_buffers_per_row\":%.2f,"
+         "\"distinct_8grams\":%.3f}}\n",
          rows, pos[0], steps, wall / steps * 1e3, n / wall, (gpu_busy - g0) / steps * 1e3, (gpu_gap - i0) / steps * 1e3,
          (expert_stats()->misses - c0.misses) / n, (expert_stats()->prefetch_hits - c0.prefetch_hits) / n,
          (expert_stats()->bytes - c0.bytes) / n / 1e6, (expert_stats()->remaps - c0.remaps) / n, cache_cap(experts_store),
-         cache_slots(experts_store), cache_mapped(experts_store), distinct_8grams(gen, ng));
+         cache_slots(experts_store), cache_mapped(experts_store), cache_bytes(experts_store) / (1024.0 * 1024 * 1024),
+         (cache_conversions(experts_store) - converted0) / n, distinct_8grams(gen, ng));
   // the CPU's time per pass in decoding's phases (model.c's phase_s)
   static const char *phases[] = {"rows", "routing_waits", "expert_loads", "requests_and_prefetch", "encoding", "adapt", "drafting"};
   printf("{\"rows_bench_phases_ms_per_step\":{");

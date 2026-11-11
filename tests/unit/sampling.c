@@ -13,6 +13,43 @@ static void expect(const char *name, int ok) {
   if (!ok) failures++, fprintf(stderr, "FAIL: %s\n", name);
 }
 
+static double normal(void) { return sqrt(-2 * log(drand48() + 1e-300)) * cos(6.283185307179586 * drand48()); }
+
+// Top-p as a full sort of every token computes it, the reference: the kept
+// tokens' probabilities (normalized) in out, the drawn token, and one draw
+// from seed.
+static const double *ranked_p;
+static int by_p(const void *a, const void *b) {
+  int i = *(const int *)a, j = *(const int *)b;
+  if (ranked_p[i] != ranked_p[j]) return ranked_p[i] > ranked_p[j] ? -1 : 1;
+  return (i > j) - (i < j);
+}
+static int full_sort_top_p(const float *logits, int count, double temp, double top_p, unsigned short seed[3], double *out) {
+  double *p = malloc((size_t)count * sizeof *p);
+  int *order = malloc((size_t)count * sizeof *order), best = sample_argmax(logits, count), n = 0, k = 0;
+  double sum = 0, kept = 0;
+  for (int i = 0; i < count; i++) p[i] = exp(((double)logits[i] - logits[best]) / temp), sum += p[i];
+  for (int i = 0; i < count; i++)
+    if (p[i] > 0) order[n++] = i;
+  ranked_p = p;
+  qsort(order, (size_t)n, sizeof *order, by_p);
+  double threshold = top_p * sum;
+  do kept += p[order[k++]];
+  while (k < n && kept < threshold);
+  memset(out, 0, (size_t)count * sizeof *out);
+  for (int i = 0; i < k; i++) out[order[i]] = p[order[i]] / kept;
+  double r = erand48(seed) * kept;
+  int token = best;
+  for (int i = 0; i < k; i++) {
+    if (p[order[i]] == 0) continue;
+    token = order[i];
+    if (r < p[order[i]]) break;
+    r -= p[order[i]];
+  }
+  free(p), free(order);
+  return token;
+}
+
 static void frequency(double temp, double top_p, const double expected[3], const char *name) {
   float logits[3] = {logf(.6f), logf(.3f), logf(.1f)};
   Sampler s = {.temp = temp, .top_p = top_p};
@@ -191,6 +228,43 @@ int main(void) {
   }
   expect("identical proposal distributions are always accepted", all_kept);
   expect("disjoint proposal support returns target support", disjoint);
+  // Top-p over DeepSeek's whole vocabulary keeps, weighs and draws what a full
+  // sort of every token gives: flat to peaked logits, equal logits, several
+  // temperatures and top-p values. And it takes little time: the engine thread
+  // samples every decoding request's token between passes.
+  enum { VOCAB = 129280 };
+  float *big = malloc(VOCAB * sizeof *big);
+  double *got = malloc(VOCAB * sizeof *got), *want = malloc(VOCAB * sizeof *want);
+  int nucleus_same = 1;
+  for (int trial = 0; trial < 40; trial++) {
+    srand48(trial + 1);
+    double spread = (double[]){.05, .5, 1, 2, 3, 5, 8, 12}[trial % 8];
+    for (int i = 0; i < VOCAB; i++) big[i] = (float)(spread * normal());
+    if (trial % 3 == 0)
+      for (int i = 0; i < VOCAB; i += 7) big[i] = big[(i * 31 + 5) % VOCAB];  // equal logits
+    big[(trial * 7919) % VOCAB] += (float)(trial % 5) * 3;                    // a leading token
+    double temp = (double[]){.6, 1, 1.3}[trial % 3], top_p = (double[]){0, .5, .9, .95, .99}[trial % 5];
+    Sampler s = {.temp = temp, .top_p = top_p};
+    sampler_seed(&s, 4242 + (uint64_t)trial);
+    unsigned short seed[3];
+    memcpy(seed, s.seed, sizeof seed);
+    int drawn = sample_proposal(big, VOCAB, &s, got);
+    nucleus_same &= drawn == full_sort_top_p(big, VOCAB, temp, top_p, seed, want) &&
+                    !memcmp(got, want, VOCAB * sizeof *got) && !memcmp(s.seed, seed, sizeof seed);
+  }
+  expect("top-p keeps, weighs and draws the tokens that a full sort keeps", nucleus_same);
+  srand48(99);
+  for (int i = 0; i < VOCAB; i++) big[i] = (float)(3 * normal());
+  Sampler timed = {.temp = 1, .top_p = .95};
+  sampler_seed(&timed, 7);
+  double fastest = 1;
+  for (int rep = 0; rep < 12; rep++) {
+    double t0 = now();
+    sample_token(big, VOCAB, &timed);
+    if (now() - t0 < fastest) fastest = now() - t0;
+  }
+  expect("top-p samples a 129,280-token vocabulary within 4 ms", fastest < 4e-3);
+  free(big), free(got), free(want);
   fprintf(stderr, "sampling: %d/%d CPU checks passed\n", checks - failures, checks);
   return failures != 0;
 }

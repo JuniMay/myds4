@@ -149,12 +149,25 @@ void gpu_profile_reset(void);
 extern double gpu_busy;  // seconds the GPU spent on committed command buffers
 extern double gpu_gap;   // seconds between them, within each gpu_sync's batch
 extern long gpu_gaps;    // of those gaps, the ones longer than 100 us
+// What the engine thread does, for measuring where its time and the GPU's idle
+// time go: outside myds4_run, running a pass, or in myds4_run with no pass
+// ready while one waits for the GPU, else for expert or Engram reads, else for
+// something else (a slot that another pass holds).
+enum { THREAD_OUTSIDE, THREAD_PASS, THREAD_WAIT_GPU, THREAD_WAIT_READ, THREAD_WAIT_OTHER, THREAD_STATES };
+void gpu_thread_state(int state);  // from the engine thread, when its state changes
+// Since start: the engine thread's seconds in each state, the GPU main queue's
+// busy seconds (gpu_busy) and its idle seconds between command buffers by
+// the engine thread's state during them (counted when they are accounted for).
+void gpu_times(double thread[THREAD_STATES], double *busy, double idle[THREAD_STATES]);
 
 // ---- io.c: SSD reads, the expert cache and memory pressure ----
 void io_read(int fd, uint64_t off, uint64_t len, Buf *dst);  // aligned, uncached
 // Rows rows[i] of rowbytes each from a table at base, packed into dst.
 void io_rows(int fd, uint64_t base, uint32_t rowbytes, const int64_t *rows, int n, uint8_t *dst);
 uint64_t io_rows_workspace(int rows);
+// Since start, for every expert store: the seconds with an expert read in
+// flight (their union), and the demand and background reads' summed seconds.
+void io_ssd_times(double *busy, double *demand, double *background);
 uint64_t mem_available(void);
 int mem_pressure(void);  // 1 normal, 2 warn, 4 critical
 typedef struct {

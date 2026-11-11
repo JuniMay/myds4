@@ -470,6 +470,38 @@ selection and halves over 12 forward passes. Such an expert is often
 selected within a few tokens and seldom later, so it stays a little longer
 without displacing the experts that are selected often.
 
+A slot holds one expert in a buffer of its own. When every layer's experts
+are within a sixteenth of the largest expert's size, every buffer has that
+size, any expert fits any slot, and the cache's limits count slots: MXFP4
+experts all take 18.9 MB. A GGUF expert set quantizes its layers
+differently: a UD-IQ1_M expert takes 7.0 to 10.4 MB and a UD-IQ2_XXS expert
+7.8 to 12.2 MB, depending on its layer. For such a set a slot's buffer has
+the size of its layer's experts, and the limits count bytes, in units of the
+largest size, so that the same memory holds more experts (`sized` in
+src/engine/io.c). When decoding, an expert that needs a slot takes the
+lowest-priority slot if its buffer fits: the buffer is large enough and at
+most a sixteenth larger than the expert. Otherwise it takes the
+lowest-priority slot with a fitting buffer among the 64 lowest priorities,
+which the next misses would evict anyway. If there is none, the cache gives
+buffers back, the lowest priorities first, until a buffer of the expert's
+size fits in its bytes, and allocates that buffer (a conversion). A
+conversion gives back no expert that was selected or read ahead in the
+current token. A read-ahead gives back at most two buffers and a demand at
+most four. If the memory pool admits no buffer even then, the read-ahead
+gets no slot, and the demand reuses a buffer that is large enough, whatever
+it wastes: among the slots with such buffers, the one that the eviction
+order takes first. If no buffer is large enough, the demand's buffer is
+required memory, for which the memory pool takes idle memory back. If the
+pool cannot, because passes hold what it would take back, the demand gives
+back the slots that nothing holds, the lowest priority first, until its
+buffer fits; with none left, its pass waits for another pass to release a
+slot, as a pass does when every slot of one size is held. A prompt pass
+goes through every layer and needs a layer's experts only until the next
+layer. Its new buffers therefore have the largest size and serve all its
+layers, and it reuses any buffer that is large enough: on a cache that it
+fills itself, it behaves as with slots of one size. Decoding then replaces
+the pass's experts and converts their buffers one miss at a time.
+
 While decoding, DeepSeek reads ahead the experts of three forecasts, each
 a router applied to a row known earlier. Before a layer's attention, the
 layer's own router runs on the residual part of its FFN input; the GPU

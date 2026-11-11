@@ -84,7 +84,7 @@ DeepSeek-specific settings belong only to its entry:
 
 | Setting | Meaning |
 | --- | --- |
-| `experts` | GGUF file or any shard of a set. Omit for the checkpoint's native MXFP4 experts and output head. |
+| `experts` | GGUF file or any shard of a set. Omit for the checkpoint's native MXFP4 experts and output head. A set whose layers' experts differ in size gets expert slots of each layer's size, so the same `memory` holds more of them (design.md). |
 | `cache_half_life` | Retention score half-life of an expert's selections in forward passes; default 50. Near misses (design.md) keep their own half-life of 12. |
 | `cache_read_cost` | Include aligned read cost in retention priority. |
 | `draft_cache` | Expert slots per DSpark stage, 15–128. Default 0 preloads all 128; these pools count against `cache`. |
@@ -138,7 +138,8 @@ The rules below keep the server from causing that pressure (see
   is swapped.
 - **When other programs grow.** The expert cache gives back the slots that
   bring the available memory back to `reserve`; under memory pressure or
-  swapping it gives back a sixteenth of its slots at a time. Once a second,
+  swapping it gives back a sixteenth of its slots at a time (of its bytes,
+  when its slots differ in size). Once a second,
   the server also takes back idle model memory, then idle KV, until the
   available memory is back at `reserve`.
 - **An idle model unloads.** A model that has gone `idle_unload` seconds

@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
 
 #include "myds4.h"
 #include "memory.h"
@@ -674,7 +675,7 @@ static void signal_block(void *context) {
 
 void gpu_wait_signal(uint64_t v) {
   SignalWait wait = {event, v};
-  if (pass_current()) pass_wait(&(PassWait){signal_ready, signal_block, &wait});
+  if (pass_current()) pass_wait(&(PassWait){signal_ready, signal_block, &wait, PASS_WAIT_GPU});
   else signal_block(&wait);
 }
 
@@ -757,6 +758,49 @@ void gpu_free_later(Buf *b) {
   memset(b, 0, sizeof *b);
 }
 
+// The engine thread's state changes (gpu_thread_state), in the clock of the
+// command buffers' GPUStartTime and GPUEndTime (host seconds, as
+// mach_absolute_time), so that each idle time between command buffers can be
+// split by what the engine thread did meanwhile. The ring holds the changes
+// since the last idle time accounted for; account() runs at every pass's
+// synchronization, long before the ring wraps.
+enum { THREAD_CHANGES = 1 << 16 };
+static struct { double t; int state; } changes[THREAD_CHANGES];
+static uint64_t nchanges, idle_from;  // changes recorded; the first one the next idle time may need
+static int thread_now;
+static double thread_since, thread_s[THREAD_STATES], idle_s[THREAD_STATES];
+
+static double host_seconds(void) { return (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) * 1e-9; }
+
+void gpu_thread_state(int state) {
+  if (state == thread_now && thread_since) return;
+  double t = host_seconds();
+  if (thread_since) thread_s[thread_now] += t - thread_since;
+  uint64_t k = nchanges++ % THREAD_CHANGES;
+  changes[k].t = t, changes[k].state = state;
+  thread_now = state, thread_since = t;
+}
+
+// The GPU was idle from a to b: each part goes to the engine thread's state then.
+static void idle_between(double a, double b) {
+  if (!nchanges) return;
+  if (nchanges - idle_from > THREAD_CHANGES) idle_from = nchanges - THREAD_CHANGES;  // overwritten: lost
+  while (idle_from + 1 < nchanges && changes[(idle_from + 1) % THREAD_CHANGES].t <= a) idle_from++;
+  for (uint64_t k = idle_from; k < nchanges; k++) {
+    double from = changes[k % THREAD_CHANGES].t, to = k + 1 < nchanges ? changes[(k + 1) % THREAD_CHANGES].t : b;
+    if (from < a) from = a;
+    if (to > b) to = b;
+    if (to > from) idle_s[changes[k % THREAD_CHANGES].state] += to - from;
+    if (to >= b) break;
+  }
+}
+
+void gpu_times(double thread[THREAD_STATES], double *busy, double idle[THREAD_STATES]) {
+  for (int k = 0; k < THREAD_STATES; k++) thread[k] = thread_s[k], idle[k] = idle_s[k];
+  if (thread_since) thread[thread_now] += host_seconds() - thread_since;
+  *busy = gpu_busy;
+}
+
 // The first `count` buffers of `done`, all finished: their errors and their
 // time. gpu_busy grows by the union of their execution intervals; gpu_gap by
 // the time between them, and gpu_gaps by the gaps longer than 100 us.
@@ -778,7 +822,7 @@ static void account(int count) {
   double end = accounted_end;
   for (int i = 0; i < count; i++) {
     double a = iv[i][0] > end ? iv[i][0] : end;
-    if (end && iv[i][0] > end) gpu_gap += iv[i][0] - end, gpu_gaps += iv[i][0] - end > 100e-6;
+    if (end && iv[i][0] > end) gpu_gap += iv[i][0] - end, gpu_gaps += iv[i][0] - end > 100e-6, idle_between(end, iv[i][0]);
     if (iv[i][1] > a) gpu_busy += iv[i][1] - a;
     if (iv[i][1] > end) end = iv[i][1];
   }
@@ -817,7 +861,7 @@ static void sync_block(void *context) {
 // Inside a pass: the pass's own last one.
 void gpu_sync(void) {
   if (pass_current()) {
-    pass_wait(&(PassWait){sync_ready, sync_block, (void *)(uintptr_t)pass_last});
+    pass_wait(&(PassWait){sync_ready, sync_block, (void *)(uintptr_t)pass_last, PASS_WAIT_GPU});
     gpu_reap();
     return;
   }

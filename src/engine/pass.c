@@ -130,6 +130,8 @@ int pass_resume(Pass *p) {
 
 int pass_ready(const Pass *p) { return !p->wait.ready || p->wait.ready(p->wait.context); }
 
+int pass_waiting_for(const Pass *p) { return p->wait.ready ? p->wait.kind : PASS_WAIT_OTHER; }
+
 void pass_block(const Pass *p) {
   if (p->wait.block) p->wait.block(p->wait.context);
 }
@@ -155,6 +157,6 @@ static int group_ready(void *group) { return dispatch_group_wait(group, DISPATCH
 static void group_block(void *group) { dispatch_group_wait(group, DISPATCH_TIME_FOREVER); }
 
 void pass_wait_group(dispatch_group_t group) {
-  if (running) pass_wait(&(PassWait){group_ready, group_block, group});
+  if (running) pass_wait(&(PassWait){group_ready, group_block, group, PASS_WAIT_READ});
   else group_block(group);
 }

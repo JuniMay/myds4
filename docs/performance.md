@@ -41,6 +41,20 @@ working set and produce misleading cache hits.
   tokens and should not be used interchangeably with them.
 - GPU time and waiting for reads can overlap. Their sum is not a wall-time
   breakdown.
+- A model's `model_decode` counters add each decoding call's own span. Calls
+  that run beside each other overlap, so these counters count the same
+  interval once per call, and they cannot compare one call with several.
+  The status's `engine_times` are process-wide and count each interval once:
+  - the engine thread's seconds outside `myds4_run` (the worker's own work:
+    sampling, sending tokens, admission), running a pass, and inside
+    `myds4_run` with no pass ready while one waits for the GPU, else for
+    expert or Engram reads, else for something else;
+  - the GPU main queue's busy seconds (the union of its command buffers),
+    and its idle seconds between command buffers, split by the engine
+    thread's state during them;
+  - the seconds the SSD had an expert read in flight (their union), and the
+    demand and background reads' summed seconds. Divided by the wall time,
+    the sums give the reads in flight on average.
 - Logical weight bytes divided by time do not prove physical DRAM or SSD
   saturation. Use hardware counters for that claim.
 
@@ -76,10 +90,10 @@ Their throughput does not represent ordinary inference.
 | --- | --- |
 | `benchmarks/compare.py` | Matched CLI control/candidate generations and output checks. |
 | `benchmarks/concurrency.py` | HTTP throughput and latency on Harness requests or local audio fixtures. |
-| `benchmarks/throughput.py` | Total tokens per second of concurrent requests against the serving modes, with the same requests alone as the correctness guard. |
+| `benchmarks/throughput.py` | Total tokens per second of concurrent requests against the serving modes, with the same requests alone as the correctness guard. `--arm` adds modes with other server settings or another server binary, which `--repeats` alternates against one reference (`--reference-cache` keeps the answers' digests for later cases); `--late-file` sends a long request while the others decode. Each request's time to first token and decode rate; for the steady window (and the long request's prefill) where the GPU's, the engine thread's and the SSD's time went; available memory and cache size per run. |
 | `benchmarks/turns.py` | A conversation followed by a longer tool-like input. |
 | `benchmarks/prefill.py` | CED prefill and continuation comparisons. |
-| `benchmarks/decode.c` | Batched model-row timing: per step the GPU's busy and idle time, and per row the expert reads and bytes. Its default prompts can make greedy decoding loop; `--text FILE --prompt-tokens N` decodes after real text instead. |
+| `benchmarks/decode.c` | Batched model-row timing: per step the GPU's busy and idle time, and per row the expert reads and bytes, the slots mapped for the GPU again and the slot buffers given back for one of another size; at the end the cache's slot limit, its allocated and mapped slots and its bytes. Its default prompts can make greedy decoding loop; `--text FILE --prompt-tokens N` decodes after real text instead. |
 | `benchmarks/products.c` | Common matrix-product correctness and warmed vector-kernel timing; these are not model throughput or physical memory-bandwidth measurements. |
 | `benchmarks/steps.c` | Whether a matrix product and a chain of vector products overlap in one command buffer, and what cutting long work into short command buffers costs. |
 | `benchmarks/pass_binding.c` | The CPU cost of binding a DeepSeek pass's buffers. |

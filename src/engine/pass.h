@@ -9,11 +9,14 @@
 typedef struct Pass Pass;
 
 // What a pass waits for. `ready` says, without blocking, whether the wait is
-// over; `block` waits until it is. Both run outside the pass.
+// over; `block` waits until it is. Both run outside the pass. `kind` says
+// what the wait is for, for measuring where the engine thread's time goes.
+enum { PASS_WAIT_OTHER, PASS_WAIT_GPU, PASS_WAIT_READ };
 typedef struct {
   int (*ready)(void *context);
   void (*block)(void *context);
   void *context;
+  int kind;  // PASS_WAIT_*
 } PassWait;
 
 // Model-wide memory that belongs to the running pass: copied out when the
@@ -42,6 +45,9 @@ void pass_free(Pass *pass);
 int pass_resume(Pass *pass);
 // Whether the pass can continue, without blocking.
 int pass_ready(const Pass *pass);
+// The kind of the pass's wait (PASS_WAIT_*): PASS_WAIT_OTHER when it waits
+// for nothing.
+int pass_waiting_for(const Pass *pass);
 // Waits until the pass can continue.
 void pass_block(const Pass *pass);
 // Runs the pass to its end, waiting at each of its yields.
