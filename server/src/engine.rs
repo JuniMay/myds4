@@ -9,7 +9,7 @@ use std::ptr;
 
 use deepseek_recipe::stream::StreamTokenizer;
 
-const ABI: c_int = 19;
+const ABI: c_int = 20;
 
 #[repr(C)]
 struct RawProcess {
@@ -192,6 +192,18 @@ pub struct Stats {
     pub model_memory_peak: u64,
     pub kv_allocated: u64,
     pub model_workspace: u64,
+    /// Process-wide seconds since start: the engine thread outside
+    /// myds4_run, running a pass, and waiting for the GPU, reads or something
+    /// else with no pass ready; the GPU main queue busy, and idle between
+    /// command buffers by the engine thread's state then; the SSD with an
+    /// expert read in flight, and the demand and background reads' summed
+    /// seconds.
+    pub thread_s: [f64; 5],
+    pub gpu_busy_s: f64,
+    pub gpu_idle_s: [f64; 5],
+    pub ssd_busy_s: f64,
+    pub demand_read_s: f64,
+    pub background_read_s: f64,
 }
 
 #[repr(C)]

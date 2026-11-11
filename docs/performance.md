@@ -41,6 +41,20 @@ working set and produce misleading cache hits.
   tokens and should not be used interchangeably with them.
 - GPU time and waiting for reads can overlap. Their sum is not a wall-time
   breakdown.
+- A model's `model_decode` counters add each decoding call's own span. Calls
+  that run beside each other overlap, so these counters count the same
+  interval once per call, and they cannot compare one call with several.
+  The status's `engine_times` are process-wide and count each interval once:
+  - the engine thread's seconds outside `myds4_run` (the worker's own work:
+    sampling, sending tokens, admission), running a pass, and inside
+    `myds4_run` with no pass ready while one waits for the GPU, else for
+    expert or Engram reads, else for something else;
+  - the GPU main queue's busy seconds (the union of its command buffers),
+    and its idle seconds between command buffers, split by the engine
+    thread's state during them;
+  - the seconds the SSD had an expert read in flight (their union), and the
+    demand and background reads' summed seconds. Divided by the wall time,
+    the sums give the reads in flight on average.
 - Logical weight bytes divided by time do not prove physical DRAM or SSD
   saturation. Use hardware counters for that claim.
 

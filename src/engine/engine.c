@@ -377,6 +377,20 @@ void myds4_stream_verify(myds4_stream *x, myds4_state *s, int32_t *rows, int dra
   x->call = STREAM_VERIFY;
 }
 
+// What the streams with a call wait for while none can go on (THREAD_*): the
+// GPU if any waits for it, else reads if any waits for them, else something
+// else.
+static int streams_wait_for(myds4_stream *const *streams, int n) {
+  int reads = 0;
+  for (int k = 0; k < n; k++) {
+    if (streams[k]->call == STREAM_NONE) continue;
+    int kind = pass_waiting_for(streams[k]->pass);
+    if (kind == PASS_WAIT_GPU) return THREAD_WAIT_GPU;
+    reads |= kind == PASS_WAIT_READ;
+  }
+  return reads ? THREAD_WAIT_READ : THREAD_WAIT_OTHER;
+}
+
 // The streams' calls advance on this thread: each stream that can go on runs
 // until it would wait, and a thread that finds none ready looks again at once
 // (a GPU wait is mostly shorter than the time a blocking wait takes to wake up)
@@ -394,15 +408,20 @@ int myds4_run(myds4_stream *const *streams, int n, double seconds) {
     for (int k = 0; k < n; k++) {
       int i = (int)(((unsigned)first + (unsigned)k) % (unsigned)n);
       myds4_stream *x = streams[i];
-      if (pass_ready(x->pass)) pass_resume(x->pass), ran = 1;
+      if (pass_ready(x->pass)) gpu_thread_state(THREAD_PASS), pass_resume(x->pass), ran = 1;
       if (x->finished) {
         x->finished = 0;
         first = (unsigned)i + 1;
+        gpu_thread_state(THREAD_OUTSIDE);
         return i;
       }
     }
+    gpu_thread_state(streams_wait_for(streams, n));
     double t = now();
-    if (t >= deadline) return -1;
+    if (t >= deadline) {
+      gpu_thread_state(THREAD_OUTSIDE);
+      return -1;
+    }
     if (ran) idle_since = t;
     // A short wait is polled, a longer one sleeps between looks: a spinning
     // core takes power and memory bandwidth that the GPU would otherwise use.
@@ -592,6 +611,9 @@ void myds4_stats_get(const myds4_model *m, myds4_stats *s) {
   s->slots = c.cache_slots; s->mapped = c.mapped; s->cap = c.cap; s->max_slots = c.max_slots;
   s->experts = c.experts; s->slot_bytes = c.slot_bytes; s->cache_bytes = c.cache_bytes;
   s->uncached_bytes = c.uncached_bytes; s->uncached = c.uncached;
+  _Static_assert(THREAD_STATES == sizeof s->thread_s / sizeof *s->thread_s, "one time per engine-thread state");
+  gpu_times(s->thread_s, &s->gpu_busy_s, s->gpu_idle_s);
+  io_ssd_times(&s->ssd_busy_s, &s->demand_read_s, &s->background_read_s);
 }
 
 // ---- tokenizers, from any thread ----

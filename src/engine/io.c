@@ -1040,6 +1040,36 @@ static void queue_push(ExpertStore *st, uint32_t entry, uint16_t layer) {
   st->queue[at % QUEUE] = entry, st->qlayer[at % QUEUE] = layer;
 }
 
+// The SSD's time for expert reads, for measuring where the time goes: the
+// seconds with at least one read in flight (their union), and the demand and
+// background reads' summed seconds. Every store's reads count.
+static pthread_mutex_t ssd_lock = PTHREAD_MUTEX_INITIALIZER;
+static int ssd_reads;
+static double ssd_since, ssd_busy, ssd_read[2];  // ssd_read: demand, background
+
+static double ssd_begin(void) {
+  double t = now();
+  pthread_mutex_lock(&ssd_lock);
+  if (!ssd_reads++) ssd_since = t;
+  pthread_mutex_unlock(&ssd_lock);
+  return t;
+}
+
+static void ssd_end(int background, double began) {
+  double t = now();
+  pthread_mutex_lock(&ssd_lock);
+  ssd_read[background] += t - began;
+  if (!--ssd_reads) ssd_busy += t - ssd_since;
+  pthread_mutex_unlock(&ssd_lock);
+}
+
+void io_ssd_times(double *busy, double *demand, double *background) {
+  pthread_mutex_lock(&ssd_lock);
+  *busy = ssd_busy + (ssd_reads ? now() - ssd_since : 0);
+  *demand = ssd_read[0], *background = ssd_read[1];
+  pthread_mutex_unlock(&ssd_lock);
+}
+
 static void *reader(void *arg) {
   ExpertStore *st = arg;
   for (;;) {
@@ -1058,7 +1088,9 @@ static void *reader(void *arg) {
     Slot *s = &st->slots[q >> 4];
     if (owned) {
       uint64_t began = metrics_io_begin(st, s, 0);
+      double reading = ssd_begin();
       read_piece(&s->piece[q & 15], 0);
+      ssd_end(1, reading);
       metrics_io_end(st, s, 0, began);
       __atomic_fetch_add(&st->stats.bytes, s->piece[q & 15].len, __ATOMIC_RELAXED);
       metrics_piece_done(st, s, s->piece[q & 15].len);
@@ -1085,7 +1117,9 @@ static void read_demand(void *ctx) {
   uint32_t q = (uint32_t)entry;
   Slot *s = &st->slots[q >> 4];
   uint64_t began = metrics_io_begin(st, s, 1);
+  double reading = ssd_begin();
   read_piece(&s->piece[q & 15], 0);
+  ssd_end(0, reading);
   metrics_io_end(st, s, 1, began);
   __atomic_fetch_add(&st->stats.bytes, s->piece[q & 15].len, __ATOMIC_RELAXED);
   metrics_piece_done(st, s, s->piece[q & 15].len);
@@ -1762,7 +1796,7 @@ void cache_wait(ExpertStore *st, int layer, const int *experts, int n) {
   double t = now();
   if (pass_current()) {
     ReadsWait wait = {st, layer, experts, n};
-    pass_wait(&(PassWait){reads_ready, reads_block, &wait});
+    pass_wait(&(PassWait){reads_ready, reads_block, &wait, PASS_WAIT_READ});
   }
   for (int k = 0; k < n; k++) finish(st, WHERE(layer, experts[k]));
   st->stats.read_s += now() - t;
