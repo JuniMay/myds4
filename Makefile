@@ -48,7 +48,7 @@ server-check: build/libmyds4.a
 
 # Fast tests never acquire model weights or run GPU kernels.
 CPU_CHECKS = activation-format-check state-file-check context-lookup-check workspace-check state-fork-check verification-schedule-check sampling-check shutdown-check cache-ready-check draft-cache-check prefetch-metrics-check prefetch-queue-check prefetch-admission-check prefetch-demote-check prefetch-refine-race-check cache-policy-check memory-available-check cache-memory-check memory-budget-check weights-stop-check weights-read-check
-EXTRA_CPU = pass memory metadata qwen-state-accounting attention-candidate prefill-prune cache-hold cache-progress cache-mapping predictor-learning predictor-state predictor-numerics
+EXTRA_CPU = pass memory metadata qwen-state-accounting attention-candidate prefill-prune cache-hold cache-progress cache-mapping cache-sizes predictor-learning predictor-state predictor-numerics
 # These need the GPU or model weights to run. make test only builds them, so
 # that a changed engine interface cannot leave one unbuildable.
 BUILD_ONLY = $(addprefix build/tests/,nemotron experts routing vision residency mxfp4-activation gpu-wait gpu-steps gpu-clock \
@@ -208,6 +208,10 @@ cache-ready-check: build/tests/cache-ready
 build/tests/cache-mapping: tests/unit/cache_mapping.c src/engine/io.c src/engine/expert_store.h tests/unit/cache_layout.h src/engine/gpu.c src/engine/pass.c src/engine/util.c src/engine/myds4.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ tests/unit/cache_mapping.c src/engine/gpu.c src/engine/pass.c src/engine/util.c src/engine/memory.c $(LDLIBS)
+
+build/tests/cache-sizes: tests/unit/cache_sizes.c src/engine/io.c src/engine/expert_store.h src/engine/gpu.c src/engine/pass.c src/engine/util.c src/engine/myds4.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -o $@ tests/unit/cache_sizes.c src/engine/gpu.c src/engine/pass.c src/engine/util.c src/engine/memory.c $(LDLIBS)
 
 build/tests/cache-progress: tests/unit/cache_progress.c src/engine/io.c src/engine/expert_store.h tests/unit/cache_layout.h src/engine/gpu.c src/engine/pass.c src/engine/util.c src/engine/myds4.h
 	@mkdir -p $(dir $@)

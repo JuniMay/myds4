@@ -70,6 +70,33 @@ shortfall back and the second gives nothing back until the memory readings
 can show it; the second store's unwritten slots count as in use too. It also checks which slot
 bytes count as not yet written: a slot whose read is under way, a load that
 dropped a piece, and the part of a slot beyond a smaller expert.
+`build/tests/cache-sizes` checks the slots of a store whose layers' experts
+differ in size, on three layers whose experts take 16, 17 and 24 sectors. A
+slot's buffer has its layer's size and the limits count bytes: a limit of
+two of the largest slots holds three of the smallest experts. A buffer up to
+a sixteenth larger than an expert is reused, and a smaller one is not. An
+expert that no low-priority buffer fits makes the lowest priorities give
+their buffers back for one of its size, but none used or read ahead in the
+current token; a read-ahead gives back at most two, and a demand that can
+give nothing back reuses the lowest buffer that is large enough. It takes a
+protected read-ahead's buffer only when no other is large enough. Among the
+64 lowest priorities a fitting buffer is reused instead. A prompt pass
+allocates the largest size, reuses the least recently used buffer that is
+large enough, and gives back no buffer of the layer before its own; when it
+can give nothing back, it reuses a buffer of a layer it is done with before
+one of its own layer. Giving slots back and the mapped limit count bytes,
+and reads stay inside buffers of their own size. Stores whose layers are
+within a sixteenth of the largest, or of one size, keep slots of one size
+and count slots. In a memory pool that refuses a further buffer, a
+conversion gives back only what the new buffer needs. In a pool over its
+limit, a demand gives at most four buffers back; when no buffer is large
+enough for it either, it takes its buffer as required memory, the pool takes
+further slots back for it, and the buffer is charged to the slot that holds
+it. A read-ahead in a shortage gives two back and gets no slot. When the
+pool cannot make room for required memory either (the cache is busy, and its
+slots are held or were used this token), the demand gives back what nothing
+holds until its buffer fits, and with nothing left its pass waits until
+another pass releases a slot.
 `build/tests/cache-mapping` checks that CPU reads need no GPU residency and
 that only an encoded use maps an expert. On a store of two layers of four
 experts, it also checks when a layer can run through a table of its experts'
