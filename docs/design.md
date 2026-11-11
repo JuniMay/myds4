@@ -461,6 +461,15 @@ uses. Reads are split into bounded pieces, with demand work ahead of
 background forecasts. Cache policy accounts for reuse and optional read
 cost; speculative reads must not invalidate experts held by active work.
 
+When decoding, the cache evicts the expert with the lowest priority: the
+sum of its selections, each weighted so that it halves over the configured
+half-life (`cache_half_life`, 50 forward passes by default), plus its near
+misses. A near miss is one of the 10 experts with a decoded row's highest
+router logits among those that no row of its pass selected; it counts half a
+selection and halves over 12 forward passes. Such an expert is often
+selected within a few tokens and seldom later, so it stays a little longer
+without displacing the experts that are selected often.
+
 While decoding, DeepSeek reads ahead the experts of three forecasts, each
 a router applied to a row known earlier. Before a layer's attention, the
 layer's own router runs on the residual part of its FFN input; the GPU

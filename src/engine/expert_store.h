@@ -133,6 +133,10 @@ void cache_metrics_report(ExpertStore *st, FILE *out);
 // Cancels the read-aheads for the layer that no reader has started and that keep[0..n) does not name.
 void cache_refine(ExpertStore *st, int layer, const int *keep, int n);
 void cache_demote(ExpertStore *st, int layer);  // after its routing: the layer's unselected read-aheads are evicted first
+// After a decoded layer's routing: its near misses, the experts its router
+// ranked just below the selected ones, each credited once; they stay a little
+// longer (see the eviction order in io.c). Layers after the scored ones are ignored.
+void cache_near(ExpertStore *st, int layer, const int *experts, int n);
 void cache_pass(ExpertStore *st, int layer);  // a prompt pass is at this layer (-1: none): keep later layers' experts
 void cache_adapt(ExpertStore *st);             // between tokens
 void cache_adapt_pass(ExpertStore *st, int layer);   // within a prompt pass at this layer

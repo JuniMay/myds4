@@ -26,6 +26,8 @@ static void setup(int half_life, int cost) {
   memset(st->where, 0xff, WHERE_BYTES);
   memset(st->escore, 0, SCORE_BYTES);
   memset(st->dscore, 0, SCORE_BYTES);
+  memset(st->nscore, 0, SCORE_BYTES);
+  st->near_weight = 1;
   memset(expert_spans, 0, sizeof expert_spans);
   memset(&st->stats, 0, sizeof st->stats);
   st->slots = fixture, st->score = fixture_score;
@@ -158,7 +160,8 @@ int main(void) {
   for (int i = 0; i < 50; i++) advance_score_clock(st);
   expect("default clock doubles weight over 50 advances", near(st->weight, 2));
   expect("clock counts forward advances", st->token == 60);
-  expect("aging preserves raw history between rescalings", st->escore[0] == 1 && st->score[0] == 1);
+  expect("aging preserves raw history between rescalings", st->escore[0] == 1);
+  expect("aging refreshes a slot's priority from its history", near(st->score[0], 0.5));
   rejected("negative half-life rejected", bad_half);
   rejected("excessive half-life rejected", too_large_half);
   rejected("invalid weighting flag rejected", bad_cost);
@@ -188,6 +191,27 @@ int main(void) {
   expect("priority multiplication leaves raw ghost history", st->escore[1] == 2);
   for (int i = 0; i < 3; i++) st->reload_cost[i] = .5;
   expect("uniform read costs preserve victim", victim(st) == 0);
+
+  // A near miss counts NEAR_CREDIT of a selection at once and fades with a
+  // half-life of NEAR_HALF_LIFE steps against the selections' 50: slot 0's
+  // expert, selected once, outranks slot 1's, selected twice, while its three
+  // near misses are fresh, and no longer NEAR_HALF_LIFE steps later.
+  setup(0, 0);
+  st->score[0] = st->escore[0] = 1, st->score[1] = st->escore[1] = 2, st->score[2] = st->escore[2] = 4;
+  expect("without near misses the least selected expert goes", victim(st) == 0);
+  for (int k = 0; k < 3; k++) cache_near(st, 0, (int[]){0}, 1);
+  expect("near misses raise a resident expert's priority at once", near(st->score[0], 1 + 3 * NEAR_CREDIT));
+  expect("fresh near misses keep an expert", victim(st) == 1);
+  for (int k = 0; k < NEAR_HALF_LIFE; k++) advance_score_clock(st);
+  double fade = exp2(-(double)NEAR_HALF_LIFE / CACHE_HALF_LIFE_DEFAULT);
+  expect("aging refreshes both parts of the priorities",
+         near(st->score[0], fade + 3 * NEAR_CREDIT / 2) && near(st->score[1], 2 * fade));
+  expect("near misses fade faster than selections", victim(st) == 0);
+  WHERE(0, 3) = -1;
+  cache_near(st, 0, (int[]){3}, 1);
+  expect("an expert without a slot keeps its near misses", st->nscore[3] > 0);
+  cache_near(st, st->scored_layers, (int[]){0}, 1);
+  expect("layers after the scored ones take no near misses", st->nscore[(size_t)st->scored_layers * st->experts] == 0);
 
   // A prompt pass keeps what decoding uses most: its victim is the slot of a
   // layer the pass is done with whose expert decoding used least, not the
@@ -265,8 +289,9 @@ int main(void) {
   incoming = 0;
   cache_load(st, 0, &incoming, 1);
   expect("reentry restores prior history before increment", near(st->escore[0], 2 + before));
-  expect("resident score keeps raw reentry history", st->score[WHERE(0, 0)] == st->escore[0]);
-  expect("weighted reentry priority uses static cost", near(eviction_priority(st, WHERE(0, 0)), st->escore[0] * .25));
+  expect("resident priority comes from the restored history", near(st->score[WHERE(0, 0)], st->escore[0] / st->weight));
+  expect("weighted reentry priority uses static cost",
+         near(eviction_priority(st, WHERE(0, 0)), st->escore[0] / st->weight * .25));
   expect("empty-span fixture performs no file reads", st->stats.bytes == 0);
 
   st->weight = 0x1p500;

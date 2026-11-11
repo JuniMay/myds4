@@ -353,7 +353,9 @@ struct ExpertStore {
   double weight;  // the current token's
   double *escore;  // [layers][experts]: per expert
   double *dscore;  // [layers][experts]: the part of escore that decoding's requests gave
-  double *score;  // per slot: its expert's score; INFINITY for a free slot, -INFINITY for an empty one
+  double near_weight;  // the current token's weight of a near miss (see cache_near)
+  double *nscore;  // [layers][experts]: near misses, each of the near weight then
+  double *score;  // per slot: its expert's priority; INFINITY for a free slot, -INFINITY for an empty one
   int retention_half_life, retention_read_cost;
   double retention_growth;
   double *reload_cost;  // [scored_layers][experts]
@@ -438,8 +440,9 @@ ExpertStore *cache_create(const ExpertLayout *l) {
   if (!st->layer_holds) die("out of memory");
   st->ready_unmaps = xmalloc((size_t)l->layers * sizeof *st->ready_unmaps);
   memset(st->ready_unmaps, 0, (size_t)l->layers * sizeof *st->ready_unmaps);
-  st->escore = xmalloc(SCORE_BYTES), st->dscore = xmalloc(SCORE_BYTES);
-  memset(st->escore, 0, SCORE_BYTES), memset(st->dscore, 0, SCORE_BYTES);
+  st->escore = xmalloc(SCORE_BYTES), st->dscore = xmalloc(SCORE_BYTES), st->nscore = xmalloc(SCORE_BYTES);
+  memset(st->escore, 0, SCORE_BYTES), memset(st->dscore, 0, SCORE_BYTES), memset(st->nscore, 0, SCORE_BYTES);
+  st->near_weight = 1;
   st->reload_cost = xmalloc(scored * sizeof *st->reload_cost);
   memset(st->reload_cost, 0, scored * sizeof *st->reload_cost);
   st->pf_ghost = xmalloc(scored);
@@ -608,10 +611,18 @@ static int draft_pool_count(ExpertStore *st, int layers) {
 // The eviction order: every expert has a score, the sum of a weight for each
 // request that selected it; the weight doubles over the configured number of
 // forward-pass aging steps. A verification batch advances once, as does the
-// end of prefill. The victim has the lowest priority, an empty slot first.
-// Optional read-cost weighting affects that priority, not the score history.
-// A recency list (head = most recently used) orders the slots for giving
-// slots back.
+// end of prefill. A decoded layer also credits its near misses, the experts
+// its router ranked just below the ones it selected (cache_near): each counts
+// NEAR_CREDIT of a selection, with a weight that doubles every NEAR_HALF_LIFE
+// steps, because such an expert is often selected within a few tokens and
+// seldom later. A slot's priority is its expert's two sums, each over its
+// current weight: the selections decayed by the configured half-life and the
+// near misses by theirs. The victim has the lowest priority, an empty slot
+// first. Optional read-cost weighting affects that priority, not the score
+// history. A recency list (head = most recently used) orders the slots for
+// giving slots back.
+enum { NEAR_HALF_LIFE = 12 };
+#define NEAR_CREDIT 0.5
 
 void cache_retention(ExpertStore *st, int half_life, int read_cost) {
   if (st->slots) die("cache retention must be set before cache_init");
@@ -646,12 +657,39 @@ static double eviction_priority(ExpertStore *st, int i) {
   return st->score[i] * st->reload_cost[st->slots[i].layer * st->experts + st->slots[i].expert];
 }
 
+// The priority of expert key = layer * experts + expert, of a scored layer.
+static double expert_priority(const ExpertStore *st, size_t key) {
+  return st->escore[key] / st->weight + NEAR_CREDIT * st->nscore[key] / st->near_weight;
+}
+
+// Ages every history by one step. The two sums of a scored layer's expert
+// decay at different rates, so its slot's priority is computed again; the
+// draft stages' pinned slots keep their raw score, rescaled with the history.
 static void advance_score_clock(ExpertStore *st) {
   st->token++;
-  if ((st->weight *= st->retention_growth) > 0x1p500) {  // rescale raw history and resident scores together
+  if ((st->weight *= st->retention_growth) > 0x1p500) {  // rescale raw history and pinned scores together
     for (int k = 0; k < st->layers * st->experts; k++) st->escore[k] /= st->weight, st->dscore[k] /= st->weight;
-    for (int i = 0; i < st->max_slots + st->npinned; i++) st->score[i] /= st->weight;
+    for (int i = st->max_slots; i < st->max_slots + st->npinned; i++) st->score[i] /= st->weight;
     st->weight = 1;
+  }
+  if ((st->near_weight *= exp2(1.0 / NEAR_HALF_LIFE)) > 0x1p500) {
+    for (int k = 0; k < st->layers * st->experts; k++) st->nscore[k] /= st->near_weight;
+    st->near_weight = 1;
+  }
+  for (int i = 0; i < st->max_slots; i++) {
+    const Slot *s = &st->slots[i];
+    if (isfinite(st->score[i]) && s->expert >= 0 && s->layer >= 0 && s->layer < st->scored_layers)
+      st->score[i] = expert_priority(st, (size_t)s->layer * st->experts + s->expert);
+  }
+}
+
+void cache_near(ExpertStore *st, int layer, const int *experts, int n) {
+  if (layer < 0 || layer >= st->scored_layers) return;
+  for (int k = 0; k < n; k++) {
+    size_t key = (size_t)layer * st->experts + experts[k];
+    st->nscore[key] += st->near_weight;
+    int i = WHERE(layer, experts[k]);
+    if (i >= 0 && i < st->max_slots && isfinite(st->score[i])) st->score[i] = expert_priority(st, key);
   }
 }
 
@@ -1185,7 +1223,8 @@ static int take(ExpertStore *st, int layer, int e, int optional) {
   st->slots[i].prefetched = 0;
   st->slots[i].layer = layer, st->slots[i].expert = e;
   place(st, layer, e, i);
-  st->score[i] = st->escore[layer * st->experts + e];
+  size_t key = (size_t)layer * st->experts + e;
+  st->score[i] = layer < st->scored_layers ? expert_priority(st, key) : st->escore[key];
   push_front(st, i);
   return i;
 }
@@ -1306,10 +1345,10 @@ static void mark_used(ExpertStore *st, int layer, int e, int i) {
   st->slots[i].prefetched = 0;
   st->slots[i].used = st->token;
   if (st->cache_backbone) memory_touch(&st->slots[i].memory);
-  double *history = &st->escore[layer * st->experts + e];
-  *history += st->weight;
-  st->score[i] = *history;
-  if (st->pass_layer < 0) st->dscore[layer * st->experts + e] += st->weight, st->stats.decode_uses++;
+  size_t key = (size_t)layer * st->experts + e;
+  st->escore[key] += st->weight;
+  st->score[i] = i < st->max_slots && layer < st->scored_layers ? expert_priority(st, key) : st->escore[key];
+  if (st->pass_layer < 0) st->dscore[key] += st->weight, st->stats.decode_uses++;
 }
 
 int cache_request(ExpertStore *st, int layer, const int *experts, int n) {

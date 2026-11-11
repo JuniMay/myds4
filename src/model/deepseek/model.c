@@ -946,6 +946,9 @@ typedef struct { Win win; uint32_t first, comp_rows; } Att;
 #define KEEP 6
 #define INFLIGHT 6
 static_assert(AHEAD >= 1 && AHEAD <= KEEP, "bounded native prefetch candidates");
+// A decoded row's near misses: the experts with its highest router logits
+// among those not selected (cache_near).
+#define NEAR_MISSES 10
 
 // A routing of a batch's rows: their logits (rows of y's gate.n), the layer
 // whose bias selects, where row 0's indices go (the rows' at stride), and the
@@ -1440,6 +1443,27 @@ int deepseek_routes(int row, uint16_t *id, uint8_t *from) {
 // own; the others and the rows' sums follow once they are in. No command
 // buffer is open while it waits; it leaves the last one open for the caller
 // to add to and commit. approx: see substitute.
+// Credits the near misses of a decoded layer l's m rows: each row's
+// NEAR_MISSES highest router logits (GL) among the experts no row selected
+// (used), each expert once.
+static void near_misses(int l, int m, const char *used) {
+  int list[EXPERTS], n = 0;
+  char listed[EXPERTS] = {0};
+  for (int r = 0; r < m; r++) {
+    const float *lg = (const float *)GL.ptr + (size_t)r * EXPERTS;
+    int top[NEAR_MISSES], nt = 0;  // the highest so far, highest first
+    for (int e = 0; e < EXPERTS; e++) {
+      if (used[e] || (nt == NEAR_MISSES && !(lg[e] > lg[top[nt - 1]]))) continue;
+      int k = nt < NEAR_MISSES ? nt++ : nt - 1;
+      for (; k > 0 && lg[e] > lg[top[k - 1]]; k--) top[k] = top[k - 1];
+      top[k] = e;
+    }
+    for (int k = 0; k < nt; k++)
+      if (!listed[top[k]]) listed[top[k]] = 1, list[n++] = top[k];
+  }
+  cache_near(experts_store, l, list, n);
+}
+
 static void routed_rows(const Batch *b, int l, int ahead, int inflight, int approx, int may_split) {
   int m = b->m, *rt = (int *)RT.ptr, need[EXPERTS], nn = 0, nready = 0, chosen[FEW * TOPK];
   float *rw = (float *)RT.ptr;
@@ -1478,6 +1502,7 @@ static void routed_rows(const Batch *b, int l, int ahead, int inflight, int appr
   // that no reader has started give the SSD back to the next layers'.
   cache_refine(experts_store, l, need, nn);
   cache_demote(experts_store, l);
+  if (!prompt_pass && l < LAYERS) near_misses(l, m, used);  // after this layer's victims, before the read-aheads'
   if (reading) gpu_keep_clock(reading * 1e-3); // the GPU idles until they are in
   if (opt.deepseek.online_predictor) {
     const int *forecast =

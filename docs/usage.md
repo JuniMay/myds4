@@ -85,7 +85,7 @@ DeepSeek-specific settings belong only to its entry:
 | Setting | Meaning |
 | --- | --- |
 | `experts` | GGUF file or any shard of a set. Omit for the checkpoint's native MXFP4 experts and output head. |
-| `cache_half_life` | Retention score half-life in forward passes; default 50. |
+| `cache_half_life` | Retention score half-life of an expert's selections in forward passes; default 50. Near misses (design.md) keep their own half-life of 12. |
 | `cache_read_cost` | Include aligned read cost in retention priority. |
 | `substitute` | Approximate expert replacement within this router-score gap; 0 disables it. |
 | `draft_cache` | Expert slots per DSpark stage, 15–128. Default 0 preloads all 128; these pools count against `cache`. |
