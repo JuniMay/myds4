@@ -239,6 +239,14 @@ position's score must be the same bits, and no other position may be
 written. It then prints both kernels' times for 256 rows over 65,536
 positions, without candidates and with a quarter of the blocks.
 
+`build/tests/prompt-attention` needs no model. It runs DeepSeek's prompt
+attention kernel on random queries, window keys and selected compressed rows
+against a kernel that stages one slice of a chunk's keys at a time. Every
+output must be the same bits: with a full window and 512 selected rows, at
+the first positions without compressed rows, with 0 to 512 selected rows,
+and with a window cut short. It then prints both kernels' times for 512
+rows.
+
 ```sh
 make build/tests/vision
 build/tests/vision

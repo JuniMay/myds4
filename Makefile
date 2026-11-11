@@ -51,7 +51,7 @@ CPU_CHECKS = activation-format-check state-file-check context-lookup-check works
 EXTRA_CPU = pass memory metadata qwen-state-accounting attention-candidate prefill-prune cache-hold cache-progress cache-mapping predictor-learning predictor-state predictor-numerics
 # These need the GPU or model weights to run. make test only builds them, so
 # that a changed engine interface cannot leave one unbuildable.
-BUILD_ONLY = $(addprefix build/tests/,nemotron experts routing index-scores vision residency mxfp4-activation gpu-wait gpu-steps gpu-clock \
+BUILD_ONLY = $(addprefix build/tests/,nemotron experts routing index-scores prompt-attention vision residency mxfp4-activation gpu-wait gpu-steps gpu-clock \
   pass-eviction gguf-decode moe-tasks memory-model qwen-mtp flash-model speech-model nemotron-model prefill-prune-model \
   draft-rows prefix-fork verification-model ced dspark-state prefill-state runahead-model state-file-model passes) \
   build/benchmarks/decode build/benchmarks/products build/benchmarks/steps build/benchmarks/pass-binding
@@ -97,6 +97,10 @@ build/tests/routing: tests/gpu/routing.c build/libmyds4.a $(KERNELS)
 build/tests/index-scores: tests/gpu/index_scores.c build/libmyds4.a $(KERNELS)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ tests/gpu/index_scores.c build/libmyds4.a $(LDLIBS)
+
+build/tests/prompt-attention: tests/gpu/prompt_attention.c build/libmyds4.a $(KERNELS)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -o $@ tests/gpu/prompt_attention.c build/libmyds4.a $(LDLIBS)
 
 build/tests/speech-model: tests/model/speech.c build/libmyds4.a $(MODEL_HEADERS)
 	@mkdir -p $(@D)
