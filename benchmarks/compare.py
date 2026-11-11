@@ -272,7 +272,7 @@ def main():
                 "desktop_load": args.desktop,
                 "temperature": 1, "top_p": 1, "seed": 12345,
                 "think": args.harness_think if args.harness_session else 75, "draft": args.draft,
-                "draft_cache": 32 if args.draft else 0, "online_predictor": False, "substitute": False}
+                "draft_cache": 32 if args.draft else 0, "online_predictor": False}
     if args.control_draft is not None or args.candidate_draft is not None:
         by_role = {role: draft_count(args, role) for role in ("control", "candidate")}
         settings.update(draft=None, draft_cache=None, draft_by_role=by_role,

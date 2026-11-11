@@ -490,7 +490,6 @@ pub struct DeepSeekOptions {
     pub experts: Option<String>,
     pub cache_half_life: i32,
     pub cache_read_cost: bool,
-    pub substitute: f32,
     pub draft_cache: i32,
     pub online_predictor: bool,
     pub predictor_state: Option<String>,
@@ -664,7 +663,8 @@ impl Model {
                     experts: experts.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
                     cache_half_life: d.cache_half_life,
                     cache_read_cost: d.cache_read_cost.into(),
-                    substitute: d.substitute,
+                    // the engine's approximate substitution stays off: a test of the C engine only
+                    substitute: 0.0,
                     draft: o.draft,
                     draft_cache: d.draft_cache,
                     online_predictor: d.online_predictor.into(),

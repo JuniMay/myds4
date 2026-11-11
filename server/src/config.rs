@@ -86,7 +86,6 @@ impl ModelConfig {
             "cache" => return Err("cache is replaced by the server-wide memory setting".into()),
             "cache_half_life" => e.deepseek_mut()?.cache_half_life = int()?,
             "cache_read_cost" => e.deepseek_mut()?.cache_read_cost = flag()?,
-            "substitute" => e.deepseek_mut()?.substitute = num()? as f32,
             "draft" => e.draft = int()?,
             "lookup" => {
                 e.lookup = match v {

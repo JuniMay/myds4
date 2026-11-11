@@ -87,7 +87,6 @@ DeepSeek-specific settings belong only to its entry:
 | `experts` | GGUF file or any shard of a set. Omit for the checkpoint's native MXFP4 experts and output head. |
 | `cache_half_life` | Retention score half-life of an expert's selections in forward passes; default 50. Near misses (design.md) keep their own half-life of 12. |
 | `cache_read_cost` | Include aligned read cost in retention priority. |
-| `substitute` | Approximate expert replacement within this router-score gap; 0 disables it. |
 | `draft_cache` | Expert slots per DSpark stage, 15–128. Default 0 preloads all 128; these pools count against `cache`. |
 | `ced` | `off` or a replay length of at least 128 tokens. Approximate decoder prefill; it can change output. |
 | `prefill_prune` | Skip decoder batches outside required dependencies. Requires CED and substitution off. |
@@ -232,7 +231,7 @@ prefilling that part again.
   and settings: the `config.json`, `.safetensors` and `.gguf` files of the
   checkpoint folder (by name, size and their first and last 64 KiB), the
   `experts` GGUF set, the DFlash2 checkpoint, and `draft`, `lookup`, `ced`,
-  `prefill_prune` and `substitute`. It is read after a rebuild of the server
+  and `prefill_prune`. It is read after a rebuild of the server
   as long as these are unchanged; a rebuild whose kernels compute
   differently then continues it from rows the old build computed. Saved
   states of another checkpoint or other settings stay until their room is

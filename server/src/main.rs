@@ -79,7 +79,6 @@ const USAGE: &str = "usage: myds4-server [--config FILE | -m MODEL [model option
   --cache-half-life N  score half-life in forward passes, 1-1000000 (default 50)
   --cache-read-cost   weight decode eviction priority by expert read bytes
   --experts GGUF  read the routed experts from a GGUF file or set of shards
-  --substitute D  approximate: replace selected experts not in memory (see build/myds4)
   --runahead     overlap exact concurrent requests with expert reads
   --pipeline     experimental native MXFP4 pipeline for concurrent requests (default off);
                  incompatible with --runahead, --draft, --experts, online prediction and substitution
