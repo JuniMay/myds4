@@ -1,5 +1,6 @@
-//! myds4-server: the OpenAI Chat Completions API over myds4's engine
-//!, for one model or several in one process. The engine
+//! myds4-server: the OpenAI Chat Completions and Responses APIs, and Codex's
+//! model catalog (codex/), over myds4's engine, for one model or several in
+//! one process. The engine
 //! (src/engine/engine.c behind src/engine/engine.h, engine.rs) runs the
 //! models and owns the stop on SIGINT or SIGTERM; the worker (worker.rs)
 //! owns the engine thread, every model's queue, batching and requests'
@@ -9,6 +10,7 @@
 
 mod calls;
 mod chat;
+mod codex;
 mod config;
 mod control;
 mod disk;
@@ -522,6 +524,21 @@ async fn models(State(s): App) -> Response {
     json(json!({"object": "list", "data": data}).to_string())
 }
 
+/// GET /v1/codex/models: Codex's model catalog (codex/mod.rs) of the
+/// DeepSeek models, which answer the Responses API that Codex uses.
+async fn codex_models(State(s): App) -> Response {
+    let models = s.models.iter().filter_map(|m| match &m.format {
+        Format::DeepSeek(d) => Some(codex::CatalogModel {
+            id: &m.id,
+            name: &m.name,
+            ctx: m.ctx,
+            effort: d.thinking.then_some(d.effort),
+        }),
+        Format::ChatMl(_) => None,
+    });
+    json(codex::catalog(models).to_string())
+}
+
 /// GET /v1/models/{id}: the model's object, and its live status under
 /// "status" (what it is doing, its requests, KV prefix cache, counters,
 /// expert cache and the process's memory).
@@ -869,6 +886,8 @@ fn main() {
             post(control_resume).fallback(use_post),
         )
         .route("/v1/models", get(models).fallback(use_get))
+        .route("/v1/codex/models", get(codex_models).fallback(use_get))
+        .route("/codex/models", get(codex_models).fallback(use_get))
         .route("/models", get(models).fallback(use_get))
         .route("/v1/models/{id}", get(model).fallback(use_get))
         .route("/models/{id}", get(model).fallback(use_get))
