@@ -131,15 +131,28 @@ pub fn error(status: StatusCode, kind: &str, message: &str) -> Response {
         .into_response()
 }
 
-/// A response's id.
+/// The API a request came through: Chat Completions (`/v1/chat/completions`)
+/// or Responses (`/v1/responses`, DeepSeek models only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Api {
+    Chat,
+    Responses,
+}
+
+/// A chat completion's id.
 pub fn response_id() -> String {
+    random_id("chatcmpl-")
+}
+
+/// `prefix` and 24 random letters and digits.
+pub fn random_id(prefix: &str) -> String {
     use rand::Rng;
     let s: String = rand::rng()
         .sample_iter(&rand::distr::Alphanumeric)
         .take(24)
         .map(char::from)
         .collect();
-    format!("chatcmpl-{s}")
+    format!("{prefix}{s}")
 }
 
 pub use crate::engine::Architecture as Family;
@@ -205,7 +218,7 @@ mod request_tests {
         };
         let body = json!({"messages": [{"role": "user", "content": "Hi"}], "top_k": 31});
         let prepared =
-            deepseek::prepare(&serde_json::to_vec(&body).unwrap(), &defaults, tokenizer).unwrap();
+            deepseek::prepare(&serde_json::to_vec(&body).unwrap(), &defaults, tokenizer, Api::Chat).unwrap();
         let request = prepared.engine_request(0, "test".into()).unwrap();
         assert_eq!(request.sampling.top_k, 31);
         assert_eq!(request.sampling.seed, Some(73));
@@ -284,7 +297,7 @@ mod request_tests {
             if chatml::prepare(&bytes, "test", &q, 0).is_ok() {
                 accepted.push(format!("Qwen accepted {body}"));
             }
-            if deepseek::prepare(&bytes, &d, dt).is_ok() {
+            if deepseek::prepare(&bytes, &d, dt, Api::Chat).is_ok() {
                 accepted.push(format!("DeepSeek accepted {body}"));
             }
         }

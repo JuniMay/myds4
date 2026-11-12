@@ -76,6 +76,8 @@ build/myds4-server
 
 The API base URL is `http://127.0.0.1:8008/v1`. Fetch `/v1/models` for the
 model names and send the desired name in each Chat Completions request.
+DeepSeek models also answer the Responses API, for clients such as Codex
+([usage](docs/usage.md#codex)).
 `--config FILE` selects another configuration; server flags override file
 settings. Changes take effect after a restart.
 

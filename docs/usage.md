@@ -287,6 +287,7 @@ prefilling that part again.
 | `GET /v1/models` | Registered model IDs and context limits. Does not load model weights. |
 | `GET /v1/models/{id}` | Model metadata and status, including `loaded`, memory and queue information, and `kv_disk`: the saved states' folder, count, GiB and budget and this run's loads, saves and GiB written (null without saved states). |
 | `POST /v1/chat/completions` | Generate with the model named in the request. Its first request loads its weights. |
+| `POST /v1/responses` | Generate through the Responses API, with a DeepSeek model. The Qwen models, Flash-Next and Nemotron answer Chat Completions only. |
 | `GET /v1/control` | Process-wide execution state, effective budgets and retained model/KV bytes. |
 | `POST /v1/control/yield` | Pause inference and reclaim to temporary budgets. |
 | `POST /v1/control/resume` | Restore configured budgets and scheduling for the matching operation. |
@@ -299,6 +300,65 @@ Chat Completions accepts message history, tools, sampling settings,
 `max_tokens` or `max_completion_tokens`, `stream`, and reasoning controls.
 Tool calls are returned as API `tool_calls`; clients do not parse the
 model's internal XML or special-token syntax.
+
+The Responses API accepts:
+- `input`: a string, or a list of messages (user, developer, system,
+  assistant), function calls and their outputs, and reasoning items;
+- `instructions`;
+- function tools, namespaces of functions, and the `apply_patch` custom
+  tool;
+- `reasoning.effort`: `none` turns thinking off; `minimal` and `low` give
+  effort 50, `medium`, `high` and `xhigh` 75, `max` and `ultra` 100, and a
+  number from 1 to 100 that effort; without one, the model's `think`
+  setting applies;
+- `max_output_tokens`, `temperature`, `top_p`, `text.format` and `stream`.
+
+The server keeps no responses. It ignores `store` and refuses requests with
+`previous_response_id` or `conversation`, so a client sends the whole
+conversation each time, as Codex does with `store: false`. Web search tools
+and tool types the model cannot call are left out; the server log counts
+them per request. A replayed reasoning item's `reasoning_text` content
+becomes part of the prompt. Encrypted reasoning is neither produced nor
+read. Images are `input_image` parts with a base64 `data:` URL, as in Chat
+Completions. A streamed response is server-sent events, each named by its
+`type`. It ends with `response.completed`, `response.incomplete` (the output
+limit was reached) or `response.failed`, without `[DONE]`.
+
+### Codex
+
+Codex talks to a custom provider only through the Responses API. Give it a
+Codex home of its own, for example `~/.codex-myds4/config.toml`:
+
+```toml
+model = "deepseek-v4.1-flash"
+model_provider = "myds4"
+model_reasoning_effort = "high"
+model_context_window = 1048576
+
+[model_providers.myds4]
+name = "myds4"
+base_url = "http://127.0.0.1:8008/v1"
+wire_api = "responses"
+env_key = "MYDS4_API_KEY"
+supports_websockets = false
+stream_idle_timeout_ms = 1800000
+```
+
+```sh
+MYDS4_API_KEY="$(cat /path/to/api-key)" CODEX_HOME=~/.codex-myds4 codex
+```
+
+- **A home of its own.** A Codex that is signed in to ChatGPT sends the
+  tools of its ChatGPT apps and plugins with every request. With Codex 0.167,
+  one such request measured 774 KB, nearly all tool definitions. That is a
+  long prefill before the first answer, and the model could call those
+  apps. The home above sent 40 KB.
+- **`stream_idle_timeout_ms`.** While a prompt is prefilled, the server sends
+  only SSE comments, and Codex does not count comments as activity. Without
+  a long idle timeout, Codex would end a long prefill and send the request
+  again.
+- **Model metadata.** Codex warns that it has no metadata for the model and
+  uses defaults.
 
 Images use content parts of type `image_url`, with a base64 `data:` URL.
 The server does not fetch remote image URLs or read client-supplied local

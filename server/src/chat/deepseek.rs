@@ -1,7 +1,8 @@
-//! DeepSeek V4.1's chat format: a Chat Completions request's JSON through the
-//! compatibility steps into recipe's conversion and V4.1 rendering, its
-//! prompt tokens from the model's tokenizer, and the worker's events through
-//! recipe's stream processor into response chunks.
+//! DeepSeek V4.1's chat format: a Chat Completions or Responses request's
+//! JSON through the compatibility steps into recipe's conversion and V4.1
+//! rendering, its prompt tokens from the model's tokenizer, and the worker's
+//! events through recipe's stream processor into the API's response chunks
+//! or events.
 
 use std::ops::Range;
 use std::pin::pin;
@@ -12,27 +13,29 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::body::Body;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use deepseek_recipe::openai::ChatCompletionRequest;
 use deepseek_recipe::openai::chat_completion::response::{
-    ChatCompletionChunk, ChatCompletionResponse, ChatCompletionToolCallDelta,
+    ChatCompletionChunk, ChatCompletionToolCallDelta,
 };
+use deepseek_recipe::openai::responses::response::{ResponsesOutputItem, ResponsesStreamEvent};
+use deepseek_recipe::openai::{ChatCompletionRequest, ResponsesRequest};
 use deepseek_recipe::request::{
     ConversationRequest, ConversionError, ConversionOptions, ProtocolRequest,
 };
 use deepseek_recipe::response::{Accumulate, ProtocolResponse};
 use deepseek_recipe::stream::{
-    InferenceChunk, InferenceFinishReason, PromptUsage, StreamProcessor,
+    ChunkGenerator, InferenceChunk, InferenceFinishReason, PromptUsage, StreamProcessor,
 };
 use deepseek_recipe_core::messages::InputMessage;
 use deepseek_recipe_core::multimodal::ImageSource;
 use deepseek_recipe_core::special_tokens::{SpecialToken, SpecialTokens, SpecialTokensMap};
 use deepseek_recipe_encoding::PromptEncoding;
 use deepseek_recipe_encoding::v4::dsv41::DeepseekV41Encoding;
+use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_stream::{Stream, StreamExt};
 
-use super::{DEFAULT_MAX_TOKENS, Error, bad, error, error_json, response_id};
+use super::{Api, DEFAULT_MAX_TOKENS, Error, bad, error, error_json, random_id};
 use crate::engine;
 use crate::worker::{self, Event, Finish, Sampling};
 
@@ -222,6 +225,83 @@ fn compatible(root: &mut Map<String, Value>, d: &Defaults) -> Result<Settings, E
     })
 }
 
+/// A Responses request's settings that the server reads itself: sampling,
+/// `max_output_tokens` and the reasoning effort, written back as the level
+/// recipe renders (as for Chat Completions). The server keeps no responses,
+/// so a request that continues a stored response or conversation is refused.
+fn responses_compatible(root: &mut Map<String, Value>, d: &Defaults) -> Result<Settings, Error> {
+    for key in ["previous_response_id", "conversation"] {
+        if root.get(key).is_some_and(|v| !v.is_null()) {
+            return Err(bad(format!(
+                "{key} is not supported: the server keeps no responses, so send the whole conversation in input"
+            )));
+        }
+    }
+    let sampling = super::sampling(root, d.sampling)?;
+    let max_tokens = match root.get("max_output_tokens") {
+        None | Some(Value::Null) => DEFAULT_MAX_TOKENS,
+        Some(value) => value
+            .as_i64()
+            .filter(|&n| n > 0)
+            .ok_or_else(|| bad("max_output_tokens must be a positive integer"))?,
+    };
+    let model = root
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(&d.id)
+        .to_string();
+    root.insert("model".into(), RECIPE_MODEL.into());
+
+    // An effort of "none" turns thinking off and another effort, a level or
+    // a number from 1 to 100, turns it on; without one, the model's default.
+    let effort_field = root
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .filter(|e| !e.is_null())
+        .cloned();
+    let thinking = match &effort_field {
+        None => d.thinking,
+        Some(Value::String(s)) => s != "none",
+        Some(_) => true,
+    };
+    let effort = effort_of(effort_field.as_ref(), d.effort);
+    if thinking {
+        let level = match effort {
+            50 => "low",
+            100 => "max",
+            _ => "high",
+        };
+        match root.get_mut("reasoning") {
+            Some(Value::Object(reasoning)) => {
+                reasoning.insert("effort".into(), level.into());
+            }
+            _ => {
+                root.insert("reasoning".into(), json!({"effort": level}));
+            }
+        }
+    }
+    Ok(Settings {
+        sampling,
+        max_tokens,
+        model,
+        effort: thinking.then_some(effort),
+    })
+}
+
+/// The declared tools that recipe's Responses conversion drops: web search,
+/// which the server cannot run, and tool types it does not know.
+fn dropped_tools(root: &Map<String, Value>) -> usize {
+    let known = ["function", "namespace", "custom", "tool_search"];
+    root.get("tools")
+        .and_then(Value::as_array)
+        .map_or(0, |tools| {
+            tools
+                .iter()
+                .filter(|t| !t.get("type").and_then(Value::as_str).is_some_and(|k| known.contains(&k)))
+                .count()
+        })
+}
+
 // ---- conversion and rendering ----
 
 /// A request converted and rendered by recipe.
@@ -263,10 +343,28 @@ fn set_effort(prompt: &mut String, specials: &mut [Range<usize>], effort: u32) {
     }
 }
 
-fn render(root: Map<String, Value>, d: &Defaults) -> Result<Rendered, Error> {
+/// The request through the API's compatibility steps, recipe's conversion
+/// and V4.1 rendering.
+fn render(root: Map<String, Value>, d: &Defaults, api: Api) -> Result<Rendered, Error> {
     let mut root = root;
-    let settings = compatible(&mut root, d)?;
-    let request: ChatCompletionRequest = serde_json::from_value(Value::Object(root))
+    match api {
+        Api::Chat => {
+            let settings = compatible(&mut root, d)?;
+            render_as::<ChatCompletionRequest>(root, settings, d)
+        }
+        Api::Responses => {
+            let settings = responses_compatible(&mut root, d)?;
+            render_as::<ResponsesRequest>(root, settings, d)
+        }
+    }
+}
+
+fn render_as<P: ProtocolRequest + DeserializeOwned>(
+    root: Map<String, Value>,
+    settings: Settings,
+    d: &Defaults,
+) -> Result<Rendered, Error> {
+    let request: P = serde_json::from_value(Value::Object(root))
         .map_err(|e| bad(format!("invalid request: {e}")))?;
     let options = ConversionOptions::default()
         .with_special_tokens(special_tokens())
@@ -293,9 +391,14 @@ pub struct Prepared {
     prompt: Vec<u8>, // the rendered prompt, the byte 0xFF at each image's place
     images: Vec<Vec<u8>>,
     settings: Settings,
+    pub api: Api,
     pub stream: bool,
+    /// The request's messages, or its input items.
     pub messages: usize,
     pub tools: usize,
+    /// Of the tools, those that conversion dropped (Responses web search and
+    /// unknown types).
+    pub dropped_tools: usize,
 }
 
 impl Prepared {
@@ -335,29 +438,47 @@ impl Prepared {
 
 /// A request's body as the engine's request: checked, converted, rendered,
 /// its images read; `tokenizer` is the model's.
-pub fn prepare(body: &[u8], d: &Defaults, tokenizer: engine::Tokenizer) -> Result<Prepared, Error> {
+pub fn prepare(
+    body: &[u8],
+    d: &Defaults,
+    tokenizer: engine::Tokenizer,
+    api: Api,
+) -> Result<Prepared, Error> {
     let Ok(Value::Object(root)) = serde_json::from_slice::<Value>(body) else {
         return Err(bad("the body is not a JSON object"));
     };
-    let messages = root
-        .get("messages")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
     let tools = root
         .get("tools")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
-    if messages == 0 {
-        return Err(bad("messages must be a non-empty array"));
-    }
-    let last = root["messages"]
-        .as_array()
-        .and_then(|m| m.last())
-        .and_then(|m| m.get("role"));
-    if last.and_then(Value::as_str) == Some("assistant") {
-        return Err(bad("the last message must not be the assistant's"));
-    }
-    let r = render(root, d)?;
+    let (messages, dropped_tools) = match api {
+        Api::Chat => {
+            let messages = root
+                .get("messages")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            if messages == 0 {
+                return Err(bad("messages must be a non-empty array"));
+            }
+            let last = root["messages"]
+                .as_array()
+                .and_then(|m| m.last())
+                .and_then(|m| m.get("role"));
+            if last.and_then(Value::as_str) == Some("assistant") {
+                return Err(bad("the last message must not be the assistant's"));
+            }
+            (messages, 0)
+        }
+        Api::Responses => {
+            let items = match root.get("input") {
+                Some(Value::String(s)) if !s.is_empty() => 1,
+                Some(Value::Array(items)) if !items.is_empty() => items.len(),
+                _ => return Err(bad("input must be a non-empty string or array")),
+            };
+            (items, dropped_tools(&root))
+        }
+    };
+    let r = render(root, d, api)?;
     let mut images = Vec::new();
     for source in &r.images {
         match source {
@@ -391,8 +512,10 @@ pub fn prepare(body: &[u8], d: &Defaults, tokenizer: engine::Tokenizer) -> Resul
         prompt,
         images,
         settings: r.settings,
+        api,
         messages,
         tools,
+        dropped_tools,
     })
 }
 
@@ -441,56 +564,172 @@ fn inference(
     }
 }
 
-/// recipe's processor over the request's events: its chunks, and whether the
-/// server's stop ended them.
-fn chunks(
+/// A protocol's response chunk: a chat completion chunk or a Responses event.
+type Chunk<P> =
+    <<<P as ProtocolRequest>::Response as ProtocolResponse>::ChunkGenerator as ChunkGenerator>::Chunk;
+
+/// What differs between the APIs' output.
+trait Output: ProtocolRequest {
+    /// A new response's id.
+    fn id() -> String;
+    /// Whether the chunk is sent.
+    fn keep(chunk: &Chunk<Self>) -> bool;
+    /// The tool calls the chunk starts.
+    fn calls(chunk: &Chunk<Self>) -> usize;
+    /// The stream's last event when the request fails: `kind` and `message`;
+    /// `next` is the stream's next sequence number.
+    fn failure(kind: &str, message: &str, id: &str, model: &str, next: usize) -> String;
+}
+
+impl Output for ChatCompletionRequest {
+    fn id() -> String {
+        random_id("chatcmpl-")
+    }
+
+    /// Not a chunk of an empty content delta and nothing else, such as the
+    /// end token's, which only adds to the usage.
+    fn keep(chunk: &ChatCompletionChunk) -> bool {
+        matches!(chunk.usage, Some(Some(_)))
+            || !chunk.choices.iter().all(|c| {
+                c.finish_reason.is_none()
+                    && c.delta.role.is_none()
+                    && c.delta.tool_calls.is_none()
+                    && matches!(&c.delta.content, Some(Some(s)) if s.is_empty())
+                    && matches!(&c.delta.reasoning_content, None | Some(None))
+            })
+    }
+
+    fn calls(chunk: &ChatCompletionChunk) -> usize {
+        chunk
+            .choices
+            .iter()
+            .filter_map(|c| c.delta.tool_calls.as_ref())
+            .flatten()
+            .filter(|d| matches!(d, ChatCompletionToolCallDelta::Start { .. }))
+            .count()
+    }
+
+    fn failure(kind: &str, message: &str, _: &str, _: &str, _: usize) -> String {
+        format!("data: {}\n\n", error_json(kind, message))
+    }
+}
+
+impl Output for ResponsesRequest {
+    fn id() -> String {
+        random_id("resp_")
+    }
+
+    fn keep(_: &ResponsesStreamEvent) -> bool {
+        true
+    }
+
+    fn calls(chunk: &ResponsesStreamEvent) -> usize {
+        match chunk {
+            ResponsesStreamEvent::OutputItemAdded { item, .. } => matches!(
+                item,
+                ResponsesOutputItem::FunctionCall { .. }
+                    | ResponsesOutputItem::CustomToolCall { .. }
+                    | ResponsesOutputItem::ToolSearchCall { .. }
+            ) as usize,
+            _ => 0,
+        }
+    }
+
+    /// A `response.failed` event whose response carries the error.
+    fn failure(kind: &str, message: &str, id: &str, model: &str, next: usize) -> String {
+        let event = json!({
+            "type": "response.failed",
+            "sequence_number": next,
+            "response": {
+                "id": id,
+                "object": "response",
+                "created_at": now(),
+                "status": "failed",
+                "model": model,
+                "output": [],
+                "error": {"code": kind, "message": message},
+                "incomplete_details": null,
+            },
+        });
+        format!("event: response.failed\ndata: {event}\n\n")
+    }
+}
+
+/// The time in Unix seconds.
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// recipe's processor over the request's events: the API's chunks, and
+/// whether the server's stop ended them.
+fn chunks<P: Output>(
     mut request: ConversationRequest,
+    id: String,
     model: String,
     tokenizer: engine::Tokenizer,
     first: Event,
     rx: UnboundedReceiver<Event>,
 ) -> (
-    impl Stream<Item = Result<ChatCompletionChunk, String>> + Send,
+    impl Stream<Item = Result<Chunk<P>, String>> + Send,
     Arc<AtomicBool>,
-) {
+)
+where
+    Chunk<P>: Send,
+{
     let stopped = Arc::new(AtomicBool::new(false));
-    let generator = ChatCompletionRequest::chunk_generator(&request, response_id(), model);
+    let generator = P::chunk_generator(&request, id, model);
     let options = std::mem::take(&mut request.parsing_options);
     let processor = StreamProcessor::new(generator, options).with_tokenizer(tokenizer);
     let chunks = processor
         .into_protocol_stream(inference(first, rx, stopped.clone()))
-        .filter(|c| !c.as_ref().is_ok_and(empty))
+        .filter(|c| c.as_ref().map_or(true, P::keep))
         .map(|c| c.map_err(|e| e.to_string()));
     (chunks, stopped)
 }
 
-/// A chunk of an empty content delta and nothing else, such as the end
-/// token's, which only adds to the usage.
-fn empty(chunk: &ChatCompletionChunk) -> bool {
-    !matches!(chunk.usage, Some(Some(_)))
-        && chunk.choices.iter().all(|c| {
-            c.finish_reason.is_none()
-                && c.delta.role.is_none()
-                && c.delta.tool_calls.is_none()
-                && matches!(&c.delta.content, Some(Some(s)) if s.is_empty())
-                && matches!(&c.delta.reasoning_content, None | Some(None))
-        })
+/// A server-sent event: the chunk's JSON, under the API's event name if it
+/// names its events (Responses does).
+fn sse<P: Output>(chunk: &Chunk<P>) -> Result<String, String>
+where
+    Chunk<P>: serde::Serialize,
+{
+    let json = serde_json::to_string(chunk).map_err(|e| e.to_string())?;
+    Ok(match <P::Response as ProtocolResponse>::sse_event_name(chunk) {
+        Some(name) => format!("event: {name}\ndata: {json}\n\n"),
+        None => format!("data: {json}\n\n"),
+    })
 }
 
-fn tool_calls(chunk: &ChatCompletionChunk) -> usize {
-    chunk
-        .choices
-        .iter()
-        .filter_map(|c| c.delta.tool_calls.as_ref())
-        .flatten()
-        .filter(|d| matches!(d, ChatCompletionToolCallDelta::Start { .. }))
-        .count()
+/// The API's last message of a stream that ended normally, if it has one
+/// (`data: [DONE]` for Chat Completions).
+fn done<P: Output>() -> String {
+    <P::Response as ProtocolResponse>::sse_done_data().map_or(String::new(), |d| format!("data: {d}\n\n"))
+}
+
+fn log_calls(id: u64, calls: usize) {
+    if calls > 0 {
+        engine::log(&format!("req {id}: {calls} tool call{}", if calls == 1 { "" } else { "s" }));
+    }
 }
 
 /// A streamed response: server-sent events from recipe's chunks, a comment
 /// every 15 s while the request waits for the engine.
-pub fn stream(p: Prepared, cancel: worker::Cancel, mut rx: UnboundedReceiver<Event>) -> Response {
+pub fn stream(p: Prepared, cancel: worker::Cancel, rx: UnboundedReceiver<Event>) -> Response {
+    match p.api {
+        Api::Chat => stream_as::<ChatCompletionRequest>(p, cancel, rx),
+        Api::Responses => stream_as::<ResponsesRequest>(p, cancel, rx),
+    }
+}
+
+fn stream_as<P: Output>(p: Prepared, cancel: worker::Cancel, mut rx: UnboundedReceiver<Event>) -> Response
+where
+    Chunk<P>: serde::Serialize + Send,
+{
     let id = cancel.id();
+    let response = P::id();
+    let model = p.settings.model.clone();
     let body = async_stream::stream! {
         let _cancel = cancel;  // dropped with the stream, polled or not
         let first = loop {
@@ -501,42 +740,43 @@ pub fn stream(p: Prepared, cancel: worker::Cancel, mut rx: UnboundedReceiver<Eve
         };
         let first = match first {
             Some(Event::Failed(message)) => {
-                yield Ok(format!("data: {}\n\ndata: [DONE]\n\n", error_json("server_error", &message)));
+                yield Ok(P::failure("server_error", &message, &response, &model, 0) + &done::<P>());
                 return;
             }
             Some(Event::Refused(message)) => {
-                yield Ok(format!("data: {}\n\ndata: [DONE]\n\n", error_json("invalid_request_error", &message)));
+                yield Ok(P::failure("invalid_request_error", &message, &response, &model, 0) + &done::<P>());
                 return;
             }
             Some(event) => event,
             None => return,
         };
-        let (chunks, stopped) = chunks(p.request, p.settings.model, p.tokenizer, first, rx);
+        let (chunks, stopped) = chunks::<P>(p.request, response.clone(), p.settings.model, p.tokenizer, first, rx);
         let mut chunks = pin!(chunks);
-        let mut calls = 0;
+        let (mut calls, mut sent) = (0, 0);
         while let Some(chunk) = chunks.next().await {
             if stopped.load(Ordering::Relaxed) {
                 break;
             }
             match chunk.and_then(|c| {
-                calls += tool_calls(&c);
-                serde_json::to_string(&c).map_err(|e| e.to_string())
+                calls += P::calls(&c);
+                sse::<P>(&c)
             }) {
-                Ok(json) => yield Ok(format!("data: {json}\n\n")),
+                Ok(event) => {
+                    sent += 1;
+                    yield Ok(event);
+                }
                 Err(message) => {
-                    yield Ok(format!("data: {}\n\n", error_json("server_error", &message)));
+                    yield Ok(P::failure("server_error", &message, &response, &model, sent));
                     return;
                 }
             }
         }
         if stopped.load(Ordering::Relaxed) {
-            yield Ok(format!("data: {}\n\n", error_json("server_error", "the server is stopping")));
+            yield Ok(P::failure("server_error", "the server is stopping", &response, &model, sent));
             return;
         }
-        if calls > 0 {
-            engine::log(&format!("req {id}: {calls} tool call{}", if calls == 1 { "" } else { "s" }));
-        }
-        yield Ok("data: [DONE]\n\n".into());
+        log_calls(id, calls);
+        yield Ok(done::<P>());
     };
     Response::builder()
         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -545,12 +785,23 @@ pub fn stream(p: Prepared, cancel: worker::Cancel, mut rx: UnboundedReceiver<Eve
         .expect("a valid response")
 }
 
-/// A response that is not streamed: recipe's accumulated chat.completion.
-pub async fn whole(
+/// A response that is not streamed: recipe's accumulated chat.completion or
+/// Responses response object.
+pub async fn whole(p: Prepared, cancel: worker::Cancel, rx: UnboundedReceiver<Event>) -> Response {
+    match p.api {
+        Api::Chat => whole_as::<ChatCompletionRequest>(p, cancel, rx).await,
+        Api::Responses => whole_as::<ResponsesRequest>(p, cancel, rx).await,
+    }
+}
+
+async fn whole_as<P: Output>(
     p: Prepared,
     cancel: worker::Cancel,
     mut rx: UnboundedReceiver<Event>,
-) -> Response {
+) -> Response
+where
+    Chunk<P>: Send,
+{
     let id = cancel.id();
     let first = match rx.recv().await {
         Some(Event::Failed(message)) => {
@@ -568,18 +819,16 @@ pub async fn whole(
             );
         }
     };
-    let created = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let model = p.settings.model.clone();
-    let (chunks, stopped) = chunks(p.request, p.settings.model, p.tokenizer, first, rx);
+    let (response_id, model) = (P::id(), p.settings.model.clone());
+    let mut response =
+        <P::Response as ProtocolResponse>::new(response_id.clone(), model, now(), 0, 0);
+    let (chunks, stopped) = chunks::<P>(p.request, response_id, p.settings.model, p.tokenizer, first, rx);
     let mut chunks = pin!(chunks);
-    let mut response = ChatCompletionResponse::new(response_id(), model, created, 0, 0);
     let mut calls = 0;
     while let Some(chunk) = chunks.next().await {
         match chunk {
             Ok(chunk) => {
-                calls += tool_calls(&chunk);
+                calls += P::calls(&chunk);
                 response.accumulate(chunk);
             }
             Err(message) => {
@@ -594,12 +843,7 @@ pub async fn whole(
             "the server is stopping",
         );
     }
-    if calls > 0 {
-        engine::log(&format!(
-            "req {id}: {calls} tool call{}",
-            if calls == 1 { "" } else { "s" }
-        ));
-    }
+    log_calls(id, calls);
     match serde_json::to_string(&response) {
         Ok(json) => (
             StatusCode::OK,
@@ -688,7 +932,7 @@ pub fn render_file(path: &str) -> i32 {
         thinking: false,
         effort: 75,
     };
-    let r = match render(root, &defaults) {
+    let r = match render(root, &defaults, Api::Chat) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("myds4-server: {path}: {}", e.message);
@@ -808,7 +1052,7 @@ mod tests {
         let Value::Object(root) = request else {
             unreachable!()
         };
-        let r = render(root, &defaults()).ok().expect("rendered");
+        let r = render(root, &defaults(), Api::Chat).ok().expect("rendered");
         assert!(
             r.prompt.starts_with(
                 "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 62 (range 1-100"
@@ -844,7 +1088,7 @@ mod tests {
         let Value::Object(root) = request else {
             unreachable!()
         };
-        let r = render(root, &defaults()).ok().expect("rendered");
+        let r = render(root, &defaults(), Api::Chat).ok().expect("rendered");
         // the reasoning and </think> in one step, then the answer token by token
         let mut ids = think.clone();
         ids.push(128822);
@@ -861,7 +1105,8 @@ mod tests {
             prompt: 10,
             reused: 4,
         };
-        let (chunks, stopped) = chunks(r.request, MODEL_ID.into(), t, first, rx);
+        let (chunks, stopped) =
+            chunks::<ChatCompletionRequest>(r.request, "chatcmpl-test".into(), MODEL_ID.into(), t, first, rx);
         let chunks: Vec<ChatCompletionChunk> = chunks.map(|c| c.expect("a chunk")).collect().await;
         assert!(!stopped.load(Ordering::Relaxed));
         let text = |f: fn(&ChatCompletionChunk) -> Option<String>| {
@@ -897,5 +1142,161 @@ mod tests {
             "no empty deltas before the last chunk:\n{}",
             all.join("\n")
         );
+    }
+
+    fn responses_settings(v: Value) -> Result<(Map<String, Value>, Settings), Error> {
+        let Value::Object(mut root) = v else {
+            panic!("an object")
+        };
+        let s = responses_compatible(&mut root, &defaults())?;
+        Ok((root, s))
+    }
+
+    #[test]
+    fn responses_requests_take_the_server_settings() {
+        let (root, s) = responses_settings(json!({
+            "model": "deepseek-v4.1-flash", "input": "hi", "max_output_tokens": 300,
+            "temperature": 0.5, "reasoning": {"effort": "xhigh", "summary": "auto"},
+        }))
+        .ok()
+        .expect("settings");
+        assert_eq!(root["model"], RECIPE_MODEL);
+        assert_eq!(s.model, "deepseek-v4.1-flash");
+        assert_eq!((s.effort, &root["reasoning"]["effort"]), (Some(75), &json!("high")));
+        assert_eq!(root["reasoning"]["summary"], "auto");
+        assert_eq!(s.max_tokens, 300);
+        assert_eq!(s.sampling.temperature, 0.5);
+
+        let effort = |v: Value| {
+            let (root, s) = responses_settings(v).ok().expect("settings");
+            (s.effort, root.get("reasoning").map(|r| r["effort"].clone()))
+        };
+        assert_eq!(effort(json!({"input": "hi", "reasoning": {"effort": "none"}})), (None, Some(json!("none"))));
+        assert_eq!(effort(json!({"input": "hi", "reasoning": {"effort": "low"}})), (Some(50), Some(json!("low"))));
+        assert_eq!(effort(json!({"input": "hi", "reasoning": {"effort": "max"}})), (Some(100), Some(json!("max"))));
+        assert_eq!(effort(json!({"input": "hi", "reasoning": {"effort": 62}})), (Some(62), Some(json!("high"))));
+        // without an effort, the model's default: thinking at 75 here
+        assert_eq!(effort(json!({"input": "hi"})), (Some(75), Some(json!("high"))));
+        assert_eq!(effort(json!({"input": "hi", "reasoning": null})), (Some(75), Some(json!("high"))));
+
+        let (_, s) = responses_settings(json!({"input": "hi"})).ok().expect("settings");
+        assert_eq!(s.max_tokens, DEFAULT_MAX_TOKENS);
+        for key in ["previous_response_id", "conversation"] {
+            let mut root = Map::new();
+            root.insert("input".into(), "hi".into());
+            root.insert(key.into(), "resp_1".into());
+            let e = responses_compatible(&mut root, &defaults()).err().expect("refused");
+            assert!(e.message.contains(key), "{}", e.message);
+        }
+        assert!(responses_settings(json!({"input": "hi", "max_output_tokens": 0})).is_err());
+    }
+
+    /// The shape of a request from Codex 0.167: developer and user messages, a
+    /// function, a namespace of functions and web search (dropped), and a
+    /// replayed tool call with its reasoning.
+    #[test]
+    fn codex_requests_render() {
+        let request = json!({
+            "model": "deepseek-v4.1-flash", "stream": true, "store": false, "tool_choice": "auto",
+            "parallel_tool_calls": true, "include": ["reasoning.encrypted_content"],
+            "prompt_cache_key": "k", "client_metadata": {"thread_id": "t"},
+            "reasoning": {"effort": "xhigh", "summary": "auto"},
+            "tools": [
+                {"type": "function", "name": "exec_command", "description": "Runs a command.", "strict": false,
+                 "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}},
+                                "required": ["cmd"], "additionalProperties": false}},
+                {"type": "namespace", "name": "multi_agent_v1", "description": "Agents.", "tools": [
+                    {"type": "function", "name": "spawn_agent", "description": "Starts an agent.", "strict": false,
+                     "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}}]},
+                {"type": "web_search", "external_web_access": false},
+            ],
+            "input": [
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "You are a coding agent."}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "List the files."}]},
+                {"type": "reasoning", "summary": [], "encrypted_content": null,
+                 "content": [{"type": "reasoning_text", "text": "I should run ls."}]},
+                {"type": "function_call", "call_id": "call_0", "name": "exec_command", "arguments": "{\"cmd\":\"ls\"}"},
+                {"type": "function_call_output", "call_id": "call_0", "output": "a.txt\nb.txt"},
+            ],
+        });
+        let Value::Object(root) = request else {
+            unreachable!()
+        };
+        assert_eq!(dropped_tools(&root), 1);
+        let r = render(root, &defaults(), Api::Responses).ok().expect("rendered");
+        assert!(r.request.stream);
+        for text in ["You are a coding agent.", "exec_command", "multi_agent_v1::spawn_agent", "I should run ls.", "a.txt"] {
+            assert!(r.prompt.contains(text), "{text} is not in the prompt:\n{}", r.prompt);
+        }
+        assert!(!r.prompt.contains("web_search"), "{}", r.prompt);
+    }
+
+    #[test]
+    fn failures_end_each_api_its_way() {
+        let chat = ChatCompletionRequest::failure("invalid_request_error", "too long", "chatcmpl-1", "m", 3);
+        let data = chat.strip_prefix("data: ").expect("a data line");
+        let v: Value = serde_json::from_str(data.trim_end()).unwrap();
+        assert_eq!(v["error"]["message"], "too long");
+
+        let event = ResponsesRequest::failure("invalid_request_error", "too long", "resp_1", "m", 3);
+        let (name, data) = event.split_once('\n').expect("two lines");
+        assert_eq!(name, "event: response.failed");
+        let v: Value = serde_json::from_str(data.strip_prefix("data: ").unwrap().trim_end()).unwrap();
+        assert_eq!(v["type"], "response.failed");
+        assert_eq!(v["sequence_number"], 3);
+        assert_eq!(v["response"]["id"], "resp_1");
+        assert_eq!(v["response"]["status"], "failed");
+        assert_eq!(v["response"]["error"]["message"], "too long");
+        assert!(event.ends_with("\n\n"));
+        assert_eq!(done::<ResponsesRequest>(), "", "Responses streams end without [DONE]");
+        assert_eq!(done::<ChatCompletionRequest>(), "data: [DONE]\n\n");
+    }
+
+    /// The engine's events as Responses events, with the checkpoint's
+    /// tokenizer (MYDS4_CHECKPOINT names its directory; skipped without it).
+    #[tokio::test]
+    async fn events_become_responses_events() {
+        let Ok(dir) = std::env::var("MYDS4_CHECKPOINT") else {
+            return;
+        };
+        let t = engine::Tokenizer::open(&dir, Some(IMAGE));
+        let tokens = |s: &str| -> Vec<u32> { t.tokenize(s).iter().map(|&t| t as u32).collect() };
+        let request = json!({"input": "hi", "stream": true});
+        let Value::Object(root) = request else {
+            unreachable!()
+        };
+        let r = render(root, &defaults(), Api::Responses).ok().expect("rendered");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ids = tokens("Hmm.");
+        ids.push(128822); // </think>
+        tx.send(Event::Tokens(ids)).unwrap();
+        for t in tokens("Hi there! 你好") {
+            tx.send(Event::Tokens(vec![t])).unwrap();
+        }
+        tx.send(Event::Done { finish: Finish::Stop }).unwrap();
+        let first = Event::Started { prompt: 10, reused: 4 };
+        let (events, stopped) = chunks::<ResponsesRequest>(r.request, "resp_1".into(), MODEL_ID.into(), t, first, rx);
+        let events: Vec<ResponsesStreamEvent> = events.map(|e| e.expect("an event")).collect().await;
+        assert!(!stopped.load(Ordering::Relaxed));
+        let json: Vec<Value> = events.iter().map(|e| serde_json::to_value(e).unwrap()).collect();
+        let types: Vec<&str> = json.iter().map(|e| e["type"].as_str().unwrap()).collect();
+        assert_eq!(types.first(), Some(&"response.created"), "{types:?}");
+        assert_eq!(types.last(), Some(&"response.completed"), "{types:?}");
+        let text = |kind: &str| -> String {
+            json.iter().filter(|e| e["type"] == kind).filter_map(|e| e["delta"].as_str()).collect()
+        };
+        assert_eq!(text("response.reasoning_text.delta"), "Hmm.");
+        assert_eq!(text("response.output_text.delta"), "Hi there! 你好");
+        let done = &json.last().unwrap()["response"];
+        assert_eq!(done["id"], "resp_1");
+        assert_eq!(done["model"], MODEL_ID);
+        assert_eq!(done["usage"]["input_tokens"], 10, "{done}");
+        assert_eq!(done["usage"]["input_tokens_details"]["cached_tokens"], 4, "{done}");
+        let sse = sse::<ResponsesRequest>(&events[0]).unwrap();
+        assert!(sse.starts_with("event: response.created\ndata: {"), "{sse}");
+        // the sequence numbers count the events
+        for (i, e) in json.iter().enumerate() {
+            assert_eq!(e["sequence_number"], i, "{e}");
+        }
     }
 }

@@ -35,7 +35,7 @@ use axum::routing::{get, post};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::chat::{Family, chatml, deepseek};
+use crate::chat::{Api, Family, chatml, deepseek};
 use crate::config::ModelConfig;
 
 const USAGE: &str = "usage: myds4-server [--config FILE | -m MODEL [model options]] [server options]
@@ -573,6 +573,20 @@ async fn completions(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     body: Body,
 ) -> Response {
+    generate(s, peer, body, Api::Chat).await
+}
+
+async fn responses(
+    State(s): App,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    body: Body,
+) -> Response {
+    generate(s, peer, body, Api::Responses).await
+}
+
+/// A request of either API: read, routed to its model, rendered and queued,
+/// then answered as a stream or as one response.
+async fn generate(s: Arc<Shared>, peer: SocketAddr, body: Body, api: Api) -> Response {
     let peer = peer.ip().to_string();
     let body = match http::read_body(body, http::LIMITS).await {
         Ok(body) => body,
@@ -591,17 +605,26 @@ async fn completions(
     let (from, shared) = (peer.clone(), s.clone());
     let queued = tokio::task::spawn_blocking(move || match &shared.models[i].format {
         Format::DeepSeek(d) => {
-            let p = deepseek::prepare(&body, d, shared.models[i].tokenizer)?;
+            let p = deepseek::prepare(&body, d, shared.models[i].tokenizer, api)?;
+            let note = match api {
+                Api::Chat => format!("{} messages, {} tools", p.messages, p.tools),
+                Api::Responses => format!(
+                    "Responses API: {} input items, {} tools ({} not supported and left out)",
+                    p.messages, p.tools, p.dropped_tools
+                ),
+            };
             let note = format!(
-                "http {arrival} from {from}: {} messages, {} tools, {}; {}",
-                p.messages,
-                p.tools,
+                "http {arrival} from {from}: {note}, {}; {}",
                 if p.stream { "streamed" } else { "one response" },
                 p.thinking()
             );
             let (cancel, rx) = submitted(p.engine_request(i, note)?)?;
             Ok::<_, chat::Error>((Prepared::DeepSeek(p), cancel, rx))
         }
+        Format::ChatMl(_) if api == Api::Responses => Err(chat::bad(format!(
+            "{} answers Chat Completions only (POST /v1/chat/completions); the Responses API is served for DeepSeek models",
+            shared.models[i].id
+        ))),
         Format::ChatMl(q) => {
             let mut p = chatml::prepare(&body, &format!("http {arrival} from {from}"), q, i)?;
             let request = std::mem::replace(
@@ -851,6 +874,8 @@ fn main() {
         .route("/models/{id}", get(model).fallback(use_get))
         .route("/v1/chat/completions", post(completions).fallback(use_post))
         .route("/chat/completions", post(completions).fallback(use_post))
+        .route("/v1/responses", post(responses).fallback(use_post))
+        .route("/responses", post(responses).fallback(use_post))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(shared.clone(), authorize))
         .with_state(shared);
