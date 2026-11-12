@@ -242,11 +242,25 @@ A request plans which KV state its prefill resumes from when the prefills
 before it have ended, so that it can resume from their states; until then it
 waits among the model's admitted requests. Decoding requests run in calls of
 at most the model's rows per call (6 for DeepSeek, 8 for Qwen3.8-27B,
-Flash-Next and Nemotron), because rows of one call share the GPU's work per
-layer. At most as many calls run at once as the decoding requests fill, and a
-call takes the requests that are free, the longest waiting first, so groups of
-requests advance independently: each call's waits are filled with the other
-calls' GPU work. A request that has just finished its prefill waits for the
+Flash-Next and Nemotron; fewer with the model's `rows_per_call` setting),
+because rows of one call share the GPU's work per layer. The decoding
+requests run in as many full calls as they fill, the others waiting for a
+call; or, while one call's waits for expert reads leave the GPU idle, they
+split evenly over at least two calls, every request in one. A call takes the
+requests that are free, the longest waiting first, so groups of requests
+advance independently: each call's waits are filled with the other calls' GPU
+work. The worker chooses between the two arrangements at run time
+(`server/src/calls.rs`), from the GPU's idle time while the engine thread
+waited for reads (the status's `engine_times`), read every quarter second:
+one second after the decoding requests or the arrangement change, a
+two-second window in which that idle time is above 12% splits the requests,
+and one below 3% returns to full calls. Only windows in which two or more
+requests of the model decode and nothing else runs count. Measured with
+UD-IQ1_M experts at 50 GiB, one call left the GPU idle 24-26% of the time
+while its rows waited for reads, two calls 5-9%, and two calls of about half
+the requests were the fastest arrangement for 2 to 8 requests. With most
+experts in memory the GPU is busy anyway: full calls read the dense weights
+once per layer for all their rows. A request that has just finished its prefill waits for the
 prefills still to come when they are short (at most 4,096 tokens in all) and
 for at most 20 seconds, so that its first decoding calls start full and do
 not take SSD reads and cache room from the prefills; a request that has

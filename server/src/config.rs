@@ -18,6 +18,9 @@ pub struct ModelConfig {
     pub engine: engine::Options,
     /// Requests running together at most.
     pub batch: usize,
+    /// Rows a decoding call takes at most, below the model's own (6 for
+    /// DeepSeek, 8 for the others); None: the model's own.
+    pub rows_per_call: Option<usize>,
     /// Its requests' defaults where a request sets none; None: the
     /// checkpoint's generation_config.json, else the format's own.
     pub temperature: Option<f64>,
@@ -41,6 +44,7 @@ impl ModelConfig {
                 ..Default::default()
             },
             batch: 4,
+            rows_per_call: None,
             temperature: None,
             top_p: None,
             top_k: None,
@@ -108,6 +112,14 @@ impl ModelConfig {
                     .ok()
                     .filter(|n| *n >= 1)
                     .ok_or("batch takes a positive integer")? as usize
+            }
+            "rows_per_call" => {
+                self.rows_per_call = Some(
+                    int()
+                        .ok()
+                        .filter(|n| *n >= 1)
+                        .ok_or("rows_per_call takes a positive integer")? as usize,
+                )
             }
             "temperature" => {
                 self.temperature = Some(
@@ -512,6 +524,18 @@ mod tests {
             (Some("qwen"), 1, 32768, Some(20), Some(0))
         );
         assert!(q.engine.deepseek().is_none());
+    }
+
+    #[test]
+    fn rows_per_call_is_per_model_and_positive() {
+        let models = parse(&json!({"models": [
+            {"model": "/m/deepseek", "rows_per_call": 2}, {"model": "/m/qwen"}
+        ]}))
+        .unwrap()
+        .models;
+        assert_eq!((models[0].rows_per_call, models[1].rows_per_call), (Some(2), None));
+        assert!(parse(&json!({"models": [{"model": "/m", "rows_per_call": 0}]})).is_err());
+        assert!(parse(&json!({"models": [{"model": "/m", "rows_per_call": "all"}]})).is_err());
     }
 
     #[test]

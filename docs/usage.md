@@ -46,7 +46,8 @@ of each architecture per process.
 | --- | --- |
 | `id` | Name clients send in `model`. Defaults to `deepseek-v4.1-flash` or the Qwen directory name in lower case. |
 | `ctx` | Maximum context positions. The server defaults to the model's limit: 1,048,576 for DeepSeek Flash and 262,144 for the supported Qwen checkpoint. |
-| `batch` | Maximum admitted requests for this model; default 4. Requests beyond the rows a decoding call takes (6 for DeepSeek, 8 for Qwen3.8-27B, Flash-Next and Nemotron) run in further decoding calls at the same time. |
+| `batch` | Maximum admitted requests for this model; default 4. A decoding call takes at most 6 rows for DeepSeek and 8 for Qwen3.8-27B, Flash-Next and Nemotron. Decoding requests run in as many full calls as they fill at the same time, the others waiting for a call; while the GPU waits for expert reads, they split evenly over two or more calls instead, every request in one (design.md, scheduling). |
+| `rows_per_call` | Rows of one decoding call at most, from 1 to the model's own (the default: 6 for DeepSeek, 8 for the others). With fewer rows per call, more calls run beside each other: each call's waits for the GPU and the SSD are filled with the other calls' work, but rows of different calls do not share the GPU's work per layer. |
 | `temperature`, `top_p`, `top_k`, `seed` | Defaults for requests that omit them or send null. Request values override them. `top_k: 0` uses the full vocabulary. |
 | `think` | Default reasoning effort, 0 for off and 1–100 for enabled reasoning. |
 | `draft` | The most speculative proposals per pass: DeepSeek DSpark 0–5; Qwen3.8-27B chained MTP 0–5; Nemotron DFlash2 0–15. Flash-Next requires 0. Each pass runs the count, up to this one, that has given the most tokens per second (design.md). |

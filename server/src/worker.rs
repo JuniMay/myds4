@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+use crate::calls::{CallChooser, Times};
 use crate::control::{self, Action, Control, Phase, Target};
 use crate::engine::{
     self, CacheCounts, DraftChoice, Logits, Lookup, Media, Model, PrefillInfo, RawSnapshot, RawState, Sampler,
@@ -54,11 +55,11 @@ const HOLD_PREFILL_ROWS: usize = 4096;
 const HOLD_TIME: Duration = Duration::from_secs(20);
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
-/// How many decoding calls of a model run at once: as many as its decoding
-/// requests fill (a call takes at most `most` rows), and one for a model whose
-/// decoder keeps its jobs in model-wide state.
-fn calls_at_once(decoding: usize, most: usize, serial: bool) -> usize {
-    if serial { 1 } else { (decoding / most).max(1) }
+/// The rows a decoding call takes at most: the model's own (`max_rows`), or
+/// fewer when the model's `rows_per_call` setting asks for fewer.
+fn rows_per_call(max_rows: usize, setting: Option<usize>) -> usize {
+    let most = max_rows.max(1);
+    setting.map_or(most, |n| n.clamp(1, most))
 }
 
 /// Whether a request ready to decode waits for the `prefilling` prompt tokens
@@ -182,6 +183,8 @@ pub struct Served {
     pub engine: engine::Options,
     /// Requests running together at most (at most the model's rows per pass).
     pub batch: usize,
+    /// Rows a decoding call takes at most; None: the model's own.
+    pub rows_per_call: Option<usize>,
     /// Seconds without requests before its weights and experts unload; 0 never.
     pub idle_unload: f64,
 }
@@ -280,6 +283,9 @@ struct Status {
     text: Option<NodeText>,
     /// The decoding requests' latest routed rows, for the live view.
     routes: Vec<Route>,
+    /// Whether the decoding requests split evenly over at least two calls
+    /// (crate::calls).
+    split_calls: bool,
     /// The cache's states (number, tokens, last use), its tree, bytes and limit.
     states: Vec<(u64, usize, Instant)>,
     tree: Vec<(kv::Node, Instant)>,
@@ -619,6 +625,7 @@ pub fn status(model: usize) -> Value {
         "ced_depth": o.deepseek().map_or(0, |d| d.ced), "lookup_depth": o.lookup,
         "prefill_prune": o.deepseek().is_some_and(|d| d.prefill_prune),
         "runahead": o.deepseek().is_some_and(|d| d.runahead), "pipeline": o.deepseek().is_some_and(|d| d.pipeline),
+        "rows_per_call": m.served.rows_per_call, "split_decoding_calls": st.split_calls,
         "drafts": st.drafts,
         "model_decode": {"computed_rows": c.decode_rows, "seconds": c.decode_seconds,
                          "main_queue_gpu_seconds": c.decode_gpu_seconds, "requested_expert_gb": c.decode.bytes as f64 / 1e9,
@@ -855,6 +862,8 @@ struct Slot {
     flights: Vec<Flight>,
     prefill_stream: Option<Stream>,
     decode_streams: Vec<Stream>,
+    /// How many calls the decoding requests run in.
+    calls: CallChooser,
 }
 
 // One KV budget and one LRU clock across models. Prefix matching is
@@ -1044,6 +1053,8 @@ struct Worker {
     memory: Memory,
     maintained: Instant,
     published: Instant,
+    /// The call choosers' clock.
+    started: Instant,
 }
 
 impl Worker {
@@ -1069,6 +1080,7 @@ impl Worker {
                     flights: Vec::new(),
                     prefill_stream: None,
                     decode_streams: Vec::new(),
+                    calls: CallChooser::new(),
                     model,
                     served,
                 }
@@ -1084,6 +1096,7 @@ impl Worker {
             memory,
             maintained: Instant::now(),
             published: Instant::now(),
+            started: Instant::now(),
         };
         w.memory.publish(&w.s);
         w
@@ -1235,6 +1248,25 @@ impl Worker {
             model_bytes: used.model_bytes,
             kv_bytes: used.kv_bytes,
         };
+    }
+
+    /// Feeds each model's call chooser with the counters just published. Its
+    /// looks are steady while two or more of its requests decode and nothing
+    /// else runs: no prefill and no other model's calls, whose GPU and SSD
+    /// time the process-wide counters would mix in.
+    fn observe_calls(&mut self) {
+        let now = self.started.elapsed().as_secs_f64();
+        let busy: Vec<bool> = self.slots.iter().map(|x| !x.flights.is_empty() || !x.pending.is_empty()).collect();
+        for (i, x) in self.slots.iter_mut().enumerate() {
+            let decoding = x.gens.iter().filter(|g| g.decoding()).count();
+            let prefilling = x.gens.iter().any(|g| !g.decoding()) || !x.pending.is_empty();
+            let others = busy.iter().enumerate().any(|(j, &b)| j != i && b);
+            let mut status = lock(&self.s.models[x.index].status);
+            let c = &status.engine;
+            let times = Times { thread: c.thread_s.iter().sum(), idle_reading: c.gpu_idle_s[3] };
+            x.calls.observe(now, times, decoding, decoding >= 2 && !prefilling && !others);
+            status.split_calls = x.calls.split();
+        }
     }
 
     fn resume_models(&mut self) {
@@ -1446,6 +1478,7 @@ impl Worker {
             if self.published.elapsed() >= Duration::from_millis(250) {
                 engine::refresh_stats();
                 self.publish_counters();
+                self.observe_calls();
                 self.published = Instant::now();
             }
         }
@@ -2492,19 +2525,21 @@ impl Slot {
     /// with its drafts or proposals, or together, each row as it would run
     /// alone, at most the model's rows per call.
     fn decode_start(&mut self, memory: &mut Memory) {
-        // Rows of one call share the GPU's work per layer, so calls stay as
-        // full as the requests allow: at most as many run at once as the
-        // decoding requests fill, and a request that finds no room waits for
-        // the next call. A call starts as soon as requests are free and there
-        // is room for it: groups of requests run independently of each other,
-        // and each call's waits are filled by the others' GPU work.
-        let most = self.model.max_rows().max(1);
+        // Rows of one call share the GPU's work per layer, so the decoding
+        // requests run in as many full calls as they fill, the rest waiting;
+        // or, while one call's waits for expert reads leave the GPU idle, split
+        // evenly over at least two calls (crate::calls). A call starts as soon
+        // as requests are free and there is room for it: groups of requests
+        // run independently of each other, and each call's waits are filled by
+        // the others' GPU work. A model that keeps its decoder's jobs in
+        // model-wide state runs one call.
+        let most = rows_per_call(self.model.max_rows(), self.served.rows_per_call);
         let total = self.gens.iter().filter(|g| g.decoding()).count();
         let serial = self.one_call_at_a_time();
         if serial && !self.flights.is_empty() {
             return;
         }
-        let allowed = calls_at_once(total, most, serial);
+        let (allowed, rows) = if serial { (1, most) } else { self.calls.calls(total, most) };
         let mut running = self
             .flights
             .iter()
@@ -2602,7 +2637,7 @@ impl Slot {
             self.flights.push(Flight { stream, call });
             return;
         }
-        for group in decoding.chunks(most) {
+        for group in decoding.chunks(rows) {
             if running >= allowed {
                 break;
             }
@@ -2666,7 +2701,8 @@ impl Slot {
         self.decode_streams.push(stream);
         // Calls that ran beside each other wrote the same routes: the live
         // view shows routes only while one decoding call runs.
-        let one_call = self.gens.iter().filter(|g| g.decoding()).count() <= self.model.max_rows().max(1);
+        let decoding = self.gens.iter().filter(|g| g.decoding()).count();
+        let one_call = self.calls.calls(decoding, rows_per_call(self.model.max_rows(), self.served.rows_per_call)).0 == 1;
         if self.per_row > 0 && one_call && ROUTES.swap(false, Ordering::Relaxed) {
             self.copy_routes(s, &ids);
         }
@@ -2740,12 +2776,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decoding_calls_run_as_many_as_their_requests_fill() {
-        assert_eq!(calls_at_once(12, 6, false), 2);
-        assert_eq!(calls_at_once(13, 6, false), 2);
-        assert_eq!(calls_at_once(5, 6, false), 1);
-        // a decoder that keeps its jobs in model-wide state runs one call at a time
-        assert_eq!(calls_at_once(12, 6, true), 1);
+    fn a_model_may_take_fewer_rows_per_decoding_call() {
+        assert_eq!(rows_per_call(6, None), 6);
+        assert_eq!(rows_per_call(6, Some(1)), 1);
+        assert_eq!(rows_per_call(6, Some(2)), 2);
+        assert_eq!(rows_per_call(6, Some(9)), 6); // never more than the model takes
+        assert_eq!(rows_per_call(6, Some(0)), 1);
+        let c = CallChooser::new();
+        assert_eq!(c.calls(4, rows_per_call(6, Some(1))), (4, 1));
+        assert_eq!(c.calls(4, rows_per_call(6, Some(2))), (2, 2));
+        assert_eq!(c.calls(12, rows_per_call(6, Some(4))), (3, 4));
     }
 
     #[test]

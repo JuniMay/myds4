@@ -7,6 +7,7 @@
 //! requests; each model family's chat adapter renders its requests
 //! and reads its replies; the live view (--tui) is view.rs.
 
+mod calls;
 mod chat;
 mod config;
 mod control;
@@ -63,6 +64,8 @@ const USAGE: &str = "usage: myds4-server [--config FILE | -m MODEL [model option
  a model's options:
   --id NAME       the name requests give in model (default: deepseek-v4.1-flash, or a Qwen directory's name)
   --batch N       its requests running together at most, at most its rows per pass (default 4)
+  --rows-per-call N  rows of one decoding call at most, at most the model's own; fewer rows per call run
+                  more calls beside each other (default: the model's own, 6 for DeepSeek, 8 for the others)
   -t T, --temperature T  the temperature of requests that set none (default: generation_config.json's, else 1)
   --top-p P       the top_p of requests that set none, 0 to 1 (default: generation_config.json's, else 1)
   --top-k K       the top_k of requests that set none, 0 for all (default: generation_config.json's, else 0)
@@ -726,6 +729,7 @@ fn main() {
             id,
             engine: e,
             batch: m.batch,
+            rows_per_call: m.rows_per_call,
             idle_unload: m.idle_unload.unwrap_or(a.budgets.idle_unload_s),
         });
         families.push(family);
