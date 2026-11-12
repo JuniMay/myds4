@@ -26,6 +26,8 @@ The root contains server settings and a nonempty `models` list:
 | `kv_disk` | Room on the SSD for saved states, in GiB; default 32, 0 turns saving and reading off (see [Saved states](#saved-states)). |
 | `kv_dir` | The saved states' folder; default `~/.cache/myds4/kv` (from `HOME`). |
 | `kv_disk_tokens` | A state is saved only when it holds at least this many tokens that no other kept state holds; default 8,192. |
+| `searxng_dir` | The SearXNG installation that Codex's web tool searches with (see [Codex](#codex)); default `~/.local/share/searxng` (from `HOME`). |
+| `searxng_socket` | The Unix socket the server starts SearXNG on; default `myds4.sock` in the SearXNG folder. macOS allows socket paths of about 104 bytes. |
 | `idle_unload` | Seconds a model may go without requests before its weights and experts unload; default 600, range 0–1,000,000, 0 never. A model's own `idle_unload` overrides it (see [Memory](#memory)). |
 | `models` | Each model's checkpoint and inference settings. |
 
@@ -289,6 +291,7 @@ prefilling that part again.
 | `POST /v1/chat/completions` | Generate with the model named in the request. Its first request loads its weights. |
 | `POST /v1/responses` | Generate through the Responses API, with a DeepSeek model. The Qwen models, Flash-Next and Nemotron answer Chat Completions only. |
 | `GET /v1/codex/models` | Codex's model catalog of the DeepSeek models (see [Codex](#codex)). Does not load model weights. |
+| `POST /v1/alpha/search` | The service behind Codex's web tool, `web.run` (see [Codex](#codex)). Does not load model weights. |
 | `GET /v1/control` | Process-wide execution state, effective budgets and retained model/KV bytes. |
 | `POST /v1/control/yield` | Pause inference and reclaim to temporary budgets. |
 | `POST /v1/control/resume` | Restore configured budgets and scheduling for the matching operation. |
@@ -350,6 +353,8 @@ Codex home of its own, for example `~/.codex-local/config.toml`:
 model = "deepseek-v4.1-flash"
 model_provider = "myds4"
 model_reasoning_effort = "high"
+# Codex's web tool, web.run, served by the server (POST /v1/alpha/search).
+web_search = "live"
 
 [model_providers.myds4]
 name = "myds4"
@@ -358,7 +363,11 @@ wire_api = "responses"
 env_key = "MYDS4_API_KEY"
 model_catalog_url = "http://127.0.0.1:8008/v1/codex/models"
 supports_websockets = false
+supports_standalone_web_search = true
 stream_idle_timeout_ms = 1800000
+
+[features]
+standalone_web_search = true
 ```
 
 ```sh
@@ -392,6 +401,31 @@ MYDS4_API_KEY="$(cat /path/to/api-key)" CODEX_HOME=~/.codex-local codex
   only SSE comments, and Codex does not count comments as activity. Without
   a long idle timeout, Codex would end a long prefill and send the request
   again.
+- **The web tool.** With `web_search = "live"`, the provider's
+  `supports_standalone_web_search` and the feature `standalone_web_search`
+  (marked under development in Codex), Codex gives the model its own
+  `web.run` tool and sends each call's commands to `POST /v1/alpha/search`:
+  - `search_query` runs on SearXNG. The server starts SearXNG on demand on a
+    Unix socket (`searxng_socket`), so it occupies no TCP port. It stops
+    SearXNG after 10 minutes without a search, and when the server stops.
+    The SearXNG folder (`searxng_dir`) holds its source in `src/`, a Python
+    environment with granian in `venv/`, and `settings.yml` with JSON output
+    enabled.
+  - `open` fetches a search result or a URL with the system curl, and shows
+    the page as numbered lines (`L12: ...`) with its links as `【n†text】`.
+    `click` follows link n of an opened page, and `find` lists the lines of
+    a page that contain a text. A page is cut at 5 MB, and a fetch at 30 s.
+  - Each Codex session keeps its results under reference ids:
+    `turnNsearchM` for a search result and `turnNviewM` for an opened page,
+    where N counts the session's calls. The references live in the server's
+    memory. After a restart, the model is told to open the URL instead.
+  - Only pages on public addresses are fetched, at every redirect: loopback,
+    private and link-local addresses are refused. Pi's `web_fetch`
+    extension, by contrast, reaches local addresses.
+  - `time` answers the time at a UTC offset. Image search, papers,
+    screenshots, finance, weather and sports are not available and say so.
+  - The output starts with a notice that web content is untrusted data. It
+    fits the output size Codex asks for.
 
 ### Yield and resume
 

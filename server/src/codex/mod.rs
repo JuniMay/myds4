@@ -1,5 +1,6 @@
 //! What Codex needs beyond the Responses API: its model catalog
-//! (GET /v1/codex/models, Codex's `model_catalog_url`).
+//! (GET /v1/codex/models, Codex's `model_catalog_url`), and the service behind
+//! its web tool (search.rs, POST /v1/alpha/search).
 //!
 //! For a model without catalog metadata, Codex assumes a context window of
 //! 272,000 tokens, caps its `model_context_window` setting there, and offers
@@ -7,6 +8,8 @@
 //! context, the reasoning levels the server maps to DeepSeek's efforts,
 //! Codex's own instructions and the `apply_patch` tool. Every catalog entry
 //! must carry instructions; Codex rejects a catalog with an entry without them.
+
+pub mod search;
 
 use serde_json::{Value, json};
 

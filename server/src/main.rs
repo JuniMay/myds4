@@ -22,6 +22,7 @@ mod worker;
 
 use std::io::IsTerminal;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::process::exit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -353,6 +354,8 @@ struct Shared {
     started: u64,
     arrivals: AtomicU64,
     models: Vec<Served>,
+    /// Codex's web tool (POST /v1/alpha/search).
+    search: codex::search::Service,
 }
 
 /// The model a request names (by name, in any case): the only model when it
@@ -537,6 +540,22 @@ async fn codex_models(State(s): App) -> Response {
         Format::ChatMl(_) => None,
     });
     json(codex::catalog(models).to_string())
+}
+
+/// POST /v1/alpha/search: Codex's web tool (codex/search.rs). Every command's
+/// result, or why it failed, is text in `output`.
+async fn alpha_search(State(s): App, ConnectInfo(peer): ConnectInfo<SocketAddr>, body: Body) -> Response {
+    let peer = peer.ip().to_string();
+    let body = match http::read_body(body, http::LIMITS).await {
+        Ok(body) => body,
+        Err(e) => return refused(&peer, e),
+    };
+    let request: codex::search::SearchRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return refused(&peer, chat::bad(format!("not a search request: {e}"))),
+    };
+    let output = s.search.handle(request).await;
+    json(json!({"output": output, "encrypted_output": null, "results": null}).to_string())
 }
 
 /// GET /v1/models/{id}: the model's object, and its live status under
@@ -875,7 +894,22 @@ fn main() {
             .map_or(0, |t| t.as_secs()),
         arrivals: AtomicU64::new(0),
         models: served_models,
+        search: {
+            let dir = a.server.searxng_dir.as_deref().map(PathBuf::from).or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|h| !h.is_empty())
+                    .map(|h| PathBuf::from(h).join(".local/share/searxng"))
+            });
+            let dir = dir.unwrap_or_else(|| PathBuf::from(".local/share/searxng"));
+            let socket = a
+                .server
+                .searxng_socket
+                .as_deref()
+                .map_or_else(|| dir.join("myds4.sock"), PathBuf::from);
+            codex::search::Service::new(dir, socket, codex::search::Policy::Public)
+        },
     });
+    let stopper = shared.clone();
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/health", get(health))
@@ -887,6 +921,8 @@ fn main() {
         )
         .route("/v1/models", get(models).fallback(use_get))
         .route("/v1/codex/models", get(codex_models).fallback(use_get))
+        .route("/v1/alpha/search", post(alpha_search).fallback(use_post))
+        .route("/alpha/search", post(alpha_search).fallback(use_post))
         .route("/codex/models", get(codex_models).fallback(use_get))
         .route("/models", get(models).fallback(use_get))
         .route("/v1/models/{id}", get(model).fallback(use_get))
@@ -903,6 +939,7 @@ fn main() {
         .enable_all()
         .build()
         .unwrap_or_else(|e| die(&format!("cannot start the runtime: {e}")));
+    let idle = stopper.clone();
     runtime.block_on(async move {
         let listener =
             tokio::net::TcpListener::from_std(listener).unwrap_or_else(|e| die(&e.to_string()));
@@ -914,8 +951,16 @@ fn main() {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         };
+        // SearXNG, if the web tool started it, stops when idle.
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                idle.search.idle();
+            }
+        });
         http::serve(listener, app, stopped, http::LIMITS).await;
     });
+    stopper.search.stop();
     worker::stop();
     if let Some(live) = live {
         live.finish();

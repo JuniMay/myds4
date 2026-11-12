@@ -170,7 +170,12 @@ pub struct Server {
     pub tui_theme: ui::Colors,
     /// The folder of the states saved on the SSD (server/src/disk.rs); None:
     /// [`default_kv_dir`].
-    pub kv_dir: Option<String>,
+    pub kv_dir: Option<String>,    /// SearXNG's installation for Codex's web tool (codex/search.rs); None:
+    /// $HOME/.local/share/searxng.
+    pub searxng_dir: Option<String>,
+    /// The Unix socket the server starts SearXNG on; None: myds4.sock in
+    /// the SearXNG folder.
+    pub searxng_socket: Option<String>,
 }
 
 impl Default for Server {
@@ -182,6 +187,8 @@ impl Default for Server {
             tui: false,
             tui_theme: ui::Colors::Auto,
             kv_dir: None,
+            searxng_dir: None,
+            searxng_socket: None,
         }
     }
 }
@@ -219,6 +226,8 @@ impl Server {
             }
             "api_key_file" => self.api_key_file = Some(text()?.into()),
             "kv_dir" => self.kv_dir = Some(text()?.into()),
+            "searxng_dir" => self.searxng_dir = Some(text()?.into()),
+            "searxng_socket" => self.searxng_socket = Some(text()?.into()),
             "tui" => self.tui = value.as_bool().ok_or("tui takes true or false")?,
             "tui_theme" => {
                 self.tui_theme = match text()? {
@@ -345,6 +354,8 @@ pub fn parse(root: &Value) -> Result<Config, String> {
             "api_key_file",
             "tui",
             "tui_theme",
+            "searxng_dir",
+            "searxng_socket",
         ]
         .contains(&k.as_str())
     }) {
@@ -357,7 +368,16 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         }
     }
     let mut server = Server::default();
-    for name in ["port", "host", "api_key_file", "kv_dir", "tui", "tui_theme"] {
+    for name in [
+        "port",
+        "host",
+        "api_key_file",
+        "kv_dir",
+        "tui",
+        "tui_theme",
+        "searxng_dir",
+        "searxng_socket",
+    ] {
         if let Some(value) = obj.get(name) {
             server.set(name, value)?;
         }

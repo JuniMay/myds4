@@ -1231,6 +1231,31 @@ mod tests {
         assert!(!r.prompt.contains("web_search"), "{}", r.prompt);
     }
 
+    /// Codex 0.167's web.run tool (tests/fixtures/codex_web_tool.json, without
+    /// its description): a namespace whose function has a generated schema.
+    #[test]
+    fn codex_web_run_renders() {
+        let tool: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/codex_web_tool.json")).unwrap();
+        let request = json!({
+            "model": "deepseek-v4.1-flash", "stream": true, "tools": [tool],
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Search the web."}]},
+                {"type": "function_call", "call_id": "call_1", "name": "run", "namespace": "web",
+                 "arguments": "{\"search_query\": [{\"q\": \"myds4\"}]}"},
+                {"type": "function_call_output", "call_id": "call_1",
+                 "output": [{"type": "input_text", "text": "[turn0search0] Example https://example.com/"}]},
+            ],
+        });
+        let Value::Object(root) = request else {
+            unreachable!()
+        };
+        let r = render(root, &defaults(), Api::Responses).ok().expect("rendered");
+        for text in ["web::run", "search_query", "turn0search0"] {
+            assert!(r.prompt.contains(text), "{text} is not in the prompt");
+        }
+    }
+
     #[test]
     fn failures_end_each_api_its_way() {
         let chat = ChatCompletionRequest::failure("invalid_request_error", "too long", "chatcmpl-1", "m", 3);
