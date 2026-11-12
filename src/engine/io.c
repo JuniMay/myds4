@@ -1457,7 +1457,7 @@ static int take(ExpertStore *st, int layer, int e, int optional) {
         i = slot_unheld(st);
         if (i < 0 && pass_current()) {
           SlotWait wait = {st, now() + 60};
-          pass_wait(&(PassWait){slot_released, slot_released_block, &wait});
+          pass_wait(&(PassWait){slot_released, slot_released_block, &wait, PASS_WAIT_OTHER});
           if (WHERE(layer, e) >= 0) return TAKE_RESIDENT;
           i = slot_unheld(st);
         }

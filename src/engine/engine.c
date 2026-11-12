@@ -329,7 +329,7 @@ static void stream_body(void *argument) {
   myds4_stream *x = argument;
   x->m->ops->pass_begin();
   for (;;) {
-    pass_wait(&(PassWait){stream_has_call, NULL, x});
+    pass_wait(&(PassWait){stream_has_call, NULL, x, PASS_WAIT_OTHER});
     if (x->call == STREAM_QUIT) break;
     stream_run(x);
     if (x->m->ops->pass_release) x->m->ops->pass_release();
